@@ -868,6 +868,279 @@ import XCTest
             }
         }
 
+        /// D2 wire evidence: a native-shell Agent Mode lease hides and denies `git`, while
+        /// `git_review_snapshot` stays advertised, rejects arguments outside its fixed surface, and
+        /// publishes selected artifacts through the shared auto-selection path.
+        func testNativeShellLeaseHidesGitWhileReviewSnapshotPublishesAndAutoSelectsArtifacts() async throws {
+            try await assertNativeShellReviewSnapshotScenario(structuredResults: .off)
+        }
+
+        /// D1 + D2: with `mcp.structured_results` on, only the snapshot (never `git`) advertises an
+        /// `outputSchema`; a success carries `structuredContent` beside the formatted text and an
+        /// argument rejection stays an `isError` text result without it.
+        func testStructuredResultsAdvertiseAndDeliverTheReviewSnapshotShapeOnly() async throws {
+            try await assertNativeShellReviewSnapshotScenario(structuredResults: .on)
+        }
+
+        /// D2 wire evidence for surfaces that never gain the snapshot, each installed from its
+        /// production lease builder. Context Builder discovery restricts it, so `tools/list` hides it
+        /// and `tools/call` is denied. The explore role hides it by advertisement only, the existing
+        /// role contract for every role-hidden tool, so a call by name still reaches the tool's own
+        /// argument check. Knowledge's closed allowlist lists and admits neither Git tool.
+        func testDiscoveryExploreAndKnowledgeLeasesKeepTheReviewSnapshotOffTheirSurfaces() async throws {
+            enum Surface: CaseIterable { case discovery, explore, knowledge }
+            for surface in Surface.allCases {
+                try await MCPSharedServerTestLease.shared.withLease { lease in
+                    let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                    do {
+                        try await activateWorkspace(fixture.contextA)
+                        let context = makeFrozenContext(
+                            fixture: fixture,
+                            selection: StoredSelection(selectedPaths: [], codemapAutoEnabled: false),
+                            bindings: []
+                        )
+                        let endpoint = try fixture.endpointA()
+                        switch surface {
+                        case .discovery:
+                            try await configureAgentModeEndpoint(endpoint, context: context, fixture: fixture) { runID in
+                                MCPBootstrapLeaseSpec.headless(
+                                    runID: runID,
+                                    gateID: runID,
+                                    clientName: endpoint.clientName,
+                                    windowID: context.windowID,
+                                    restrictedTools: DiscoverMCPToolPolicy.restrictedTools,
+                                    reason: "discover-run",
+                                    ttl: 10,
+                                    tabID: context.tabID,
+                                    purpose: .discoverRun
+                                )
+                            }
+                        case .explore:
+                            try await configureAgentModeEndpoint(endpoint, context: context, fixture: fixture) { runID in
+                                MCPBootstrapLeaseSpec.agentMode(
+                                    tabID: context.tabID,
+                                    runID: runID,
+                                    gateID: UUID(),
+                                    windowID: context.windowID,
+                                    agent: .codexExec,
+                                    taskLabelKind: .explore
+                                )
+                            }
+                        case .knowledge:
+                            try await configureAgentModeEndpoint(
+                                endpoint,
+                                context: context,
+                                fixture: fixture,
+                                sessionProfile: .knowledge
+                            )
+                        }
+
+                        let label = "\(surface)"
+                        let advertised = try await Set(endpoint.listToolNames())
+                        XCTAssertFalse(advertised.contains(MCPWindowToolName.gitReviewSnapshot), "\(label): \(advertised.sorted())")
+                        XCTAssertEqual(
+                            advertised.contains(MCPWindowToolName.git),
+                            surface != .knowledge,
+                            "\(label): \(advertised.sorted())"
+                        )
+
+                        let call = try await endpoint.callTool(
+                            name: MCPWindowToolName.gitReviewSnapshot,
+                            arguments: ["op": "diff"]
+                        )
+                        switch surface {
+                        case .discovery:
+                            XCTAssertTrue(
+                                call.rawJSON.contains("Tool 'git_review_snapshot' is disabled for this connection."),
+                                "\(label): \(call.rawJSON)"
+                            )
+                        case .explore:
+                            XCTAssertTrue(
+                                call.rawJSON.contains("git_review_snapshot does not accept: op."),
+                                "\(label): \(call.rawJSON)"
+                            )
+                            XCTAssertFalse(call.rawJSON.contains("disabled for this connection"), "\(label): \(call.rawJSON)")
+                        case .knowledge:
+                            let denial = try XCTUnwrap(
+                                ServerNetworkManager.positiveToolCeilingDenialMessage(
+                                    forCanonicalToolName: MCPWindowToolName.gitReviewSnapshot,
+                                    allowedToolsOverride: AgentModeMCPToolPolicy.knowledgeAllowedTools
+                                )
+                            )
+                            XCTAssertTrue(call.rawJSON.contains(denial), "\(label): \(call.rawJSON)")
+                        }
+                        XCTAssertTrue(call.rawJSON.contains("\"isError\":true"), "\(label): \(call.rawJSON)")
+
+                        await fixture.cleanup()
+                    } catch {
+                        await fixture.cleanup()
+                        throw error
+                    }
+                }
+            }
+        }
+
+        private func assertNativeShellReviewSnapshotScenario(
+            structuredResults: MCPStructuredResultsMode
+        ) async throws {
+            let settings = GlobalSettingsStore.shared
+            let previousStructuredResults = settings.mcpStructuredResultsMode()
+            // The mode is read when the connection registers its handlers, so set it first.
+            settings.setMCPStructuredResultsMode(structuredResults, commit: false)
+            defer { settings.setMCPStructuredResultsMode(previousStructuredResults, commit: false) }
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                let gitFixture = try ReviewGitRepositoryFixture(name: "ReviewSnapshotNativeShell")
+                defer { gitFixture.cleanup() }
+                do {
+                    try await activateWorkspace(fixture.contextA)
+                    let root = try gitFixture.makeRepository(
+                        named: "logical",
+                        files: [
+                            "Sources/Feature.swift": "let value = \"initial\"\n",
+                            "Sources/Other.swift": "let other = \"initial\"\n"
+                        ]
+                    )
+                    let file = root.appendingPathComponent("Sources/Feature.swift")
+                    let otherFile = root.appendingPathComponent("Sources/Other.swift")
+                    try write("let value = \"review_snapshot_source\"\n", to: file)
+                    try write("let other = \"excluded_by_path_filter\"\n", to: otherFile)
+                    _ = try await fixture.contextA.window.workspaceFileContextStore.loadRoot(
+                        path: root.path,
+                        kind: .primaryWorkspace
+                    )
+                    // Both changed files are selected; the snapshot's `paths` filter keeps only `file`.
+                    let sourceSelection = StoredSelection(
+                        selectedPaths: [file.path, otherFile.path],
+                        codemapAutoEnabled: false
+                    )
+                    let context = makeFrozenContext(
+                        fixture: fixture,
+                        selection: sourceSelection,
+                        bindings: []
+                    )
+                    let endpoint = try fixture.endpointA()
+                    try await configureAgentModeEndpoint(endpoint, context: context, fixture: fixture) { runID in
+                        // The production lease builder supplies the restrictions a native-shell run installs.
+                        MCPBootstrapLeaseSpec.agentMode(
+                            tabID: context.tabID,
+                            runID: runID,
+                            gateID: UUID(),
+                            windowID: context.windowID,
+                            agent: .codexExec,
+                            runHasNativeShell: true
+                        )
+                    }
+
+                    let structured = structuredResults == .on
+                    let toolsList = try await endpoint.client.request(
+                        method: "tools/list",
+                        params: [:],
+                        timeoutSeconds: 10
+                    )
+                    let listedTools = try XCTUnwrap(Self.resultObject(toolsList)["tools"] as? [[String: Any]])
+                    let snapshotListing = try XCTUnwrap(
+                        listedTools.first { $0["name"] as? String == MCPWindowToolName.gitReviewSnapshot }
+                    )
+                    if structured {
+                        let outputSchema = try XCTUnwrap(snapshotListing["outputSchema"] as? [String: Any])
+                        XCTAssertEqual(outputSchema["type"] as? String, "object")
+                        let properties = try XCTUnwrap(outputSchema["properties"] as? [String: Any])
+                        XCTAssertNotNil(properties["primary_artifacts"])
+                    } else {
+                        XCTAssertNil(snapshotListing["outputSchema"])
+                    }
+
+                    let advertised = try await Set(endpoint.listToolNames())
+                    XCTAssertFalse(advertised.contains(MCPWindowToolName.git), "\(advertised.sorted())")
+                    XCTAssertTrue(advertised.contains(MCPWindowToolName.gitReviewSnapshot), "\(advertised.sorted())")
+                    XCTAssertTrue(advertised.contains(MCPWindowToolName.readFile), "\(advertised.sorted())")
+
+                    let gitResponse = try await endpoint.callTool(
+                        name: MCPWindowToolName.git,
+                        arguments: ["op": "status"]
+                    )
+                    XCTAssertTrue(
+                        gitResponse.rawJSON.contains("Tool 'git' is disabled for this connection."),
+                        gitResponse.rawJSON
+                    )
+
+                    let rejected = try await endpoint.callTool(
+                        name: MCPWindowToolName.gitReviewSnapshot,
+                        arguments: ["op": "status", "detail": "patches", "scope": "selected"]
+                    )
+                    XCTAssertTrue(
+                        rejected.rawJSON.contains("git_review_snapshot does not accept: detail, op."),
+                        rejected.rawJSON
+                    )
+                    let rejectedResult = try Self.resultObject(rejected)
+                    XCTAssertEqual(rejectedResult["isError"] as? Bool, true)
+                    XCTAssertNil(rejectedResult["structuredContent"], rejected.rawJSON)
+                    let untouchedSelection = try XCTUnwrap(
+                        fixture.contextA.window.workspaceManager.composeTab(with: fixture.contextA.tabID)
+                    ).selection
+                    XCTAssertEqual(Set(untouchedSelection.selectedPaths), [file.path, otherFile.path])
+
+                    let snapshotResponse = try await endpoint.callTool(
+                        name: MCPWindowToolName.gitReviewSnapshot,
+                        arguments: [
+                            "repo_root": root.path,
+                            "scope": "selected",
+                            "paths": [file.path],
+                            "mode": "deep"
+                        ],
+                        timeoutSeconds: 30
+                    )
+                    XCTAssertFalse(snapshotResponse.rawJSON.contains("\"isError\":true"), snapshotResponse.rawJSON)
+                    let snapshotText = try toolResultText(snapshotResponse)
+                    // The text is formatted from the reply DTO (op=diff with artifacts), not the
+                    // caller's arguments, so it names the published snapshot and its MAP.
+                    XCTAssertTrue(snapshotText.contains("_git_data/"), snapshotText)
+                    XCTAssertTrue(snapshotText.contains("MAP.txt"), snapshotText)
+                    let snapshotResult = try Self.resultObject(snapshotResponse)
+                    if structured {
+                        let structuredContent = try XCTUnwrap(snapshotResult["structuredContent"] as? [String: Any])
+                        XCTAssertEqual(structuredContent["op"] as? String, "diff")
+                        XCTAssertNotNil(structuredContent["primary_artifacts"] as? [String: Any], snapshotResponse.rawJSON)
+                        XCTAssertNil(structuredContent[AgentDelegatedQuestionNoticeWire.resultKey])
+                        XCTAssertFalse(snapshotText.hasPrefix("{"), "Text stays formatted, not JSON")
+                        // The live payload stays inside the advertised top-level shape.
+                        let schema = try XCTUnwrap(MCPToolOutputSchemas.gitReviewSnapshot.objectValue)
+                        let declared = try Set(XCTUnwrap(schema["properties"]?.objectValue).keys)
+                        let required = Set((schema["required"]?.arrayValue ?? []).compactMap(\.stringValue))
+                        XCTAssertTrue(Set(structuredContent.keys).isSubset(of: declared), "\(structuredContent.keys.sorted())")
+                        XCTAssertTrue(required.isSubset(of: Set(structuredContent.keys)), "\(structuredContent.keys.sorted())")
+                    } else {
+                        XCTAssertNil(snapshotResult["structuredContent"], snapshotResponse.rawJSON)
+                    }
+                    let publishedSelection = try XCTUnwrap(
+                        fixture.contextA.window.workspaceManager.composeTab(with: fixture.contextA.tabID)
+                    ).selection
+                    XCTAssertTrue(publishedSelection.selectedPaths.contains(file.path))
+                    _ = try requireSelectedPath(
+                        suffix: "/MAP.txt",
+                        in: publishedSelection,
+                        context: "git_review_snapshot selected artifact publication",
+                        toolOutput: snapshotText
+                    )
+                    let patchPath = try requireSelectedPath(
+                        suffix: "/diff/all.patch",
+                        in: publishedSelection,
+                        context: "git_review_snapshot selected artifact publication",
+                        toolOutput: snapshotText
+                    )
+                    let patchText = try String(contentsOfFile: patchPath, encoding: .utf8)
+                    XCTAssertTrue(patchText.contains("review_snapshot_source"), patchText)
+                    XCTAssertFalse(patchText.contains("excluded_by_path_filter"), patchText)
+
+                    await fixture.cleanup()
+                } catch {
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
         func testAskOracleReviewUsesAuthorizedSelectedArtifactAndKeepsMapAsContext() async throws {
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(lease: lease)
@@ -4927,18 +5200,21 @@ import XCTest
             _ endpoint: PersistentMCPTestEndpoint,
             context: MCPServerViewModel.TabContextSnapshot,
             fixture: PersistentMCPTestFixture,
-            sessionProfile: AgentSessionProfile = .standard
+            sessionProfile: AgentSessionProfile = .standard,
+            leaseSpec: ((_ runID: UUID) -> MCPBootstrapLeaseSpec)? = nil
         ) async throws {
             _ = try await endpoint.callTool(
                 name: "bind_context",
                 arguments: ["op": "bind", "context_id": context.tabID.uuidString]
             )
-            await fixture.networkManager.setRunPurpose(.agentModeRun, for: endpoint.connectionID)
             let runID = try XCTUnwrap(context.runID)
+            let spec = leaseSpec?(runID)
+            let purpose = spec?.purpose ?? .agentModeRun
+            await fixture.networkManager.setRunPurpose(purpose, for: endpoint.connectionID)
             try await fixture.networkManager.debugSeedConnectionRunRouting(
                 connectionID: endpoint.connectionID,
                 runID: runID,
-                purpose: .agentModeRun,
+                purpose: purpose,
                 windowID: context.windowID
             )
             if sessionProfile == .knowledge {
@@ -4971,6 +5247,30 @@ import XCTest
                     Set(advertisedToolNames),
                     AgentModeMCPToolPolicy.knowledgeAllowedTools
                 )
+            } else if let spec {
+                // A production lease builder supplies every field the run's policy installs.
+                await fixture.networkManager.installClientConnectionPolicy(
+                    for: endpoint.clientName,
+                    windowID: context.windowID,
+                    restrictedTools: spec.restrictedTools,
+                    oneShot: true,
+                    reason: spec.reason ?? "lease surface integration",
+                    ttl: 10,
+                    tabID: context.tabID,
+                    runID: runID,
+                    additionalTools: spec.additionalTools,
+                    allowedToolsOverride: spec.allowedToolsOverride,
+                    sessionProfile: spec.sessionProfile,
+                    purpose: spec.purpose,
+                    taskLabelKind: spec.taskLabelKind,
+                    allowsAgentExternalControlTools: spec.allowsAgentExternalControlTools
+                )
+                let admission = await fixture.networkManager.debugApplyPendingPolicy(
+                    clientName: endpoint.clientName,
+                    connectionID: endpoint.connectionID,
+                    requireRunRouting: false
+                )
+                XCTAssertEqual(admission.outcome, "applied")
             } else {
                 await fixture.networkManager.debugSetAdditionalTools(
                     for: endpoint.connectionID,
@@ -5138,6 +5438,12 @@ import XCTest
                     for: connection.clientName
                 )
             }
+        }
+
+        private static func resultObject(_ response: PersistentMCPTestRPCResponse) throws -> [String: Any] {
+            let data = try XCTUnwrap(response.rawJSON.data(using: .utf8))
+            let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+            return try XCTUnwrap(object["result"] as? [String: Any], response.rawJSON)
         }
 
         private func toolResultText(_ response: PersistentMCPTestRPCResponse) throws -> String {

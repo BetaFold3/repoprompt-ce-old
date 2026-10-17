@@ -272,6 +272,7 @@ package enum AgentDelegatedQuestionNoticeWire {
         MCPWindowToolName.workspaceContext,
         MCPWindowToolName.prompt,
         MCPWindowToolName.git,
+        MCPWindowToolName.gitReviewSnapshot,
         MCPWindowToolName.oracleUtils,
         MCPWindowToolName.oracleChatLog,
         MCPWindowToolName.askOracle,

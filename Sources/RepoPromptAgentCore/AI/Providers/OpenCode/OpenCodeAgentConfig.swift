@@ -32,6 +32,12 @@ package struct OpenCodeAgentConfig {
     /// RepoPrompt-managed OpenCode mode for chat/Oracle prompt-only paths. Exposes no tools.
     static let managedNoToolsSessionModeID = "repoprompt_no_tools"
 
+    /// Whether an explicitly requested managed session mode keeps OpenCode's native bash tool.
+    /// Unknown or absent modes report `false`, which keeps the RepoPrompt `git` tool visible.
+    static func sessionModeHasNativeShell(_ sessionModeID: String?) -> Bool {
+        sessionModeID == managedSessionModeID || sessionModeID == managedFullAccessSessionModeID
+    }
+
     let commandName: String
     let additionalPathHints: [String]
     let modelString: String?

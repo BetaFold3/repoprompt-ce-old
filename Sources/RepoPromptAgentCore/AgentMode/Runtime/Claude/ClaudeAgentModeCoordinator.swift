@@ -2541,6 +2541,64 @@ package final class ClaudeAgentModeCoordinator {
         }
     }
 
+    /// Native-shell signal for this run's MCP lease (code-mode readiness D2). `true` only when
+    /// RepoPrompt itself launches Claude with Bash enabled: the pending launch policy (the value
+    /// `performEnsureClaudeNativeSession` compares and recycles against) and, when a controller is
+    /// already live, that process's captured launch settings, because a recycle can be deferred
+    /// while a turn is in flight. Anything else reports `false`, which keeps `git` visible.
+    ///
+    /// Standard Agent Mode never puts Bash in `--disallowedTools` (`agentDisallowedTools`), so a
+    /// `false` here can leave `git` visible beside an available Bash; it never hides `git`
+    /// from a run without a RepoPrompt-configured shell.
+    package func runHasNativeShell(for session: AgentTabSession) -> Bool {
+        let liveLaunchSettings: ControllerLaunchSettings?? = session.claudeController == nil
+            ? .none
+            : .some(controllerLaunchSettingsByTabID[session.tabID])
+        return Self.runHasNativeShell(
+            pendingAllowNativeBashTool: effectiveClaudeRuntimePermission(for: session).allowNativeBashTool,
+            sessionProfile: session.profile,
+            liveControllerLaunchSettings: liveLaunchSettings
+        )
+    }
+
+    /// Pure decision behind `runHasNativeShell(for:)`. `liveControllerLaunchSettings` is `nil`
+    /// when no controller is live, `.some(nil)` when a live controller has no recorded launch
+    /// settings (unknown, so `false`), and `.some(settings)` otherwise.
+    static func runHasNativeShell(
+        pendingAllowNativeBashTool: Bool?,
+        sessionProfile: AgentSessionProfile,
+        liveControllerLaunchSettings: ControllerLaunchSettings??
+    ) -> Bool {
+        guard launchKeepsNativeBash(allowNativeBashTool: pendingAllowNativeBashTool, sessionProfile: sessionProfile) else {
+            return false
+        }
+        switch liveControllerLaunchSettings {
+        case .none:
+            return true
+        case .some(.none):
+            return false
+        case let .some(.some(settings)):
+            return launchKeepsNativeBash(
+                allowNativeBashTool: settings.allowNativeBashTool,
+                sessionProfile: settings.sessionProfile
+            )
+        }
+    }
+
+    /// Whether a launch with these settings has Bash enabled by RepoPrompt's preference and absent
+    /// from the `--disallowedTools` list `makeDefaultController` passes.
+    private static func launchKeepsNativeBash(
+        allowNativeBashTool: Bool?,
+        sessionProfile: AgentSessionProfile
+    ) -> Bool {
+        guard allowNativeBashTool == true, sessionProfile == .standard else { return false }
+        return !ClaudeCodeIntegrationConfiguration.disallowedTools(
+            for: .agentRun,
+            allowNativeBashTool: true,
+            sessionProfile: sessionProfile
+        ).contains("Bash")
+    }
+
     private func effectiveClaudeRuntimePermission(
         for session: AgentTabSession
     ) -> ClaudeControllerLaunchPolicy {

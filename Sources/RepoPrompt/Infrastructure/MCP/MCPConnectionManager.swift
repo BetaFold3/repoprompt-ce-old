@@ -808,6 +808,7 @@ actor ServerNetworkManager {
             "oracle_utils",
             "oracle_chat_log",
             "git",
+            "git_review_snapshot",
             "manage_worktree"
         ]
         return !migrated.contains(toolName)

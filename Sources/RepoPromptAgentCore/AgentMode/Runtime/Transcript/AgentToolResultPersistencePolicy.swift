@@ -1570,7 +1570,7 @@ package enum AgentToolResultPersistencePolicy {
         ), let inlineSummary = renderSummary.inlineSummaryText {
             return inlineSummary
         }
-        if normalizedToolName == "git" {
+        if normalizedToolName == "git" || normalizedToolName == "git_review_snapshot" {
             let argsObject = jsonObject(from: argsJSON, context: context)
             for rawResultJSON in rawResultJSONCandidates {
                 guard let summary = gitStorageSummaryText(

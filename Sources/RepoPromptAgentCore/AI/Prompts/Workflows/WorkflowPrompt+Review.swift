@@ -27,6 +27,10 @@ You are a **Code Reviewer** using \(toolDesc). Your workflow: understand the sco
 	/// CLI variant of rp-review.
 	static var rpReviewCLI: String { rpReview(variant: .cli) }
 
+	/// Agent Mode hides `git` when the run has a native shell; inspection moves to that shell.
+	/// Every non-CLI variant carries it because installed MCP skills also load inside Agent Mode runs.
+	static let nativeShellGitInspectionNote = "If `git` is not in your tool list because this Agent Mode run has a native shell, run the same inspection there (`git status` for untracked files, `git log -10`, `git diff HEAD --stat` for staged and unstaged changes)."
+
 	/// Core review workflow content.
 	static func rpReviewCore(variant: WorkflowPromptVariant) -> String {
 		let builderName = variant == .cli ? "`builder`" : "`context_builder`"
@@ -58,7 +62,7 @@ rpce-cli -w <window_id> -e 'git status'
 rpce-cli -w <window_id> -e 'git log --count 10'
 rpce-cli -w <window_id> -e 'git diff --detail files'
 ```
-"""))
+"""))\(variant == .cli ? "" : "\n\n\(nativeShellGitInspectionNote)")
 
 \(reviewScopeConfirmationBlock(variant: variant))
 

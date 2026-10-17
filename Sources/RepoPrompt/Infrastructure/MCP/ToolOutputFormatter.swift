@@ -1078,7 +1078,7 @@ extension ToolOutputFormatter {
             return formatBindContext(args: args, value: result)
         case "manage_workspaces":
             return formatManageWorkspaces(args: args, value: result)
-        case "git":
+        case "git", "git_review_snapshot":
             return formatGit(args: args, value: result, emitResources: emitResources)
         case "manage_worktree":
             return formatManageWorktree(args: args, value: result)

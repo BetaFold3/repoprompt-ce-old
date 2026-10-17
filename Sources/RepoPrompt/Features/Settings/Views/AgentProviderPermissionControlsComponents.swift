@@ -218,7 +218,7 @@ struct CodexProviderToolsRuntimeSection: View {
             ) {
                 ProviderRuntimeToggleRow(
                     title: "Bash",
-                    description: "Allow Codex to run shell commands when your permission level allows it.",
+                    description: "Allow Codex to run shell commands when your permission level allows it. With Bash on, Agent Mode hides RepoPrompt's git tool and uses the shell for Git inspection; git_review_snapshot stays available for Oracle reviews.",
                     isOn: tools.bashToolEnabled,
                     onChange: { onApplyMutation(.bashTool(enabled: $0)) }
                 )
@@ -381,6 +381,13 @@ struct ClaudeProviderToolsRuntimeSection: View {
                 set: { onApplyMutation(.bashTool(enabled: $0)) }
             ))
             .toggleStyle(.switch)
+
+            Text(
+                "With Bash on, Agent Mode hides RepoPrompt's git tool and uses the shell for Git inspection; git_review_snapshot stays available for Oracle reviews. RepoPrompt can't see Bash rules in your own Claude Code settings, so if you deny Bash there, turn this off to get git back."
+            )
+            .font(.footnote)
+            .foregroundColor(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
 
             Toggle("RepoPrompt Only (Strict MCP)", isOn: Binding(
                 get: { tools.mcpStrictModeEnabled },

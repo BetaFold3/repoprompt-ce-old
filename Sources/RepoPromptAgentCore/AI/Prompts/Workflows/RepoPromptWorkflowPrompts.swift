@@ -73,7 +73,8 @@ package enum RepoPromptWorkflowPrompts {
     /// Version 67: Replaces blocking Step B batch guidance with bounded, indexed, resumable consultations that queue behind actual Oracle capacity.
     /// Version 68: Documents the extended Claude automatic lifecycle wait when explicit one-hour prompt-cache configuration is resolved at launch.
     /// Version 69: Raises the Codex-family automatic lifecycle wait from 10 to 25 minutes as a CE operational heuristic.
-    package static let skillsVersion = 69
+    /// Version 70: rp-reminder lists `git_review_snapshot` for Oracle-review diff publication; non-CLI rp-reminder, rp-review, and rp-oracle-export route Git inspection to the native shell when an Agent Mode run hides `git`.
+    package static let skillsVersion = 70
 
     package static func render(
         id: RepoPromptWorkflowID,

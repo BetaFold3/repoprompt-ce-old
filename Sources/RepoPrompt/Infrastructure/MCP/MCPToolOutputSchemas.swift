@@ -25,7 +25,8 @@ enum MCPStructuredResultsMode: String, CaseIterable {
 /// data; a consumer that keeps only tool data (for example a later code-mode sink) must treat the
 /// key as reserved and route its entries as notices rather than as DTO fields.
 ///
-/// The legacy `git` tool intentionally has no schema.
+/// The legacy `git` tool intentionally has no schema; `git_review_snapshot` declares the diff
+/// shape of the same `GitToolReplyDTO`.
 enum MCPToolOutputSchemas {
     /// `ToolResultDTOs.ReadFileReply`.
     static let readFile: Value = object(
@@ -150,12 +151,61 @@ enum MCPToolOutputSchemas {
         ]
     )
 
+    /// `ToolResultDTOs.GitToolReplyDTO` as `git_review_snapshot` returns it: always `op = diff`
+    /// with artifacts, so the status, log, show, and blame payloads of the legacy `git` tool are
+    /// not declared. Multi-root snapshots fill `repos` and `aggregate`; single-root snapshots
+    /// fill the flat fields.
+    static let gitReviewSnapshot: Value = {
+        let diffPayload: [String: Value] = [
+            "diff": gitDiff,
+            "worktree": gitWorktree,
+            "snapshot_id": string,
+            "snapshot_dir": string,
+            "artifacts": gitArtifacts,
+            "primary_artifacts": gitPrimaryArtifacts,
+            "summary": gitSummary,
+            "oneliner": string,
+            "inputs": gitDiffInputs,
+            "mode_details": string,
+            "inline": gitInline,
+            "warning": string,
+            "empty_reason": string,
+            "error": string
+        ]
+        let repo = object(
+            required: ["repo_root", "repo_key"],
+            properties: diffPayload.merging([
+                "repo_root": string,
+                "repo_key": string,
+                "repo_name": string
+            ]) { current, _ in current }
+        )
+        return object(
+            required: ["op"],
+            properties: diffPayload.merging([
+                "op": string,
+                "repos": array(repo),
+                "aggregate": object(
+                    required: [],
+                    properties: [
+                        "totals": gitTotals,
+                        "by_status": countsByKey,
+                        "oneliner": string,
+                        "repo_count": integer
+                    ]
+                ),
+                AgentDelegatedQuestionNoticeWire.resultKey: delegatedQuestionNotices
+            ]) { current, _ in current }
+        )
+    }()
+
     /// Tool name → schema for every tool that advertises one.
     static let schemasByToolName: [String: Value] = [
         MCPWindowToolName.readFile: readFile,
         MCPWindowToolName.search: fileSearch,
         MCPWindowToolName.getFileTree: getFileTree,
-        MCPWindowToolName.getCodeStructure: getCodeStructure
+        MCPWindowToolName.getCodeStructure: getCodeStructure,
+        MCPWindowToolName.gitReviewSnapshot: gitReviewSnapshot
     ]
 
     // MARK: - Shared fragments
@@ -218,6 +268,135 @@ enum MCPToolOutputSchemas {
             ))
         ]
     )
+
+    /// `GitToolReplyDTO.TotalsDTO`.
+    private static let gitTotals: Value = object(
+        required: ["files", "insertions", "deletions"],
+        properties: ["files": integer, "insertions": integer, "deletions": integer]
+    )
+
+    /// `GitToolReplyDTO.DiffDTO`.
+    private static let gitDiff: Value = object(
+        required: ["compare", "totals", "oneliner"],
+        properties: [
+            "compare": string,
+            "detail": string,
+            "files": array(object(
+                required: ["path", "status"],
+                properties: [
+                    "path": string,
+                    "status": string,
+                    "insertions": integer,
+                    "deletions": integer,
+                    "hunks": array(object(
+                        required: ["header", "old_start", "new_start", "patch"],
+                        properties: [
+                            "header": string,
+                            "old_start": integer,
+                            "new_start": integer,
+                            "patch": string
+                        ]
+                    ))
+                ]
+            )),
+            "totals": gitTotals,
+            "by_status": countsByKey,
+            "oneliner": string,
+            "truncated": boolean,
+            "truncation_note": string
+        ]
+    )
+
+    /// `GitToolReplyDTO.WorktreeDTO`.
+    private static let gitWorktree: Value = object(
+        required: ["is_worktree", "worktree_root"],
+        properties: [
+            "is_worktree": boolean,
+            "worktree_name": string,
+            "worktree_root": string,
+            "common_git_dir": string,
+            "main_worktree_root": string,
+            "worktree_branch": string,
+            "main_branch": string,
+            "worktree_head": string,
+            "main_head": string
+        ]
+    )
+
+    /// `GitToolReplyDTO.ArtifactsDTO`.
+    private static let gitArtifacts: Value = object(
+        required: ["manifest", "map", "files_tsv", "tree"],
+        properties: [
+            "manifest": string,
+            "map": string,
+            "files_tsv": string,
+            "changed_lines": string,
+            "tree": string,
+            "selection_paths": string,
+            "all_patch": string,
+            "deep_hunks": string,
+            "deep_changed_lines": string
+        ]
+    )
+
+    /// `GitToolReplyDTO.PrimaryArtifactsDTO`.
+    private static let gitPrimaryArtifacts: Value = object(
+        required: ["map"],
+        properties: [
+            "map": string,
+            "all_patch": string,
+            "auto_selected": array(string),
+            "per_file_patches": array(object(
+                required: ["jump_index", "git_path", "selection_path"],
+                properties: [
+                    "jump_index": integer,
+                    "git_path": string,
+                    "selection_path": string,
+                    "status": string,
+                    "additions": integer,
+                    "deletions": integer
+                ]
+            ))
+        ]
+    )
+
+    /// `GitToolReplyDTO.SummaryDTO`.
+    private static let gitSummary: Value = object(
+        required: ["files", "insertions", "deletions"],
+        properties: [
+            "files": integer,
+            "insertions": integer,
+            "deletions": integer,
+            "by_status": countsByKey
+        ]
+    )
+
+    /// `GitToolReplyDTO.DiffInputsDTO`.
+    private static let gitDiffInputs: Value = object(
+        required: ["compare", "scope", "context_lines", "detect_renames"],
+        properties: [
+            "compare": string,
+            "compare_input": string,
+            "scope": string,
+            "requested_paths_count": integer,
+            "context_lines": integer,
+            "detect_renames": boolean
+        ]
+    )
+
+    /// `GitToolReplyDTO.InlineDTO`.
+    private static let gitInline: Value = object(
+        required: ["map_excerpt", "truncated", "total_lines", "returned_lines"],
+        properties: [
+            "map_excerpt": string,
+            "truncated": boolean,
+            "total_lines": integer,
+            "returned_lines": integer
+        ]
+    )
+
+    /// A `[String: Int]` map such as `by_status` (git status letter → file count).
+    private static let countsByKey: Value = ["type": "object", "additionalProperties": integer]
 
     /// `ToolResultDTOs.PerFileCount`.
     private static let perFileCount: Value = object(

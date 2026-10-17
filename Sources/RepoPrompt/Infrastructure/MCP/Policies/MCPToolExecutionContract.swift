@@ -94,6 +94,7 @@ enum MCPToolExecutionContractCatalog {
             MCPGlobalToolName.bindContext,
             MCPGlobalToolName.manageWorkspaces,
             MCPWindowToolName.git,
+            MCPWindowToolName.gitReviewSnapshot,
             MCPWindowToolName.manageWorktree
         ] {
             result[toolName] = .workspaceLifecycleCancellable

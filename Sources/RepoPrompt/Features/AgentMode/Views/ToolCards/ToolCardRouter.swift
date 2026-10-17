@@ -105,6 +105,7 @@ enum ToolCardRouter {
         "bind_context",
         "manage_workspaces",
         "git",
+        "git_review_snapshot",
         "manage_worktree",
         "context_builder",
         "request_user_input",
@@ -207,7 +208,7 @@ enum ToolCardRouter {
             return AnyView(UnknownToolResultCard(item: item, title: toolDisplayName(for: normalized ?? item.toolName)))
         case "manage_workspaces":
             return AnyView(ManageWorkspacesResultCard(item: item))
-        case "git":
+        case "git", "git_review_snapshot":
             return AnyView(GitResultCard(item: item))
         case "manage_worktree":
             if isWorktreeMergeOp(item.toolArgsJSON) || isWorktreeMergeResult(item.toolResultJSON) {

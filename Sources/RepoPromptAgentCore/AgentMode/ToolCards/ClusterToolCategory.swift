@@ -237,7 +237,7 @@ package enum ClusterToolCategory {
         "agent_explore", "agent_run", "agent_manage"
     ]
     private static let configTools: Set<String> = [
-        "manage_selection", "workspace_context", "prompt", "git", "manage_worktree",
+        "manage_selection", "workspace_context", "prompt", "git", "git_review_snapshot", "manage_worktree",
         "bind_context", "manage_workspaces", "list_models", "context_builder",
         "app_settings"
     ]

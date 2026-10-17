@@ -186,6 +186,7 @@ package struct AgentToolCardRenderSummary: Codable, Equatable {
     private static func defaultTitle(for toolName: String) -> String {
         switch toolName {
         case "git": "Git"
+        case "git_review_snapshot": "Git Review Snapshot"
         case "file_search": "Search"
         case "search": "Web Search"
         case "web_read": "Read Web Page"
@@ -252,7 +253,7 @@ package enum AgentToolCardRenderSummaryBuilder {
             return fileTreeSummary(normalizedToolName: normalizedToolName, statusWord: statusWord, rawObject: rawObject, argsObject: argsObject)
         case "get_code_structure":
             return codeStructureSummary(statusWord: statusWord, rawObject: rawObject, argsObject: argsObject)
-        case "git":
+        case "git", "git_review_snapshot":
             return gitSummary(statusWord: statusWord, rawObject: rawObject, argsObject: argsObject)
         default:
             return safeNativeToolSummary(normalizedToolName: normalizedToolName, statusWord: statusWord, rawObject: rawObject, argsObject: argsObject)
@@ -867,7 +868,7 @@ package enum AgentToolCardRenderSummaryBuilder {
         case "read", "read_file", "file_search", "grep", "bash", "shell", "apply_edits", "apply_patch", "edit",
              "get_file_tree", "get_code_structure", "file_actions", "manage_selection", "workspace_context", "prompt",
              "ask_oracle", "oracle_send", "oracle_utils", "oracle_chat_log", "chat_send", "chats", "list_models",
-             "bind_context", "manage_workspaces", "git", "manage_worktree", "context_builder", "request_user_input",
+             "bind_context", "manage_workspaces", "git", "git_review_snapshot", "manage_worktree", "context_builder", "request_user_input",
              "ask_user", "ask_user_question", "agent_explore", "agent_run", "agent_manage", "app_settings":
             return false
         default:

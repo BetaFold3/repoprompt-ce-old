@@ -45,6 +45,7 @@ enum MCPWindowToolGroup: CaseIterable, Hashable {
         case .git:
             [
                 MCPWindowToolName.git,
+                MCPWindowToolName.gitReviewSnapshot,
                 MCPWindowToolName.manageWorktree
             ]
         case .contextBuilder:

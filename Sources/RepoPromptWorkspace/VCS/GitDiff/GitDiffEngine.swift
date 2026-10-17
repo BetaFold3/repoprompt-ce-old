@@ -186,28 +186,40 @@ package actor GitDiffEngine {
     ) -> [VCSUncommittedFile] {
         guard !pathspecs.isEmpty else { return files }
 
-        return files.filter { file in
-            for spec in pathspecs {
-                if spec.hasSuffix("/") {
-                    // Directory prefix match
-                    if file.path.hasPrefix(spec) || file.path == String(spec.dropLast()) {
-                        return true
-                    }
-                } else {
-                    // Exact match or the spec is a directory containing the file
-                    if file.path == spec || file.path.hasPrefix(spec + "/") {
-                        return true
-                    }
-                }
-            }
-            return false
-        }
+        return files.filter { Self.pathMatchesAnyPathspec($0.path, pathspecs) }
     }
 
+    /// Literal pathspec match: exact path, a directory containing the path, or a `/`-suffixed
+    /// directory prefix. `.` is the repository root.
+    private nonisolated static func pathMatchesAnyPathspec(_ path: String, _ pathspecs: [String]) -> Bool {
+        for spec in pathspecs {
+            if spec == "." {
+                return true
+            }
+            if spec.hasSuffix("/") {
+                // Directory prefix match
+                if path.hasPrefix(spec) || path == String(spec.dropLast()) {
+                    return true
+                }
+            } else {
+                // Exact match or the spec is a directory containing the file
+                if path == spec || path.hasPrefix(spec + "/") {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    /// `pathspecs` (caller `path`/`paths` filters) intersect `scope`: with `.all` they restrict
+    /// the snapshot to matching changes, with `.selected` they narrow the selected paths. A
+    /// non-nil list that has no entry inside this repository publishes no changes; absolute
+    /// paths in other repositories never widen this one.
     func buildSnapshotInputs(
         compare: GitDiffCompareSpec,
         scope: GitDiffScope,
         selectedAbsolutePaths: [String],
+        pathspecs: [String]? = nil,
         repoURL: URL,
         contextLines: Int,
         detectRenames: Bool,
@@ -215,14 +227,32 @@ package actor GitDiffEngine {
         generateDiffText: Bool
     ) async throws -> GitDiffSnapshotBuildResult {
         let normalizedSelected = normalizedAbsolutePaths(selectedAbsolutePaths)
-        let requestedPaths: [String]?
-        if scope == .selected {
-            let gitPaths = gitRelativePaths(from: normalizedSelected, repoRootPath: repoURL.path)
-            let cleaned = Array(Set(gitPaths)).sorted()
-            requestedPaths = cleaned.isEmpty ? nil : cleaned
-        } else {
-            requestedPaths = nil
+        let repoPathspecs: [String]? = pathspecs.map { specs in
+            GitDiffPathNormalization.gitPathspecs(from: specs, repoRootPath: repoURL.path)
+                .filter { !$0.hasPrefix("/") }
         }
+        let selectedRequestedPaths: [String]? = if scope == .selected {
+            Array(Set(gitRelativePaths(from: normalizedSelected, repoRootPath: repoURL.path))).sorted()
+        } else {
+            nil
+        }
+        // nil = whole repository; otherwise the only paths this snapshot may contain.
+        let pathFilter: [String]? = switch (selectedRequestedPaths, repoPathspecs) {
+        case (nil, nil):
+            nil
+        case let (selected?, nil):
+            selected
+        case let (nil, specs?):
+            specs.contains(".") ? nil : Array(Set(specs)).sorted()
+        case let (selected?, specs?):
+            // Both directions: a selected file inside a filter directory, or a filter file inside a
+            // selected directory. Every kept entry lies within both the selection and the filter.
+            Array(Set(
+                selected.filter { Self.pathMatchesAnyPathspec($0, specs) }
+                    + specs.filter { Self.pathMatchesAnyPathspec($0, selected) }
+            )).sorted()
+        }
+        let requestedPaths: [String]? = pathFilter?.isEmpty == false ? pathFilter : nil
 
         let fingerprint = try await fingerprint(for: compare, repoURL: repoURL)
 
@@ -243,12 +273,19 @@ package actor GitDiffEngine {
             detectRenames: detectRenames,
             at: repoURL
         )
-        let filtered = filterChangedFiles(
+        let scopeFiltered = filterChangedFiles(
             changedFiles,
             scope: scope,
             selectedAbsolutePaths: normalizedSelected,
             repoRootPath: repoURL.path
         )
+        // With caller filters, the changed-file list follows the same effective filter as the diff.
+        let filtered: [VCSUncommittedFile] = if repoPathspecs != nil {
+            pathFilter.map { filter in changedFiles.filter { Self.pathMatchesAnyPathspec($0.path, filter) } }
+                ?? changedFiles
+        } else {
+            scopeFiltered
+        }
 
         let summaryFiles = filtered.count
         let summaryInsertions = filtered.reduce(0) { $0 + ($1.additions ?? 0) }
@@ -258,8 +295,7 @@ package actor GitDiffEngine {
         var perFile: [String: String]?
         var rawPerFile: [String: Data]?
         if generateDiffText {
-            let pathFilter = (scope == .selected) ? requestedPaths : nil
-            if scope == .all || (pathFilter?.isEmpty == false) {
+            if pathFilter?.isEmpty != true, !filtered.isEmpty {
                 let tracked = try await diffOutput(
                     backend: backend,
                     compare: normalizedCompare,

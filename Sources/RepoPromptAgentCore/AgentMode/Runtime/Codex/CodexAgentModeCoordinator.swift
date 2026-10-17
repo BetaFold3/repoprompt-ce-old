@@ -3385,7 +3385,8 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
         sessionProfile: AgentSessionProfile = .standard,
         taskLabelKind: AgentModelCatalog.TaskLabelKind? = nil,
         allowsAgentExternalControlTools: Bool = false,
-        additionalRestrictedTools: Set<String> = []
+        additionalRestrictedTools: Set<String> = [],
+        runHasNativeShell: Bool = false
     ) -> MCPBootstrapLease? {
         guard shouldManageCodexTooling else { return nil }
         viewModel?.bindPendingOracleReviewContext(tabID: tabID, runID: runID)
@@ -3398,7 +3399,8 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
             sessionProfile: sessionProfile,
             taskLabelKind: taskLabelKind,
             allowsAgentExternalControlTools: allowsAgentExternalControlTools,
-            additionalRestrictedTools: additionalRestrictedTools
+            additionalRestrictedTools: additionalRestrictedTools,
+            runHasNativeShell: runHasNativeShell
         )
         return MCPBootstrapLease(
             spec: leaseSpec,
@@ -4454,7 +4456,11 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
                 sessionProfile: session.profile,
                 taskLabelKind: session.mcpControlContext?.taskLabelKind,
                 allowsAgentExternalControlTools: delegationPolicy.allowsAgentExternalControlTools,
-                additionalRestrictedTools: delegationPolicy.additionalRestrictedTools
+                additionalRestrictedTools: delegationPolicy.additionalRestrictedTools,
+                // The controller prepared above captured its shell-tool launch value; the
+                // policy installs at this transport start, so both describe the same process.
+                runHasNativeShell: session.profile == .standard
+                    && (session.codexController?.runHasNativeShell ?? false)
             ) else { return }
             let acquired = await lease.acquire()
             guard acquired else { return }

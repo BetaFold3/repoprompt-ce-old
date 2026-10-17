@@ -628,6 +628,11 @@ package final class AgentModeRunService {
         let expectedPIDPolicyArmer = dependencies.expectedPIDPolicyArmer
         let taskLabelKind = session.mcpControlContext?.taskLabelKind
         let delegationPolicy = dependencies.delegationRunToolPolicyResolver(session)
+        let runHasNativeShell = resolveRunHasNativeShell(
+            selectedAgent: selectedAgent,
+            session: session,
+            acpSessionModeID: acpRunRequest?.sessionModeID
+        )
         let runCoordinator = runCoordinator
         let makeLease: (_ runID: UUID) -> MCPBootstrapLease = { runID in
             self.dependencies.bindPendingOracleReviewContext(tabID, runID)
@@ -640,7 +645,8 @@ package final class AgentModeRunService {
                 sessionProfile: session.profile,
                 taskLabelKind: taskLabelKind,
                 allowsAgentExternalControlTools: delegationPolicy.allowsAgentExternalControlTools,
-                additionalRestrictedTools: delegationPolicy.additionalRestrictedTools
+                additionalRestrictedTools: delegationPolicy.additionalRestrictedTools,
+                runHasNativeShell: runHasNativeShell
             )
             let lease = MCPBootstrapLease(
                 spec: leaseSpec,
@@ -830,6 +836,25 @@ package final class AgentModeRunService {
         )
         steeringDebugLog("[AgentRunSteeringWake] ACP active submit runner returned sent=\(sent) agent=\(selectedAgent.rawValue) model=\(selectedModelString ?? "default") runID=\(String(describing: targetRunID)) attempt=\(String(describing: targetRunAttemptID))")
         return sent
+    }
+
+    /// Native-shell signal for the run's MCP lease, computed from the effective launch settings.
+    /// Claude reads the coordinator's effective Bash launch policy; OpenCode reads the requested
+    /// managed session mode. Every other provider, and any unknown value, reports `false` so the
+    /// RepoPrompt `git` tool stays visible. Codex computes its own value in its coordinator.
+    private func resolveRunHasNativeShell(
+        selectedAgent: AgentProviderKind,
+        session: AgentTabSession,
+        acpSessionModeID: String?
+    ) -> Bool {
+        guard session.profile == .standard else { return false }
+        if selectedAgent.usesClaudeNativeRuntime {
+            return dependencies.claudeCoordinator.runHasNativeShell(for: session)
+        }
+        if selectedAgent == .openCode {
+            return OpenCodeAgentConfig.sessionModeHasNativeShell(acpSessionModeID)
+        }
+        return false
     }
 
     @discardableResult

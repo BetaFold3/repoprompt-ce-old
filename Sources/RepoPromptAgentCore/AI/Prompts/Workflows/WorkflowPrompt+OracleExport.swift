@@ -112,7 +112,7 @@ Start by checking git state:
 rpce-cli -w <window_id> -e 'git status'
 rpce-cli -w <window_id> -e 'git diff --detail files'
 ```
-"""))
+"""))\(variant == .cli ? "" : "\n\n\(nativeShellGitInspectionNote)")
 
 \(reviewScopeConfirmationBlock(variant: variant, heading: "#### Review Scope Confirmation"))
 

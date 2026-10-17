@@ -30,13 +30,13 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         )
         XCTAssertEqual(
             MCPWindowToolGroup.git.orderedToolNames,
-            [MCPWindowToolName.git, MCPWindowToolName.manageWorktree],
+            [MCPWindowToolName.git, MCPWindowToolName.gitReviewSnapshot, MCPWindowToolName.manageWorktree],
             ".git group should reserve deterministic provider order for git-related tools."
         )
         XCTAssertEqual(
             tools.map(\.name).filter { MCPWindowToolGroup.git.orderedToolNames.contains($0) },
             MCPWindowToolGroup.git.orderedToolNames,
-            "Window catalog should keep .git providers ordered as git, manage_worktree."
+            "Window catalog should keep .git providers ordered as git, git_review_snapshot, manage_worktree."
         )
 
         if ProcessInfo.processInfo.environment["RECORD_MCP_WINDOW_TOOL_CATALOG"] == "1" {
@@ -878,21 +878,22 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         "7|prompt|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=e1377f12a6495829c0ade3e37b9325f7a07dc2065288b16bb810d01a4df9e55d|schema=8c8ea22a39bbb9e10c364ad483527faf109a52e1eb9c45c0c939f569ecf144d1",
         "8|apply_edits|enabled=true|ann=title=nil,readOnly=false,destructive=true,idempotent=nil,openWorld=false|desc=d33efa75e3e29e1e4e1cfe90d0e9d621337c397e5329aee02f4a261726d790fa|schema=e1ad464843910182006a484b0545305f8d53821a795cd8e116c07a01eededed8",
         "9|oracle_utils|enabled=true|ann=title=nil,readOnly=nil,destructive=nil,idempotent=nil,openWorld=nil|desc=27f95db5e0be6c58c0ce9ee266dd398fd3c40218b1cd575cb6770c81a8fc63e7|schema=7d3c55c22f02f8825008521e4c20cd304a7c12f3679743b34f5a2bf315d19d7b",
-        "10|ask_oracle|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=b37fd53f2cb00b5ab76ff8288a26c018987deeceefa750c77badc93260c37bf7|schema=d31504261e77cc256f1515dc9eb43e49fbab7491b84691b1e238e04699585a12",
-        "11|oracle_send|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=788f198c056f825fccbbb4b47d7ac73fd966720a5b25bd2ad4a4a59a88d25646|schema=fe707d3b115d3a22103ad81b217af7025030616179849ad4d326db4597c14b78",
+        "10|ask_oracle|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=1c1a0d2c4592633ee7b52c46ad63c5848f12f8a74913a69a7bdddf697ccef9bf|schema=d31504261e77cc256f1515dc9eb43e49fbab7491b84691b1e238e04699585a12",
+        "11|oracle_send|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=33e3f901816699654b939756275995cf6e377f7f897dbe291761c8077da074cc|schema=fe707d3b115d3a22103ad81b217af7025030616179849ad4d326db4597c14b78",
         "12|oracle_chat_log|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=48e4697cb8489f95351b4cbb2b6b38ef2d842527b23e6a4ce5fd4cd67cdd5320|schema=94345e29237a1bf1d5fbba4e28cd618ecbbd9505ff3cacad657fa6bff202dfc8",
         "13|git|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=1a9ff83872cf8842146dd84563dd880f7d9b8f6190cc6e9204a0ea82fc8feca6|schema=51bd804997d6acfaa17d529867f6188b969282a4db95956e859a74ab07de626a",
-        "14|manage_worktree|enabled=true|ann=title=nil,readOnly=false,destructive=true,idempotent=nil,openWorld=false|desc=857ab8975667e3d2e5b35a09c7415e07ca0ab2f0ff16de6895170d4d1b47a820|schema=9263f9f047982b3709d92040f749804d69928d222ce46038a4171ded34d12bc6",
-        "15|context_builder|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=d83348b6b803b303965401075041ddc5d7dcea3512020afa3f352c04413750fb|schema=2da87e6e171809a1e0eb0614fa8f7db2f91311f655f8427745060be80755da1f",
-        "16|ask_user|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=6b3870ae4848eb01c73de9fbbdf2ed1782487db150260469853757f799257ee0|schema=080446bb7697cf5f4cd31f07b42ecff8ab29edc8501ee0e84e61426748569156",
-        "17|remote_pairing|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=b66a65cddc2ce05b1aa4bd372bf87806149f0059c77318f2c0c88d998953733b|schema=78d2d5faef64665bd00b69fe88ebd9776445c1b21e028dbaf03f7bbeaa6dfed2",
-        "18|agent_explore|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=c99c0866d0cafeb3d4365592cc139369fc554295d16c48727fba567da1088f46|schema=3ebe5f060c868bed56e458923fa82b973d1d71a6c43c094d2b1623b2984efd90",
-        "19|agent_run|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=444e2154a065bd73221bc7335d1c35931c94888244f2823d7aff391b2ba17030|schema=c71be9897e5ebf3bc4253b244e52f947b5b8be019e1384035075afbc0ee076e7",
-        "20|agent_manage|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=b057e2b0203e6ec0faeac9b9342f1823d655cd7a60e51436d44d817da5516d69|schema=4cd0a819fec64efd8e0d3ad26a5242f622dd9496627b19f381bbc02ebc8fc3e5",
-        "21|share_thoughts|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=b1ac755b39a4ac2d8a621e78801a258c5d95ec2ff4e063f600081fa27891a852|schema=a5dea0c92fd4da06a15f991e1e8a287235ca681ae381cef1b594bc7c07e538d7",
-        "22|set_status|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=19bbfd6fc47639e02295de4e9289ea77f25c6a91ad150998726768b84c266783|schema=0854d727c81f1eb8fa0a14edb9d6ab8bb58974d919cc53150bd72473f1ae0196",
-        "23|wait_for_next_user_instruction|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=3a59a13a0026414ae04dd21d730a7144b91c67146dce77340fe730c865bea3d7|schema=15335c3bbadf042948d0a1ba52f0fcb01125428dda4952dbda418051904d82ef",
-        "24|history|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=e082791f37b91a339f66223799d917cb511ac5d18dbff5bc1f93790743ffe4a8|schema=62e0b861675086e0619134fac7d8823a71531b2afccb6b4451d9c7f519389e5d"
+        "14|git_review_snapshot|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=4d9e913b48c0d9ef7c175e610b5f9d5e3a26f0e5bae39ad6e9af5b2138558141|schema=2f1a6144a0a16bfa52a04efffcdfa45524836b8967e65b7ee4eb963f8ef00bbf",
+        "15|manage_worktree|enabled=true|ann=title=nil,readOnly=false,destructive=true,idempotent=nil,openWorld=false|desc=857ab8975667e3d2e5b35a09c7415e07ca0ab2f0ff16de6895170d4d1b47a820|schema=9263f9f047982b3709d92040f749804d69928d222ce46038a4171ded34d12bc6",
+        "16|context_builder|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=d83348b6b803b303965401075041ddc5d7dcea3512020afa3f352c04413750fb|schema=2da87e6e171809a1e0eb0614fa8f7db2f91311f655f8427745060be80755da1f",
+        "17|ask_user|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=6b3870ae4848eb01c73de9fbbdf2ed1782487db150260469853757f799257ee0|schema=080446bb7697cf5f4cd31f07b42ecff8ab29edc8501ee0e84e61426748569156",
+        "18|remote_pairing|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=b66a65cddc2ce05b1aa4bd372bf87806149f0059c77318f2c0c88d998953733b|schema=78d2d5faef64665bd00b69fe88ebd9776445c1b21e028dbaf03f7bbeaa6dfed2",
+        "19|agent_explore|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=c99c0866d0cafeb3d4365592cc139369fc554295d16c48727fba567da1088f46|schema=3ebe5f060c868bed56e458923fa82b973d1d71a6c43c094d2b1623b2984efd90",
+        "20|agent_run|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=444e2154a065bd73221bc7335d1c35931c94888244f2823d7aff391b2ba17030|schema=c71be9897e5ebf3bc4253b244e52f947b5b8be019e1384035075afbc0ee076e7",
+        "21|agent_manage|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=b057e2b0203e6ec0faeac9b9342f1823d655cd7a60e51436d44d817da5516d69|schema=4cd0a819fec64efd8e0d3ad26a5242f622dd9496627b19f381bbc02ebc8fc3e5",
+        "22|share_thoughts|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=b1ac755b39a4ac2d8a621e78801a258c5d95ec2ff4e063f600081fa27891a852|schema=a5dea0c92fd4da06a15f991e1e8a287235ca681ae381cef1b594bc7c07e538d7",
+        "23|set_status|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=19bbfd6fc47639e02295de4e9289ea77f25c6a91ad150998726768b84c266783|schema=0854d727c81f1eb8fa0a14edb9d6ab8bb58974d919cc53150bd72473f1ae0196",
+        "24|wait_for_next_user_instruction|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=3a59a13a0026414ae04dd21d730a7144b91c67146dce77340fe730c865bea3d7|schema=15335c3bbadf042948d0a1ba52f0fcb01125428dda4952dbda418051904d82ef",
+        "25|history|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=e082791f37b91a339f66223799d917cb511ac5d18dbff5bc1f93790743ffe4a8|schema=62e0b861675086e0619134fac7d8823a71531b2afccb6b4451d9c7f519389e5d"
     ]
 
     private static func signatures(for tools: [RepoPromptApp.Tool]) throws -> [String] {

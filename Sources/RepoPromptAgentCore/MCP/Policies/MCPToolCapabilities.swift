@@ -20,6 +20,9 @@ package enum MCPToolCapability: CaseIterable, Hashable {
     case structuralExplore
     case agentConversationSend
     case gitRead
+    /// `git_review_snapshot`: publishes diff artifacts and auto-selects them, so it is not a
+    /// read-only capability and is kept separate from `gitRead`.
+    case gitReviewSnapshot
     case worktreeManage
     case appSettings
 
@@ -43,6 +46,7 @@ package enum MCPToolCapability: CaseIterable, Hashable {
         case .fileManagement: "file_management"
         case .structuralExplore: "structural_explore"
         case .gitRead: "git_read"
+        case .gitReviewSnapshot: "git_review_snapshot"
         case .worktreeManage: "worktree_manage"
         case .appSettings: "app_settings"
         }
@@ -106,6 +110,9 @@ package enum MCPToolCapabilities {
         ],
         .gitRead: [
             "git"
+        ],
+        .gitReviewSnapshot: [
+            "git_review_snapshot"
         ],
         .worktreeManage: [
             "manage_worktree"

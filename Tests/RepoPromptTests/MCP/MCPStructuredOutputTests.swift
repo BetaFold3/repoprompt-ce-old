@@ -13,6 +13,13 @@ import XCTest
 /// field (owner decision 2026-10-17).
 final class MCPStructuredOutputTests: XCTestCase {
     private typealias DTO = ToolResultDTOs
+    private typealias GitDTO = ToolResultDTOs.GitToolReplyDTO
+
+    /// Tools whose DTO carries an optional `worktree_scope`.
+    private static let worktreeScopedTools: Set<String> = [
+        MCPWindowToolName.readFile, MCPWindowToolName.search,
+        MCPWindowToolName.getFileTree, MCPWindowToolName.getCodeStructure
+    ]
 
     // MARK: - Result projection
 
@@ -258,9 +265,19 @@ final class MCPStructuredOutputTests: XCTestCase {
         }
         // Optional nested objects are absent from the minimal DTOs; check their own minimal shapes.
         let worktreeScope = try Value(Self.worktreeScope(minimalMapping: true))
-        for toolName in MCPToolOutputSchemas.schemasByToolName.keys {
+        XCTAssertEqual(
+            Set(MCPToolOutputSchemas.schemasByToolName.keys.filter { Self.property("worktree_scope", of: $0) != nil }),
+            Self.worktreeScopedTools
+        )
+        for toolName in Self.worktreeScopedTools {
             let fragment = try XCTUnwrap(Self.property("worktree_scope", of: toolName))
             Self.assertConforms(worktreeScope, to: fragment, keys: .requiredOnly, path: "\(toolName).worktree_scope")
+        }
+        let snapshotSchema = try XCTUnwrap(MCPToolOutputSchemas.schemasByToolName[MCPWindowToolName.gitReviewSnapshot])
+        for (propertyPath, minimal) in try Self.minimalGitSnapshotFragments() {
+            let label = "git_review_snapshot." + propertyPath.joined(separator: ".")
+            let fragment = try XCTUnwrap(Self.schema(at: propertyPath, in: snapshotSchema), label)
+            Self.assertConforms(minimal, to: fragment, keys: .requiredOnly, path: label)
         }
         let retry = try Value(DTO.CodeStructureReplyDTO.RetryDTO(retryable: false, retryAfterMilliseconds: nil))
         let retryFragment = try XCTUnwrap(Self.property("retry", of: MCPWindowToolName.getCodeStructure))
@@ -277,19 +294,17 @@ final class MCPStructuredOutputTests: XCTestCase {
         }
     }
 
-    func testOnlyTheFourExplorationToolsAdvertiseAnOutputSchema() {
+    func testOnlyTheExplorationToolsAndTheReviewSnapshotAdvertiseAnOutputSchema() {
         XCTAssertEqual(
             Set(MCPToolOutputSchemas.schemasByToolName.keys),
-            [
-                MCPWindowToolName.readFile, MCPWindowToolName.search,
-                MCPWindowToolName.getFileTree, MCPWindowToolName.getCodeStructure
-            ]
+            Self.worktreeScopedTools.union([MCPWindowToolName.gitReviewSnapshot])
         )
+        // The legacy `git` tool returns the same DTO for every op but declares no schema.
         XCTAssertNil(MCPToolOutputSchemas.schemasByToolName[MCPWindowToolName.git])
     }
 
     @MainActor
-    func testWindowCatalogAttachesSchemasToTheExplorationToolsOnly() async {
+    func testWindowCatalogAttachesExactlyTheDeclaredSchemas() async {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
         let window = WindowState()
@@ -437,7 +452,103 @@ final class MCPStructuredOutputTests: XCTestCase {
             Fixture(toolName: MCPWindowToolName.readFile, value: Value(read)),
             Fixture(toolName: MCPWindowToolName.search, value: Value(search)),
             Fixture(toolName: MCPWindowToolName.getFileTree, value: Value(tree)),
-            Fixture(toolName: MCPWindowToolName.getCodeStructure, value: Value(structure))
+            Fixture(toolName: MCPWindowToolName.getCodeStructure, value: Value(structure)),
+            Fixture(toolName: MCPWindowToolName.gitReviewSnapshot, value: Value(fullGitSnapshot()))
+        ]
+    }
+
+    /// A `git_review_snapshot` reply with every diff-relevant field set, flat and per repo. The
+    /// status, log, show, and blame payloads stay nil: the snapshot always runs `op = diff`.
+    private static func fullGitSnapshot() -> GitDTO {
+        let byStatus = ["M": 1, "A": 1]
+        let totals = GitDTO.TotalsDTO(files: 2, insertions: 3, deletions: 1)
+        let diff = GitDTO.DiffDTO(
+            compare: "uncommitted", detail: "summary",
+            files: [.init(
+                path: "Sources/A.swift", status: "M", insertions: 3, deletions: 1,
+                hunks: [.init(header: "@@ -1 +1 @@", oldStart: 1, newStart: 1, patch: "-a\n+b")]
+            )],
+            totals: totals, byStatus: byStatus, oneliner: "2 files (+3 -1)", truncated: true,
+            truncationNote: "trimmed"
+        )
+        let worktree = GitDTO.WorktreeDTO(
+            isWorktree: true, worktreeName: "wt", worktreeRoot: "/wt", commonGitDir: "/repo/.git",
+            mainWorktreeRoot: "/repo", worktreeBranch: "feature", mainBranch: "main", worktreeHead: "abc",
+            mainHead: "def"
+        )
+        let artifacts = GitDTO.ArtifactsDTO(
+            manifest: "manifest.json", map: "MAP.txt", filesTsv: "files.tsv", changedLines: "changed.tsv",
+            tree: "tree.txt", selectionPaths: "selection.txt", allPatch: "diff/all.patch", deepHunks: "hunks.txt",
+            deepChangedLines: "deep.tsv"
+        )
+        let primary = GitDTO.PrimaryArtifactsDTO(
+            map: "MAP.txt", allPatch: "diff/all.patch", autoSelected: ["MAP.txt"],
+            perFilePatches: [.init(
+                jumpIndex: 1, gitPath: "Sources/A.swift", selectionPath: "diff/A.patch", status: "M",
+                additions: 3, deletions: 1
+            )]
+        )
+        let summary = GitDTO.SummaryDTO(files: 2, insertions: 3, deletions: 1, byStatus: byStatus)
+        let inputs = GitDTO.DiffInputsDTO(
+            compare: "uncommitted", compareInput: "uncommitted", scope: "selected", requestedPathsCount: 1,
+            contextLines: 3, detectRenames: false
+        )
+        let inline = GitDTO.InlineDTO(mapExcerpt: "MAP", truncated: false, totalLines: 1, returnedLines: 1)
+        let repo = GitDTO.RepoResultDTO(
+            repoRoot: "/repo", repoKey: "repo-key", repoName: "repo", diff: diff, worktree: worktree,
+            snapshotId: "snap-1", snapshotDir: "/snap", artifacts: artifacts, primaryArtifacts: primary,
+            summary: summary, oneliner: "2 files (+3 -1)", inputs: inputs, modeDetails: "standard", inline: inline,
+            warning: "warn", emptyReason: "none", error: "partial"
+        )
+        return GitDTO(
+            op: "diff", repos: [repo],
+            aggregate: .init(totals: totals, byStatus: byStatus, oneliner: "1 repo", repoCount: 1),
+            diff: diff, worktree: worktree, snapshotId: "snap-1", snapshotDir: "/snap", artifacts: artifacts,
+            primaryArtifacts: primary, summary: summary, oneliner: "2 files (+3 -1)", inputs: inputs,
+            modeDetails: "standard", inline: inline, warning: "warn", emptyReason: "none", error: "partial"
+        )
+    }
+
+    /// Minimal shapes of the snapshot's optional nested values, keyed by property path (array
+    /// properties are checked through their item schema).
+    private static func minimalGitSnapshotFragments() throws -> [([String], Value)] {
+        let totals = GitDTO.TotalsDTO(files: 0, insertions: 0, deletions: 0)
+        let diff = GitDTO.DiffDTO(
+            compare: "uncommitted", detail: nil, files: nil, totals: totals, byStatus: nil, oneliner: "",
+            truncated: nil, truncationNote: nil
+        )
+        let diffFile = GitDTO.DiffFileDTO(
+            path: "Sources/A.swift", status: "M", insertions: nil, deletions: nil, hunks: nil
+        )
+        let hunk = GitDTO.DiffHunkDTO(header: "@@", oldStart: 0, newStart: 0, patch: "")
+        let worktree = GitDTO.WorktreeDTO(
+            isWorktree: false, worktreeName: nil, worktreeRoot: "/repo", commonGitDir: nil,
+            mainWorktreeRoot: nil, worktreeBranch: nil, mainBranch: nil, worktreeHead: nil, mainHead: nil
+        )
+        let artifacts = GitDTO.ArtifactsDTO(
+            manifest: "m", map: "MAP.txt", filesTsv: "f", changedLines: nil, tree: "t", selectionPaths: nil,
+            allPatch: nil, deepHunks: nil, deepChangedLines: nil
+        )
+        let primary = GitDTO.PrimaryArtifactsDTO(map: "MAP.txt", allPatch: nil, autoSelected: nil, perFilePatches: nil)
+        let perFilePatch = GitDTO.PrimaryArtifactsDTO.PerFilePatchDTO(
+            jumpIndex: 0, gitPath: "a", selectionPath: "b", status: nil, additions: nil, deletions: nil
+        )
+        return try [
+            (["diff"], Value(diff)),
+            (["diff", "files"], Value([diffFile])),
+            (["diff", "files", "hunks"], Value([hunk])),
+            (["worktree"], Value(worktree)),
+            (["artifacts"], Value(artifacts)),
+            (["primary_artifacts"], Value(primary)),
+            (["primary_artifacts", "per_file_patches"], Value([perFilePatch])),
+            (["summary"], Value(GitDTO.SummaryDTO(files: 0, insertions: 0, deletions: 0, byStatus: nil))),
+            (["inputs"], Value(GitDTO.DiffInputsDTO(
+                compare: "uncommitted", compareInput: nil, scope: "all", requestedPathsCount: nil,
+                contextLines: 3, detectRenames: false
+            ))),
+            (["inline"], Value(GitDTO.InlineDTO(mapExcerpt: "", truncated: false, totalLines: 0, returnedLines: 0))),
+            (["repos"], Value([GitDTO.RepoResultDTO(repoRoot: "/repo", repoKey: "repo-key")])),
+            (["aggregate"], Value(GitDTO.AggregateDTO()))
         ]
     }
 
@@ -467,11 +578,13 @@ final class MCPStructuredOutputTests: XCTestCase {
             retry: nil,
             worktreeScope: nil
         )
+        let snapshot = GitDTO(op: "diff")
         return try [
             Fixture(toolName: MCPWindowToolName.readFile, value: Value(read)),
             Fixture(toolName: MCPWindowToolName.search, value: Value(search)),
             Fixture(toolName: MCPWindowToolName.getFileTree, value: Value(tree)),
-            Fixture(toolName: MCPWindowToolName.getCodeStructure, value: Value(structure))
+            Fixture(toolName: MCPWindowToolName.getCodeStructure, value: Value(structure)),
+            Fixture(toolName: MCPWindowToolName.gitReviewSnapshot, value: Value(snapshot))
         ]
     }
 
@@ -517,6 +630,20 @@ final class MCPStructuredOutputTests: XCTestCase {
         MCPToolOutputSchemas.schemasByToolName[toolName]?.objectValue?["properties"]?.objectValue?[name]
     }
 
+    /// Walks object `properties`, stepping through array `items`, so `["diff", "files", "hunks"]`
+    /// resolves the hunks array schema.
+    private static func schema(at propertyPath: [String], in root: Value) -> Value? {
+        var current = root
+        for name in propertyPath {
+            if current.objectValue?["type"] == .string("array"), let items = current.objectValue?["items"] {
+                current = items
+            }
+            guard let next = current.objectValue?["properties"]?.objectValue?[name] else { return nil }
+            current = next
+        }
+        return current
+    }
+
     private static func assertConforms(
         _ value: Value,
         to schema: Value,
@@ -539,6 +666,14 @@ final class MCPStructuredOutputTests: XCTestCase {
             }
             for (index, item) in items.enumerated() {
                 assertConforms(item, to: itemSchema, keys: expectation, path: "\(path)[\(index)]", file: file, line: line)
+            }
+        case let ("object", .object(object)) where schemaObject["additionalProperties"]?.objectValue != nil:
+            // A map such as `by_status`: no declared keys, every value matches one schema.
+            let valueSchema = schemaObject["additionalProperties"] ?? .null
+            XCTAssertNil(schemaObject["properties"], path, file: file, line: line)
+            XCTAssertFalse(object.isEmpty, "\(path): map fixture needs entries", file: file, line: line)
+            for (key, child) in object {
+                assertConforms(child, to: valueSchema, keys: expectation, path: "\(path).\(key)", file: file, line: line)
             }
         case let ("object", .object(object)):
             XCTAssertEqual(schemaObject["additionalProperties"], .bool(true), path, file: file, line: line)

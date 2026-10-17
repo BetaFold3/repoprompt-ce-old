@@ -19,7 +19,7 @@ import XCTest
                     MCPToolExecutionContractCatalog.orderedAdvertisedToolNames,
                     caseLabel
                 )
-                XCTAssertEqual(MCPToolDurationInventory.entries.count, 28, caseLabel)
+                XCTAssertEqual(MCPToolDurationInventory.entries.count, 29, caseLabel)
                 XCTAssertEqual(
                     Set(MCPToolDurationInventory.entries.map(\.toolName)).count,
                     MCPToolDurationInventory.entries.count,
@@ -81,6 +81,7 @@ import XCTest
                         MCPGlobalToolName.bindContext,
                         MCPGlobalToolName.manageWorkspaces,
                         MCPWindowToolName.git,
+                        MCPWindowToolName.gitReviewSnapshot,
                         MCPWindowToolName.manageWorktree
                     ],
                     caseLabel
@@ -215,12 +216,13 @@ import XCTest
                         MCPGlobalToolName.bindContext,
                         MCPGlobalToolName.manageWorkspaces,
                         MCPWindowToolName.git,
+                        MCPWindowToolName.gitReviewSnapshot,
                         MCPWindowToolName.manageWorktree
                     ],
                     caseLabel
                 )
                 let tools = try XCTUnwrap(payload["tools"] as? [[String: Any]], caseLabel)
-                XCTAssertEqual(tools.count, 28, caseLabel)
+                XCTAssertEqual(tools.count, 29, caseLabel)
                 let manageWorkspaces = try XCTUnwrap(tools.first {
                     $0["tool"] as? String == MCPGlobalToolName.manageWorkspaces
                 }, caseLabel)

@@ -13,6 +13,11 @@ package enum AgentModeMCPToolPolicy {
 
     static let restrictedTools: Set<String> = MCPToolCapabilities.toolNames(for: restrictedCapabilities)
 
+    /// Added to a run's restrictions when its final launch configuration gives the provider a
+    /// native shell (`runHasNativeShell`). Only plain Git inspection moves to the shell; the
+    /// review snapshot stays available.
+    static let nativeShellRestrictedTools: Set<String> = MCPToolCapabilities.toolNames(for: [.gitRead])
+
     /// Positive ceiling for a Knowledge session. Global availability, ordinary
     /// restrictions, and policy-gated grants are still intersected with this set.
     package static let knowledgeAllowedTools = KnowledgeSessionPolicy.allowedMCPToolNames

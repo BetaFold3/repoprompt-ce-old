@@ -16,7 +16,8 @@ package actor GitDiffSnapshotPublisher {
     // MARK: - Multi-root publish (repo-scoped storage)
 
     /// Publish a snapshot for a specific repo with repo-scoped storage.
-    /// Always creates a fresh snapshot tagged with the provided tabID.
+    /// Always creates a fresh snapshot tagged with the provided tabID. `pathspecs` are the
+    /// caller's `path`/`paths` filters; they intersect `scope` (see `GitDiffEngine`).
     package func publish(
         workspaceDirectory: URL,
         repo: GitRepoDescriptor,
@@ -26,6 +27,7 @@ package actor GitDiffSnapshotPublisher {
         compareInput: String?,
         scope: GitDiffScope,
         selectedAbsolutePaths: [String],
+        pathspecs: [String]? = nil,
         contextLines: Int,
         detectRenames: Bool,
         snapshotIDOverride: String?,
@@ -48,6 +50,7 @@ package actor GitDiffSnapshotPublisher {
             scope: scope,
             requestedPaths: requestedPaths,
             selectedAbsolutePaths: normalizedSelected,
+            pathspecs: pathspecs,
             contextLines: contextLines,
             detectRenames: detectRenames,
             snapshotIDOverride: snapshotIDOverride,
@@ -66,6 +69,7 @@ package actor GitDiffSnapshotPublisher {
         scope: GitDiffScope,
         requestedPaths: [String]?,
         selectedAbsolutePaths: [String],
+        pathspecs: [String]?,
         contextLines: Int,
         detectRenames: Bool,
         snapshotIDOverride: String?,
@@ -75,6 +79,7 @@ package actor GitDiffSnapshotPublisher {
             compare: compare,
             scope: scope,
             selectedAbsolutePaths: selectedAbsolutePaths,
+            pathspecs: pathspecs,
             repoURL: repo.rootURL,
             contextLines: contextLines,
             detectRenames: detectRenames,

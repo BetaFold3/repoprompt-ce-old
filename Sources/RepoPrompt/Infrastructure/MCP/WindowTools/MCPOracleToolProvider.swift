@@ -69,6 +69,8 @@ final class MCPOracleToolProvider: MCPWindowToolProviding {
 
             Every Oracle send re-packages the full chat history. `selection_mode` controls this send's packaging on any single send with an explicit conversation target (`chat_id` or `new_chat:true`): `current` (default) re-packages the current workspace selection exactly as before; `none` sends no workspace selection and suppresses review-mode frozen/automatic diffs for this send; `explicit_slices` packages only the supplied `slices` for this send. Explicit slices never mutate the shared workspace selection. In `review` mode, `none` and `explicit_slices` omit the automatic diff, so put diff text in `message` or slice the changed files. `consultations` lanes always package `current`. Prune selection, use `selection_mode:none`, or continue a long lane in a fresh chat with a concise summary.
 
+            Before a `review` of Git changes, publish the diff with `git_review_snapshot` (for example `{"scope":"selected"}`); it auto-selects the review artifacts that `current` packaging sends. It stays available in Agent Mode runs that hide `git` because the run has a native shell.
+
             Before a provider starts, the exact immutable packaged request is checked against a known model context window with output reserve and tokenizer margin. `max_output_tokens` customizes only that reserve. Unknown context windows skip the overflow check. Result usage echoes `context_window` and `pct` only for exact windows, never provider fallbacks, and reports the applied `output_reserve_tokens`.
 
             `response_mode` controls how much reply text returns inline: `full` (default) returns the complete response; `tail` returns the last ~2000 characters as `excerpt` plus stats; `none` returns stats only. Whenever the reply is trimmed (`tail` or `none`), the full response is auto-exported and the result includes `export_path`, shareable `oracle_export_path` / `oracle_export_instruction`, `line_count`, and `char_count` so the full text remains retrievable. Ask Oracle replies to end with a final `## Recommendations` section so `tail` remains semantically useful.
@@ -214,7 +216,7 @@ final class MCPOracleToolProvider: MCPWindowToolProviding {
 
             Pass `export_response: true` to write the response to a shareable file and get back shareable `oracle_export_path` / `oracle_export_instruction` values. To hand the export to a child agent, include `oracle_export_path` inside the `message` (or `messages`) you send on your next delegation call; your system prompt names the specific delegation tool available to you.
 
-            Build context first with file reads, `manage_selection`, or `workspace_context`.
+            Build context first with file reads, `manage_selection`, or `workspace_context`. Before a `review` of Git changes, publish the diff with `git_review_snapshot`; it auto-selects the review artifacts.
             """,
             annotations: .repoPromptLocalEphemeralState,
             inputSchema: .object(

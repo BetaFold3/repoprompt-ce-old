@@ -6,6 +6,49 @@ import RepoPromptAgentCore
 import RepoPromptPlatform
 import RepoPromptWorkspace
 
+/// Which advertised tool entered the shared Git implementation. `reviewSnapshot` is the
+/// fixed-argument `git_review_snapshot` surface; both kinds share publication, auto-selection,
+/// advertisement, and cleanup, and authorize artifacts under the tool name actually invoked.
+enum MCPGitToolInvocationKind: Equatable {
+    case full
+    case reviewSnapshot
+
+    static let reviewSnapshotAcceptedArguments: Set<String> = [
+        "compare", "scope", "mode",
+        "repo_root", "repo_roots", "repo_key",
+        "path", "paths", "context_lines", "detect_renames"
+    ]
+
+    var toolName: String {
+        switch self {
+        case .full: MCPWindowToolName.git
+        case .reviewSnapshot: MCPWindowToolName.gitReviewSnapshot
+        }
+    }
+
+    /// `full` passes arguments through. `reviewSnapshot` rejects every argument outside
+    /// `reviewSnapshotAcceptedArguments` and pins `op=diff`, `artifacts=true`, `detail=summary`.
+    func normalizedArguments(_ args: [String: Value]) throws -> [String: Value] {
+        switch self {
+        case .full:
+            return args
+        case .reviewSnapshot:
+            let rejected = args.keys.filter { !Self.reviewSnapshotAcceptedArguments.contains($0) }.sorted()
+            guard rejected.isEmpty else {
+                let accepted = Self.reviewSnapshotAcceptedArguments.sorted().joined(separator: ", ")
+                throw MCPError.invalidParams(
+                    "\(MCPWindowToolName.gitReviewSnapshot) does not accept: \(rejected.joined(separator: ", ")). Accepted arguments: \(accepted). Use `git` for other operations."
+                )
+            }
+            var normalized = args
+            normalized["op"] = .string("diff")
+            normalized["artifacts"] = .bool(true)
+            normalized["detail"] = .string("summary")
+            return normalized
+        }
+    }
+}
+
 @MainActor
 private final class MCPGitRequestContext {
     typealias WorktreeDTO = ToolResultDTOs.GitToolReplyDTO.WorktreeDTO
@@ -328,7 +371,7 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
     }
 
     func buildTools() -> [Tool] {
-        [gitTool()]
+        [gitTool(), gitReviewSnapshotTool()]
     }
 
     private func gitTool() -> Tool {
@@ -421,41 +464,98 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
                 required: ["op"]
             )
         ) { [self] _, args in
-            let connectionID = ServerNetworkManager.currentConnectionID
-            let invocationID = UUID()
-            do {
-                let reply = try await executeGitTool(
-                    args: args,
-                    connectionID: connectionID,
-                    advertisementInvocationID: invocationID
-                )
-                let encoded = try await MCPProviderProjectionWorker.encode(
-                    reply,
-                    toolName: MCPWindowToolName.git
-                )
-                try Task.checkCancellation()
-                if let advertised = await takeStagedAdvertisement(invocationID: invocationID) {
-                    do {
-                        _ = try await dependencies.replaceAdvertisedGitArtifactsForCurrentTab(
-                            MCPWindowToolName.git,
-                            advertised
-                        )
-                    } catch let error as CancellationError {
-                        throw error
-                    } catch {
-                        await dependencies.invalidateAdvertisedGitArtifactsForCurrentTab(
-                            MCPWindowToolName.git
-                        )
-                        dependencies.logDebug(
-                            "Git artifacts were published, but advertised aliases were not authorized: \(error.localizedDescription)"
-                        )
-                    }
+            try await handleGitInvocation(kind: .full, args: args)
+        }
+    }
+
+    private func gitReviewSnapshotTool() -> Tool {
+        runtime.tool(
+            name: MCPWindowToolName.gitReviewSnapshot,
+            freshnessPolicy: .providerManaged,
+            description: """
+            Publish a Git diff snapshot for Oracle review. Equivalent to `git` with `op=diff`, `artifacts=true`, `detail=summary`.
+
+            Run this before `ask_oracle` review mode so the review includes git diff context. It writes MAP.txt, files.tsv, and patch artifacts and auto-selects the primary review artifacts into context when possible.
+
+            It stays available in Agent Mode runs that hide `git` because the run has a native shell; use the shell for other Git inspection (status, log, show, blame) in those runs.
+
+            **Compare specs**: `uncommitted` (default), `staged`, `unstaged`, `back:N`, `mergebase:X`, `main`/`trunk`, `uncommitted:main`, `staged:main`, `last`, `<snapshot_id>`, `<revspec>`.
+
+            **Options**:
+            - `scope`: "all" | "selected" — filter to selected files only
+            - `mode`: "quick" | "standard" | "deep" (default: "standard")
+            - `repo_root` / `repo_roots` / `repo_key`: repository targeting, same as `git`
+
+            Other arguments are rejected.
+
+            **Examples**:
+            - Selected files: `{"scope":"selected"}`
+            - Branch vs trunk: `{"compare":"main"}`
+            """,
+            annotations: .repoPromptLocalEphemeralState,
+            inputSchema: .object(
+                properties: [
+                    "compare": .string(description: "Compare spec (supports main/trunk aliases); default uncommitted"),
+                    "scope": .string(description: "Diff scope", enum: ["all", "selected"]),
+                    "mode": .string(description: "Artifact mode", enum: ["quick", "standard", "deep"]),
+                    "repo_root": .string(description: "Repository root path inside a loaded root, or loaded root name. Supports @wt, @main, or @main:<branch>."),
+                    "repo_roots": .array(description: "Multiple repository root paths inside loaded roots, or root names. Supports @wt, @main, or @main:<branch> suffixes.", items: .string()),
+                    "repo_key": .string(description: "Repository key (optional alternative to repo_root)"),
+                    "path": .string(description: "Single pathspec"),
+                    "paths": .array(description: "Multiple pathspecs", items: .string()),
+                    "context_lines": .integer(description: "Diff context lines"),
+                    "detect_renames": .boolean(description: "Enable rename detection")
+                ],
+                required: []
+            ),
+            // Advertised only on connections opened with `mcp.structured_results` = `on`; the
+            // legacy `git` tool keeps no schema.
+            outputSchema: MCPToolOutputSchemas.gitReviewSnapshot
+        ) { [self] _, args in
+            try await handleGitInvocation(kind: .reviewSnapshot, args: args)
+        }
+    }
+
+    private func handleGitInvocation(
+        kind: MCPGitToolInvocationKind,
+        args: [String: Value]
+    ) async throws -> Value {
+        let arguments = try kind.normalizedArguments(args)
+        let connectionID = ServerNetworkManager.currentConnectionID
+        let invocationID = UUID()
+        do {
+            let reply = try await executeGitTool(
+                args: arguments,
+                invocationKind: kind,
+                connectionID: connectionID,
+                advertisementInvocationID: invocationID
+            )
+            let encoded = try await MCPProviderProjectionWorker.encode(
+                reply,
+                toolName: kind.toolName
+            )
+            try Task.checkCancellation()
+            if let advertised = await takeStagedAdvertisement(invocationID: invocationID) {
+                do {
+                    _ = try await dependencies.replaceAdvertisedGitArtifactsForCurrentTab(
+                        kind.toolName,
+                        advertised
+                    )
+                } catch let error as CancellationError {
+                    throw error
+                } catch {
+                    await dependencies.invalidateAdvertisedGitArtifactsForCurrentTab(
+                        kind.toolName
+                    )
+                    dependencies.logDebug(
+                        "Git artifacts were published, but advertised aliases were not authorized: \(error.localizedDescription)"
+                    )
                 }
-                return encoded
-            } catch {
-                await discardStagedAdvertisement(invocationID: invocationID)
-                throw error
             }
+            return encoded
+        } catch {
+            await discardStagedAdvertisement(invocationID: invocationID)
+            throw error
         }
     }
 
@@ -471,6 +571,7 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
 
     private func executeGitTool(
         args: [String: Value],
+        invocationKind: MCPGitToolInvocationKind,
         connectionID: UUID?,
         advertisementInvocationID: UUID
     ) async throws -> ToolResultDTOs.GitToolReplyDTO {
@@ -478,6 +579,7 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
         return try await MCPToolWorkCountDiagnostics.withGitInvocation(operation: operation) { [self] in
             try await executeGitToolBody(
                 args: args,
+                invocationKind: invocationKind,
                 connectionID: connectionID,
                 advertisementInvocationID: advertisementInvocationID
             )
@@ -486,10 +588,13 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
 
     private func executeGitToolBody(
         args: [String: Value],
+        invocationKind: MCPGitToolInvocationKind,
         connectionID: UUID?,
         advertisementInvocationID: UUID
     ) async throws -> ToolResultDTOs.GitToolReplyDTO {
         typealias Reply = ToolResultDTOs.GitToolReplyDTO
+        // Tab routing and artifact authorization use the tool the caller actually invoked.
+        let invokedToolName = invocationKind.toolName
 
         enum GitOp: String {
             case status, diff, log, show, blame
@@ -519,7 +624,7 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
         {
             try dependencies.resolveTabContextSnapshot(
                 metadata,
-                MCPWindowToolName.git,
+                invokedToolName,
                 .allowLegacyImplicitRouting
             )
         } else {
@@ -721,7 +826,7 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
             if !readyCandidates.isEmpty {
                 do {
                     let commit = try await dependencies.commitPrimaryGitDiffArtifactsToCurrentTab(
-                        MCPWindowToolName.git,
+                        invokedToolName,
                         readyCandidates,
                         sourceSelectionForArtifactCommit
                     )
@@ -1129,7 +1234,7 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
                     let resolvedContext = try preLookupSelectedPublicationContext
                         ?? dependencies.resolveTabContextSnapshot(
                             metadata,
-                            MCPWindowToolName.git,
+                            invokedToolName,
                             .allowLegacyImplicitRouting
                         )
                     let snapshotSelection = resolvedContext.snapshot.selection
@@ -1199,6 +1304,7 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
                                 compareInput: repoCompare.input,
                                 scope: scope,
                                 selectedAbsolutePaths: repoSelectedPaths,
+                                pathspecs: pathspecs,
                                 contextLines: contextLines,
                                 detectRenames: detectRenames,
                                 snapshotIDOverride: snapshotIDOverride,
@@ -1310,6 +1416,7 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
                     compareInput: compare.input,
                     scope: scope,
                     selectedAbsolutePaths: allSelectedAbsolutePaths,
+                    pathspecs: pathspecs,
                     contextLines: contextLines,
                     detectRenames: detectRenames,
                     snapshotIDOverride: snapshotIDOverride,

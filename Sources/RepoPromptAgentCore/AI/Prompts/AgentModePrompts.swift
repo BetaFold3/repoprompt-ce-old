@@ -90,6 +90,7 @@ enum AgentModePrompts {
         	- Use `file_search` to locate relevant files and symbols
         	- Read key sections with `read_file` — prefer targeted line ranges over full files
         	- Synthesize findings into a clear summary
+        - \(Fragments.gitInspectionGuidance)
 
         3. **For implementation-related questions** ("how would I add X?"):
         	- Identify the relevant files and current patterns
@@ -177,6 +178,7 @@ enum AgentModePrompts {
         - `oracle_chat_log` - Recover conversation text after `ask_oracle op:"wait"` without IDs has collected owned undelivered operations
         \(Fragments.namedOracleConsultationGuidance)
         \(Fragments.oracleFreshChatGuidance)
+        \(Fragments.gitReviewSnapshotGuidance)
         \(Fragments.oracleResumableWaitGuidance)
         \(delegationBlock)
         *User Interaction:*
@@ -281,6 +283,21 @@ enum AgentModePrompts {
         - For independent opinions, issue all `ask_oracle` calls together in the same tool-call batch. Give every lane `new_chat:true` and its own explicit `model`; `chat_name` is optional display text only and never selects a model. Refer to lanes by preset alias only, and never relay one lane's metadata to another.
         - Continue each lane with its own returned `chat_id`. The lane stays on its own preset, so `model` can be omitted on continuation; passing a different `model` switches that lane deliberately. Each result reports how the model was chosen through `model_selection` (`explicit`, `inherited`, or `automatic`).
         - Before comparing or synthesizing answers, verify every result's returned `model_preset_id` and `model_preset_name` match the requested preset. If identity is missing, mismatched, or any lane fails, report that failure and do not synthesize the answers.
+        """
+
+        /// Git inspection routing keyed to the tool list the lease actually enforces: a run with a
+        /// native shell has `git` hidden, so the model never has to infer whether it has a shell.
+        /// Explore prompts carry it alone because explore runs lose `git` the same way.
+        static let gitInspectionGuidance = "For Git inspection (status, log, show, blame), use the `git` tool while it is in your tool list; if it is not, run the same inspection in your native shell when you have one."
+
+        /// Git publication for Oracle review. `git_review_snapshot` stays available when an
+        /// Agent Mode run hides `git` because the run has a native shell. Explore and Knowledge
+        /// prompts omit it because their tool surfaces exclude the snapshot.
+        static let gitReviewSnapshotGuidance = """
+
+        **Git review context**
+        - Before an Oracle review of Git changes, publish the diff with `git_review_snapshot` (for example `{"scope":"selected"}`); it auto-selects the review artifacts.
+        - \(gitInspectionGuidance)
         """
 
         /// Fresh-chat contract shared by every prompt that recommends `new_chat:true` Oracle

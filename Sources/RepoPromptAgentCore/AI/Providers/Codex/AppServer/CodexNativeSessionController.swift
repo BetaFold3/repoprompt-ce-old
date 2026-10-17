@@ -131,6 +131,15 @@ package protocol CodexSessionControlling: AnyObject {
     func cancelCurrentTurn() async
     func shutdown() async
     func respondToServerRequest(id: CodexAppServerRequestID, result: [String: Any]) async
+    /// Whether this controller launches Codex with its native shell tool. Feeds the Agent Mode
+    /// MCP lease's native-shell signal; unknown reports `false` so `git` stays visible.
+    var runHasNativeShell: Bool { get }
+}
+
+package extension CodexSessionControlling {
+    var runHasNativeShell: Bool {
+        false
+    }
 }
 
 package final class CodexNativeSessionController {
@@ -506,6 +515,9 @@ package final class CodexNativeSessionController {
         var goalSupportEnabledProvider: @MainActor () -> Bool = { false }
         var reasoningSummariesEnabledProvider: @MainActor () -> Bool = { false }
         var computerUseEnabledProvider: @MainActor () -> Bool = { false }
+        /// Explicit Agent Mode shell-tool launch value captured at controller creation. Nil when
+        /// the launch falls back to the Codex Bash preference inside the config overrides.
+        var shellToolEnabled: Bool?
 
         package static func agentModeDefault(
             forceExperimentalSteering: Bool,
@@ -547,7 +559,8 @@ package final class CodexNativeSessionController {
                 processModelReasoningSummary: nil,
                 goalSupportEnabledProvider: goalSupportEnabledProvider,
                 reasoningSummariesEnabledProvider: reasoningSummariesEnabledProvider,
-                computerUseEnabledProvider: computerUseEnabledProvider
+                computerUseEnabledProvider: computerUseEnabledProvider,
+                shellToolEnabled: shellToolEnabled
             )
         }
     }
@@ -632,6 +645,10 @@ package final class CodexNativeSessionController {
     private let windowID: Int
     private let workspacePath: String?
     private let options: Options
+    package var runHasNativeShell: Bool {
+        options.shellToolEnabled ?? false
+    }
+
     private let clientShutdownBehavior: ClientShutdownBehavior
     private let expectedMCPClientName: String?
     private let requestExecutor: (@Sendable (String, [String: Any]?, TimeInterval?) async throws -> [String: Any])?

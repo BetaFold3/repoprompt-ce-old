@@ -60,6 +60,7 @@ enum MCPToolAdmissionPolicy {
         MCPWindowToolName.oracleSend: .control,
         MCPWindowToolName.oracleChatLog: .smallRead,
         MCPWindowToolName.git: .gitRead,
+        MCPWindowToolName.gitReviewSnapshot: .gitRead,
         MCPWindowToolName.manageWorktree: .exclusive,
         MCPWindowToolName.contextBuilder: .control,
         MCPWindowToolName.askUser: .control,

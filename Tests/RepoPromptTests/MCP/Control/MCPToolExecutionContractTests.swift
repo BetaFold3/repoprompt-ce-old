@@ -41,7 +41,7 @@ final class MCPToolExecutionContractTests: XCTestCase {
                 MCPGlobalToolName.orderedToolNames + MCPWindowToolGroup.orderedToolNames,
                 caseLabel
             )
-            XCTAssertEqual(MCPToolExecutionContractCatalog.orderedAdvertisedToolNames.count, 28, caseLabel)
+            XCTAssertEqual(MCPToolExecutionContractCatalog.orderedAdvertisedToolNames.count, 29, caseLabel)
             XCTAssertEqual(
                 Set(MCPToolExecutionContractCatalog.orderedAdvertisedToolNames).count,
                 MCPToolExecutionContractCatalog.orderedAdvertisedToolNames.count,
@@ -124,6 +124,7 @@ final class MCPToolExecutionContractTests: XCTestCase {
                 MCPGlobalToolName.bindContext,
                 MCPGlobalToolName.manageWorkspaces,
                 MCPWindowToolName.git,
+                MCPWindowToolName.gitReviewSnapshot,
                 MCPWindowToolName.manageWorktree
             ], caseLabel)
             assertNoWatchdogDeadline(for: names(for: .workspaceLifecycleCancellable), label: caseLabel)

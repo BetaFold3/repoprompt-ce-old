@@ -30,7 +30,7 @@ Continue your current workflow using \(toolDesc) instead of built-in alternative
 | Signatures / overview | \(variant == .cli ? "`structure`" : "`get_code_structure`") | reading whole files |
 | Edit file | \(variant == .cli ? "`edit`" : "`apply_edits`") | sed, Edit |
 | Create / delete / move | \(variant == .cli ? "`file`" : "`file_actions`") | touch, rm, mv, Write |
-| Git status / diff / log / blame | `git` | shelling out for analysis |
+\(variant == .cli ? "| Git status / diff / log / blame | `git` | shelling out for analysis |" : "| Git status / diff / log / blame | `git` | shelling out while `git` is in your tool list |\n| Publish a diff for Oracle review | `git_review_snapshot` | hand-built `git` diff artifacts |\n\n\(nativeShellGitInspectionNote) `git_review_snapshot` stays available there.")
 
 ## Context & Planning
 

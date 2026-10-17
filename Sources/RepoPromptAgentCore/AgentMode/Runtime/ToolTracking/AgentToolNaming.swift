@@ -70,7 +70,7 @@ package func toolIcon(for toolName: String?) -> String {
         return "bubble.left.and.bubble.right"
     case "context_builder", "mcp__RepoPrompt__context_builder":
         return "sparkles"
-    case "git", "mcp__RepoPrompt__git":
+    case "git", "mcp__RepoPrompt__git", "git_review_snapshot", "mcp__RepoPrompt__git_review_snapshot":
         return "arrow.triangle.branch"
     case "manage_worktree", "mcp__RepoPrompt__manage_worktree":
         return "rectangle.split.3x1"
@@ -148,6 +148,8 @@ package func toolDisplayName(for toolName: String?) -> String {
         return "Context Builder"
     case "git":
         return "Git"
+    case "git_review_snapshot":
+        return "Git Review Snapshot"
     case "manage_worktree":
         return "Worktrees"
     case "prompt":

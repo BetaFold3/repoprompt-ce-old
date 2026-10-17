@@ -21,6 +21,9 @@ package enum MCPWindowToolName {
     package static let oracleChatLog = "oracle_chat_log"
 
     package static let git = "git"
+    /// Fixed `git` diff publication (`op=diff`, `artifacts=true`) for Oracle review. It stays
+    /// available in Agent Mode runs that hide `git` because the run has a native shell.
+    package static let gitReviewSnapshot = "git_review_snapshot"
     package static let manageWorktree = "manage_worktree"
     package static let contextBuilder = "context_builder"
     package static let askUser = "ask_user"

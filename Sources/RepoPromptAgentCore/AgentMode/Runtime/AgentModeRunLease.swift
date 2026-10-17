@@ -11,7 +11,8 @@ extension MCPBootstrapLeaseSpec {
         sessionProfile: AgentSessionProfile = .standard,
         taskLabelKind: AgentModelCatalog.TaskLabelKind? = nil,
         allowsAgentExternalControlTools: Bool = false,
-        additionalRestrictedTools: Set<String> = []
+        additionalRestrictedTools: Set<String> = [],
+        runHasNativeShell: Bool = false
     ) -> MCPBootstrapLeaseSpec {
         MCPBootstrapLeaseSpec(
             runID: runID,
@@ -21,7 +22,11 @@ extension MCPBootstrapLeaseSpec {
             clientName: agent.mcpClientNameHint,
             // Delegation-leaf restrictions are unioned, never substituted, so they hide and deny
             // their tools even when grants or the advertisement flag would otherwise expose them.
-            restrictedTools: AgentModeMCPToolPolicy.restrictedTools.union(additionalRestrictedTools),
+            // A run with a native shell does plain Git inspection there, so the full `git` tool
+            // is hidden and denied; `git_review_snapshot` stays available for Oracle review.
+            restrictedTools: AgentModeMCPToolPolicy.restrictedTools
+                .union(additionalRestrictedTools)
+                .union(runHasNativeShell ? AgentModeMCPToolPolicy.nativeShellRestrictedTools : []),
             additionalTools: AgentModeMCPPolicyInstaller.additionalTools(
                 for: agent,
                 sessionProfile: sessionProfile
