@@ -53,6 +53,7 @@ package enum MCPIntegrationHelper {
         "git",
         "git_review_snapshot",
         "bind_context",
+        "code_mode",
         "manage_workspaces",
         "context_builder",
         "share_thoughts",

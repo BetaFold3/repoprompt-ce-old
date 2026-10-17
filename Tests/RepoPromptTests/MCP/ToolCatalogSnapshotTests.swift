@@ -893,7 +893,8 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         "22|share_thoughts|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=b1ac755b39a4ac2d8a621e78801a258c5d95ec2ff4e063f600081fa27891a852|schema=a5dea0c92fd4da06a15f991e1e8a287235ca681ae381cef1b594bc7c07e538d7",
         "23|set_status|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=19bbfd6fc47639e02295de4e9289ea77f25c6a91ad150998726768b84c266783|schema=0854d727c81f1eb8fa0a14edb9d6ab8bb58974d919cc53150bd72473f1ae0196",
         "24|wait_for_next_user_instruction|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=3a59a13a0026414ae04dd21d730a7144b91c67146dce77340fe730c865bea3d7|schema=15335c3bbadf042948d0a1ba52f0fcb01125428dda4952dbda418051904d82ef",
-        "25|history|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=e082791f37b91a339f66223799d917cb511ac5d18dbff5bc1f93790743ffe4a8|schema=62e0b861675086e0619134fac7d8823a71531b2afccb6b4451d9c7f519389e5d"
+        "25|history|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=e082791f37b91a339f66223799d917cb511ac5d18dbff5bc1f93790743ffe4a8|schema=62e0b861675086e0619134fac7d8823a71531b2afccb6b4451d9c7f519389e5d",
+        "26|code_mode|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=81d387c9a0be4a15c9a6034cf9a295e27d9fdcee32ee50c67b64d2bc85361baf|schema=3a53ad002b6be098358ec6e27e5d3ea0d51d9671493b1d446f0bcdaf31afb7bf"
     ]
 
     private static func signatures(for tools: [RepoPromptApp.Tool]) throws -> [String] {

@@ -41,7 +41,7 @@ final class MCPToolExecutionContractTests: XCTestCase {
                 MCPGlobalToolName.orderedToolNames + MCPWindowToolGroup.orderedToolNames,
                 caseLabel
             )
-            XCTAssertEqual(MCPToolExecutionContractCatalog.orderedAdvertisedToolNames.count, 29, caseLabel)
+            XCTAssertEqual(MCPToolExecutionContractCatalog.orderedAdvertisedToolNames.count, 30, caseLabel)
             XCTAssertEqual(
                 Set(MCPToolExecutionContractCatalog.orderedAdvertisedToolNames).count,
                 MCPToolExecutionContractCatalog.orderedAdvertisedToolNames.count,
@@ -73,14 +73,20 @@ final class MCPToolExecutionContractTests: XCTestCase {
                 MCPWindowToolName.agentManage,
                 MCPWindowToolName.shareThoughts,
                 MCPWindowToolName.setStatus,
-                MCPWindowToolName.history
+                MCPWindowToolName.history,
+                MCPWindowToolName.codeMode
             ], caseLabel)
 
             for toolName in names(for: .bounded) {
                 guard case let .bounded(deadline, cancellationGrace) = MCPToolExecutionContractCatalog.contract(for: toolName) else {
                     return XCTFail(caseLabel + ": Expected bounded contract for \(toolName)")
                 }
-                XCTAssertEqual(deadline, MCPTimeoutPolicy.boundedToolExecutionDeadline, caseLabel + ": " + toolName)
+                // `code_mode` (plan §6 D3): its 60 s script wall clock plus the executor's 2 s cleanup
+                // allowance, so its own timeout result always arrives before the watchdog's.
+                let expectedDeadline: Duration = toolName == MCPWindowToolName.codeMode
+                    ? .seconds(62)
+                    : MCPTimeoutPolicy.boundedToolExecutionDeadline
+                XCTAssertEqual(deadline, expectedDeadline, caseLabel + ": " + toolName)
                 XCTAssertEqual(cancellationGrace, MCPTimeoutPolicy.boundedToolCancellationCleanupGrace, caseLabel + ": " + toolName)
             }
         }

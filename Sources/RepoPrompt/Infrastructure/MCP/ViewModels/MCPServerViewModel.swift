@@ -1875,7 +1875,8 @@ final class MCPServerViewModel: ObservableObject {
             MCPRemotePairingToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies),
             MCPAgentControlToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies),
             MCPAgentSessionControlToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies),
-            MCPHistoryToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies)
+            MCPHistoryToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies),
+            MCPCodeModeToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies)
         ]
     )
     private var cancellables: Set<AnyCancellable> = []
@@ -3502,7 +3503,11 @@ final class MCPServerViewModel: ObservableObject {
             mcpServerViewModelDebugLog("runTool '\(name)' bound context for tab=\(context.tabID) runID=\(context.runID?.uuidString ?? "nil")")
         }
 
-        let shouldTrackActiveTool = await shouldTrackActiveTool(for: metadata)
+        // A `code_mode` child never takes, overwrites, or clears the parent's active-tool cancel
+        // slot (plan §6 D3); it keeps its own run-indexed execution registration below.
+        let shouldTrackActiveTool = ServerNetworkManager.currentToolInvocationOrigin.isCodeModeChild
+            ? false
+            : await shouldTrackActiveTool(for: metadata)
         let executionRunID = await resolveRunIDForExecution(metadata: metadata, resolvedContext: resolvedContext)
         let indexedRunID = shouldRegisterRunToolExecution(toolName: name)
             ? executionRunID

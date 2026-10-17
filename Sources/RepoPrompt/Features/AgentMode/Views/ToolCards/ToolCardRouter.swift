@@ -133,7 +133,7 @@ enum ToolCardRouter {
             toolIsError: item.toolIsError,
             agentControlContext: agentControlContext
         )
-        return AnyView(
+        return markingCodeModeChild(item, AnyView(
             ToolCallCard(
                 item: item,
                 title: presentation?.title ?? toolDisplayName(for: normalized ?? item.toolName),
@@ -142,6 +142,24 @@ enum ToolCardRouter {
                 showRunScopedToolCancel: showRunScopedToolCancel,
                 cancelActiveToolsAction: cancelActiveToolsAction
             )
+        ))
+    }
+
+    /// Provenance label for a flat `code_mode` child card (plan §6 D3); nil for every other item.
+    static func codeModeChildMarker(for item: AgentChatItem) -> String? {
+        item.codeModeParentInvocationID == nil ? nil : "via code_mode"
+    }
+
+    /// Children render as the same canonical card, flat in the transcript, with a provenance line.
+    private static func markingCodeModeChild(_ item: AgentChatItem, _ card: AnyView) -> AnyView {
+        guard let marker = codeModeChildMarker(for: item) else { return card }
+        return AnyView(
+            VStack(alignment: .leading, spacing: 2) {
+                Text(marker)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                card
+            }
         )
     }
 
@@ -152,6 +170,22 @@ enum ToolCardRouter {
         oracleToolCardContext: AgentOracleToolCardContext? = nil,
         contextBuilder: ContextBuilderCardContext? = nil,
         promptManager: PromptViewModel? = nil
+    ) -> AnyView {
+        markingCodeModeChild(item, canonicalResultView(
+            for: item,
+            isMostRecentEditBubble: isMostRecentEditBubble,
+            oracleOpenContext: oracleOpenContext,
+            oracleToolCardContext: oracleToolCardContext,
+            promptManager: promptManager
+        ))
+    }
+
+    private static func canonicalResultView(
+        for item: AgentChatItem,
+        isMostRecentEditBubble: Bool,
+        oracleOpenContext: AgentOracleOpenContext?,
+        oracleToolCardContext: AgentOracleToolCardContext?,
+        promptManager: PromptViewModel?
     ) -> AnyView {
         let normalized = normalizedToolCardName(item.toolName)
         let key = normalized?.lowercased()

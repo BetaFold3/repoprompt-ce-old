@@ -54,6 +54,13 @@ enum MCPToolExecutionContractCatalog {
         cancellationGrace: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace
     )
 
+    /// `code_mode` (plan §6 D3): the script's 60 s wall limit plus 2 s for the executor to stop,
+    /// so the script normally settles with its own partial result before this deadline.
+    static let codeModeContract = MCPToolExecutionContract.bounded(
+        deadline: .seconds(62),
+        cancellationGrace: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace
+    )
+
     static let orderedAdvertisedToolNames = MCPGlobalToolName.orderedToolNames + MCPWindowToolGroup.orderedToolNames
 
     static let contracts: [String: MCPToolExecutionContract] = {
@@ -99,6 +106,8 @@ enum MCPToolExecutionContractCatalog {
         ] {
             result[toolName] = .workspaceLifecycleCancellable
         }
+
+        result[MCPWindowToolName.codeMode] = codeModeContract
 
         return result
     }()

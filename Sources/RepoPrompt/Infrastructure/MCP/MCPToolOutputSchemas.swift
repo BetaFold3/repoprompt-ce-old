@@ -199,13 +199,48 @@ enum MCPToolOutputSchemas {
         )
     }()
 
+    /// `MCPCodeModeExecutionResult.structuredContent`: the stop status, accepted guest output,
+    /// call counts, and every terminal failed call. The human-readable footer is text only.
+    static let codeMode: Value = object(
+        required: ["status", "output", "counts", "failed_calls"],
+        properties: [
+            "status": string,
+            "reason": string,
+            "message": string,
+            "output": string,
+            "counts": object(
+                required: ["calls", "attempts", "completed", "failed", "queued_at_stop", "in_flight_at_stop", "retries"],
+                properties: [
+                    "calls": integer,
+                    "attempts": integer,
+                    "completed": integer,
+                    "failed": integer,
+                    "queued_at_stop": integer,
+                    "in_flight_at_stop": integer,
+                    "retries": integer
+                ]
+            ),
+            "failed_calls": array(object(
+                required: ["call_id", "tool", "attempts", "code"],
+                properties: [
+                    "call_id": integer,
+                    "tool": string,
+                    "attempts": integer,
+                    "code": string
+                ]
+            )),
+            AgentDelegatedQuestionNoticeWire.resultKey: delegatedQuestionNotices
+        ]
+    )
+
     /// Tool name → schema for every tool that advertises one.
     static let schemasByToolName: [String: Value] = [
         MCPWindowToolName.readFile: readFile,
         MCPWindowToolName.search: fileSearch,
         MCPWindowToolName.getFileTree: getFileTree,
         MCPWindowToolName.getCodeStructure: getCodeStructure,
-        MCPWindowToolName.gitReviewSnapshot: gitReviewSnapshot
+        MCPWindowToolName.gitReviewSnapshot: gitReviewSnapshot,
+        MCPWindowToolName.codeMode: codeMode
     ]
 
     // MARK: - Shared fragments

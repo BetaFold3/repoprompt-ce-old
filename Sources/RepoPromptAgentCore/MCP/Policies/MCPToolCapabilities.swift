@@ -25,6 +25,8 @@ package enum MCPToolCapability: CaseIterable, Hashable {
     case gitReviewSnapshot
     case worktreeManage
     case appSettings
+    /// `code_mode`: scripts over the four exploration tools, gated by per-run eligibility.
+    case codeMode
 
     /// Stable snake_case name for MCP discovery serialization.
     var externalName: String {
@@ -49,6 +51,7 @@ package enum MCPToolCapability: CaseIterable, Hashable {
         case .gitReviewSnapshot: "git_review_snapshot"
         case .worktreeManage: "worktree_manage"
         case .appSettings: "app_settings"
+        case .codeMode: "code_mode"
         }
     }
 }
@@ -119,6 +122,9 @@ package enum MCPToolCapabilities {
         ],
         .appSettings: [
             "app_settings"
+        ],
+        .codeMode: [
+            "code_mode"
         ]
     ]
 

@@ -279,7 +279,9 @@ package enum AgentDelegatedQuestionNoticeWire {
         MCPWindowToolName.oracleSend,
         MCPWindowToolName.agentRun,
         MCPWindowToolName.agentManage,
-        MCPWindowToolName.history
+        MCPWindowToolName.history,
+        // The parent attaches notices once after its children; children never reserve them.
+        MCPWindowToolName.codeMode
     ]
 
     package static func isEligible(toolName: String) -> Bool {

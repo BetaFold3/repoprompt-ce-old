@@ -36,6 +36,10 @@ package enum MCPWindowToolName {
 
     package static let history = "history"
 
+    /// RepoPrompt-owned script executor over the four exploration tools (plan §6 D3). Advertised
+    /// and executable only under an installed run policy with `.directTools` eligibility.
+    package static let codeMode = "code_mode"
+
     package static let shareThoughts = "share_thoughts"
     package static let setStatus = "set_status"
     package static let waitForNextInstruction = "wait_for_next_user_instruction"

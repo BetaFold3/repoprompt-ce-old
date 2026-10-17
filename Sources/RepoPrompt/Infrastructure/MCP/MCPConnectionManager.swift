@@ -1354,6 +1354,9 @@ actor ServerNetworkManager {
     private var additionalToolsByConnection: [UUID: Set<String>] = [:]
     private var allowedToolsOverrideByConnection: [UUID: Set<String>] = [:]
     private var sessionProfileByConnection: [UUID: AgentSessionProfile] = [:]
+    /// Per-run `code_mode` eligibility staged from the installed Agent Mode policy (plan §6 D3).
+    /// Absent means `.native`; never derived from the handshake client name.
+    private var codeModeEligibilityByConnection: [UUID: MCPCodeModeEligibility] = [:]
     private var runPurposeByConnection: [UUID: MCPRunPurpose] = [:]
     private var windowAssignmentByConnection: [UUID: Int] = [:]
     private var preassignedConnections: Set<UUID> = []
@@ -1393,6 +1396,8 @@ actor ServerNetworkManager {
         let taskLabelKind: AgentModelCatalog.TaskLabelKind?
         /// Whether role-aware advertisement should allow agent_run/agent_manage for this run
         let allowsAgentExternalControlTools: Bool
+        /// Per-run `code_mode` eligibility, normalized at install (immutable for the run).
+        let codeModeEligibility: MCPCodeModeEligibility
         /// When true, only an MCP peer whose verified PID descends from a registered
         /// expected agent PID may consume this queued policy.
         var requiresExpectedAgentPID: Bool
@@ -1413,6 +1418,7 @@ actor ServerNetworkManager {
         let purpose: MCPRunPurpose
         let taskLabelKind: AgentModelCatalog.TaskLabelKind?
         let allowsAgentExternalControlTools: Bool
+        let codeModeEligibility: MCPCodeModeEligibility
         let updatedAt: Date
     }
 
@@ -1444,6 +1450,7 @@ actor ServerNetworkManager {
         let additionalTools: Set<String>?
         let allowedToolsOverride: Set<String>?
         let sessionProfile: AgentSessionProfile?
+        let codeModeEligibility: MCPCodeModeEligibility?
         let runPurpose: MCPRunPurpose?
         let windowID: Int?
         let windowAssignment: Int?
@@ -2473,6 +2480,11 @@ actor ServerNetworkManager {
     /// Fresh per-invocation typed result capture for an in-process child; nil otherwise.
     @TaskLocal
     static var currentInProcessToolResultSink: MCPInProcessToolResultSink?
+    /// Observer-facing invocation ID of the tool provider currently executing (the same UUID
+    /// tool-event observers receive). A `code_mode` executor passes it as the actual
+    /// `parentInvocationID` of its children; nil outside provider dispatch.
+    @TaskLocal
+    static var currentToolInvocationID: UUID?
 
     /// The exact `tools/call` closure registered with the SDK for one connection.
     typealias RegisteredToolCall = @Sendable (CallTool.Parameters) async throws -> CallTool.Result
@@ -2483,6 +2495,9 @@ actor ServerNetworkManager {
         let handler: RegisteredToolCall
         let lifecycleGeneration: UInt64
     }
+
+    nonisolated static let codeModeNotEligibleMessage =
+        "Tool 'code_mode' is not available for this run: it is enabled only for eligible runs (supported provider and session profile, with RepoPrompt tools set to direct + code_mode). Use the direct tools instead."
 
     /// Connection-owned handles to each connection's registered `tools/call` closure, for
     /// in-process re-entry. Dispatch handles only, never result sinks. Removed when
@@ -2548,6 +2563,17 @@ actor ServerNetworkManager {
                 )
             )
         }
+        // Children exist only under an eligible installed run policy (the same gate as `code_mode`).
+        guard isCodeModeExposureAllowed(for: connectionID) else {
+            return MCPInProcessToolResult(
+                value: nil,
+                result: Self.executionContractToolErrorResult(
+                    rawJSON: false,
+                    code: "code_mode_not_eligible",
+                    message: Self.codeModeNotEligibleMessage
+                )
+            )
+        }
         let sink = MCPInProcessToolResultSink()
         do {
             let result = try await Self.$currentToolInvocationOrigin.withValue(
@@ -2560,7 +2586,13 @@ actor ServerNetworkManager {
                                 try await Self.$currentEffectiveWindowID.withValue(nil) {
                                     try await Self.$currentTabContextHint.withValue(nil) {
                                         try await Self.$currentConnectionID.withValue(nil) {
-                                            try await handle.handler(params)
+                                            // Observers delivered inline for this child read the
+                                            // parent linkage (flat "via code_mode" cards).
+                                            try await AgentToolEventLinkage.$current.withValue(
+                                                AgentToolEventLinkage(codeModeParentInvocationID: parentInvocationID)
+                                            ) {
+                                                try await handle.handler(params)
+                                            }
                                         }
                                     }
                                 }
@@ -3299,6 +3331,23 @@ actor ServerNetworkManager {
         effectivePolicyState(for: connectionID).sessionProfile
     }
 
+    /// The installed run policy's `code_mode` eligibility for this connection. Anything but a
+    /// standard Agent Mode run policy (unknown, Knowledge, discovery, externally-installed default)
+    /// is `.native`, re-normalized here against the connection's effective purpose and profile.
+    func effectiveCodeModeEligibility(for connectionID: UUID) -> MCPCodeModeEligibility {
+        let policy = effectivePolicyState(for: connectionID)
+        let runState = runIDByConnectionID[connectionID].flatMap { runPolicyStateByRunID[$0] }
+        let staged = codeModeEligibilityByConnection[connectionID] ?? runState?.codeModeEligibility ?? .native
+        return MCPCodeModeEligibility.normalized(staged, purpose: policy.purpose, sessionProfile: policy.sessionProfile)
+    }
+
+    /// `code_mode` is advertised and executable only on a connection whose installed run policy
+    /// opted into direct RepoPrompt tools (`direct + code_mode`). A Codex read-only companion is not
+    /// supported yet and stays denied.
+    func isCodeModeExposureAllowed(for connectionID: UUID) -> Bool {
+        effectiveCodeModeEligibility(for: connectionID) == .directTools
+    }
+
     func setRunPurpose(_ purpose: MCPRunPurpose, for connectionID: UUID) {
         runPurposeByConnection[connectionID] = purpose
     }
@@ -3559,6 +3608,7 @@ actor ServerNetworkManager {
         purpose: MCPRunPurpose,
         taskLabelKind: AgentModelCatalog.TaskLabelKind? = nil,
         allowsAgentExternalControlTools: Bool = false,
+        codeModeEligibility: MCPCodeModeEligibility = .native,
         updatedAt: Date
     ) {
         if let existing = runPolicyStateByRunID[runID], existing.updatedAt >= updatedAt {
@@ -3575,6 +3625,11 @@ actor ServerNetworkManager {
             purpose: purpose,
             taskLabelKind: taskLabelKind,
             allowsAgentExternalControlTools: allowsAgentExternalControlTools,
+            codeModeEligibility: MCPCodeModeEligibility.normalized(
+                codeModeEligibility,
+                purpose: purpose,
+                sessionProfile: sessionProfile
+            ),
             updatedAt: updatedAt
         )
         windowIDByRunID[runID] = windowID
@@ -3594,6 +3649,7 @@ actor ServerNetworkManager {
             purpose: policy.purpose,
             taskLabelKind: policy.taskLabelKind,
             allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools,
+            codeModeEligibility: policy.codeModeEligibility,
             updatedAt: policy.createdAt
         )
     }
@@ -3823,6 +3879,7 @@ actor ServerNetworkManager {
             allowedToolsOverrideByConnection.removeValue(forKey: connectionID)
         }
         sessionProfileByConnection[connectionID] = cached.sessionProfile
+        codeModeEligibilityByConnection[connectionID] = cached.codeModeEligibility
         runPurposeByConnection[connectionID] = cached.purpose
         preassignedConnections.insert(connectionID)
         if persistWindowBinding {
@@ -6099,6 +6156,7 @@ actor ServerNetworkManager {
         additionalToolsByConnection.removeAll()
         allowedToolsOverrideByConnection.removeAll()
         sessionProfileByConnection.removeAll()
+        codeModeEligibilityByConnection.removeAll()
         runPurposeByConnection.removeAll()
         windowCountAtConnectionTime.removeAll()
         preassignedConnections.removeAll()
@@ -6872,6 +6930,7 @@ actor ServerNetworkManager {
         additionalToolsByConnection.removeValue(forKey: id)
         allowedToolsOverrideByConnection.removeValue(forKey: id)
         sessionProfileByConnection.removeValue(forKey: id)
+        codeModeEligibilityByConnection.removeValue(forKey: id)
         runPurposeByConnection.removeValue(forKey: id)
         runIDByConnectionID.removeValue(forKey: id)
         pendingPolicyApplicationIDByConnectionID.removeValue(forKey: id)
@@ -7794,6 +7853,52 @@ actor ServerNetworkManager {
         allowsAgentExternalControlTools: Bool = false,
         requiresExpectedAgentPID: Bool = false
     ) async {
+        await installClientConnectionPolicy(
+            for: clientName,
+            windowID: windowID,
+            restrictedTools: restrictedTools,
+            oneShot: oneShot,
+            reason: reason,
+            ttl: ttl,
+            tabID: tabID,
+            runID: runID,
+            additionalTools: additionalTools,
+            allowedToolsOverride: allowedToolsOverride,
+            sessionProfile: sessionProfile,
+            purpose: purpose,
+            taskLabelKind: taskLabelKind,
+            allowsAgentExternalControlTools: allowsAgentExternalControlTools,
+            requiresExpectedAgentPID: requiresExpectedAgentPID,
+            codeModeEligibility: .native
+        )
+    }
+
+    /// Installs a pending policy carrying the run's `code_mode` eligibility (plan §6 D3). The
+    /// eligibility is normalized here (only standard Agent Mode runs keep a non-native value) and is
+    /// immutable for the run: staging, run-state cache, rollback and rehydration copy it verbatim.
+    func installClientConnectionPolicy(
+        for clientName: String,
+        windowID: Int,
+        restrictedTools: Set<String>,
+        oneShot: Bool = true,
+        reason: String? = nil,
+        ttl: TimeInterval = 15,
+        tabID: UUID? = nil,
+        runID: UUID? = nil,
+        additionalTools: Set<String>? = nil,
+        allowedToolsOverride: Set<String>? = nil,
+        sessionProfile: AgentSessionProfile = .standard,
+        purpose: MCPRunPurpose = .unknown,
+        taskLabelKind: AgentModelCatalog.TaskLabelKind? = nil,
+        allowsAgentExternalControlTools: Bool = false,
+        requiresExpectedAgentPID: Bool = false,
+        codeModeEligibility: MCPCodeModeEligibility
+    ) async {
+        let normalizedCodeModeEligibility = MCPCodeModeEligibility.normalized(
+            codeModeEligibility,
+            purpose: purpose,
+            sessionProfile: sessionProfile
+        )
         let storageKey = Self.clientStorageKey(clientName)
         pruneExpiredPolicies(for: clientName)
         let sanitizedRestricted = Self.sanitizedRoutingRestrictedTools(restrictedTools)
@@ -7816,6 +7921,7 @@ actor ServerNetworkManager {
             purpose: purpose,
             taskLabelKind: taskLabelKind,
             allowsAgentExternalControlTools: allowsAgentExternalControlTools,
+            codeModeEligibility: normalizedCodeModeEligibility,
             requiresExpectedAgentPID: requiresExpectedAgentPID,
             reservationConnectionID: nil
         )
@@ -7837,6 +7943,7 @@ actor ServerNetworkManager {
                 purpose: purpose,
                 taskLabelKind: taskLabelKind,
                 allowsAgentExternalControlTools: allowsAgentExternalControlTools,
+                codeModeEligibility: normalizedCodeModeEligibility,
                 updatedAt: policy.createdAt
             )
         }
@@ -8176,6 +8283,7 @@ actor ServerNetworkManager {
             allowedToolsOverride: Set<String>? = nil,
             sessionProfile: AgentSessionProfile = .standard,
             purpose: MCPRunPurpose,
+            codeModeEligibility: MCPCodeModeEligibility = .native,
             updatedAt: Date = Date()
         ) {
             seedRunPolicyState(
@@ -8188,8 +8296,17 @@ actor ServerNetworkManager {
                 allowedToolsOverride: allowedToolsOverride,
                 sessionProfile: sessionProfile,
                 purpose: purpose,
+                codeModeEligibility: codeModeEligibility,
                 updatedAt: updatedAt
             )
+        }
+
+        func debugRunCodeModeEligibility(for runID: UUID) -> MCPCodeModeEligibility? {
+            runPolicyStateByRunID[runID]?.codeModeEligibility
+        }
+
+        func debugStagedCodeModeEligibility(for connectionID: UUID) -> MCPCodeModeEligibility? {
+            codeModeEligibilityByConnection[connectionID]
         }
 
         func debugConnectionPolicyState(for connectionID: UUID) -> (restrictedTools: Set<String>, additionalTools: Set<String>, allowedToolsOverride: Set<String>?, sessionProfile: AgentSessionProfile, purpose: MCPRunPurpose, windowID: Int?) {
@@ -10865,6 +10982,7 @@ actor ServerNetworkManager {
             additionalTools: additionalToolsByConnection[connectionID],
             allowedToolsOverride: allowedToolsOverrideByConnection[connectionID],
             sessionProfile: sessionProfileByConnection[connectionID],
+            codeModeEligibility: codeModeEligibilityByConnection[connectionID],
             runPurpose: runPurposeByConnection[connectionID],
             windowID: connectionWindowMap[connectionID],
             windowAssignment: windowAssignmentByConnection[connectionID],
@@ -10890,6 +11008,7 @@ actor ServerNetworkManager {
             allowedToolsOverrideByConnection.removeValue(forKey: connectionID)
         }
         sessionProfileByConnection[connectionID] = policy.sessionProfile
+        codeModeEligibilityByConnection[connectionID] = policy.codeModeEligibility
         preassignedConnections.insert(connectionID)
         runPurposeByConnection[connectionID] = policy.purpose
         cacheRunPolicyStateIfNeeded(policy)
@@ -11256,6 +11375,11 @@ actor ServerNetworkManager {
             } else {
                 sessionProfileByConnection.removeValue(forKey: connectionID)
             }
+            if let codeModeEligibility = restorePoint.codeModeEligibility {
+                codeModeEligibilityByConnection[connectionID] = codeModeEligibility
+            } else {
+                codeModeEligibilityByConnection.removeValue(forKey: connectionID)
+            }
             if let runPurpose = restorePoint.runPurpose {
                 runPurposeByConnection[connectionID] = runPurpose
             } else {
@@ -11358,6 +11482,7 @@ actor ServerNetworkManager {
                 purpose: cached.purpose,
                 taskLabelKind: cached.taskLabelKind,
                 allowsAgentExternalControlTools: cached.allowsAgentExternalControlTools,
+                codeModeEligibility: cached.codeModeEligibility,
                 updatedAt: Date()
             )
         }
@@ -11418,6 +11543,7 @@ actor ServerNetworkManager {
                     purpose: cached.purpose,
                     taskLabelKind: cached.taskLabelKind,
                     allowsAgentExternalControlTools: cached.allowsAgentExternalControlTools,
+                    codeModeEligibility: cached.codeModeEligibility,
                     updatedAt: Date()
                 )
             }
@@ -11566,6 +11692,7 @@ actor ServerNetworkManager {
             let policy = await effectivePolicyState(for: connectionID)
             let restricted = policy.restricted
             let additionalTools = policy.additional
+            let codeModeExposureAllowed = await isCodeModeExposureAllowed(for: connectionID)
             #if DEBUG
                 var hiddenToolReasons: [String: Int] = [:]
                 var hiddenToolSamples: [String] = []
@@ -11594,6 +11721,13 @@ actor ServerNetworkManager {
                         if restricted.contains(tool.name) {
                             #if DEBUG
                                 recordHiddenTool(tool.name, reason: "restricted")
+                            #endif
+                            continue
+                        }
+                        // • `code_mode` only for an installed run policy that opted into direct tools
+                        if tool.name == MCPCodeModeEligibility.codeModeToolName, !codeModeExposureAllowed {
+                            #if DEBUG
+                                recordHiddenTool(tool.name, reason: "code_mode_not_eligible")
                             #endif
                             continue
                         }
@@ -11736,6 +11870,22 @@ actor ServerNetworkManager {
                 reason: "tools/call"
             )
             let earlyPolicy = await effectivePolicyState(for: connectionID)
+            // `code_mode` executes only under an installed run policy that opted into direct tools,
+            // whatever the connection's restrictions, grants or handshake identity.
+            if toolName == MCPCodeModeEligibility.codeModeToolName,
+               await !isCodeModeExposureAllowed(for: connectionID)
+            {
+                let message = Self.codeModeNotEligibleMessage
+                return await denyToolCall(
+                    connectionID: connectionID,
+                    invocationID: prePolicyInvocationID,
+                    toolName: toolName,
+                    args: params.arguments,
+                    code: "code_mode_not_eligible",
+                    message: message,
+                    result: CallTool.Result.err(message)
+                )
+            }
             if let denialMessage = Self.positiveToolCeilingDenialMessage(
                 forCanonicalToolName: toolName,
                 allowedToolsOverride: earlyPolicy.allowedToolsOverride
@@ -11933,13 +12083,19 @@ actor ServerNetworkManager {
             let capturedRawJSON = extractedRawJSON
             connectionLog("tools/call \(toolName): args normalized keys=\(cleanedArguments.keys.sorted().joined(separator: ","))")
             // Normalization may extract (or silently drop) routing from wrapped, nested, or
-            // JSON-string forms; a child may not supply any of them, whatever the value.
-            if invocationOrigin.isCodeModeChild,
+            // JSON-string forms; a child may not supply any of them, whatever the value. The
+            // `code_mode` parent may not either: its children always run in the connection's
+            // bound context, so a parent override is rejected before any route is resolved or
+            // rebound rather than letting the script read a different window than its children.
+            let isCodeModeParent = !invocationOrigin.isCodeModeChild && toolName == MCPWindowToolName.codeMode
+            if invocationOrigin.isCodeModeChild || isCodeModeParent,
                extractedTabID != nil || extractedWindowID != nil || extractedContextID != nil
                || !normalized.encounteredRoutingKeys.isEmpty
                || !MCPCodeModeChildIngress.forbiddenRoutingArgumentKeys.isDisjoint(with: cleanedArguments.keys)
             {
-                let denial = MCPCodeModeChildIngress.routingOverrideDenial
+                let denial = isCodeModeParent
+                    ? MCPCodeModeChildIngress.parentRoutingOverrideDenial
+                    : MCPCodeModeChildIngress.routingOverrideDenial
                 return await denyToolCall(
                     connectionID: connectionID,
                     invocationID: invocationID,
@@ -12866,11 +13022,13 @@ actor ServerNetworkManager {
                                                 }
                                             }
                                             let value = try await MCPToolExecutionHandlerPhaseContext.$recorder.withValue(handlerPhaseRecorder) {
-                                                try await EditFlowPerf.measure(
-                                                    EditFlowPerf.Stage.MCPToolCall.resolvedProviderDispatch,
-                                                    EditFlowPerf.Dimensions(toolName: toolName),
-                                                    operation: operation
-                                                )
+                                                try await Self.$currentToolInvocationID.withValue(invocationID) {
+                                                    try await EditFlowPerf.measure(
+                                                        EditFlowPerf.Stage.MCPToolCall.resolvedProviderDispatch,
+                                                        EditFlowPerf.Dimensions(toolName: toolName),
+                                                        operation: operation
+                                                    )
+                                                }
                                             }
                                             await emitExecutionTrace(.handlerCompleted, cancellationOutcome: "success")
                                             EditFlowPerf.lifecycleEvent(
@@ -13183,13 +13341,47 @@ actor ServerNetworkManager {
                                     // advertises an outputSchema for.
                                     let structuredResult = structuredResultsEnabled && toolDef.outputSchema != nil
 
+                                    // `code_mode` (plan §6 D3): the provider retains its final result here, so a
+                                    // contract timeout or cancellation below keeps the partial output and counts.
+                                    let codeModeRetention: MCPCodeModeResultRetention? = toolName == MCPWindowToolName.codeMode
+                                        ? MCPCodeModeResultRetention()
+                                        : nil
+
                                     let resolvedOperation: @Sendable () async throws -> Value = {
-                                        #if DEBUG
-                                            if let operation = await self.debugResolvedToolOperationOverrides[toolName] {
-                                                return try await operation()
-                                            }
-                                        #endif
-                                        return try await toolDef.callAsFunction(effectiveArgs)
+                                        try await MCPCodeModeResultRetention.$current.withValue(codeModeRetention) {
+                                            #if DEBUG
+                                                if let operation = await self.debugResolvedToolOperationOverrides[toolName] {
+                                                    return try await operation()
+                                                }
+                                            #endif
+                                            return try await toolDef.callAsFunction(effectiveArgs)
+                                        }
+                                    }
+
+                                    /// The retained `code_mode` result instead of a generic contract or cancellation
+                                    /// error. Never waits behind a force disconnect; a script that never began is
+                                    /// abandoned and falls through to the generic result.
+                                    @Sendable func retainedCodeModeResult(after error: Error, context: String) async -> CallTool.Result? {
+                                        guard let codeModeRetention else { return nil }
+                                        if case MCPToolExecutionWatchdogError.cleanupUnresponsive = error { return nil }
+                                        guard let retained = await codeModeRetention.resolve() else { return nil }
+                                        if let runID = await self.toolTrackingRunIDForCompletion(callTimeRunID: observerRunIDForCallbacksFinal, connectionID: connectionID, toolName: toolName, invocationID: invocationID, context: "\(context) code_mode retained result") {
+                                            _ = await self.fireToolCompletedObservers(
+                                                runID: runID,
+                                                invocationID: invocationID,
+                                                toolName: toolName,
+                                                args: capturedArguments,
+                                                resultJSON: ToolOutputFormatter.rawJSONString(retained),
+                                                isError: MCPCodeModeToolResult.isError(toolName: toolName, value: retained)
+                                            )
+                                        }
+                                        let result = Self.makeToolResult(
+                                            toolName: toolName,
+                                            args: effectiveArgsForFormatter,
+                                            value: retained,
+                                            structured: structuredResult
+                                        )
+                                        return handlerResult(result, outcome: "codeModeRetained")
                                     }
 
                                     // Now dispatch. If window-scoped, wrap in ownership scope (fallback to service window).
@@ -13283,7 +13475,7 @@ actor ServerNetworkManager {
                                                                 EditFlowPerf.Stage.MCPToolCall.completionObserverCallbacks,
                                                                 EditFlowPerf.Dimensions(toolName: toolName)
                                                             ) {
-                                                                await self.fireToolCompletedObservers(runID: runID, invocationID: invocationID, toolName: toolName, args: capturedArguments, resultJSON: resultJSON, isError: false)
+                                                                await self.fireToolCompletedObservers(runID: runID, invocationID: invocationID, toolName: toolName, args: capturedArguments, resultJSON: resultJSON, isError: MCPCodeModeToolResult.isError(toolName: toolName, value: observedValue))
                                                             }
                                                             #if DEBUG
                                                                 if toolName == "agent_run" {
@@ -13335,11 +13527,19 @@ actor ServerNetworkManager {
                                             }
                                         } catch {
                                             releaseResourceAdmissionLeasesAfterProviderError(error)
+                                            if let retained = await retainedCodeModeResult(after: error, context: "window-scoped") {
+                                                return retained
+                                            }
                                             if let failure = await executionContractFailureResult(
                                                 for: error,
                                                 context: "window-scoped"
                                             ) {
                                                 return failure
+                                            }
+                                            if invocationOrigin.isCodeModeChild,
+                                               let transient = MCPInProcessToolResult.transientPOSIXCode(of: error)
+                                            {
+                                                inProcessResultSink?.recordTransientFailure(transient)
                                             }
                                             let permitPostDispatchEnvelopeState = EditFlowPerf.begin(
                                                 EditFlowPerf.Stage.MCPToolCall.permitPostDispatchEnvelope,
@@ -13424,7 +13624,7 @@ actor ServerNetworkManager {
                                                         EditFlowPerf.Stage.MCPToolCall.completionObserverCallbacks,
                                                         EditFlowPerf.Dimensions(toolName: toolName)
                                                     ) {
-                                                        await self.fireToolCompletedObservers(runID: runID, invocationID: invocationID, toolName: toolName, args: capturedArguments, resultJSON: resultJSON, isError: false)
+                                                        await self.fireToolCompletedObservers(runID: runID, invocationID: invocationID, toolName: toolName, args: capturedArguments, resultJSON: resultJSON, isError: MCPCodeModeToolResult.isError(toolName: toolName, value: observedValue))
                                                     }
                                                     #if DEBUG
                                                         if toolName == "agent_run" {
@@ -13469,11 +13669,19 @@ actor ServerNetworkManager {
                                             return handlerResult(toolResult, outcome: "success")
                                         } catch {
                                             releaseResourceAdmissionLeasesAfterProviderError(error)
+                                            if let retained = await retainedCodeModeResult(after: error, context: "global") {
+                                                return retained
+                                            }
                                             if let failure = await executionContractFailureResult(
                                                 for: error,
                                                 context: "global"
                                             ) {
                                                 return failure
+                                            }
+                                            if invocationOrigin.isCodeModeChild,
+                                               let transient = MCPInProcessToolResult.transientPOSIXCode(of: error)
+                                            {
+                                                inProcessResultSink?.recordTransientFailure(transient)
                                             }
                                             let permitPostDispatchEnvelopeState = EditFlowPerf.begin(
                                                 EditFlowPerf.Stage.MCPToolCall.permitPostDispatchEnvelope,
@@ -13770,7 +13978,9 @@ actor ServerNetworkManager {
     /// committed delegated-question notices under the reserved
     /// `AgentDelegatedQuestionNoticeWire.resultKey`, so structured-only clients see the same
     /// notices as the appended text block (owner decision 2026-10-17). Error results do not pass
-    /// through here: they keep `isError: true`, their text, and no `structuredContent`.
+    /// through here: they keep `isError: true`, their text, and no `structuredContent`. The one
+    /// exception is a completed `code_mode` script: its status sets `isError`, and a failed script
+    /// keeps its output, counts and failed calls in `structuredContent` too (plan §6 D3 failure rule).
     static func makeToolResult(
         toolName: String,
         args: [String: Value],
@@ -13784,8 +13994,17 @@ actor ServerNetworkManager {
             emitResources: Self.emitResourceContent
         )
         // MCP requires structuredContent to be a JSON object; every schema-bearing DTO is one.
-        let structuredContent: Value? = if structured, case .object = value { value } else { nil }
-        return CallTool.Result(content: blocks, structuredContent: structuredContent, isError: false)
+        let structuredContent: Value? = if structured, case .object = value {
+            MCPCodeModeToolResult.structuredContent(toolName: toolName, value: value)
+        } else {
+            nil
+        }
+        // A `code_mode` result's status is authoritative; every other success value stays green.
+        return CallTool.Result(
+            content: blocks,
+            structuredContent: structuredContent,
+            isError: MCPCodeModeToolResult.isError(toolName: toolName, value: value)
+        )
     }
 
     /// Extract text content from tool result content blocks for observer callbacks

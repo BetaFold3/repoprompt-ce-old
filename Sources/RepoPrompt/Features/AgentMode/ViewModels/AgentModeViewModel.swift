@@ -2213,7 +2213,8 @@ final class AgentModeViewModel: ObservableObject {
         purpose: MCPRunPurpose,
         taskLabelKind: AgentModelCatalog.TaskLabelKind? = nil,
         allowsAgentExternalControlTools: Bool = false,
-        requiresExpectedAgentPID: Bool = false
+        requiresExpectedAgentPID: Bool = false,
+        codeModeEligibility: MCPCodeModeEligibility = .native
     ) async {
         await ServerNetworkManager.shared.installClientConnectionPolicy(
             for: clientName,
@@ -2230,7 +2231,8 @@ final class AgentModeViewModel: ObservableObject {
             purpose: purpose,
             taskLabelKind: taskLabelKind,
             allowsAgentExternalControlTools: allowsAgentExternalControlTools,
-            requiresExpectedAgentPID: requiresExpectedAgentPID
+            requiresExpectedAgentPID: requiresExpectedAgentPID,
+            codeModeEligibility: codeModeEligibility
         )
     }
 
@@ -2323,7 +2325,7 @@ final class AgentModeViewModel: ObservableObject {
         acpControllerFactory = { provider, runRequest in
             try ACPAgentSessionController(provider: provider, runRequest: runRequest, mcpHost: ServerNetworkManager.shared)
         }
-        connectionPolicyInstaller = { clientName, windowID, restrictedTools, oneShot, reason, ttl, tabID, runID, additionalTools, allowedToolsOverride, sessionProfile, purpose, taskLabelKind, allowsAgentExternalControlTools, requiresExpectedAgentPID in
+        connectionPolicyInstaller = { clientName, windowID, restrictedTools, oneShot, reason, ttl, tabID, runID, additionalTools, allowedToolsOverride, sessionProfile, purpose, taskLabelKind, allowsAgentExternalControlTools, requiresExpectedAgentPID, codeModeEligibility in
             await Self.defaultConnectionPolicyInstaller(
                 clientName: clientName,
                 windowID: windowID,
@@ -2339,7 +2341,8 @@ final class AgentModeViewModel: ObservableObject {
                 purpose: purpose,
                 taskLabelKind: taskLabelKind,
                 allowsAgentExternalControlTools: allowsAgentExternalControlTools,
-                requiresExpectedAgentPID: requiresExpectedAgentPID
+                requiresExpectedAgentPID: requiresExpectedAgentPID,
+                codeModeEligibility: codeModeEligibility
             )
         }
         mcpServerEnabler = { [weak mcpServer] in
@@ -2467,7 +2470,7 @@ final class AgentModeViewModel: ObservableObject {
             acpControllerFactory: @escaping AgentACPControllerFactory = { provider, runRequest in
                 try ACPAgentSessionController(provider: provider, runRequest: runRequest, mcpHost: ServerNetworkManager.shared)
             },
-            connectionPolicyInstaller: @escaping AgentConnectionPolicyInstaller = { clientName, windowID, restrictedTools, oneShot, reason, ttl, tabID, runID, additionalTools, allowedToolsOverride, sessionProfile, purpose, taskLabelKind, allowsAgentExternalControlTools, requiresExpectedAgentPID in
+            connectionPolicyInstaller: @escaping AgentConnectionPolicyInstaller = { clientName, windowID, restrictedTools, oneShot, reason, ttl, tabID, runID, additionalTools, allowedToolsOverride, sessionProfile, purpose, taskLabelKind, allowsAgentExternalControlTools, requiresExpectedAgentPID, codeModeEligibility in
                 await AgentModeViewModel.defaultConnectionPolicyInstaller(
                     clientName: clientName,
                     windowID: windowID,
@@ -2483,7 +2486,8 @@ final class AgentModeViewModel: ObservableObject {
                     purpose: purpose,
                     taskLabelKind: taskLabelKind,
                     allowsAgentExternalControlTools: allowsAgentExternalControlTools,
-                    requiresExpectedAgentPID: requiresExpectedAgentPID
+                    requiresExpectedAgentPID: requiresExpectedAgentPID,
+                    codeModeEligibility: codeModeEligibility
                 )
             },
             mcpRunRoutingCleaner: @escaping MCPRunRoutingCleaner = { runID, windowID, reason in

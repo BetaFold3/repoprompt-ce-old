@@ -1490,6 +1490,16 @@ class GlobalSettingsStore: ObservableObject {
         CodexReasoningSummaries.postDidChangeIfNeeded(previousValue: oldValue, currentValue: codexReasoningSummariesEnabled())
     }
 
+    /// Claude Code RepoPrompt tools mode; read once per run at launch (see
+    /// `ClaudeAgentModeCoordinator.codeModeEligibility(for:)`).
+    func claudeRepoPromptToolsMode() -> RepoPromptToolsMode {
+        ClaudeAgentToolPreferences.repoPromptToolsMode(defaults: defaults)
+    }
+
+    func setClaudeRepoPromptToolsMode(_ mode: RepoPromptToolsMode) {
+        ClaudeAgentToolPreferences.setRepoPromptToolsMode(mode, defaults: defaults)
+    }
+
     #if DEBUG
         func claudeRawEventLoggingEnabled() -> Bool {
             defaults.bool(forKey: "claudeRawEventLoggingEnabled")

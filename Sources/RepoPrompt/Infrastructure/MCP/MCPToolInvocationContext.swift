@@ -21,6 +21,34 @@ enum MCPToolInvocationOrigin: Equatable {
 struct MCPInProcessToolResult {
     let value: Value?
     let result: CallTool.Result
+    /// Set only when the handler converted a thrown provider error that is a typed POSIX EINTR or
+    /// EAGAIN (directly or as a bounded `NSUnderlyingErrorKey` chain) into its error result. Never
+    /// derived from error text; never on the wire.
+    let transientPOSIXCode: POSIXErrorCode?
+
+    init(value: Value?, result: CallTool.Result, transientPOSIXCode: POSIXErrorCode? = nil) {
+        self.value = value
+        self.result = result
+        self.transientPOSIXCode = transientPOSIXCode
+    }
+
+    /// Typed transient classification of a thrown provider error. Cancellation is never transient.
+    static func transientPOSIXCode(of error: Error) -> POSIXErrorCode? {
+        guard !(error is CancellationError) else { return nil }
+        var current: NSError? = error as NSError
+        var depth = 0
+        while let nsError = current, depth < 4 {
+            if nsError.domain == NSPOSIXErrorDomain,
+               let code = POSIXErrorCode(rawValue: Int32(truncatingIfNeeded: nsError.code)),
+               code == .EINTR || code == .EAGAIN
+            {
+                return code
+            }
+            current = nsError.userInfo[NSUnderlyingErrorKey] as? NSError
+            depth += 1
+        }
+        return nil
+    }
 }
 
 /// Invocation-owned capture for one in-process child call. Never reused or shared: the re-entry
@@ -35,6 +63,7 @@ final class MCPInProcessToolResultSink: @unchecked Sendable {
     private var capturedValue: Value?
     private var didCapture = false
     private var isClosed = false
+    private var transientPOSIXCode: POSIXErrorCode?
 
     /// Records the sanitized successful provider value. A second capture, or a capture after
     /// completion or abandonment, is an invariant failure and never overwrites.
@@ -49,6 +78,15 @@ final class MCPInProcessToolResultSink: @unchecked Sendable {
         return .success(())
     }
 
+    /// Records that the handler is returning an error result for a thrown typed transient POSIX
+    /// error. Ignored after completion or abandonment.
+    func recordTransientFailure(_ code: POSIXErrorCode) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isClosed else { return }
+        transientPOSIXCode = code
+    }
+
     /// Combines the capture with the handler's returned result, once, and releases the capture.
     func complete(with result: CallTool.Result) -> Result<MCPInProcessToolResult, InvariantError> {
         lock.lock()
@@ -57,7 +95,10 @@ final class MCPInProcessToolResultSink: @unchecked Sendable {
         isClosed = true
         let value = capturedValue
         capturedValue = nil
-        return .success(MCPInProcessToolResult(value: value, result: result))
+        // Only an error result can carry the transient disposition.
+        let transient = result.isError == true ? transientPOSIXCode : nil
+        transientPOSIXCode = nil
+        return .success(MCPInProcessToolResult(value: value, result: result, transientPOSIXCode: transient))
     }
 
     /// Releases any capture when the handler threw. Idempotent.
@@ -65,6 +106,7 @@ final class MCPInProcessToolResultSink: @unchecked Sendable {
         lock.lock()
         isClosed = true
         capturedValue = nil
+        transientPOSIXCode = nil
         lock.unlock()
     }
 }
@@ -110,6 +152,13 @@ enum MCPCodeModeChildIngress {
     static let routingOverrideDenial = (
         code: "code_mode_child_routing_override",
         message: "code_mode children may not override routing (context_id, _tabID, _windowID, window_id)."
+    )
+
+    /// The `code_mode` call itself may not carry routing either (null, wrapped, or nested forms
+    /// included): the script runs in the connection's bound context, chosen with `bind_context`.
+    static let parentRoutingOverrideDenial = (
+        code: "code_mode_routing_override",
+        message: "code_mode cannot be routed (context_id, _tabID, _windowID, window_id). It runs in this connection's bound context; call bind_context first to choose a different context, then call code_mode without routing arguments."
     )
 
     /// The value a child hands back: the reserved delegated-question notice field never enters

@@ -1830,7 +1830,8 @@ package enum AgentTranscriptToolNormalizer {
             processID: processID,
             exitCode: exitCode,
             summaryText: summaryText(for: item, keyPaths: keyPaths, status: status),
-            keyPaths: keyPaths
+            keyPaths: keyPaths,
+            codeModeParentInvocationID: item.codeModeParentInvocationID
         )
         context?.storeToolExecution(execution, for: item.id)
         return execution

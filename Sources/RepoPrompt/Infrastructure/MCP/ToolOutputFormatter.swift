@@ -1018,6 +1018,10 @@ extension ToolOutputFormatter {
         result: Value,
         emitResources: Bool
     ) -> [MCP.Tool.Content] {
+        // `code_mode` text is the executor's own output and footer, in every mode.
+        if toolName == MCPWindowToolName.codeMode {
+            return [.text(MCPCodeModeToolResult.text(from: result))]
+        }
         // Raw JSON mode: bypass all markdown/text formatting.
         if wantsRawJSON(args: args) {
             return [.text(rawJSONString(result))]

@@ -19,7 +19,7 @@ import XCTest
                     MCPToolExecutionContractCatalog.orderedAdvertisedToolNames,
                     caseLabel
                 )
-                XCTAssertEqual(MCPToolDurationInventory.entries.count, 29, caseLabel)
+                XCTAssertEqual(MCPToolDurationInventory.entries.count, 30, caseLabel)
                 XCTAssertEqual(
                     Set(MCPToolDurationInventory.entries.map(\.toolName)).count,
                     MCPToolDurationInventory.entries.count,
@@ -86,7 +86,18 @@ import XCTest
                     ],
                     caseLabel
                 )
-                XCTAssertEqual(MCPToolDurationInventory.boundedToolNames.count, 12, caseLabel)
+                XCTAssertEqual(MCPToolDurationInventory.boundedToolNames.count, 13, caseLabel)
+                // `code_mode` (plan §6 D3) is bounded by its own 62-second contract.
+                let codeMode = try XCTUnwrap(MCPToolDurationInventory.entries.first {
+                    $0.toolName == MCPWindowToolName.codeMode
+                }, caseLabel)
+                XCTAssertEqual(codeMode.contractKind, .bounded, caseLabel)
+                XCTAssertEqual(codeMode.executionDeadlineSeconds, 62, caseLabel)
+                XCTAssertEqual(codeMode.expectedActiveDuration, "Ordinary dispatch must complete within 62 seconds.", caseLabel)
+                let readFile = try XCTUnwrap(MCPToolDurationInventory.entries.first {
+                    $0.toolName == MCPWindowToolName.readFile
+                }, caseLabel)
+                XCTAssertEqual(readFile.expectedActiveDuration, "Ordinary dispatch must complete within 30 seconds.", caseLabel)
                 XCTAssertTrue(
                     MCPToolDurationInventory.entries.allSatisfy {
                         !$0.expectedActiveDuration.isEmpty
@@ -222,7 +233,7 @@ import XCTest
                     caseLabel
                 )
                 let tools = try XCTUnwrap(payload["tools"] as? [[String: Any]], caseLabel)
-                XCTAssertEqual(tools.count, 29, caseLabel)
+                XCTAssertEqual(tools.count, 30, caseLabel)
                 let manageWorkspaces = try XCTUnwrap(tools.first {
                     $0["tool"] as? String == MCPGlobalToolName.manageWorkspaces
                 }, caseLabel)

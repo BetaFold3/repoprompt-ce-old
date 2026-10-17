@@ -136,6 +136,9 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
     public var toolArgsJSON: String? // JSON string of tool arguments
     public var toolResultJSON: String? // Tool execution result JSON (for toolResult kind)
     public var toolIsError: Bool?
+    /// Parent `code_mode` invocation for a flat child tool card (plan §6 D3); nil for every
+    /// ordinary tool item and for all legacy transcripts.
+    public var codeModeParentInvocationID: UUID?
 
     /// Optional reasoning text (for models with extended thinking)
     public var reasoning: String?
@@ -180,7 +183,8 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         codexGoalMode: AgentCodexGoalModeMetadata? = nil,
         scheduledSend: AgentScheduledSendProvenance? = nil,
         isLocalControlPlaneEcho: Bool = false,
-        isUndeliveredRemoteSend: Bool = false
+        isUndeliveredRemoteSend: Bool = false,
+        codeModeParentInvocationID: UUID? = nil
     ) {
         self.id = id
         self.timestamp = timestamp
@@ -201,6 +205,7 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         self.scheduledSend = scheduledSend
         self.isLocalControlPlaneEcho = isLocalControlPlaneEcho
         self.isUndeliveredRemoteSend = isUndeliveredRemoteSend
+        self.codeModeParentInvocationID = codeModeParentInvocationID
     }
 
     /// Returns a copy of this item with a replaced timestamp and all other fields
@@ -227,7 +232,8 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
             codexGoalMode: codexGoalMode,
             scheduledSend: scheduledSend,
             isLocalControlPlaneEcho: isLocalControlPlaneEcho,
-            isUndeliveredRemoteSend: isUndeliveredRemoteSend
+            isUndeliveredRemoteSend: isUndeliveredRemoteSend,
+            codeModeParentInvocationID: codeModeParentInvocationID
         )
     }
 
@@ -242,7 +248,7 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         case id, timestamp, kind, text, attachments, taggedFileAttachments
         case toolName, toolInvocationID, toolArgsJSON, toolResultJSON, toolIsError
         case reasoning, sequenceIndex, isStreaming, workflow, codexGoalMode, scheduledSend
-        case isLocalControlPlaneEcho, isUndeliveredRemoteSend
+        case isLocalControlPlaneEcho, isUndeliveredRemoteSend, codeModeParentInvocationID
     }
 
     public init(from decoder: Decoder) throws {
@@ -266,6 +272,7 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         scheduledSend = try c.decodeIfPresent(AgentScheduledSendProvenance.self, forKey: .scheduledSend)
         isLocalControlPlaneEcho = try c.decodeIfPresent(Bool.self, forKey: .isLocalControlPlaneEcho) ?? false
         isUndeliveredRemoteSend = try c.decodeIfPresent(Bool.self, forKey: .isUndeliveredRemoteSend) ?? false
+        codeModeParentInvocationID = try c.decodeIfPresent(UUID.self, forKey: .codeModeParentInvocationID)
     }
 
     // MARK: - Factory Methods
@@ -345,7 +352,8 @@ extension AgentChatItem {
             codexGoalMode: codexGoalMode,
             scheduledSend: scheduledSend,
             isLocalControlPlaneEcho: isLocalControlPlaneEcho,
-            isUndeliveredRemoteSend: isUndeliveredRemoteSend
+            isUndeliveredRemoteSend: isUndeliveredRemoteSend,
+            codeModeParentInvocationID: codeModeParentInvocationID
         )
     }
 }
@@ -373,6 +381,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
     public var scheduledSend: AgentScheduledSendProvenance?
     public var isLocalControlPlaneEcho: Bool
     public var isUndeliveredRemoteSend: Bool
+    public var codeModeParentInvocationID: UUID?
 
     public init(from item: AgentChatItem, sanitizeToolResults: Bool = true) {
         id = item.id
@@ -390,6 +399,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
         scheduledSend = item.scheduledSend
         isLocalControlPlaneEcho = item.isLocalControlPlaneEcho
         isUndeliveredRemoteSend = item.isUndeliveredRemoteSend
+        codeModeParentInvocationID = item.codeModeParentInvocationID
         toolResultStatus = nil
 
         if sanitizeToolResults, item.kind == .toolResult {
@@ -464,7 +474,8 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
             codexGoalMode: codexGoalMode,
             scheduledSend: scheduledSend,
             isLocalControlPlaneEcho: isLocalControlPlaneEcho,
-            isUndeliveredRemoteSend: isUndeliveredRemoteSend
+            isUndeliveredRemoteSend: isUndeliveredRemoteSend,
+            codeModeParentInvocationID: codeModeParentInvocationID
         )
     }
 
@@ -513,6 +524,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
         case scheduledSend
         case isLocalControlPlaneEcho
         case isUndeliveredRemoteSend
+        case codeModeParentInvocationID
     }
 
     public init(from decoder: Decoder) throws {
@@ -536,6 +548,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
         scheduledSend = try container.decodeIfPresent(AgentScheduledSendProvenance.self, forKey: .scheduledSend)
         isLocalControlPlaneEcho = try container.decodeIfPresent(Bool.self, forKey: .isLocalControlPlaneEcho) ?? false
         isUndeliveredRemoteSend = try container.decodeIfPresent(Bool.self, forKey: .isUndeliveredRemoteSend) ?? false
+        codeModeParentInvocationID = try container.decodeIfPresent(UUID.self, forKey: .codeModeParentInvocationID)
     }
 }
 

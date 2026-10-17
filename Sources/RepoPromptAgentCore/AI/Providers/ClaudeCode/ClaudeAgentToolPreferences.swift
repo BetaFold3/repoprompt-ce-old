@@ -257,6 +257,7 @@ package struct ClaudeAgentToolPreferences {
     private static let permissionModeKey = "claudeCodePermissionMode"
     private static let mcpStrictModeEnabledKey = "claudeCodeMCPStrictModeEnabled"
     private static let toolSearchEnabledKey = "claudeCodeToolSearchEnabled"
+    private static let repoPromptToolsModeKey = "claudeCodeRepoPromptToolsMode"
     private static let effortLevelKey = "claudeCodeEffortLevel"
     private static let effortLevelsByModelSlugKey = "claudeCodeEffortLevelsByModelSlug"
     private static let agentModePromptDeliveryKey = "claudeCodeAgentModePromptDelivery"
@@ -387,6 +388,19 @@ package struct ClaudeAgentToolPreferences {
 
     package static func setToolSearchEnabled(_ isEnabled: Bool, defaults: UserDefaults = .standard) {
         defaults.set(isEnabled, forKey: toolSearchEnabledKey)
+    }
+
+    // MARK: - RepoPrompt tools mode
+
+    /// How RepoPrompt tools are offered to official Claude Code Agent Mode runs. Defaults to
+    /// `.native` (direct tools only); `.directCodeMode` additionally offers `code_mode` beside the
+    /// direct tools. Read once per run at launch; a missing or unknown value is `.native`.
+    package static func repoPromptToolsMode(defaults: UserDefaults = .standard) -> RepoPromptToolsMode {
+        defaults.string(forKey: repoPromptToolsModeKey).flatMap(RepoPromptToolsMode.init(rawValue:)) ?? .native
+    }
+
+    package static func setRepoPromptToolsMode(_ mode: RepoPromptToolsMode, defaults: UserDefaults = .standard) {
+        defaults.set(mode.rawValue, forKey: repoPromptToolsModeKey)
     }
 
     // MARK: - Claude Code native prompt mode

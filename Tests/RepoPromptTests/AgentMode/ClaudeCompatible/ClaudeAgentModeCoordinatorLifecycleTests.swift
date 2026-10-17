@@ -1416,6 +1416,99 @@ extension AgentModeRunServiceLifecycleTests {
         ], in: recorder)
     }
 
+    /// Production composition: the Agent Mode host's provider preferences and a default binding
+    /// service read `UserDefaults.standard`, the store the app settings write. Read-only.
+    func testClaudeProviderPreferencesReadTheStandardDefaultsStore() {
+        let harness = makeHarness(recorder: LifecycleRecorder())
+        XCTAssertTrue(harness.host.providerBindingService.preferences.defaults === UserDefaults.standard)
+        XCTAssertTrue(AgentModeProviderBindingService().preferences.defaults === UserDefaults.standard)
+    }
+
+    /// F3: Claude reads `tools/list` at connect, so a RepoPrompt tools mode change recycles a live
+    /// controller before the next send, in both directions, like the Bash toggle; an unchanged mode
+    /// does not. Preferences come from an isolated suite, never `UserDefaults.standard`.
+    func testQueuedClaudeSteeringRecyclesControllerWhenRepoPromptToolsModeChanges() async throws {
+        let scenarios: [(launched: RepoPromptToolsMode?, preferred: RepoPromptToolsMode, relaunched: RepoPromptToolsMode?)] = [
+            (nil, .directCodeMode, .directCodeMode),
+            (.directCodeMode, .native, nil),
+            (nil, .native, nil),
+            (.directCodeMode, .directCodeMode, .directCodeMode)
+        ]
+        for scenario in scenarios {
+            let suiteName = "ClaudeToolsModeRecycleTests.\(UUID().uuidString)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+            defer { defaults.removePersistentDomain(forName: suiteName) }
+            ClaudeAgentToolPreferences.setRepoPromptToolsMode(scenario.preferred, defaults: defaults)
+            let isolatedBindings = AgentModeProviderBindingService(
+                preferences: AgentProviderPreferenceSnapshotStore(defaults: defaults)
+            )
+
+            let recorder = LifecycleRecorder()
+            let oldController = LifecycleFakeNativeController(recorder: recorder, label: "old", hasTurnInFlight: false)
+            let newController = LifecycleFakeNativeController(recorder: recorder, label: "new", hasTurnInFlight: false)
+            let harness = makeHarness(
+                recorder: recorder,
+                idleWaiter: { _ in recorder.record("idle") },
+                claudeControllerFactory: { _, _, _, settings in
+                    recorder.record("factory:claude:tools=\(settings.repoPromptToolsMode?.rawValue ?? "nil")")
+                    return newController
+                }
+            )
+            // The coordinator reads every provider preference through this host's isolated store.
+            let host = IsolatedPreferencesClaudeCoordinatorHost(base: harness.host, providerBindingService: isolatedBindings)
+            harness.host.claudeCoordinator.attach(viewModel: host)
+            defer { harness.host.claudeCoordinator.attach(viewModel: harness.host) }
+
+            let session = makeRunningClaudeSession(controller: oldController)
+            let profile = AgentProviderPermissionProfile.providerOverride(.claude(.fullAccess))
+            let runtime = ClaudeControllerLaunchPolicy.resolve(
+                permissionMode: isolatedBindings.runtimePermission(for: .claudeCode, profile: profile).claudePermissionMode,
+                profile: profile,
+                defaults: defaults,
+                securePermissions: isolatedBindings.preferences.securePermissions
+            )
+            session.permissionProfile = profile
+            harness.host.claudeCoordinator.test_setControllerLaunchSettings(
+                .init(
+                    runtimeVariant: .standard,
+                    workspacePath: URL(fileURLWithPath: FileManager.default.currentDirectoryPath).standardizedFileURL.path,
+                    permissionMode: runtime.permissionMode,
+                    allowNativeBashTool: runtime.allowNativeBashTool,
+                    mcpStrictMode: runtime.mcpStrictMode,
+                    sessionProfile: .standard,
+                    toolSearchEnabled: nil,
+                    repoPromptToolsMode: scenario.launched
+                ),
+                for: session
+            )
+            session.pendingClaudeSteeringInstructions = [makeClaudeSteeringInstruction(session: session, text: "tools mode changed")]
+
+            let queueStarted = await harness.service.submitQueuedClaudeSteeringIfSupported(session: session)
+            XCTAssertTrue(queueStarted)
+            await session.claudeSteeringFlushTask?.value
+
+            let label = "\(scenario.launched?.rawValue ?? "nil")->\(scenario.preferred.rawValue)"
+            XCTAssertTrue(session.pendingClaudeSteeringInstructions.isEmpty, label)
+            XCTAssertEqual(
+                harness.host.claudeCoordinator.test_controllerLaunchSettings(for: session)?.repoPromptToolsMode,
+                scenario.relaunched,
+                label
+            )
+            if scenario.launched == scenario.relaunched {
+                // Control: with the same tools mode (and permissions resolved from the same store),
+                // the live controller is kept, so the recycles above come from the tools mode alone.
+                XCTAssertFalse(recorder.contains("old:shutdown"), label)
+                XCTAssertFalse(recorder.contains("factory:claude:tools="), label)
+                XCTAssertTrue(recorder.contains("old:send"), label)
+            } else {
+                XCTAssertTrue(recorder.contains("old:shutdown"), label)
+                XCTAssertTrue(recorder.contains("factory:claude:tools=\(scenario.relaunched?.rawValue ?? "nil")"), label)
+                XCTAssertTrue(recorder.contains("new:send"), label)
+                XCTAssertFalse(recorder.contains("old:send"), label)
+            }
+        }
+    }
+
     func testQueuedClaudeSteeringRevalidatesPermissionsImmediatelyBeforeDispatch() async {
         let recorder = LifecycleRecorder()
         let eventsReadyGate = LifecycleAsyncGate()
@@ -2641,6 +2734,72 @@ extension AgentModeRunServiceLifecycleTests {
             ),
             for: session
         )
+    }
+}
+
+/// Test-only Claude coordinator host: forwards everything to the real Agent Mode host except
+/// `providerBindingService`, which reads an isolated `UserDefaults` suite.
+@MainActor
+private final class IsolatedPreferencesClaudeCoordinatorHost: ClaudeAgentModeCoordinatorHost {
+    private let base: any ClaudeAgentModeCoordinatorHost
+    let providerBindingService: AgentModeProviderBindingService
+
+    init(base: any ClaudeAgentModeCoordinatorHost, providerBindingService: AgentModeProviderBindingService) {
+        self.base = base
+        self.providerBindingService = providerBindingService
+    }
+
+    var sessions: [UUID: AgentTabSession] {
+        base.sessions
+    }
+
+    func requestUIRefresh(tabID: UUID, urgent: Bool, scope: AgentUIRefreshScope) {
+        base.requestUIRefresh(tabID: tabID, urgent: urgent, scope: scope)
+    }
+
+    func scheduleSave(for tabID: UUID) {
+        base.scheduleSave(for: tabID)
+    }
+
+    func setAgentRunActive(_ tabID: UUID, isActive: Bool) {
+        base.setAgentRunActive(tabID, isActive: isActive)
+    }
+
+    func mcpDelegationRunToolPolicy(for session: AgentTabSession) -> AgentDelegationPolicy.RunToolPolicy {
+        base.mcpDelegationRunToolPolicy(for: session)
+    }
+
+    func provisionalClaudeContextWindowKey(for session: AgentTabSession) -> ClaudeProvisionalContextWindowResolver.Key? {
+        base.provisionalClaudeContextWindowKey(for: session)
+    }
+
+    func syncSpawnResolvedClaudeConfiguredContextWindow(
+        _ value: Int?,
+        launchKey: ClaudeProvisionalContextWindowResolver.Key,
+        for session: AgentTabSession
+    ) {
+        base.syncSpawnResolvedClaudeConfiguredContextWindow(value, launchKey: launchKey, for: session)
+    }
+
+    func stageClaudeResumeRecoveryHandoffIfNeeded(
+        for session: AgentTabSession,
+        ifStillOwned: @escaping @MainActor () -> Bool,
+        beforeCommit: (@MainActor () async -> Void)?
+    ) async -> Bool {
+        await base.stageClaudeResumeRecoveryHandoffIfNeeded(
+            for: session,
+            ifStillOwned: ifStillOwned,
+            beforeCommit: beforeCommit
+        )
+    }
+
+    func prependPendingHandoffIfNeeded(_ text: String, session: AgentTabSession) -> String {
+        base.prependPendingHandoffIfNeeded(text, session: session)
+    }
+
+    @discardableResult
+    func updatePermissionBindingState(from session: AgentTabSession, syncUI: Bool) -> Bool {
+        base.updatePermissionBindingState(from: session, syncUI: syncUI)
     }
 }
 

@@ -295,6 +295,8 @@ final class AgentToolTrackingController {
                 runID: runID,
                 observationPolicy: observationPolicy,
                 onCalled: { [weak self, eventDeliveryMailbox] invocationID, toolName, args in
+                    // Captured before the mailbox hop; re-bound for the main-actor callback.
+                    let linkage = AgentToolEventLinkage.current
                     #if DEBUG
                         let scheduledAt = DispatchTime.now().uptimeNanoseconds
                         EditFlowPerf.lifecycleEvent(
@@ -320,7 +322,9 @@ final class AgentToolTrackingController {
                                     )
                                 )
                                 guard let self, shouldDeliverCallback(for: runID) else { return 0 }
-                                onCalled(invocationID, toolName, args)
+                                AgentToolEventLinkage.$current.withValue(linkage) {
+                                    onCalled(invocationID, toolName, args)
+                                }
                                 return Int((DispatchTime.now().uptimeNanoseconds - enteredAt) / 1000)
                             }
                             EditFlowPerf.lifecycleEvent(
@@ -335,12 +339,15 @@ final class AgentToolTrackingController {
                         #else
                             await MainActor.run { [weak self] in
                                 guard let self, shouldDeliverCallback(for: runID) else { return }
-                                onCalled(invocationID, toolName, args)
+                                AgentToolEventLinkage.$current.withValue(linkage) {
+                                    onCalled(invocationID, toolName, args)
+                                }
                             }
                         #endif
                     }
                 },
                 onCompleted: { [weak self, eventDeliveryMailbox] invocationID, toolName, args, resultJSON, isError in
+                    let linkage = AgentToolEventLinkage.current
                     #if DEBUG
                         let scheduledAt = DispatchTime.now().uptimeNanoseconds
                         EditFlowPerf.lifecycleEvent(
@@ -366,7 +373,9 @@ final class AgentToolTrackingController {
                                     )
                                 )
                                 guard let self, shouldDeliverCallback(for: runID) else { return 0 }
-                                onCompleted(invocationID, toolName, args, resultJSON, isError)
+                                AgentToolEventLinkage.$current.withValue(linkage) {
+                                    onCompleted(invocationID, toolName, args, resultJSON, isError)
+                                }
                                 return Int((DispatchTime.now().uptimeNanoseconds - enteredAt) / 1000)
                             }
                             EditFlowPerf.lifecycleEvent(
@@ -382,7 +391,9 @@ final class AgentToolTrackingController {
                         #else
                             await MainActor.run { [weak self] in
                                 guard let self, shouldDeliverCallback(for: runID) else { return }
-                                onCompleted(invocationID, toolName, args, resultJSON, isError)
+                                AgentToolEventLinkage.$current.withValue(linkage) {
+                                    onCompleted(invocationID, toolName, args, resultJSON, isError)
+                                }
                             }
                         #endif
                     }

@@ -1672,7 +1672,7 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
                 controllers.add(controller)
                 return controller
             },
-            connectionPolicyInstaller: { clientName, windowID, restrictedTools, oneShot, reason, ttl, tabID, runID, additionalTools, allowedToolsOverride, sessionProfile, purpose, taskLabelKind, allowsAgentExternalControlTools, requiresExpectedAgentPID in
+            connectionPolicyInstaller: { clientName, windowID, restrictedTools, oneShot, reason, ttl, tabID, runID, additionalTools, allowedToolsOverride, sessionProfile, purpose, taskLabelKind, allowsAgentExternalControlTools, requiresExpectedAgentPID, codeModeEligibility in
                 // The production installer's call, then the routing signal the fake process cannot send.
                 await ServerNetworkManager.shared.installClientConnectionPolicy(
                     for: clientName,
@@ -1689,7 +1689,8 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
                     purpose: purpose,
                     taskLabelKind: taskLabelKind,
                     allowsAgentExternalControlTools: allowsAgentExternalControlTools,
-                    requiresExpectedAgentPID: requiresExpectedAgentPID
+                    requiresExpectedAgentPID: requiresExpectedAgentPID,
+                    codeModeEligibility: codeModeEligibility
                 )
                 if let runID {
                     await MCPRoutingWaiter.notifyRouted(runID: runID)

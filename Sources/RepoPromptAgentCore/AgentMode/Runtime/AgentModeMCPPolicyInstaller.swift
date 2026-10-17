@@ -44,7 +44,9 @@ enum AgentModeMCPPolicyInstaller {
             .agentModeRun,
             taskLabelKind,
             allowsAgentExternalControlTools,
-            agent.requiresExpectedPIDOwnedAgentModeMCPRouting
+            agent.requiresExpectedPIDOwnedAgentModeMCPRouting,
+            // Direct installs carry no launch-resolved eligibility; only the run lease does.
+            .native
         )
     }
 }

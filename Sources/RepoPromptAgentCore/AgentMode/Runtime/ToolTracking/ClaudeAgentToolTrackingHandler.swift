@@ -543,6 +543,16 @@ final class ClaudeAgentToolTrackingHandler {
         hooks.endActiveReasoningSegment(session)
         let storedToolName = Self.canonicalTranscriptToolName(toolName)
         let argsJSON = AgentToolTrackingController.encodeArgsToJSON(args)
+        if let linkage = AgentToolEventLinkage.current {
+            appendCodeModeChildToolCall(
+                invocationID: invocationID,
+                storedToolName: storedToolName,
+                argsJSON: argsJSON,
+                linkage: linkage,
+                session: session
+            )
+            return
+        }
         let signature = Self.repoPromptInvocationSignature(toolName: toolName, argsJSON: argsJSON)
         if let providerInvocationID = consumePendingProviderInvocationID(
             forSignature: signature,
@@ -584,13 +594,14 @@ final class ClaudeAgentToolTrackingHandler {
         let indexedSignatureCandidates = session.indexedToolItemIndices(
             signature: signature,
             pendingCallsOnly: true
-        )
+        ).filter { session.items[$0].codeModeParentInvocationID == nil }
         inspectedItemCount += indexedSignatureCandidates.count
         var signatureCandidates = indexedSignatureCandidates
         var signatureUsedFallback = false
         if signatureCandidates.isEmpty {
             let fallback = session.activeTurnToolItemIndices(where: { item in
                 item.kind == .toolCall
+                    && item.codeModeParentInvocationID == nil
                     && Self.repoPromptInvocationSignature(
                         toolName: item.toolName ?? "",
                         argsJSON: item.toolArgsJSON
@@ -740,6 +751,18 @@ final class ClaudeAgentToolTrackingHandler {
         hooks.endActiveReasoningSegment(session)
         let storedToolName = Self.canonicalTranscriptToolName(toolName)
         let argsJSON = AgentToolTrackingController.encodeArgsToJSON(args)
+        if let linkage = AgentToolEventLinkage.current {
+            finalizeCodeModeChildToolResult(
+                invocationID: invocationID,
+                storedToolName: storedToolName,
+                argsJSON: argsJSON,
+                resultJSON: resultJSON,
+                isError: isError,
+                linkage: linkage,
+                session: session
+            )
+            return
+        }
         let signature = Self.repoPromptInvocationSignature(toolName: toolName, argsJSON: argsJSON)
         let resolvedInvocationID = providerInvocationByTrackerInvocationID[invocationID] ?? invocationID
         providerInvocationByTrackerInvocationID.removeValue(forKey: invocationID)
@@ -787,13 +810,14 @@ final class ClaudeAgentToolTrackingHandler {
             let indexedSignatureCandidates = session.indexedToolItemIndices(
                 signature: signature,
                 pendingCallsOnly: true
-            )
+            ).filter { session.items[$0].codeModeParentInvocationID == nil }
             inspectedItemCount += indexedSignatureCandidates.count
             var matchingPendingSignatureIndices = indexedSignatureCandidates
             var signatureUsedFallback = false
             if matchingPendingSignatureIndices.isEmpty {
                 let fallback = session.activeTurnToolItemIndices(where: { item in
                     item.kind == .toolCall
+                        && item.codeModeParentInvocationID == nil
                         && Self.repoPromptInvocationSignature(
                             toolName: item.toolName ?? "",
                             argsJSON: item.toolArgsJSON
@@ -891,6 +915,87 @@ final class ClaudeAgentToolTrackingHandler {
                 isError: isError,
                 sequenceIndex: session.nextSequenceIndex
             )
+            session.appendItem(toolResultItem)
+        }
+        hooks.requestUIRefresh(session.tabID, false)
+    }
+
+    // MARK: - code_mode Child Cards (plan §6 D3)
+
+    /// The parent card's transcript invocation: the provider-stream ID when the tracker
+    /// invocation was correlated to one, else the tracker invocation itself.
+    private func transcriptParentInvocationID(for linkage: AgentToolEventLinkage) -> UUID {
+        providerInvocationByTrackerInvocationID[linkage.codeModeParentInvocationID]
+            ?? linkage.codeModeParentInvocationID
+    }
+
+    /// A child is never correlated with provider-stream slots (the provider never sees it):
+    /// it always gets its own flat canonical card, keyed by its own tracker invocation.
+    private func appendCodeModeChildToolCall(
+        invocationID: UUID,
+        storedToolName: String,
+        argsJSON: String?,
+        linkage: AgentToolEventLinkage,
+        session: AgentTabSession
+    ) {
+        var toolItem = AgentChatItem.toolCall(
+            name: storedToolName,
+            invocationID: invocationID,
+            argsJSON: argsJSON,
+            sequenceIndex: session.nextSequenceIndex
+        )
+        toolItem.codeModeParentInvocationID = transcriptParentInvocationID(for: linkage)
+        session.appendItem(toolItem)
+        hooks.requestUIRefresh(session.tabID, false)
+        MCPToolObserverAttributionContext.record(correlationPath: "code_mode_child", scannedItemCount: 0)
+    }
+
+    /// Finalizes a child card by its exact invocation ID only; no signature or name fallback.
+    private func finalizeCodeModeChildToolResult(
+        invocationID: UUID,
+        storedToolName: String,
+        argsJSON: String?,
+        resultJSON: String,
+        isError: Bool,
+        linkage: AgentToolEventLinkage,
+        session: AgentTabSession
+    ) {
+        let parentInvocationID = transcriptParentInvocationID(for: linkage)
+        let isChildCard: (AgentChatItem) -> Bool = { item in
+            item.toolInvocationID == invocationID && item.codeModeParentInvocationID != nil
+        }
+        let indexed = session.indexedToolItemIndices(invocationID: invocationID)
+        let targetIndex = indexed.last(where: { isChildCard(session.items[$0]) })
+            ?? session.activeTurnToolItemIndices(where: isChildCard).lastIndex
+        MCPToolObserverAttributionContext.record(correlationPath: "code_mode_child", scannedItemCount: indexed.count)
+
+        if isError, resultJSON.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            if let targetIndex, session.items[targetIndex].kind == .toolCall {
+                session.removeItem(at: targetIndex)
+                hooks.requestUIRefresh(session.tabID, false)
+            }
+            return
+        }
+
+        if let targetIndex {
+            var updated = session.items[targetIndex]
+            updated.toolName = storedToolName
+            updated.kind = .toolResult
+            updated.toolResultJSON = resultJSON
+            updated.toolArgsJSON = argsJSON ?? updated.toolArgsJSON
+            updated.toolIsError = isError
+            updated.text = resultJSON
+            session.replaceItem(at: targetIndex, with: updated)
+        } else {
+            var toolResultItem = AgentChatItem.toolResult(
+                name: storedToolName,
+                invocationID: invocationID,
+                argsJSON: argsJSON,
+                resultJSON: resultJSON,
+                isError: isError,
+                sequenceIndex: session.nextSequenceIndex
+            )
+            toolResultItem.codeModeParentInvocationID = parentInvocationID
             session.appendItem(toolResultItem)
         }
         hooks.requestUIRefresh(session.tabID, false)
@@ -1030,6 +1135,7 @@ final class ClaudeAgentToolTrackingHandler {
         func isEligible(_ item: AgentChatItem) -> Bool {
             item.sequenceIndex >= turnStartSequenceIndex
                 && (item.kind == .toolCall || item.kind == .toolResult)
+                && item.codeModeParentInvocationID == nil
         }
 
         if let invocationID {

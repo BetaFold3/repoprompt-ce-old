@@ -63,7 +63,7 @@ var repoPromptAppDependencies: [Target.Dependency] = [
     "RepoPromptWorkspace",
     .product(name: "RepoPromptShared", package: "RepoPromptCore"),
     "RepoPromptRemoteWire",
-    "RepoPromptC", "CSwiftPCRE2", "TreeSitterScannerSupport",
+    "RepoPromptC", "CSwiftPCRE2", "TreeSitterScannerSupport", "CRepoPromptCodeMode",
     "Sparkle",
     .product(name: "Logging", package: "swift-log"),
     .product(name: "KeyboardShortcuts", package: "KeyboardShortcuts"),
@@ -254,6 +254,28 @@ let package = Package(
         // Exact-snapshot scanner ABI fallback for upstream JavaScript/Python products.
         // See docs/architecture/source-layout.md and ThirdPartyLicenses/tree-sitter/README.md.
         .target(name: "TreeSitterScannerSupport", path: "Sources/TreeSitterScannerSupport", sources: ["src/javascript/scanner.c", "src/python/scanner.c"], publicHeadersPath: "include"),
+        // App-only `code_mode` runtime: unmodified QuickJS-ng 0.17.0 subset (no quickjs-libc) plus
+        // the opaque host. See docs/architecture/source-layout.md and ThirdPartyLicenses/quickjs-ng.
+        .target(
+            name: "CRepoPromptCodeMode",
+            path: "Sources/CRepoPromptCodeMode",
+            sources: [
+                "src/RepoPromptCodeMode.c",
+                "vendor/quickjs-ng/quickjs.c",
+                "vendor/quickjs-ng/libregexp.c",
+                "vendor/quickjs-ng/libunicode.c",
+                "vendor/quickjs-ng/dtoa.c"
+            ],
+            publicHeadersPath: "include",
+            // Mirrors upstream v0.17.0's CMakeLists.txt/meson.build: `_GNU_SOURCE`, `QUICKJS_NG_BUILD`
+            // and `-funsigned-char` (its only semantic codegen flag; Apple arm64 `char` is signed).
+            cSettings: [
+                .headerSearchPath("vendor/quickjs-ng"),
+                .define("_GNU_SOURCE"),
+                .define("QUICKJS_NG_BUILD"),
+                .unsafeFlags(["-funsigned-char"])
+            ]
+        ),
         .binaryTarget(name: "Sparkle", path: "Vendor/Sparkle/Sparkle.xcframework"),
         .testTarget(
             name: "RepoPromptTests",

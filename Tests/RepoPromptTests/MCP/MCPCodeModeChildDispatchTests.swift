@@ -209,7 +209,8 @@ final class MCPCodeModeChildDispatchTests: XCTestCase {
                         tabID: context.tabID,
                         runID: UUID(),
                         additionalTools: [],
-                        purpose: .agentModeRun
+                        purpose: .agentModeRun,
+                        codeModeEligibility: .directTools
                     )
                     let endpoint = try await fixture.makeAdditionalEndpoint(
                         label: "code-mode-child",
@@ -219,6 +220,14 @@ final class MCPCodeModeChildDispatchTests: XCTestCase {
                     let connectionID = endpoint.connectionID
                     let registered = await manager.debugHasRegisteredToolCallHandler(connectionID: connectionID)
                     XCTAssertTrue(registered)
+                    // The installed eligibility is staged on the admitted connection (Step 5).
+                    let staged = await manager.debugStagedCodeModeEligibility(for: connectionID)
+                    XCTAssertEqual(staged, .directTools)
+                    let eligibleCodeMode = try await endpoint.callTool(name: MCPCodeModeEligibility.codeModeToolName, arguments: [:])
+                    XCTAssertFalse(
+                        eligibleCodeMode.rawJSON.contains(ServerNetworkManager.codeModeNotEligibleMessage),
+                        eligibleCodeMode.rawJSON
+                    )
                     _ = try await endpoint.callTool(name: MCPWindowToolName.manageSelection, arguments: ["op": "clear"])
 
                     func child(_ name: String, _ arguments: [String: Value]) async throws -> MCPInProcessToolResult {
@@ -351,7 +360,8 @@ final class MCPCodeModeChildDispatchTests: XCTestCase {
                         tabID: context.tabID,
                         runID: UUID(),
                         additionalTools: [],
-                        purpose: .agentModeRun
+                        purpose: .agentModeRun,
+                        codeModeEligibility: .directTools
                     )
                     let settings = GlobalSettingsStore.shared
                     let previousStructuredResults = settings.mcpStructuredResultsMode()
@@ -388,6 +398,45 @@ final class MCPCodeModeChildDispatchTests: XCTestCase {
                         ),
                         Self.texts(restricted.result).joined()
                     )
+                    // A native (default) run policy neither executes `code_mode` nor admits children.
+                    let nativeClientName = "code-mode-child-native-\(UUID().uuidString)"
+                    await manager.installClientConnectionPolicy(
+                        for: nativeClientName,
+                        windowID: context.window.windowID,
+                        restrictedTools: [],
+                        tabID: context.tabID,
+                        runID: UUID(),
+                        additionalTools: [],
+                        purpose: .agentModeRun
+                    )
+                    let nativeEndpoint = try await fixture.makeAdditionalEndpoint(
+                        label: "code-mode-child-native",
+                        clientName: nativeClientName,
+                        requiredToolNames: [MCPWindowToolName.readFile]
+                    )
+                    let nativeStaged = await manager.debugStagedCodeModeEligibility(for: nativeEndpoint.connectionID)
+                    XCTAssertEqual(nativeStaged, .native)
+                    let nativeCodeMode = try await nativeEndpoint.callTool(
+                        name: MCPCodeModeEligibility.codeModeToolName, arguments: [:]
+                    )
+                    XCTAssertTrue(
+                        nativeCodeMode.rawJSON.contains(ServerNetworkManager.codeModeNotEligibleMessage),
+                        nativeCodeMode.rawJSON
+                    )
+                    let nativeChild = try await manager.invokeCodeModeChild(
+                        connectionID: nativeEndpoint.connectionID,
+                        parentInvocationID: UUID(),
+                        params: CallTool.Parameters(
+                            name: MCPWindowToolName.readFile, arguments: ["path": .string(context.fileURL.path)]
+                        )
+                    )
+                    XCTAssertNil(nativeChild.value)
+                    XCTAssertEqual(nativeChild.result.isError, true)
+                    XCTAssertTrue(
+                        Self.texts(nativeChild.result).joined().contains("code_mode_not_eligible"),
+                        Self.texts(nativeChild.result).joined()
+                    )
+
                     // A provider error is returned as the handler's error result, with no value.
                     let missing = try await child(
                         MCPWindowToolName.readFile,

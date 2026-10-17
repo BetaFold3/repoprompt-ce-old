@@ -18,7 +18,8 @@ package typealias AgentConnectionPolicyInstaller = (
     _ purpose: MCPRunPurpose,
     _ taskLabelKind: AgentModelCatalog.TaskLabelKind?,
     _ allowsAgentExternalControlTools: Bool,
-    _ requiresExpectedAgentPID: Bool
+    _ requiresExpectedAgentPID: Bool,
+    _ codeModeEligibility: MCPCodeModeEligibility
 ) async -> Void
 package typealias AgentMCPServerEnabler = () async -> Void
 package typealias AgentCodexActiveToolQuery = (_ runID: UUID) -> Bool

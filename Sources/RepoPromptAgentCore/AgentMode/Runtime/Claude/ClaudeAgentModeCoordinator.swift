@@ -66,6 +66,10 @@ package final class ClaudeAgentModeCoordinator {
         /// Effort-free identity used to invalidate Auto across base-model or
         /// backend-selection changes.
         let autoPermissionValidationKey: AutoPermissionValidationKey?
+        /// `.directCodeMode` when the process was launched under it; `nil` for native or a launch
+        /// that can never be `code_mode` eligible. Claude reads `tools/list` at connect, so a
+        /// change recycles the controller like the Bash toggle.
+        let repoPromptToolsMode: RepoPromptToolsMode?
 
         init(
             runtimeVariant: ClaudeCodeRuntimeVariant,
@@ -75,7 +79,8 @@ package final class ClaudeAgentModeCoordinator {
             mcpStrictMode: Bool?,
             sessionProfile: AgentSessionProfile,
             toolSearchEnabled: Bool?,
-            autoPermissionValidationKey: AutoPermissionValidationKey? = nil
+            autoPermissionValidationKey: AutoPermissionValidationKey? = nil,
+            repoPromptToolsMode: RepoPromptToolsMode? = nil
         ) {
             self.runtimeVariant = runtimeVariant
             self.workspacePath = workspacePath
@@ -85,6 +90,7 @@ package final class ClaudeAgentModeCoordinator {
             self.sessionProfile = sessionProfile
             self.toolSearchEnabled = toolSearchEnabled
             self.autoPermissionValidationKey = autoPermissionValidationKey
+            self.repoPromptToolsMode = repoPromptToolsMode
         }
     }
 
@@ -506,6 +512,7 @@ package final class ClaudeAgentModeCoordinator {
         let effectiveAllowNativeBashTool = session.profile == .knowledge ? false : runtimePermission.allowNativeBashTool
         let effectiveMCPStrictMode = session.profile == .knowledge ? true : runtimePermission.mcpStrictMode
         let effectiveToolSearchEnabled = session.profile == .knowledge ? false : nil
+        let effectiveRepoPromptToolsMode = launchRepoPromptToolsMode(for: session)
 
         // If the session's Claude runtime variant or effective permission mode no
         // longer matches the controller, recycle it so the next process launches
@@ -521,9 +528,11 @@ package final class ClaudeAgentModeCoordinator {
         let toolSearchChanged = currentLaunchSettings?.toolSearchEnabled != effectiveToolSearchEnabled
         let autoPermissionValidationKeyChanged =
             currentLaunchSettings?.autoPermissionValidationKey != autoPermissionValidationKey
+        let repoPromptToolsModeChanged = currentLaunchSettings?.repoPromptToolsMode != effectiveRepoPromptToolsMode
         if let existingController = session.claudeController,
            runtimeVariantChanged || permissionModeChanged || bashToolChanged || mcpStrictModeChanged
            || sessionProfileChanged || toolSearchChanged || autoPermissionValidationKeyChanged
+           || repoPromptToolsModeChanged
         {
             let hasTurnInFlight = await existingController.hasTurnInFlight
             guard !Task.isCancelled,
@@ -586,7 +595,8 @@ package final class ClaudeAgentModeCoordinator {
                 mcpStrictMode: effectiveMCPStrictMode,
                 sessionProfile: session.profile,
                 toolSearchEnabled: effectiveToolSearchEnabled,
-                autoPermissionValidationKey: autoPermissionValidationKey
+                autoPermissionValidationKey: autoPermissionValidationKey,
+                repoPromptToolsMode: effectiveRepoPromptToolsMode
             )
             let createdController: any NativeAgentRuntimeControlling
             do {
@@ -650,7 +660,8 @@ package final class ClaudeAgentModeCoordinator {
                 effectiveAllowNativeBashTool: effectiveAllowNativeBashTool,
                 effectiveMCPStrictMode: effectiveMCPStrictMode,
                 effectiveToolSearchEnabled: effectiveToolSearchEnabled,
-                autoPermissionValidationKey: autoPermissionValidationKey
+                autoPermissionValidationKey: autoPermissionValidationKey,
+                effectiveRepoPromptToolsMode: effectiveRepoPromptToolsMode
             )
             guard !Task.isCancelled else { return }
             if let launchKey {
@@ -838,7 +849,8 @@ package final class ClaudeAgentModeCoordinator {
                 session: session,
                 selectedModelRaw: session.selectedModelRaw,
                 runtimeVariant: runtimeVariant
-            )
+            ),
+            repoPromptToolsMode: launchRepoPromptToolsMode(for: session)
         )
         return controllerLaunchSettingsByTabID[session.tabID] != expected
     }
@@ -1201,7 +1213,8 @@ package final class ClaudeAgentModeCoordinator {
         effectiveAllowNativeBashTool: Bool?,
         effectiveMCPStrictMode: Bool?,
         effectiveToolSearchEnabled: Bool?,
-        autoPermissionValidationKey: AutoPermissionValidationKey?
+        autoPermissionValidationKey: AutoPermissionValidationKey?,
+        effectiveRepoPromptToolsMode: RepoPromptToolsMode?
     ) async throws -> NativeAgentRuntimeSessionRef {
         let existingSessionID = session.providerSessionID
         let runAttemptID = session.activeRunAttemptID
@@ -1282,7 +1295,8 @@ package final class ClaudeAgentModeCoordinator {
                     mcpStrictMode: effectiveMCPStrictMode,
                     sessionProfile: session.profile,
                     toolSearchEnabled: effectiveToolSearchEnabled,
-                    autoPermissionValidationKey: autoPermissionValidationKey
+                    autoPermissionValidationKey: autoPermissionValidationKey,
+                    repoPromptToolsMode: effectiveRepoPromptToolsMode
                 )
                 freshController = try claudeControllerFactory(
                     runID,
@@ -2582,6 +2596,71 @@ package final class ClaudeAgentModeCoordinator {
                 allowNativeBashTool: settings.allowNativeBashTool,
                 sessionProfile: settings.sessionProfile
             )
+        }
+    }
+
+    /// Per-run `code_mode` eligibility for this Claude launch, captured once beside
+    /// `runHasNativeShell(for:)` and immutable for the run. Only an official Claude Code
+    /// (`.claudeCode`, standard runtime variant) Standard-profile launch whose model resolves
+    /// through the existing Claude model authority, with the RepoPrompt tools setting at
+    /// `direct + code_mode`, is `.directTools`; everything else — compatible backends, Knowledge,
+    /// MCP-safe external defaults, unresolved/custom models, unknown live launch settings — is
+    /// `.native`.
+    package func codeModeEligibility(for session: AgentTabSession) -> MCPCodeModeEligibility {
+        let liveLaunchSettings: ControllerLaunchSettings?? = session.claudeController == nil
+            ? .none
+            : .some(controllerLaunchSettingsByTabID[session.tabID])
+        let defaults = viewModel?.providerBindingService.preferences.defaults ?? .standard
+        return Self.codeModeEligibility(
+            toolsMode: ClaudeAgentToolPreferences.repoPromptToolsMode(defaults: defaults),
+            agentKind: session.selectedAgent,
+            sessionProfile: session.profile,
+            permissionProfile: session.permissionProfile,
+            selectedModelRaw: session.selectedModelRaw,
+            liveControllerLaunchSettings: liveLaunchSettings
+        )
+    }
+
+    /// The RepoPrompt tools mode recorded in a launch's settings, so a change recycles a live
+    /// controller before the next run (Claude reads `tools/list` once, at connect). Only
+    /// `.directCodeMode` is recorded; `nil` means native, or a launch that can never be
+    /// `code_mode` eligible, so the toggle never recycles those.
+    private func launchRepoPromptToolsMode(for session: AgentTabSession) -> RepoPromptToolsMode? {
+        guard session.selectedAgent == .claudeCode, session.profile == .standard else { return nil }
+        let defaults = viewModel?.providerBindingService.preferences.defaults ?? .standard
+        let mode = ClaudeAgentToolPreferences.repoPromptToolsMode(defaults: defaults)
+        return mode == .directCodeMode ? mode : nil
+    }
+
+    /// Pure decision behind `codeModeEligibility(for:)`. `liveControllerLaunchSettings` follows
+    /// the `runHasNativeShell` convention: `nil` when no controller is live, `.some(nil)` when a
+    /// live controller has no recorded launch settings (unknown, so `.native`).
+    static func codeModeEligibility(
+        toolsMode: RepoPromptToolsMode,
+        agentKind: AgentProviderKind,
+        sessionProfile: AgentSessionProfile,
+        permissionProfile: AgentProviderPermissionProfile,
+        selectedModelRaw: String,
+        liveControllerLaunchSettings: ControllerLaunchSettings??
+    ) -> MCPCodeModeEligibility {
+        guard toolsMode == .directCodeMode,
+              agentKind == .claudeCode,
+              sessionProfile == .standard,
+              permissionProfile != .mcpSafeDefaults,
+              AgentModel.resolvedModel(forRaw: selectedModelRaw, agentKind: .claudeCode) != nil
+        else {
+            return .native
+        }
+        switch liveControllerLaunchSettings {
+        case .none:
+            return .directTools
+        case .some(.none):
+            return .native
+        case let .some(.some(settings)):
+            guard settings.runtimeVariant == .standard, settings.sessionProfile == .standard else {
+                return .native
+            }
+            return .directTools
         }
     }
 

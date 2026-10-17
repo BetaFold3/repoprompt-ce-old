@@ -87,6 +87,7 @@ Sources/
   RepoPromptC/                   # C support target
   CSwiftPCRE2/                   # C PCRE2 target
   TreeSitterScannerSupport/      # narrow exact-snapshot JavaScript/Python scanner ABI fallback
+  CRepoPromptCodeMode/           # app-only bounded code-mode host over vendored QuickJS-ng
 Tests/
   RepoPromptTests/               # XCTest tests, support, and fixtures
 ```
@@ -126,7 +127,7 @@ The old IDE-era Prompt selected-files panel is also removed. Do not add back `Pr
 - `Sources/RepoPromptExecutable` is restricted to the shipped executable entry. Do not add lifecycle, feature, infrastructure, startup, or composition logic there.
 - New product-flow code goes under `Sources/RepoPrompt/Features/<FeatureName>`.
 - New app lifecycle, launch/configuration, command, root view/view-model, notification-name, and composition-root wiring goes under `Sources/RepoPrompt/App` in the `RepoPromptApp` target.
-- There is no Objective-C bridging header. Swift reaches C code through explicit module imports (`RepoPromptC`, `CSwiftPCRE2`, tree-sitter grammar modules); expose new C entry points through public headers in `Sources/RepoPromptC/include`.
+- There is no Objective-C bridging header. Swift reaches C code through explicit module imports (`RepoPromptC`, `CSwiftPCRE2`, tree-sitter grammar modules); expose new C entry points through public headers in `Sources/RepoPromptC/include`, except for the documented `CRepoPromptCodeMode` target below.
 - New cross-cutting service/platform code goes under `Sources/RepoPrompt/Infrastructure/<Area>`; dependency-free generic primitives that use no app declarations go under `Sources/RepoPromptPlatform/Infrastructure/<Area>`.
 - New workspace-engine code (context store, indexing, path lookup, selection/slices, token accounting, codemap, search, filesystem, VCS, diffing, syntax parsing, durable artifacts) that needs no app, agent, UI, or MCP declarations goes under `Sources/RepoPromptWorkspace/<Area>`; product view models and adapters over it stay in the app.
 - Native Remote Control host discovery/client transport and persistence belong under `Infrastructure/RemoteHosts`; app-owned pairing keys, discovery authority, and approval routing belong under `Infrastructure/Security/RemotePairing`; gateway admission/relay stays in `RepoPromptGateway`; shared signed discovery wire DTOs stay in `RepoPromptRemoteWire`; onboarding presentation stays under `Features/Settings`.
@@ -179,6 +180,12 @@ These files are intentionally compiled as app-integrated diagnostics and live un
 - `Sources/TreeSitterScannerSupport` is an internal C linker compatibility target, not a restored local grammar target. It contains byte-for-byte exact-snapshot copies of the upstream JavaScript and Python `scanner.c` implementations plus their required `tree_sitter` helper headers. It does not contain parser copies, grammar definitions, queries, or CE-authored scanner code.
 - Clean coordinated SwiftPM root graphs compile the exact-pinned upstream JavaScript and Python parser objects but omit their scanner objects, leaving unresolved external-scanner ABI symbols. `TreeSitterScannerSupport` supplies only those missing symbols while CE continues linking the upstream package products.
 - The tracked checksum manifest at [`ThirdPartyLicenses/tree-sitter/scanner-support.sha256`](../../ThirdPartyLicenses/tree-sitter/scanner-support.sha256) protects the copied snapshots from drift. Do not expand this target, restore the seven retired local grammar directories, or replace the target with transient `.build/checkouts` mutation. Remove the target, guardrails, checksums, and this exception together only after validated upstream revisions or SwiftPM behavior compile the scanners directly from the dependency products in a clean graph.
+
+### Code-mode QuickJS-ng target
+
+- `Sources/CRepoPromptCodeMode` is an internal C target that only `RepoPromptApp` depends on. `src/RepoPromptCodeMode.c` is the CE-authored bounded host, and `include/RepoPromptCodeMode.h` is its only public interface. Swift reaches it only from `Sources/RepoPrompt/Infrastructure/MCP/CodeMode`.
+- `vendor/quickjs-ng` holds an unmodified QuickJS-ng 0.17.0 subset: `quickjs.c`, `libregexp.c`, `libunicode.c`, `dtoa.c`, and the headers they need. It never includes `quickjs-libc` or any other filesystem, OS, module, or timer layer. Provenance, the archive checksum, the license, and update steps live in [`ThirdPartyLicenses/quickjs-ng`](../../ThirdPartyLicenses/quickjs-ng/README.md). The tracked `vendor.sha256` manifest protects the vendored files from drift.
+- Do not edit vendored files in place, add other upstream files, or let any other target depend on this one. To update QuickJS-ng, replace the whole subset from a verified upstream archive and regenerate the manifest.
 
 No top-level `Sources/RepoPrompt/Notifications` exception remains; app-wide notification-name extensions now live under `Sources/RepoPrompt/App/Notifications`.
 

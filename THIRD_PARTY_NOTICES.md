@@ -26,6 +26,14 @@ RepoPrompt CE includes PCRE2 source and its SLJIT dependency. Their copied
 licenses are included at [`ThirdPartyLicenses/pcre2/LICENSE.txt`](ThirdPartyLicenses/pcre2/LICENSE.txt)
 and [`ThirdPartyLicenses/sljit/LICENSE`](ThirdPartyLicenses/sljit/LICENSE).
 
+## QuickJS-ng
+
+RepoPrompt CE includes an unmodified subset of QuickJS-ng 0.17.0 source for the
+experimental `code_mode` executor. The copied license is included at
+[`ThirdPartyLicenses/quickjs-ng/LICENSE`](ThirdPartyLicenses/quickjs-ng/LICENSE), and
+the source archive checksum, file list and provenance are recorded under
+[`ThirdPartyLicenses/quickjs-ng/`](ThirdPartyLicenses/quickjs-ng/).
+
 ## Tree-sitter grammar packages and runtime
 
 RepoPrompt CE links Tree-sitter grammar package products through fixed, source-preserving SwiftPM revision pins. Those package dependencies still require attribution when distributed.

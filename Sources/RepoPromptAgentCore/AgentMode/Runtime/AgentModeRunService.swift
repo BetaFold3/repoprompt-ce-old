@@ -633,6 +633,7 @@ package final class AgentModeRunService {
             session: session,
             acpSessionModeID: acpRunRequest?.sessionModeID
         )
+        let codeModeEligibility = resolveCodeModeEligibility(selectedAgent: selectedAgent, session: session)
         let runCoordinator = runCoordinator
         let makeLease: (_ runID: UUID) -> MCPBootstrapLease = { runID in
             self.dependencies.bindPendingOracleReviewContext(tabID, runID)
@@ -646,7 +647,8 @@ package final class AgentModeRunService {
                 taskLabelKind: taskLabelKind,
                 allowsAgentExternalControlTools: delegationPolicy.allowsAgentExternalControlTools,
                 additionalRestrictedTools: delegationPolicy.additionalRestrictedTools,
-                runHasNativeShell: runHasNativeShell
+                runHasNativeShell: runHasNativeShell,
+                codeModeEligibility: codeModeEligibility
             )
             let lease = MCPBootstrapLease(
                 spec: leaseSpec,
@@ -855,6 +857,18 @@ package final class AgentModeRunService {
             return OpenCodeAgentConfig.sessionModeHasNativeShell(acpSessionModeID)
         }
         return false
+    }
+
+    /// `code_mode` eligibility for the run's MCP lease, captured once from the final launch
+    /// configuration beside `resolveRunHasNativeShell` and immutable for the run. Only official
+    /// Claude Code resolves it (from the coordinator's launch facts); every other provider —
+    /// including Codex, whose read-only companion is deferred — is `.native`.
+    private func resolveCodeModeEligibility(
+        selectedAgent: AgentProviderKind,
+        session: AgentTabSession
+    ) -> MCPCodeModeEligibility {
+        guard selectedAgent == .claudeCode, session.selectedAgent == .claudeCode else { return .native }
+        return dependencies.claudeCoordinator.codeModeEligibility(for: session)
     }
 
     @discardableResult

@@ -17,6 +17,8 @@ enum DiscoverMCPToolPolicy {
         .worktreeManage,
         // Discovery keeps its existing `git` surface and never gains the review snapshot.
         .gitReviewSnapshot,
+        // Discovery never gets `code_mode` (plan §6 D3), independently of its eligibility gate.
+        .codeMode,
 
         .agentExternalControl,
         .agentExploreControl,

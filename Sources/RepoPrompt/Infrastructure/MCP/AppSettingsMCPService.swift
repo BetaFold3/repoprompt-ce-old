@@ -955,6 +955,21 @@ private enum AppSettingsMCPRegistry {
             read: { .bool($0.codexReasoningSummariesEnabled()) },
             write: { try $0.setCodexReasoningSummariesEnabled(requiredBool(from: $1)) }
         ),
+        stringEnumSetting(
+            key: "agent_mode.claude_repoprompt_tools",
+            group: "agent_mode",
+            label: "Claude RepoPrompt Tools",
+            description: "How RepoPrompt tools are offered to official Claude Code Agent Mode runs. 'native' (default) offers the direct tools only; 'direct_code_mode' also offers code_mode beside the direct tools on Standard-profile runs with a resolved Claude model. Compatible backends, Knowledge and MCP-safe sessions stay native. Applies to runs started after the change.",
+            allowedValues: RepoPromptToolsMode.allCases.map(\.rawValue),
+            read: { .string($0.claudeRepoPromptToolsMode().rawValue) },
+            write: { store, value in
+                let raw = try requiredString(from: value)
+                guard let mode = RepoPromptToolsMode(rawValue: raw) else {
+                    throw MCPError.invalidParams("Invalid value for 'agent_mode.claude_repoprompt_tools'.")
+                }
+                store.setClaudeRepoPromptToolsMode(mode)
+            }
+        ),
 
         // File-system / ignore preferences. Local .repo_ignore file content remains
         // repository content; this group exposes app-wide scalar behavior only.

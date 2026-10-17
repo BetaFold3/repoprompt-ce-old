@@ -294,10 +294,11 @@ final class MCPStructuredOutputTests: XCTestCase {
         }
     }
 
-    func testOnlyTheExplorationToolsAndTheReviewSnapshotAdvertiseAnOutputSchema() {
+    func testOnlyTheExplorationToolsTheReviewSnapshotAndCodeModeAdvertiseAnOutputSchema() {
+        // `code_mode` (plan §6 D3) advertises its result shape like the other schema-bearing tools.
         XCTAssertEqual(
             Set(MCPToolOutputSchemas.schemasByToolName.keys),
-            Self.worktreeScopedTools.union([MCPWindowToolName.gitReviewSnapshot])
+            Self.worktreeScopedTools.union([MCPWindowToolName.gitReviewSnapshot, MCPWindowToolName.codeMode])
         )
         // The legacy `git` tool returns the same DTO for every op but declares no schema.
         XCTAssertNil(MCPToolOutputSchemas.schemasByToolName[MCPWindowToolName.git])

@@ -69,7 +69,8 @@ extension MCPBootstrapLease {
                 leaseSpec.purpose,
                 leaseSpec.taskLabelKind,
                 leaseSpec.allowsAgentExternalControlTools,
-                leaseSpec.requiresExpectedAgentPID
+                leaseSpec.requiresExpectedAgentPID,
+                leaseSpec.codeModeEligibility
             )
         }
     }

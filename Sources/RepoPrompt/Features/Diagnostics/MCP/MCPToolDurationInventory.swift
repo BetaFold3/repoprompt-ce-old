@@ -171,7 +171,7 @@ import RepoPromptShared
                     contractKind: contract.kind,
                     executionDeadlineSeconds: deadline.mcpSeconds,
                     cleanupGraceSeconds: cancellationGrace.mcpSeconds,
-                    expectedActiveDuration: "Ordinary dispatch must complete within \(MCPTimeoutPolicy.boundedToolExecutionDeadlineSeconds) seconds.",
+                    expectedActiveDuration: "Ordinary dispatch must complete within \(deadline.components.seconds) seconds.",
                     evidence: "ServerNetworkManager applies MCPToolExecutionWatchdog at the resolved provider boundary.",
                     qualification: "Cancellation must release provider, limiter, ownership, and run-registration state; an uncooperative handler force-disconnects its connection after grace.",
                     semanticWaitMaximumSeconds: semanticWaitMaximumSeconds,

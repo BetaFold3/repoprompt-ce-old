@@ -48,6 +48,8 @@ public struct AgentTranscriptToolExecution: Codable, Sendable, Equatable {
     public var exitCode: Int?
     public var summaryText: String?
     public var keyPaths: [String]
+    /// Parent `code_mode` invocation for a flat child tool card (plan §6 D3); absent in legacy data.
+    public var codeModeParentInvocationID: UUID?
 
     public init(
         stableExecutionID: String,
@@ -61,7 +63,8 @@ public struct AgentTranscriptToolExecution: Codable, Sendable, Equatable {
         processID: String? = nil,
         exitCode: Int? = nil,
         summaryText: String? = nil,
-        keyPaths: [String] = []
+        keyPaths: [String] = [],
+        codeModeParentInvocationID: UUID? = nil
     ) {
         self.stableExecutionID = stableExecutionID
         self.toolName = toolName
@@ -75,6 +78,7 @@ public struct AgentTranscriptToolExecution: Codable, Sendable, Equatable {
         self.exitCode = exitCode
         self.summaryText = summaryText
         self.keyPaths = keyPaths
+        self.codeModeParentInvocationID = codeModeParentInvocationID
     }
 }
 
@@ -179,7 +183,8 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
             codexGoalMode: codexGoalMode,
             scheduledSend: scheduledSend,
             isLocalControlPlaneEcho: isLocalControlPlaneEcho ?? false,
-            isUndeliveredRemoteSend: isUndeliveredRemoteSend ?? false
+            isUndeliveredRemoteSend: isUndeliveredRemoteSend ?? false,
+            codeModeParentInvocationID: toolExecution?.codeModeParentInvocationID
         )
     }
 

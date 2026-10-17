@@ -15,6 +15,8 @@ enum MCPWindowToolGroup: CaseIterable, Hashable {
     case agentControl
     case agentSessionControl
     case history
+    /// Last so adding it leaves every earlier catalog position unchanged.
+    case codeMode
 
     var orderedToolNames: [String] {
         switch self {
@@ -68,6 +70,8 @@ enum MCPWindowToolGroup: CaseIterable, Hashable {
             ]
         case .history:
             [MCPWindowToolName.history]
+        case .codeMode:
+            [MCPWindowToolName.codeMode]
         }
     }
 
