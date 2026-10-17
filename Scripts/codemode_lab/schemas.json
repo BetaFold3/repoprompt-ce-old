@@ -1,0 +1,207 @@
+{
+ "read_file": {
+  "type": "object",
+  "properties": {
+   "content": {
+    "type": "string"
+   },
+   "display_path": {
+    "type": "string"
+   },
+   "first_line": {
+    "type": "integer"
+   },
+   "last_line": {
+    "type": "integer"
+   },
+   "total_lines": {
+    "type": "integer"
+   }
+  },
+  "additionalProperties": true
+ },
+ "file_search": {
+  "type": "object",
+  "properties": {
+   "content_match_groups": {
+    "type": "array",
+    "items": {
+     "type": "object",
+     "properties": {
+      "lines": {
+       "type": "array",
+       "items": {
+        "type": "object",
+        "properties": {
+         "context_after": {
+          "type": "array",
+          "items": {
+           "type": "object",
+           "properties": {}
+          }
+         },
+         "context_before": {
+          "type": "array",
+          "items": {
+           "type": "object",
+           "properties": {}
+          }
+         },
+         "line_number": {
+          "type": "integer"
+         },
+         "line_text": {
+          "type": "string"
+         }
+        }
+       }
+      },
+      "path": {
+       "type": "string"
+      }
+     }
+    }
+   },
+   "content_matches": {
+    "type": "integer"
+   },
+   "limit_hit": {
+    "type": "boolean"
+   },
+   "matched_files": {
+    "type": "integer"
+   },
+   "path_match_lines": {
+    "type": "array",
+    "items": {
+     "type": "string"
+    }
+   },
+   "path_matches": {
+    "type": "integer"
+   },
+   "per_file_counts": {
+    "type": "array",
+    "items": {
+     "type": "object",
+     "properties": {
+      "count": {
+       "type": "integer"
+      },
+      "path": {
+       "type": "string"
+      }
+     }
+    }
+   },
+   "per_file_totals": {
+    "type": "array",
+    "items": {
+     "type": "object",
+     "properties": {
+      "count": {
+       "type": "integer"
+      },
+      "path": {
+       "type": "string"
+      }
+     }
+    }
+   },
+   "searched_files": {
+    "type": "integer"
+   },
+   "total_files": {
+    "type": "integer"
+   },
+   "total_matches": {
+    "type": "integer"
+   }
+  },
+  "additionalProperties": true
+ },
+ "get_code_structure": {
+  "type": "object",
+  "properties": {
+   "files": {
+    "type": "array",
+    "items": {
+     "type": "object",
+     "properties": {
+      "content": {
+       "type": "string"
+      },
+      "depth": {
+       "type": "integer"
+      },
+      "path": {
+       "type": "string"
+      },
+      "reached_by": {
+       "type": "array",
+       "items": {}
+      },
+      "role": {
+       "type": "string"
+      },
+      "tokens": {
+       "type": "integer"
+      }
+     }
+    }
+   },
+   "issues": {
+    "type": "array",
+    "items": {}
+   },
+   "status": {
+    "type": "string"
+   },
+   "summary": {
+    "type": "object",
+    "properties": {
+     "codemap_content_tokens": {
+      "type": "integer"
+     },
+     "examined_edges": {
+      "type": "integer"
+     },
+     "requested_seeds": {
+      "type": "integer"
+     },
+     "resolved_seeds": {
+      "type": "integer"
+     },
+     "returned_files": {
+      "type": "integer"
+     },
+     "returned_related": {
+      "type": "integer"
+     },
+     "returned_seeds": {
+      "type": "integer"
+     }
+    }
+   }
+  },
+  "additionalProperties": true
+ },
+ "get_file_tree": {
+  "type": "object",
+  "properties": {
+   "roots_count": {
+    "type": "integer"
+   },
+   "tree": {
+    "type": "string"
+   },
+   "uses_legend": {
+    "type": "boolean"
+   },
+   "was_truncated": {
+    "type": "boolean"
+   }
+  },
+  "additionalProperties": true
+ }
+}
