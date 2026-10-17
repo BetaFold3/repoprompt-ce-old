@@ -1272,6 +1272,18 @@ class GlobalSettingsStore: ObservableObject {
         }
     }
 
+    /// Read once per MCP connection when it registers its handlers; see `MCPStructuredResultsMode`.
+    func mcpStructuredResultsMode() -> MCPStructuredResultsMode {
+        scalarPreferences.mcp?.structuredResults.flatMap(MCPStructuredResultsMode.init(rawValue:))
+            ?? .defaultMode
+    }
+
+    func setMCPStructuredResultsMode(_ mode: MCPStructuredResultsMode, commit: Bool = true) {
+        updateMCPScalar(commit: commit) { settings in
+            settings.structuredResults = mode.rawValue
+        }
+    }
+
     func mcpTemporarilyDisablePresets() -> Bool {
         scalarPreferences.mcp?.temporarilyDisablePresets ?? false
     }

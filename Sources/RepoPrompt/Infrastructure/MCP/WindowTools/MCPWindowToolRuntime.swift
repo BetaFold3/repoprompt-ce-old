@@ -35,6 +35,7 @@ final class MCPWindowToolRuntime {
         description: String,
         annotations: MCP.Tool.Annotations = .init(),
         inputSchema: JSONSchema,
+        outputSchema: Value? = nil,
         isEnabledByDefault: Bool = true,
         implementation: @escaping ProviderImplementation
     ) -> Tool {
@@ -43,6 +44,7 @@ final class MCPWindowToolRuntime {
             description: description,
             inputSchema: inputSchema,
             annotations: annotations,
+            outputSchema: outputSchema,
             isEnabledByDefault: isEnabledByDefault,
             returnsValue: { [weak self] args in
                 guard let self else {

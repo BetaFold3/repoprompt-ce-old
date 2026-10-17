@@ -887,6 +887,20 @@ private enum AppSettingsMCPRegistry {
             write: { try $0.setMCPShowModelPresets(requiredBool(from: $1)) },
             afterWrite: postRecommendationsDidApply
         ),
+        stringEnumSetting(
+            key: "mcp.structured_results",
+            group: "mcp",
+            description: "Whether MCP connections advertise outputSchema and return structuredContent beside the unchanged text for read_file, file_search, get_code_structure and get_file_tree. Applies to connections opened after the change.",
+            allowedValues: MCPStructuredResultsMode.allCases.map(\.rawValue),
+            read: { .string($0.mcpStructuredResultsMode().rawValue) },
+            write: { store, value in
+                let raw = try requiredString(from: value)
+                guard let mode = MCPStructuredResultsMode(rawValue: raw) else {
+                    throw MCPError.invalidParams("Invalid value for 'mcp.structured_results'.")
+                }
+                store.setMCPStructuredResultsMode(mode)
+            }
+        ),
         boolSetting(
             key: "mcp.remote_gateway_enabled",
             group: "mcp",

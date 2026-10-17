@@ -15,6 +15,9 @@ public struct Tool: Sendable {
     let description: String
     let inputSchema: JSONSchema
     let annotations: MCP.Tool.Annotations
+    /// JSON Schema for `structuredContent`, advertised in `tools/list` only on connections
+    /// opened with `mcp.structured_results` = `on` (`MCPToolOutputSchemas`).
+    let outputSchema: Value?
     public let isEnabledByDefault: Bool
     private let implementation: @Sendable ([String: Value]) async throws -> Value
 
@@ -26,6 +29,7 @@ public struct Tool: Sendable {
         description: String,
         inputSchema: JSONSchema,
         annotations: MCP.Tool.Annotations = .init(),
+        outputSchema: Value? = nil,
         isEnabledByDefault: Bool = true,
         implementation: @Sendable @escaping ([String: Value]) async throws -> some Encodable
     ) {
@@ -33,6 +37,7 @@ public struct Tool: Sendable {
         self.description = description
         self.inputSchema = inputSchema
         self.annotations = annotations
+        self.outputSchema = outputSchema
         self.isEnabledByDefault = isEnabledByDefault
         self.implementation = { input in
             let result = try await implementation(input)
@@ -52,6 +57,7 @@ public struct Tool: Sendable {
         description: String,
         inputSchema: JSONSchema,
         annotations: MCP.Tool.Annotations = .init(),
+        outputSchema: Value? = nil,
         isEnabledByDefault: Bool = true,
         returnsValue implementation: @Sendable @escaping ([String: Value]) async throws -> Value
     ) {
@@ -59,6 +65,7 @@ public struct Tool: Sendable {
         self.description = description
         self.inputSchema = inputSchema
         self.annotations = annotations
+        self.outputSchema = outputSchema
         self.isEnabledByDefault = isEnabledByDefault
         self.implementation = implementation
     }

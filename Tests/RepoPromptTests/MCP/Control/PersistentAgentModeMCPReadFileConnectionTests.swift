@@ -20,6 +20,18 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         #endif
     }
 
+    func testDelegatedQuestionDeliveryWithStructuredResultsCarriesTheNoticeInTextAndStructuredContent() async throws {
+        #if DEBUG
+            try await withStructuredResultsMode(.on) {
+                try await withFixture(agentOwned: true) { fixture in
+                    try await runCheckpoint(fixture: fixture, scenario: .delegatedQuestionDeliveryStructured)
+                }
+            }
+        #else
+            throw XCTSkip("Persistent Agent Mode MCP socketpair integration requires DEBUG inspection helpers.")
+        #endif
+    }
+
     func testDelegatedQuestionPostAttachCancellationReleasesAndNextReadDelivers() async throws {
         #if DEBUG
             try await withFixture(agentOwned: true) { fixture in
@@ -296,6 +308,30 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             throw XCTSkip("Persistent Agent Mode MCP socketpair integration requires DEBUG inspection helpers.")
         #endif
     }
+
+    func testStructuredResultsOnConnectionKeepsSchemasAndStructuredContentAfterSettingTurnsOff() async throws {
+        #if DEBUG
+            try await withStructuredResultsMode(.on) {
+                try await withFixture { fixture in
+                    try await runCheckpoint(fixture: fixture, scenario: .structuredResultsPinnedOn)
+                }
+            }
+        #else
+            throw XCTSkip("Persistent Agent Mode MCP socketpair integration requires DEBUG inspection helpers.")
+        #endif
+    }
+
+    func testStructuredResultsOffConnectionStaysTextOnlyAfterSettingTurnsOn() async throws {
+        #if DEBUG
+            try await withStructuredResultsMode(.off) {
+                try await withFixture { fixture in
+                    try await runCheckpoint(fixture: fixture, scenario: .structuredResultsPinnedOff)
+                }
+            }
+        #else
+            throw XCTSkip("Persistent Agent Mode MCP socketpair integration requires DEBUG inspection helpers.")
+        #endif
+    }
 }
 
 #if DEBUG
@@ -325,10 +361,13 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             case knowledgeRootDelegation
             case knowledgeWorkerDelegationDenial
             case delegatedQuestionDelivery
+            case delegatedQuestionDeliveryStructured
             case delegatedQuestionCancellation
             case delegatedQuestionError
             case delegatedQuestionResolvedDuringCompletion
             case delegatedQuestionAttemptReplacedDuringCompletion
+            case structuredResultsPinnedOn
+            case structuredResultsPinnedOff
 
             var requiresSerialReadPrelude: Bool {
                 switch self {
@@ -337,9 +376,10 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                      .worktreeCoverageCertificatePersistenceBoundary, .worktreeCoverageCertificateFailClosed,
                      .worktreeSearchPhysicalCoverage, .threeRootFileToolScope, .hiddenWorktreeReadSliceRebase,
                      .subWorkerDelegationDenial, .knowledgeRootDelegation, .knowledgeWorkerDelegationDenial,
-                     .delegatedQuestionDelivery, .delegatedQuestionCancellation,
+                     .delegatedQuestionDelivery, .delegatedQuestionDeliveryStructured, .delegatedQuestionCancellation,
                      .delegatedQuestionError, .delegatedQuestionResolvedDuringCompletion,
-                     .delegatedQuestionAttemptReplacedDuringCompletion:
+                     .delegatedQuestionAttemptReplacedDuringCompletion,
+                     .structuredResultsPinnedOn, .structuredResultsPinnedOff:
                     false
                 default:
                     true
@@ -549,9 +589,114 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 try await assertKnowledgeRootDelegation(fixture: fixture)
             case .knowledgeWorkerDelegationDenial:
                 try await assertKnowledgeWorkerDelegationDenial(fixture: fixture)
-            case .delegatedQuestionDelivery, .delegatedQuestionCancellation, .delegatedQuestionError,
-                 .delegatedQuestionResolvedDuringCompletion, .delegatedQuestionAttemptReplacedDuringCompletion:
+            case .delegatedQuestionDelivery, .delegatedQuestionDeliveryStructured, .delegatedQuestionCancellation,
+                 .delegatedQuestionError, .delegatedQuestionResolvedDuringCompletion,
+                 .delegatedQuestionAttemptReplacedDuringCompletion:
                 try await assertDelegatedQuestionDelivery(fixture: fixture, scenario: scenario)
+            case .structuredResultsPinnedOn, .structuredResultsPinnedOff:
+                try await assertStructuredResultsPinnedToConnection(
+                    fixture: fixture,
+                    pinnedOn: scenario == .structuredResultsPinnedOn,
+                    initialToolsResponse: toolsResponse
+                )
+            }
+        }
+
+        /// Runs `operation` with `mcp.structured_results` set in memory, restoring the previous mode.
+        func withStructuredResultsMode(
+            _ mode: MCPStructuredResultsMode,
+            _ operation: () async throws -> Void
+        ) async throws {
+            let settings = GlobalSettingsStore.shared
+            let previous = settings.mcpStructuredResultsMode()
+            settings.setMCPStructuredResultsMode(mode, commit: false)
+            defer { settings.setMCPStructuredResultsMode(previous, commit: false) }
+            try await operation()
+        }
+
+        /// The mode read when the connection registered its handlers governs both `tools/list` and
+        /// `tools/call` for the connection's lifetime; flipping the setting mid-connection changes
+        /// neither. Errors never carry `structuredContent`.
+        func assertStructuredResultsPinnedToConnection(
+            fixture: Fixture,
+            pinnedOn: Bool,
+            initialToolsResponse: String
+        ) async throws {
+            try Self.assertExplorationOutputSchemas(in: initialToolsResponse, id: 2, advertised: pinnedOn)
+
+            GlobalSettingsStore.shared.setMCPStructuredResultsMode(pinnedOn ? .off : .on, commit: false)
+            let relisted = try await fixture.socketClient.request(id: 3, method: "tools/list", params: [:])
+            try Self.assertExplorationOutputSchemas(in: relisted, id: 3, advertised: pinnedOn)
+
+            let readResponse = try await fixture.socketClient.request(
+                id: 4, method: "tools/call",
+                params: ["name": MCPWindowToolName.readFile, "arguments": ["path": fixture.fileURL.path]]
+            )
+            let readText = try Self.readFileText(from: readResponse, id: 4)
+            XCTAssertTrue(readText.contains(Fixture.sentinelContent), readText)
+            let readResult = try XCTUnwrap(try Self.responseObject(from: readResponse, id: 4)["result"] as? [String: Any])
+            XCTAssertEqual(readResult["isError"] as? Bool, false)
+            if pinnedOn {
+                let structured = try XCTUnwrap(readResult["structuredContent"] as? [String: Any])
+                XCTAssertTrue((structured["content"] as? String)?.contains(Fixture.sentinelContent) == true)
+                XCTAssertNotNil(structured["total_lines"] as? NSNumber)
+                XCTAssertNil(structured[AgentDelegatedQuestionNoticeWire.resultKey])
+                XCTAssertFalse(readText.hasPrefix("{"), "Text stays formatted, not JSON")
+            } else {
+                XCTAssertEqual(Set(readResult.keys), ["content", "isError"])
+            }
+
+            // `_rawJSON` keeps its compact JSON text; with schemas advertised, the same payload is
+            // also structuredContent.
+            let rawResponse = try await fixture.socketClient.request(
+                id: 5, method: "tools/call",
+                params: [
+                    "name": MCPWindowToolName.readFile,
+                    "arguments": ["path": fixture.fileURL.path, "_rawJSON": true]
+                ]
+            )
+            let rawText = try Self.readFileText(from: rawResponse, id: 5)
+            let rawPayload = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: Data(rawText.utf8)) as? [String: Any]
+            )
+            let rawResult = try XCTUnwrap(try Self.responseObject(from: rawResponse, id: 5)["result"] as? [String: Any])
+            if pinnedOn {
+                let structured = try XCTUnwrap(rawResult["structuredContent"] as? [String: Any])
+                XCTAssertEqual(
+                    try JSONSerialization.data(withJSONObject: structured, options: [.sortedKeys]),
+                    try JSONSerialization.data(withJSONObject: rawPayload, options: [.sortedKeys])
+                )
+            } else {
+                XCTAssertEqual(Set(rawResult.keys), ["content", "isError"])
+            }
+
+            let errorResponse = try await fixture.socketClient.request(
+                id: 6, method: "tools/call",
+                params: [
+                    "name": MCPWindowToolName.readFile,
+                    "arguments": ["path": fixture.rootURL.appendingPathComponent("missing.swift").path]
+                ]
+            )
+            let errorResult = try XCTUnwrap(try Self.responseObject(from: errorResponse, id: 6)["result"] as? [String: Any])
+            XCTAssertEqual(errorResult["isError"] as? Bool, true)
+            XCTAssertNil(errorResult["structuredContent"])
+            XCTAssertFalse(try Self.toolContent(from: errorResponse, id: 6).isEmpty)
+        }
+
+        static func assertExplorationOutputSchemas(in rawJSON: String, id: Int, advertised: Bool) throws {
+            let object = try responseObject(from: rawJSON, id: id)
+            let result = try XCTUnwrap(object["result"] as? [String: Any])
+            let tools = try XCTUnwrap(result["tools"] as? [[String: Any]])
+            let names = Set(tools.compactMap { $0["name"] as? String })
+            XCTAssertTrue(names.contains(MCPWindowToolName.readFile))
+            for tool in tools {
+                let name = try XCTUnwrap(tool["name"] as? String)
+                let schema = tool["outputSchema"] as? [String: Any]
+                if advertised, MCPToolOutputSchemas.schemasByToolName[name] != nil {
+                    XCTAssertEqual(schema?["type"] as? String, "object", name)
+                } else {
+                    XCTAssertNil(tool["outputSchema"], name)
+                }
             }
         }
 
@@ -720,7 +865,9 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     }
                 }
 
-                let delivered = scenario == .delegatedQuestionDelivery
+                // Structured results were on when this connection registered its handlers.
+                let structured = scenario == .delegatedQuestionDeliveryStructured
+                let delivered = scenario == .delegatedQuestionDelivery || structured
                 let resolveDuringCompletion = scenario == .delegatedQuestionResolvedDuringCompletion
                 let replaceAttemptDuringCompletion = scenario == .delegatedQuestionAttemptReplacedDuringCompletion
                 let errorCall = scenario == .delegatedQuestionError
@@ -780,6 +927,20 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                         Self.delegatedQuestionNoticeNotes(in: parent).map(\.text), [noticeText],
                         "The parent transcript records exactly the notice text returned on the wire"
                     )
+                    if structured {
+                        // Owner decision 2026-10-17: the same committed notice is also model-visible in
+                        // the reserved structured field, beside the unchanged DTO fields.
+                        let structuredContent = try XCTUnwrap(result["structuredContent"] as? [String: Any])
+                        XCTAssertTrue((structuredContent["content"] as? String)?.contains(Fixture.sentinelContent) == true)
+                        XCTAssertNotNil(structuredContent["total_lines"] as? NSNumber)
+                        let entries = try XCTUnwrap(
+                            structuredContent[AgentDelegatedQuestionNoticeWire.resultKey] as? [[String: Any]]
+                        )
+                        XCTAssertEqual(entries.count, 1)
+                        XCTAssertEqual(entries.first?["text"] as? String, noticeText)
+                        XCTAssertEqual(entries.first?["child_session_id"] as? String, childSessionID.uuidString)
+                        XCTAssertEqual(entries.first?["interaction_id"] as? String, interaction.id.uuidString)
+                    }
                 } else {
                     // Resolved, cancelled, or superseded by a newer parent attempt while the handler was
                     // suspended in its completion observers: the notice is neither returned nor recorded.
@@ -849,6 +1010,16 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     try JSONSerialization.data(withJSONObject: baselineBlocks, options: [.sortedKeys])
                 )
                 XCTAssertEqual(Self.delegatedQuestionNoticeNotes(in: parent).count, 1, "An acknowledged notice is never recorded again")
+                if structured {
+                    let afterCommitResult = try XCTUnwrap(
+                        try Self.responseObject(from: afterCommit, id: 6)["result"] as? [String: Any]
+                    )
+                    let afterCommitStructured = try XCTUnwrap(afterCommitResult["structuredContent"] as? [String: Any])
+                    XCTAssertNil(
+                        afterCommitStructured[AgentDelegatedQuestionNoticeWire.resultKey],
+                        "An acknowledged notice is never delivered again in either format"
+                    )
+                }
                 await fixture.networkManager.unregisterToolEventObserver(for: Fixture.runID, token: observerToken)
                 vm.skipAskUser(tabID: childTabID, interactionID: interaction.id)
                 _ = try await questionTask.value

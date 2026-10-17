@@ -193,7 +193,8 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                     )
                 ],
                 required: ["scope"]
-            )
+            ),
+            outputSchema: MCPToolOutputSchemas.getCodeStructure
         ) { [self] _, args in
             try await withActiveWorktreeStartupBenchmarkTag {
                 try await MCPToolWorkCountDiagnostics.withGitInvocation(
@@ -385,7 +386,8 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                     "path": .string(description: "Optional starting folder (absolute or relative) when type='files'. When provided, the tree is generated from this folder and 'mode' and 'max_depth' apply from that subtree.")
                 ],
                 required: []
-            )
+            ),
+            outputSchema: MCPToolOutputSchemas.getFileTree
         ) { [self] _, args in
             try await withActiveWorktreeStartupBenchmarkTag {
                 let type = args["type"]?.stringValue ?? "files"
@@ -476,7 +478,8 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                     "limit": .integer(description: "Number of lines to read")
                 ],
                 required: ["path"]
-            )
+            ),
+            outputSchema: MCPToolOutputSchemas.readFile
         ) { [self] _, args in
             try await executeReadFile(args: args)
         }
@@ -653,7 +656,8 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                     "whole_word": .boolean(description: "Match whole words only")
                 ],
                 required: ["pattern"]
-            )
+            ),
+            outputSchema: MCPToolOutputSchemas.fileSearch
         ) { [self] _, args in
             try await executeFileSearchToolValue(args: args)
         }

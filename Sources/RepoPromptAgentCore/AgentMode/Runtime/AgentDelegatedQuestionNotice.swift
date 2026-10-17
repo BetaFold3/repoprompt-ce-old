@@ -239,7 +239,9 @@ package struct AgentDelegatedQuestionNoticePayload: Equatable {
 /// result path (`MCPServerViewModel.runTool`, `ToolOutputFormatter`, wait services).
 package enum AgentDelegatedQuestionNoticeWire {
     /// Dedicated root key on an object tool result carrying `[AgentDelegatedQuestionNoticePayload.wireValue()]`.
-    static let resultKey = "delegated_question_notices"
+    /// Reserved runtime metadata, never tool data; also an optional property of every MCP
+    /// `outputSchema` (`MCPToolOutputSchemas.delegatedQuestionNotices`).
+    package static let resultKey = "delegated_question_notices"
     /// Per-entry `kind` discriminator.
     static let entryKind = "delegated_question"
     /// `agent_run` wait result when woken early by a pending child question.

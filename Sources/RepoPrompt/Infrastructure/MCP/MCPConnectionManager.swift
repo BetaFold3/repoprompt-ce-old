@@ -11262,6 +11262,14 @@ actor ServerNetworkManager {
     }
 
     func registerHandlers(for server: MCP.Server, connectionID: UUID) async {
+        // Read once per connection and shared by tools/list and tools/call: a connection that has
+        // advertised an outputSchema keeps returning structuredContent, so a setting change applies
+        // to the next connection only.
+        let structuredResultsEnabled = await MainActor.run {
+            GlobalSettingsStore.shared.mcpStructuredResultsMode() == .on
+        }
+        connectionLog("Structured results \(structuredResultsEnabled ? "on" : "off") for connection \(connectionID)")
+
         // ------------------------------------------------------------------
         //  prompts/list
         // ------------------------------------------------------------------
@@ -11476,7 +11484,8 @@ actor ServerNetworkManager {
                                     toolName: tool.name,
                                     clientIdentifier: clientIdentifier,
                                     runPurpose: policy.purpose
-                                )
+                                ),
+                                outputSchema: structuredResultsEnabled ? tool.outputSchema : nil
                             )
                         )
                     }
@@ -12951,6 +12960,10 @@ actor ServerNetworkManager {
                                     EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.serviceToolLookup, serviceToolLookupState)
                                     endPermitPreDispatchEnvelopeIfNeeded()
 
+                                    // Successful results carry structuredContent only for tools this connection
+                                    // advertises an outputSchema for.
+                                    let structuredResult = structuredResultsEnabled && toolDef.outputSchema != nil
+
                                     let resolvedOperation: @Sendable () async throws -> Value = {
                                         #if DEBUG
                                             if let operation = await self.debugResolvedToolOperationOverrides[toolName] {
@@ -13072,14 +13085,15 @@ actor ServerNetworkManager {
                                                     // because the SDK still sends a result returned after cancellation.
                                                     let value = await delivery.settle(dispatchedValue, handOff: !Task.isCancelled)
                                                     // Build well‑structured, human‑readable content blocks for the result
-                                                    let contentBlocks = EditFlowPerf.measure(
+                                                    let toolResult = EditFlowPerf.measure(
                                                         EditFlowPerf.Stage.MCPToolCall.formatResult,
                                                         EditFlowPerf.Dimensions(toolName: toolName)
                                                     ) {
-                                                        Self.formatToolResult(
+                                                        Self.makeToolResult(
                                                             toolName: toolName,
                                                             args: effectiveArgsForFormatter,
-                                                            value: value
+                                                            value: value,
+                                                            structured: structuredResult
                                                         )
                                                     }
                                                     EditFlowPerf.lifecycleEvent(
@@ -13092,10 +13106,7 @@ actor ServerNetworkManager {
                                                     // when the run completes. This prevents killing the host MCP client
                                                     // (e.g., Claude Desktop) that invoked context_builder.
 
-                                                    return handlerResult(
-                                                        CallTool.Result(content: contentBlocks, isError: false),
-                                                        outcome: "success"
-                                                    )
+                                                    return handlerResult(toolResult, outcome: "success")
                                                 }
                                             }
                                         } catch {
@@ -13207,14 +13218,15 @@ actor ServerNetworkManager {
                                             // nothing below suspends. See the window-scoped branch above.
                                             let value = await delivery.settle(dispatchedValue, handOff: !Task.isCancelled)
                                             // Build well‑structured, human‑readable content blocks for the result
-                                            let contentBlocks = EditFlowPerf.measure(
+                                            let toolResult = EditFlowPerf.measure(
                                                 EditFlowPerf.Stage.MCPToolCall.formatResult,
                                                 EditFlowPerf.Dimensions(toolName: toolName)
                                             ) {
-                                                Self.formatToolResult(
+                                                Self.makeToolResult(
                                                     toolName: toolName,
                                                     args: effectiveArgsForFormatter,
-                                                    value: value
+                                                    value: value,
+                                                    structured: structuredResult
                                                 )
                                             }
                                             EditFlowPerf.lifecycleEvent(
@@ -13225,10 +13237,7 @@ actor ServerNetworkManager {
                                             // Note: context_builder caller termination is NOT done here.
                                             // See comment in window-scoped branch above.
 
-                                            return handlerResult(
-                                                CallTool.Result(content: contentBlocks, isError: false),
-                                                outcome: "success"
-                                            )
+                                            return handlerResult(toolResult, outcome: "success")
                                         } catch {
                                             releaseResourceAdmissionLeasesAfterProviderError(error)
                                             if let failure = await executionContractFailureResult(
@@ -13519,18 +13528,27 @@ actor ServerNetworkManager {
         UserDefaults.standard.bool(forKey: "mcp.emitResourceContent")
     }
 
-    private static func formatToolResult(
+    /// Successful `tools/call` result: the formatted text blocks, unchanged by `structured`, plus
+    /// (when `structured`) the settled tool payload as `structuredContent`. That payload keeps any
+    /// committed delegated-question notices under the reserved
+    /// `AgentDelegatedQuestionNoticeWire.resultKey`, so structured-only clients see the same
+    /// notices as the appended text block (owner decision 2026-10-17). Error results do not pass
+    /// through here: they keep `isError: true`, their text, and no `structuredContent`.
+    static func makeToolResult(
         toolName: String,
         args: [String: Value],
-        value: Value
-    ) -> [MCP.Tool.Content] {
-        let emit = Self.emitResourceContent
-        return ToolOutputFormatter.buildContentBlocks(
+        value: Value,
+        structured: Bool
+    ) -> CallTool.Result {
+        let blocks = ToolOutputFormatter.buildContentBlocks(
             toolName: toolName,
             args: args,
             result: value,
-            emitResources: emit
+            emitResources: Self.emitResourceContent
         )
+        // MCP requires structuredContent to be a JSON object; every schema-bearing DTO is one.
+        let structuredContent: Value? = if structured, case .object = value { value } else { nil }
+        return CallTool.Result(content: blocks, structuredContent: structuredContent, isError: false)
     }
 
     /// Extract text content from tool result content blocks for observer callbacks

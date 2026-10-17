@@ -590,6 +590,8 @@ struct GlobalScalarPreferences: Codable, Equatable {
         var remoteGatewayBindAddress: String?
         var remoteGatewayPort: Int?
         var remoteControlShowPairingDetails: Bool?
+        /// `MCPStructuredResultsMode` raw value; nil or unknown reads as `off`.
+        var structuredResults: String?
 
         init(
             autoStart: Bool? = nil,
@@ -598,7 +600,8 @@ struct GlobalScalarPreferences: Codable, Equatable {
             remoteGatewayEnabled: Bool? = nil,
             remoteGatewayBindAddress: String? = nil,
             remoteGatewayPort: Int? = nil,
-            remoteControlShowPairingDetails: Bool? = nil
+            remoteControlShowPairingDetails: Bool? = nil,
+            structuredResults: String? = nil
         ) {
             self.autoStart = autoStart
             self.showModelPresets = showModelPresets
@@ -607,6 +610,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
             self.remoteGatewayBindAddress = remoteGatewayBindAddress
             self.remoteGatewayPort = remoteGatewayPort
             self.remoteControlShowPairingDetails = remoteControlShowPairingDetails
+            self.structuredResults = structuredResults
         }
     }
 
