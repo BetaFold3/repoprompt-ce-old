@@ -74,6 +74,20 @@ final class MCPToolResultDeliveryTransaction: @unchecked Sendable {
         return settled
     }
 
+    /// In-process `code_mode` child exit (plan §6 D3 notices): closes the transaction, strips
+    /// each participant's attachment in registration order, and abandons (releases) every
+    /// participant without settling, so a child never commits or acknowledges a notice.
+    /// Synchronous: callers format and return the stripped value without suspending.
+    /// After the transaction closed, returns `value` unchanged.
+    func releaseAttachments(from value: Value) -> Value {
+        let closed = close()
+        let stripped = closed.reduce(value) { partial, participant in participant.unannotate(partial) }
+        for participant in closed {
+            participant.abandon()
+        }
+        return stripped
+    }
+
     /// Releases every participant that never reached `settle`. Idempotent; first close wins.
     func abandon() {
         for participant in close() {

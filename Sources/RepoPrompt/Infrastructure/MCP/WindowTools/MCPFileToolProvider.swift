@@ -562,7 +562,8 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
             EditFlowPerf.Stage.ReadFile.providerAutoSelect,
             EditFlowPerf.Dimensions(outcome: readResult.shouldAutoSelect ? "attempted" : "skipped")
         ) {
-            if readResult.shouldAutoSelect {
+            // In-process `code_mode` children never change selection (plan §6 D3).
+            if readResult.shouldAutoSelect, !ServerNetworkManager.currentToolInvocationOrigin.isCodeModeChild {
                 await dependencies.enqueueReadFileAutoSelection(readResult.reply, path, resolvedPath, metadata)
             }
         }
@@ -1026,6 +1027,8 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
             EditFlowPerf.Stage.Search.providerAutoSelection,
             EditFlowPerf.Dimensions(searchMode: mode.rawValue, contextLines: contextLines)
         ) {
+            // In-process `code_mode` children never change selection (plan §6 D3).
+            guard !ServerNetworkManager.currentToolInvocationOrigin.isCodeModeChild else { return }
             await dependencies.enqueueFileSearchAutoSelection(
                 mode,
                 contextLines,

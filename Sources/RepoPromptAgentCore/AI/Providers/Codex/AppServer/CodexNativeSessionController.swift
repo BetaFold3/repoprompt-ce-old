@@ -528,8 +528,10 @@ package final class CodexNativeSessionController {
             suppressThirdPartyMCPServers: Bool = false,
             goalSupportEnabledProvider: @escaping @MainActor () -> Bool,
             reasoningSummariesEnabledProvider: @escaping @MainActor () -> Bool = { false },
-            computerUseEnabledProvider: @escaping @MainActor () -> Bool = { false }
+            computerUseEnabledProvider: @escaping @MainActor () -> Bool = { false },
+            repoPromptDirectServerName: String? = nil
         ) -> Options {
+            // The immutable name is captured at controller creation; start and resume share it.
             Options(
                 requestTimeout: 120,
                 configOverridesProvider: {
@@ -549,7 +551,8 @@ package final class CodexNativeSessionController {
                         suppressThirdPartyMCPServers: suppressThirdPartyMCPServers,
                         goalSupportEnabled: featurePolicy.goalSupportEnabled,
                         reasoningSummariesEnabled: featurePolicy.reasoningSummariesEnabled,
-                        computerUseEnabled: featurePolicy.computerUseEnabled
+                        computerUseEnabled: featurePolicy.computerUseEnabled,
+                        repoPromptDirectServerName: repoPromptDirectServerName
                     )
                 },
                 approvalPolicyProvider: approvalPolicyProvider,
@@ -8614,7 +8617,8 @@ package final class CodexNativeSessionController {
         suppressThirdPartyMCPServers: Bool = false,
         goalSupportEnabled: Bool = false,
         reasoningSummariesEnabled: Bool? = nil,
-        computerUseEnabled: Bool = false
+        computerUseEnabled: Bool = false,
+        repoPromptDirectServerName: String? = nil
     ) -> [String: Any] {
         let serverEntries = MCPIntegrationHelper.codexMCPServerEntries()
         let preferences = CodexAgentToolPreferences.snapshot(for: serverEntries)
@@ -8629,7 +8633,8 @@ package final class CodexNativeSessionController {
         )
         var overrides = CodexOverrides.appServerConfigMap(
             toolPolicy: toolPolicy,
-            featurePolicy: .resolved(goalsEnabled: goalSupportEnabled, computerUseEnabled: computerUseEnabled)
+            featurePolicy: .resolved(goalsEnabled: goalSupportEnabled, computerUseEnabled: computerUseEnabled),
+            repoPromptDirectServerName: repoPromptDirectServerName
         )
         let mcpOverrides = appServerMCPServerOverrides(
             serverEntries: serverEntries,

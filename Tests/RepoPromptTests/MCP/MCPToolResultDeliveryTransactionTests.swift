@@ -102,6 +102,39 @@ final class MCPToolResultDeliveryTransactionTests: XCTestCase {
         XCTAssertEqual(recorder.events, ["first.abandon", "second.abandon"])
     }
 
+    func testReleaseAttachmentsStripsInOrderAndAbandonsWithoutEverSettling() async {
+        let transaction = MCPToolResultDeliveryTransaction()
+        let recorder = Recorder()
+        for name in ["first", "second"] {
+            transaction.register(
+                unannotate: { value in
+                    recorder.append("\(name).unannotate")
+                    guard case var .object(object) = value else { return value }
+                    object.removeValue(forKey: name)
+                    return .object(object)
+                },
+                settle: { value, _ in
+                    recorder.append("\(name).settle")
+                    return value
+                },
+                abandon: { recorder.append("\(name).abandon") }
+            )
+        }
+        let attached: Value = .object(["ok": .bool(true), "first": .bool(true), "second": .bool(true)])
+
+        XCTAssertEqual(transaction.releaseAttachments(from: attached), .object(["ok": .bool(true)]))
+        XCTAssertEqual(
+            recorder.events,
+            ["first.unannotate", "second.unannotate", "first.abandon", "second.abandon"]
+        )
+        // Closed: later settle, abandon, or release never reach a participant again.
+        let settled = await transaction.settle(attached, handOff: true)
+        XCTAssertEqual(settled, attached)
+        transaction.abandon()
+        XCTAssertEqual(transaction.releaseAttachments(from: attached), attached)
+        XCTAssertEqual(recorder.events.count, 4)
+    }
+
     func testRegistrationAfterTheTransactionClosedAbandonsImmediately() async {
         for closesBySettle in [true, false] {
             let transaction = MCPToolResultDeliveryTransaction()

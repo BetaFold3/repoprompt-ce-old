@@ -74,9 +74,21 @@ enum CodexOverrides {
         )
     }
 
+    /// Thread-level Codex key listing namespaces whose tools stay direct (outside Codex's own
+    /// code mode). Plan §6 D3 `direct + code_mode`; inert unless a direct server name is supplied.
+    static let directOnlyToolNamespacesKey = "features.code_mode.direct_only_tool_namespaces"
+
+    /// Codex MCP tool namespace for a configured server name: `mcp__` plus the exact name with
+    /// `-` turned into `_`, case preserved. Nil for an empty name (fail closed: no override).
+    static func directOnlyToolNamespace(forServerName serverName: String?) -> String? {
+        guard let serverName, !serverName.isEmpty else { return nil }
+        return "mcp__" + serverName.replacingOccurrences(of: "-", with: "_")
+    }
+
     static func cliConfigArgs(
         toolPolicy: ToolPolicy,
-        featurePolicy: FeaturePolicy = .defaultDisabled
+        featurePolicy: FeaturePolicy = .defaultDisabled,
+        repoPromptDirectServerName: String? = nil
     ) -> [String] {
         var args: [String] = [
             "-c", "tool_output_token_limit=\(toolPolicy.toolOutputTokenLimit)"
@@ -110,12 +122,16 @@ enum CodexOverrides {
             args.append(contentsOf: ["-c", "model_reasoning_summary=\(modelReasoningSummary.rawValue)"])
         }
         appendForcedConfigOverrideArgs(to: &args, featurePolicy: featurePolicy)
+        if let namespace = directOnlyToolNamespace(forServerName: repoPromptDirectServerName) {
+            args.append(contentsOf: ["-c", "\(directOnlyToolNamespacesKey)=[\(tomlBasicString(namespace))]"])
+        }
         return args
     }
 
     static func appServerConfigMap(
         toolPolicy: ToolPolicy,
-        featurePolicy: FeaturePolicy = .defaultDisabled
+        featurePolicy: FeaturePolicy = .defaultDisabled,
+        repoPromptDirectServerName: String? = nil
     ) -> [String: Any] {
         var overrides: [String: Any] = [
             "tool_output_token_limit": toolPolicy.toolOutputTokenLimit
@@ -149,6 +165,9 @@ enum CodexOverrides {
             overrides["model_reasoning_summary"] = modelReasoningSummary.rawValue
         }
         applyForcedConfigOverrides(to: &overrides, featurePolicy: featurePolicy)
+        if let namespace = directOnlyToolNamespace(forServerName: repoPromptDirectServerName) {
+            overrides[directOnlyToolNamespacesKey] = [namespace]
+        }
         return overrides
     }
 
@@ -208,6 +227,25 @@ enum CodexOverrides {
             config[key] = value
         }
         return config
+    }
+
+    /// TOML basic string literal (quotes, backslashes, and control characters escaped).
+    static func tomlBasicString(_ value: String) -> String {
+        var escaped = "\""
+        for scalar in value.unicodeScalars {
+            switch scalar {
+            case "\"": escaped += "\\\""
+            case "\\": escaped += "\\\\"
+            case "\n": escaped += "\\n"
+            case "\r": escaped += "\\r"
+            case "\t": escaped += "\\t"
+            case _ where scalar.value < 0x20 || scalar.value == 0x7F:
+                escaped += String(format: "\\u%04X", scalar.value)
+            default:
+                escaped.unicodeScalars.append(scalar)
+            }
+        }
+        return escaped + "\""
     }
 
     private static func webSearchMode(enabled: Bool) -> String {

@@ -2466,6 +2466,170 @@ actor ServerNetworkManager {
     static var currentEffectiveWindowID: Int?
     @TaskLocal
     static var currentToolResultDelivery: MCPToolResultDeliveryTransaction?
+    /// Non-wire origin of the current `tools/call` invocation (plan §6 D3). Set only by
+    /// `invokeCodeModeChild`; wire calls keep `.transport`.
+    @TaskLocal
+    static var currentToolInvocationOrigin: MCPToolInvocationOrigin = .transport
+    /// Fresh per-invocation typed result capture for an in-process child; nil otherwise.
+    @TaskLocal
+    static var currentInProcessToolResultSink: MCPInProcessToolResultSink?
+
+    /// The exact `tools/call` closure registered with the SDK for one connection.
+    typealias RegisteredToolCall = @Sendable (CallTool.Parameters) async throws -> CallTool.Result
+
+    /// One connection's registered `tools/call` closure, fenced to the connection lifecycle
+    /// generation observed when registration began.
+    private struct RegisteredToolCallHandle {
+        let handler: RegisteredToolCall
+        let lifecycleGeneration: UInt64
+    }
+
+    /// Connection-owned handles to each connection's registered `tools/call` closure, for
+    /// in-process re-entry. Dispatch handles only, never result sinks. Removed when
+    /// connection teardown begins; never published or invoked once that lifecycle ended.
+    private var registeredToolCallHandlers: [UUID: RegisteredToolCallHandle] = [:]
+
+    /// The exact connection lifecycle `lifecycleGeneration` names is still live: not being
+    /// removed, still registered, and not replaced by stop/remove since it was captured.
+    private func isToolCallReentryLive(connectionID: UUID, lifecycleGeneration: UInt64?) -> Bool {
+        guard let lifecycleGeneration,
+              !connectionsBeingRemoved.contains(connectionID),
+              connections[connectionID] != nil,
+              connectionLifecycleGenerationByID[connectionID] == lifecycleGeneration
+        else {
+            return false
+        }
+        return true
+    }
+
+    /// Publishes a registered `tools/call` closure only if the lifecycle captured when
+    /// registration began is still live after registration's suspension points; teardown that
+    /// began or completed meanwhile (including server stop) leaves nothing published.
+    @discardableResult
+    private func publishRegisteredToolCallHandler(
+        _ handler: @escaping RegisteredToolCall,
+        connectionID: UUID,
+        expectedLifecycleGeneration: UInt64?
+    ) -> Bool {
+        guard let expectedLifecycleGeneration,
+              isToolCallReentryLive(connectionID: connectionID, lifecycleGeneration: expectedLifecycleGeneration)
+        else {
+            return false
+        }
+        registeredToolCallHandlers[connectionID] = RegisteredToolCallHandle(
+            handler: handler,
+            lifecycleGeneration: expectedLifecycleGeneration
+        )
+        return true
+    }
+
+    /// Re-enters the connection's registered `tools/call` closure as a `code_mode` child (plan §6
+    /// D3 dispatch): full policy, restriction, admission, contract, observer, and cancellation
+    /// path, with a non-wire origin and a fresh typed sink. Parent dispatch authorization,
+    /// delivery transaction, and routing hints are shadowed; the handler establishes its own.
+    /// A connection being removed (or never registered) fails as connection-unavailable and
+    /// never falls back to another connection. A thrown handler error propagates unchanged.
+    func invokeCodeModeChild(
+        connectionID: UUID,
+        parentInvocationID: UUID,
+        params: CallTool.Parameters
+    ) async throws -> MCPInProcessToolResult {
+        guard let handle = registeredToolCallHandlers[connectionID],
+              isToolCallReentryLive(connectionID: connectionID, lifecycleGeneration: handle.lifecycleGeneration)
+        else {
+            // A handle whose lifecycle ended is dropped, never invoked.
+            registeredToolCallHandlers.removeValue(forKey: connectionID)
+            return MCPInProcessToolResult(
+                value: nil,
+                result: Self.executionContractToolErrorResult(
+                    rawJSON: false,
+                    code: "tool_execution_connection_terminal",
+                    message: "The MCP connection is closing."
+                )
+            )
+        }
+        let sink = MCPInProcessToolResultSink()
+        do {
+            let result = try await Self.$currentToolInvocationOrigin.withValue(
+                .codeModeChild(parentInvocationID: parentInvocationID)
+            ) {
+                try await Self.$currentInProcessToolResultSink.withValue(sink) {
+                    try await Self.$currentToolResultDelivery.withValue(nil) {
+                        try await Self.$currentToolDispatchAuthorization.withValue(nil) {
+                            try await Self.$currentExplicitWindowRoutingHint.withValue(nil) {
+                                try await Self.$currentEffectiveWindowID.withValue(nil) {
+                                    try await Self.$currentTabContextHint.withValue(nil) {
+                                        try await Self.$currentConnectionID.withValue(nil) {
+                                            try await handle.handler(params)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            switch sink.complete(with: result) {
+            case let .success(envelope):
+                return envelope
+            case let .failure(error):
+                assertionFailure("In-process tool result sink completed twice: \(error)")
+                return MCPInProcessToolResult(value: nil, result: result)
+            }
+        } catch {
+            sink.abandon()
+            throw error
+        }
+    }
+
+    /// Final handoff value for a successful dispatch. Transport calls settle the delivery
+    /// transaction (plan §6.2). A `code_mode` child instead releases every participant without
+    /// committing, strips the reserved notice field, and captures that same sanitized value in
+    /// its sink, so neither child text, `structuredContent`, nor the typed capture carries or
+    /// acknowledges a delegated-question notice. Nothing suspends on the child path.
+    nonisolated static func finalHandoffValue(
+        _ dispatchedValue: Value,
+        delivery: MCPToolResultDeliveryTransaction,
+        origin: MCPToolInvocationOrigin,
+        sink: MCPInProcessToolResultSink?
+    ) async -> Value {
+        guard origin.isCodeModeChild else {
+            return await delivery.settle(dispatchedValue, handOff: !Task.isCancelled)
+        }
+        let value = MCPCodeModeChildIngress.sanitized(delivery.releaseAttachments(from: dispatchedValue))
+        if let sink, case let .failure(error) = sink.capture(value) {
+            assertionFailure("In-process tool result captured twice: \(error)")
+        }
+        return value
+    }
+
+    #if DEBUG
+        func debugHasRegisteredToolCallHandler(connectionID: UUID) -> Bool {
+            registeredToolCallHandlers[connectionID] != nil
+        }
+
+        func debugConnectionLifecycleGeneration(connectionID: UUID) -> UInt64? {
+            connectionLifecycleGenerationByID[connectionID]
+        }
+
+        func debugIsToolCallReentryLive(connectionID: UUID, lifecycleGeneration: UInt64?) -> Bool {
+            isToolCallReentryLive(connectionID: connectionID, lifecycleGeneration: lifecycleGeneration)
+        }
+
+        /// Drives the post-registration publication fence directly with an inert closure, as a
+        /// registration resuming after `withMethodHandler` would. Never replaces a live handle.
+        func debugPublishLateRegisteredToolCallHandlerForTesting(
+            connectionID: UUID,
+            expectedLifecycleGeneration: UInt64?
+        ) -> Bool {
+            guard registeredToolCallHandlers[connectionID] == nil else { return false }
+            return publishRegisteredToolCallHandler(
+                { _ in .err("late registration") },
+                connectionID: connectionID,
+                expectedLifecycleGeneration: expectedLifecycleGeneration
+            )
+        }
+    #endif
 
     nonisolated static func explicitWindowRoutingHint(
         connectionID: UUID,
@@ -5852,6 +6016,7 @@ actor ServerNetworkManager {
             connectionTasks[id]?.cancel()
             connections.removeValue(forKey: id)
             connectionLifecycleGenerationByID.removeValue(forKey: id)
+            registeredToolCallHandlers.removeValue(forKey: id)
             bootstrapPeerPIDByConnectionID.removeValue(forKey: id)
             #if DEBUG
                 debugHelperPeerIdentityByConnectionID.removeValue(forKey: id)
@@ -6501,6 +6666,7 @@ actor ServerNetworkManager {
               ObjectIdentifier(connection as AnyObject) == expectedIdentity
         else { return nil }
         connectionsBeingRemoved.insert(connectionID)
+        registeredToolCallHandlers.removeValue(forKey: connectionID)
         invalidateBootstrapReplacementCredits(predecessorConnectionID: connectionID)
         return CommittedConnectionRemoval(
             connectionID: connectionID,
@@ -6626,6 +6792,7 @@ actor ServerNetworkManager {
             || callLimiters[id] != nil
         else {
             connectionLog("removeConnection: \(id) already removed; ignoring duplicate call")
+            registeredToolCallHandlers.removeValue(forKey: id)
             connectionsBeingRemoved.remove(id)
             return false
         }
@@ -6634,6 +6801,8 @@ actor ServerNetworkManager {
             connectionsBeingRemoved.insert(id)
             invalidateBootstrapReplacementCredits(predecessorConnectionID: id)
         }
+        // In-process re-entry never outlives teardown's start.
+        registeredToolCallHandlers.removeValue(forKey: id)
         defer { connectionsBeingRemoved.remove(id) }
 
         // Claim and persist the first terminal cause before any suspension.
@@ -11263,6 +11432,8 @@ actor ServerNetworkManager {
     }
 
     func registerHandlers(for server: MCP.Server, connectionID: UUID) async {
+        // Captured before the first suspension: the lifecycle this registration belongs to.
+        let registrationLifecycleGeneration = connectionLifecycleGenerationByID[connectionID]
         // Read once per connection and shared by tools/list and tools/call: a connection that has
         // advertised an outputSchema keeps returning structuredContent, so a setting change applies
         // to the next connection only.
@@ -11507,7 +11678,9 @@ actor ServerNetworkManager {
         // ------------------------------------------------------------------
         //  tools/call  (UPDATED)
         // ------------------------------------------------------------------
-        await server.withMethodHandler(CallTool.self) { [weak self] params in
+        // One closure serves the wire and in-process `code_mode` children (plan §6 D3): it is
+        // registered with the SDK and retained, unchanged, for `invokeCodeModeChild`.
+        let registeredToolCall: RegisteredToolCall = { [weak self] params in
             // Final result handoff boundary (plan §6.2): settled once by a success branch below
             // right before formatting; every other exit releases its participants.
             let delivery = MCPToolResultDeliveryTransaction()
@@ -11522,6 +11695,27 @@ actor ServerNetworkManager {
             let originalName = params.name
             let toolName = Self.canonicalToolName(for: originalName)
             let prePolicyInvocationID = UUID()
+            // Captured once: nested scopes below never change the origin or the child sink.
+            let invocationOrigin = Self.currentToolInvocationOrigin
+            let inProcessResultSink = Self.currentInProcessToolResultSink
+            if invocationOrigin.isCodeModeChild,
+               let denial = MCPCodeModeChildIngress.denial(
+                   canonicalToolName: toolName,
+                   admissionClass: Self.admissionClass(forCanonicalToolName: toolName),
+                   arguments: params.arguments
+               )
+            {
+                let result = CallTool.Result.err(denial.message)
+                return await denyToolCall(
+                    connectionID: connectionID,
+                    invocationID: prePolicyInvocationID,
+                    toolName: toolName,
+                    args: params.arguments,
+                    code: denial.code,
+                    message: denial.message,
+                    result: result
+                )
+            }
             #if DEBUG
                 let qualificationCanonicalToolName = Self.qualificationCanonicalToolName(for: originalName)
                 let qualificationRawIngressLease = debugQualificationRawIngress.begin(
@@ -11634,13 +11828,19 @@ actor ServerNetworkManager {
                 }
             #endif
             #if DEBUG
-                let transportRequestIdentity = MCPRequestTimelineRegistry.shared.claimToolRequest(
-                    connectionID: connectionID.uuidString,
-                    originalToolName: originalName
-                )
-                let inheritedRequestIdentity = transportRequestIdentity?.fillingMissingFields(
-                    from: MCPRequestTimelineContext.current
-                ) ?? MCPRequestTimelineContext.current
+                // An in-process child has no transport request: it must neither claim the parent's
+                // pending wire identity nor inherit the parent's app invocation ID.
+                let transportRequestIdentity = invocationOrigin.isCodeModeChild
+                    ? nil
+                    : MCPRequestTimelineRegistry.shared.claimToolRequest(
+                        connectionID: connectionID.uuidString,
+                        originalToolName: originalName
+                    )
+                let inheritedRequestIdentity = invocationOrigin.isCodeModeChild
+                    ? nil
+                    : transportRequestIdentity?.fillingMissingFields(
+                        from: MCPRequestTimelineContext.current
+                    ) ?? MCPRequestTimelineContext.current
                 let fallbackConnectionGeneration = await requestTimelineConnectionGeneration(for: connectionID)
                 let requestIdentity = MCPRequestTimelineIdentity(
                     jsonRPCRequestID: inheritedRequestIdentity?.jsonRPCRequestID,
@@ -11732,6 +11932,24 @@ actor ServerNetworkManager {
             let cleanedArguments = normalized.payload
             let capturedRawJSON = extractedRawJSON
             connectionLog("tools/call \(toolName): args normalized keys=\(cleanedArguments.keys.sorted().joined(separator: ","))")
+            // Normalization may extract (or silently drop) routing from wrapped, nested, or
+            // JSON-string forms; a child may not supply any of them, whatever the value.
+            if invocationOrigin.isCodeModeChild,
+               extractedTabID != nil || extractedWindowID != nil || extractedContextID != nil
+               || !normalized.encounteredRoutingKeys.isEmpty
+               || !MCPCodeModeChildIngress.forbiddenRoutingArgumentKeys.isDisjoint(with: cleanedArguments.keys)
+            {
+                let denial = MCPCodeModeChildIngress.routingOverrideDenial
+                return await denyToolCall(
+                    connectionID: connectionID,
+                    invocationID: invocationID,
+                    toolName: toolName,
+                    args: cleanedArguments,
+                    code: denial.code,
+                    message: denial.message,
+                    result: CallTool.Result.err(denial.message)
+                )
+            }
 
             // tools/list already performs any needed persisted routing hydration.
             // Do not repeat it on each tools/call; it can re-enter routing notifications
@@ -13084,7 +13302,12 @@ actor ServerNetworkManager {
                                                     // revalidate, then commit and record or strip. Nothing below suspends before
                                                     // the content is returned. A cancelled handler strips and releases them,
                                                     // because the SDK still sends a result returned after cancellation.
-                                                    let value = await delivery.settle(dispatchedValue, handOff: !Task.isCancelled)
+                                                    let value = await Self.finalHandoffValue(
+                                                        dispatchedValue,
+                                                        delivery: delivery,
+                                                        origin: invocationOrigin,
+                                                        sink: inProcessResultSink
+                                                    )
                                                     // Build well‑structured, human‑readable content blocks for the result
                                                     let toolResult = EditFlowPerf.measure(
                                                         EditFlowPerf.Stage.MCPToolCall.formatResult,
@@ -13217,7 +13440,12 @@ actor ServerNetworkManager {
 
                                             // Final handoff boundary after the last suspending completion processing;
                                             // nothing below suspends. See the window-scoped branch above.
-                                            let value = await delivery.settle(dispatchedValue, handOff: !Task.isCancelled)
+                                            let value = await Self.finalHandoffValue(
+                                                dispatchedValue,
+                                                delivery: delivery,
+                                                origin: invocationOrigin,
+                                                sink: inProcessResultSink
+                                            )
                                             // Build well‑structured, human‑readable content blocks for the result
                                             let toolResult = EditFlowPerf.measure(
                                                 EditFlowPerf.Stage.MCPToolCall.formatResult,
@@ -13343,6 +13571,14 @@ actor ServerNetworkManager {
                 } // withPermit wrapper
             } // LimiterEnvelope wrapper
         }
+        await server.withMethodHandler(CallTool.self, handler: registeredToolCall)
+        // Teardown may have begun or completed while registration suspended; publish only into
+        // the lifecycle observed when registration began.
+        publishRegisteredToolCallHandler(
+            registeredToolCall,
+            connectionID: connectionID,
+            expectedLifecycleGeneration: registrationLifecycleGeneration
+        )
     }
 
     /// Update the enabled state and notify clients

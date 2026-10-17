@@ -12,7 +12,8 @@ extension MCPBootstrapLeaseSpec {
         taskLabelKind: AgentModelCatalog.TaskLabelKind? = nil,
         allowsAgentExternalControlTools: Bool = false,
         additionalRestrictedTools: Set<String> = [],
-        runHasNativeShell: Bool = false
+        runHasNativeShell: Bool = false,
+        codeModeEligibility: MCPCodeModeEligibility = .native
     ) -> MCPBootstrapLeaseSpec {
         MCPBootstrapLeaseSpec(
             runID: runID,
@@ -41,7 +42,8 @@ extension MCPBootstrapLeaseSpec {
             purpose: .agentModeRun,
             taskLabelKind: taskLabelKind,
             allowsAgentExternalControlTools: allowsAgentExternalControlTools,
-            requiresExpectedAgentPID: agent.requiresExpectedPIDOwnedAgentModeMCPRouting
+            requiresExpectedAgentPID: agent.requiresExpectedPIDOwnedAgentModeMCPRouting,
+            codeModeEligibility: codeModeEligibility
         )
     }
 }

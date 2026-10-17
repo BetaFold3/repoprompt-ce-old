@@ -33,6 +33,9 @@ package struct MCPBootstrapLeaseSpec {
     /// When true, the queued policy is reserved until the MCP peer PID is a descendant
     /// of an explicitly registered expected agent process.
     package let requiresExpectedAgentPID: Bool
+    /// Per-run `code_mode` exposure (plan §6 D3). Always `.native` for Knowledge and
+    /// non-Agent Mode runs; not persisted and not consumed by policy installation yet.
+    package let codeModeEligibility: MCPCodeModeEligibility
 
     init(
         runID: UUID,
@@ -50,7 +53,8 @@ package struct MCPBootstrapLeaseSpec {
         purpose: MCPRunPurpose,
         taskLabelKind: AgentModelCatalog.TaskLabelKind?,
         allowsAgentExternalControlTools: Bool,
-        requiresExpectedAgentPID: Bool
+        requiresExpectedAgentPID: Bool,
+        codeModeEligibility: MCPCodeModeEligibility = .native
     ) {
         self.runID = runID
         self.gateID = gateID
@@ -68,6 +72,11 @@ package struct MCPBootstrapLeaseSpec {
         self.taskLabelKind = taskLabelKind
         self.allowsAgentExternalControlTools = allowsAgentExternalControlTools
         self.requiresExpectedAgentPID = requiresExpectedAgentPID
+        self.codeModeEligibility = MCPCodeModeEligibility.normalized(
+            codeModeEligibility,
+            purpose: purpose,
+            sessionProfile: sessionProfile
+        )
     }
 }
 

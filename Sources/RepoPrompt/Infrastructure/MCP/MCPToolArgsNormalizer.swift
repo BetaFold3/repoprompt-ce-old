@@ -23,10 +23,18 @@ struct NormalizedArgs {
     var rawJSON: Bool = false
     /// Warnings generated during normalization (e.g., unwrapped tool-name wrapper)
     var warnings: [String]
+    /// Every `MCPToolArgsNormalizer.routingOverrideKeys` member present, by name, in the
+    /// top-level or `args`-nested payload examined for routing extraction, whatever its value
+    /// and whether or not it was extracted. Observation only; normalization is unchanged.
+    var encounteredRoutingKeys: Set<String> = []
 }
 
 /// Pure, stateless helpers for argument sanitization
 enum MCPToolArgsNormalizer {
+    /// Hidden routing fields plus the public explicit-window argument. Presence-sensitive
+    /// callers (in-process `code_mode` children) read `NormalizedArgs.encounteredRoutingKeys`.
+    static let routingOverrideKeys: Set<String> = ["context_id", "_tabID", "_windowID", "window_id"]
+
     /// Normalize MCP tool call arguments by:
     /// 1. Parsing JSON strings
     /// 2. Unwrapping Codex-style "args" wrappers
@@ -125,6 +133,7 @@ enum MCPToolArgsNormalizer {
         var extractedContextID: UUID?
         var extractedWorkingDirs: [String] = []
         var extractedRawJSON = false
+        var encounteredRoutingKeys = routingOverrideKeys.intersection(raw.keys)
 
         // Check if params are wrapped in an "args" key (Codex format)
         if let nestedArgsValue = raw["args"] {
@@ -136,6 +145,7 @@ enum MCPToolArgsNormalizer {
             }
 
             if var nestedArgs {
+                encounteredRoutingKeys.formUnion(routingOverrideKeys.intersection(nestedArgs.keys))
                 // Extract _tabID if present in nested payload
                 if let tabIDValue = nestedArgs["_tabID"],
                    let tabIDString = tabIDValue.stringValue,
@@ -226,7 +236,8 @@ enum MCPToolArgsNormalizer {
             contextID: extractedContextID,
             workingDirs: extractedWorkingDirs,
             rawJSON: extractedRawJSON,
-            warnings: warnings
+            warnings: warnings,
+            encounteredRoutingKeys: encounteredRoutingKeys
         )
     }
 

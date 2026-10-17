@@ -433,6 +433,61 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
         XCTAssertEqual(optIn["model_reasoning_summary"] as? String, "auto")
     }
 
+    /// Plan §6 D3 `direct + code_mode`: the namespace override is inert unless a direct server
+    /// name is supplied, then CLI and app-server builders emit the same one-element list.
+    func testDirectOnlyToolNamespaceOverrideIsInertByDefaultAndHasCLIAppServerParity() {
+        let policy = CodexNativeSessionController.defaultAppServerToolPolicy(
+            shellToolEnabled: true,
+            webSearchRequestEnabled: false,
+            forceExperimentalSteering: false
+        )
+        let key = CodexOverrides.directOnlyToolNamespacesKey
+        XCTAssertEqual(key, "features.code_mode.direct_only_tool_namespaces")
+        for featurePolicy in [CodexOverrides.FeaturePolicy.defaultDisabled, .enabledForComputerUse] {
+            let baselineCLI = CodexOverrides.cliConfigArgs(toolPolicy: policy, featurePolicy: featurePolicy)
+            let baselineMap = CodexOverrides.appServerConfigMap(toolPolicy: policy, featurePolicy: featurePolicy)
+            XCTAssertFalse(baselineCLI.contains { $0.contains("direct_only_tool_namespaces") })
+            XCTAssertNil(baselineMap[key])
+            // Empty names fail closed and leave output byte-identical.
+            XCTAssertEqual(
+                CodexOverrides.cliConfigArgs(toolPolicy: policy, featurePolicy: featurePolicy, repoPromptDirectServerName: ""),
+                baselineCLI
+            )
+            XCTAssertNil(
+                CodexOverrides.appServerConfigMap(
+                    toolPolicy: policy, featurePolicy: featurePolicy, repoPromptDirectServerName: ""
+                )[key]
+            )
+
+            // Hyphens become underscores; case is preserved, never lowercased.
+            let serverName = "RepoPrompt-Direct-Read"
+            let cli = CodexOverrides.cliConfigArgs(
+                toolPolicy: policy, featurePolicy: featurePolicy, repoPromptDirectServerName: serverName
+            )
+            XCTAssertEqual(Array(cli.dropLast(2)), baselineCLI, "Only the namespace pair is appended")
+            XCTAssertEqual(Array(cli.suffix(2)), ["-c", "\(key)=[\"mcp__RepoPrompt_Direct_Read\"]"])
+            var map = CodexOverrides.appServerConfigMap(
+                toolPolicy: policy, featurePolicy: featurePolicy, repoPromptDirectServerName: serverName
+            )
+            XCTAssertEqual(map.removeValue(forKey: key) as? [String], ["mcp__RepoPrompt_Direct_Read"])
+            XCTAssertEqual(NSDictionary(dictionary: map), NSDictionary(dictionary: baselineMap))
+            // Feature policy (computer use, tool search) is unchanged by the namespace key.
+            XCTAssertEqual(map["features.computer_use"] as? Bool, featurePolicy.computerUseEnabled)
+        }
+        XCTAssertEqual(CodexOverrides.tomlBasicString("a\"b\\c\n"), "\"a\\\"b\\\\c\\n\"")
+        XCTAssertNil(CodexOverrides.directOnlyToolNamespace(forServerName: nil))
+
+        // The production default path stays inert; an explicit name threads through unchanged.
+        XCTAssertNil(CodexNativeSessionController.defaultAppServerConfigOverrides(forceExperimentalSteering: false)[key])
+        XCTAssertEqual(
+            CodexNativeSessionController.defaultAppServerConfigOverrides(
+                forceExperimentalSteering: false,
+                repoPromptDirectServerName: "repoprompt-direct"
+            )[key] as? [String],
+            ["mcp__repoprompt_direct"]
+        )
+    }
+
     func testRuntimePoliciesDoNotForceParallelToolCallsOff() {
         let policy = CodexOverrides.ToolPolicy(
             toolOutputTokenLimit: CodexIntegrationConfiguration.desiredToolOutputTokenLimit,

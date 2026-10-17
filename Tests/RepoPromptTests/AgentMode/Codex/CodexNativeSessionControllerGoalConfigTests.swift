@@ -79,6 +79,41 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         )
     }
 
+    func testAgentModeDefaultCarriesDirectOnlyNamespaceToStartAndResumeOnlyWhenSupplied() async throws {
+        let key = CodexOverrides.directOnlyToolNamespacesKey
+        for serverName: String? in [nil, "RepoPrompt-Direct"] {
+            let options = CodexNativeSessionController.Options.agentModeDefault(
+                forceExperimentalSteering: false,
+                approvalPolicyProvider: { .never },
+                sandboxModeProvider: { .readOnly },
+                approvalReviewerProvider: { .user },
+                goalSupportEnabledProvider: { false },
+                repoPromptDirectServerName: serverName
+            )
+            let expected = serverName.map { _ in ["mcp__RepoPrompt_Direct"] }
+
+            let (startController, startRecordURL) = try await makeController(options: options)
+            _ = try await startController.startOrResume(existing: nil, baseInstructions: "Agent")
+            await startController.shutdown()
+            let startConfig = try XCTUnwrap(recordedParams(for: "thread/start", at: startRecordURL)["config"] as? [String: Any])
+            XCTAssertEqual(startConfig[key] as? [String], expected, "thread/start")
+
+            let (resumeController, resumeRecordURL) = try await makeController(options: options)
+            let existing = CodexNativeSessionController.SessionRef(
+                conversationID: "existing-thread",
+                rolloutPath: nil,
+                model: nil,
+                reasoningEffort: nil
+            )
+            _ = try await resumeController.startOrResume(existing: existing, baseInstructions: "Agent")
+            await resumeController.shutdown()
+            let resumeConfig = try XCTUnwrap(recordedParams(for: "thread/resume", at: resumeRecordURL)["config"] as? [String: Any])
+            XCTAssertEqual(resumeConfig[key] as? [String], expected, "thread/resume")
+            // No process-level launch argument carries the thread-level key.
+            XCTAssertFalse(try recordedProcessArguments(at: resumeRecordURL).contains { $0.contains(key) })
+        }
+    }
+
     func testDefaultConfigOverridesOmitThreadReasoningSummaryWhenUnspecified() {
         let config = CodexNativeSessionController.defaultAppServerConfigOverrides(
             forceExperimentalSteering: false

@@ -3508,8 +3508,10 @@ final class MCPServerViewModel: ObservableObject {
             ? executionRunID
             : nil
         // Delegated child-question notices (plan §6.2) may ride on this result only while the
-        // parent run attempt active when the tool started is still the active one.
+        // parent run attempt active when the tool started is still the active one. In-process
+        // `code_mode` children never reserve notices; the parent delivers them once (plan §6 D3).
         let delegatedQuestionTarget: AgentDelegatedQuestionDeliveryTarget? = if let executionRunID,
+                                                                                !ServerNetworkManager.currentToolInvocationOrigin.isCodeModeChild,
                                                                                 AgentDelegatedQuestionNoticeWire.isEligible(toolName: name),
                                                                                 let targetWindow = try? requireTargetWindow()
         {
