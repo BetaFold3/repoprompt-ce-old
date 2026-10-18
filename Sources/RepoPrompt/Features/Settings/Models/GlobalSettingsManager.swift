@@ -1500,6 +1500,16 @@ class GlobalSettingsStore: ObservableObject {
         ClaudeAgentToolPreferences.setRepoPromptToolsMode(mode, defaults: defaults)
     }
 
+    /// Codex RepoPrompt tools mode; captured per Codex controller, so a change reconnects on the
+    /// next send and resumes the same thread (see `CodexAgentModeCoordinator`).
+    func codexRepoPromptToolsMode() -> RepoPromptToolsMode {
+        CodexAgentToolPreferences.repoPromptToolsMode(defaults: defaults)
+    }
+
+    func setCodexRepoPromptToolsMode(_ mode: RepoPromptToolsMode) {
+        CodexAgentToolPreferences.setRepoPromptToolsMode(mode, defaults: defaults)
+    }
+
     #if DEBUG
         func claudeRawEventLoggingEnabled() -> Bool {
             defaults.bool(forKey: "claudeRawEventLoggingEnabled")

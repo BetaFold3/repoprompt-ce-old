@@ -7777,6 +7777,8 @@ final class LifecycleNoopCodexController: CodexSessionControlling {
     fileprivate var resumeDeliveryGate: LifecyclePublicationGate?
     /// Text of every `startUserTurn` / `steerUserTurn` dispatch, in order.
     private(set) var sentTexts: [String] = []
+    /// The read-only companion this fake reports launching (nil keeps the run native).
+    var readOnlyCompanionServerName: String?
 
     init(
         recorder: LifecycleRecorder,

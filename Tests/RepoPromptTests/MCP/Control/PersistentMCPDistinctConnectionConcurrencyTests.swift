@@ -1574,7 +1574,8 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                 MCPWindowToolName.readFile,
                 MCPWindowToolName.search,
                 "bind_context"
-            ]
+            ],
+            companion: PersistentMCPTestEndpoint.CompanionAdmission? = nil
         ) async throws -> PersistentMCPTestEndpoint {
             let endpoint = try await PersistentMCPTestEndpoint.make(
                 label: label,
@@ -1583,7 +1584,8 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                 sessionToken: sessionToken,
                 principal: principal,
                 clearPersistedRoutingState: clearPersistedRoutingState,
-                requiredToolNames: requiredToolNames
+                requiredToolNames: requiredToolNames,
+                companion: companion
             )
             additionalPersistentMCPTestEndpoints.append(endpoint)
             return endpoint
@@ -1858,6 +1860,18 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             self.connectionManager = connectionManager
         }
 
+        /// Read-only companion bootstrap inputs (plan §6 D3 Codex row). The fixture bypasses the
+        /// listener, so it runs the production admission decision before registration and the
+        /// production companion attach at initialize.
+        struct CompanionAdmission {
+            let credential: String
+            let observedPeerPID: Int?
+        }
+
+        enum CompanionFixtureError: Error {
+            case admissionDenied(String)
+        }
+
         static func make(
             label: String,
             networkManager: ServerNetworkManager,
@@ -1869,7 +1883,8 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                 MCPWindowToolName.readFile,
                 MCPWindowToolName.search,
                 "bind_context"
-            ]
+            ],
+            companion: CompanionAdmission? = nil
         ) async throws -> PersistentMCPTestEndpoint {
             let connectionID = UUID()
             let sessionToken = overrideSessionToken ?? "persistent-mcp-distinct-\(label)-\(UUID().uuidString)"
@@ -1912,6 +1927,19 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                 client: client,
                 connectionManager: manager
             )
+            if let companion {
+                let decision = await networkManager.debugAdmitCompanionForSocketFixture(
+                    connectionID: connectionID,
+                    sessionToken: sessionToken,
+                    companionCredential: companion.credential,
+                    observedPeerPID: companion.observedPeerPID
+                )
+                guard case .companion = decision else {
+                    client.close()
+                    await manager.stop()
+                    throw CompanionFixtureError.admissionDenied(String(describing: decision))
+                }
+            }
             await networkManager.debugRegisterConnectionForSocketFixture(
                 connectionID: connectionID,
                 connection: manager,
@@ -1926,6 +1954,9 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             let startTask = Task {
                 try await manager.start { clientInfo in
                     guard clientInfo.name == clientName else { return false }
+                    if companion != nil {
+                        return await networkManager.debugAttachCompanionAtInitialize(connectionID: connectionID)
+                    }
                     _ = await networkManager.debugApplyPendingPolicy(
                         clientName: clientName,
                         connectionID: connectionID,

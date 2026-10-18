@@ -1,6 +1,7 @@
 import Foundation
 import OSLog
 import RepoPromptPlatform
+import RepoPromptShared
 import RepoPromptWorkspace
 
 package struct CodexTurnStartReceipt: Equatable {
@@ -134,11 +135,19 @@ package protocol CodexSessionControlling: AnyObject {
     /// Whether this controller launches Codex with its native shell tool. Feeds the Agent Mode
     /// MCP lease's native-shell signal; unknown reports `false` so `git` stays visible.
     var runHasNativeShell: Bool { get }
+    /// The read-only companion server name this controller launches with (plan §6 D3 Codex row),
+    /// captured at creation. Feeds the lease's `code_mode` eligibility so policy and launch agree;
+    /// nil (the default, and for test doubles) keeps the run native.
+    var readOnlyCompanionServerName: String? { get }
 }
 
 package extension CodexSessionControlling {
     var runHasNativeShell: Bool {
         false
+    }
+
+    var readOnlyCompanionServerName: String? {
+        nil
     }
 }
 
@@ -518,6 +527,9 @@ package final class CodexNativeSessionController {
         /// Explicit Agent Mode shell-tool launch value captured at controller creation. Nil when
         /// the launch falls back to the Codex Bash preference inside the config overrides.
         var shellToolEnabled: Bool?
+        /// Read-only companion launch (plan §6 D3 Codex row), captured at controller creation.
+        /// Nil leaves the native config without any added server entry, key or credential.
+        var readOnlyCompanion: ReadOnlyCompanionLaunch?
 
         package static func agentModeDefault(
             forceExperimentalSteering: Bool,
@@ -529,10 +541,14 @@ package final class CodexNativeSessionController {
             goalSupportEnabledProvider: @escaping @MainActor () -> Bool,
             reasoningSummariesEnabledProvider: @escaping @MainActor () -> Bool = { false },
             computerUseEnabledProvider: @escaping @MainActor () -> Bool = { false },
-            repoPromptDirectServerName: String? = nil
+            repoPromptDirectServerName: String? = nil,
+            readOnlyCompanion: ReadOnlyCompanionLaunch? = nil
         ) -> Options {
+            // Only the companion's namespace is direct-only; the primary's tools stay inside
+            // Codex's own code mode.
+            let repoPromptDirectServerName = repoPromptDirectServerName ?? readOnlyCompanion?.serverName
             // The immutable name is captured at controller creation; start and resume share it.
-            Options(
+            return Options(
                 requestTimeout: 120,
                 configOverridesProvider: {
                     let featurePolicy = await MainActor.run {
@@ -563,8 +579,46 @@ package final class CodexNativeSessionController {
                 goalSupportEnabledProvider: goalSupportEnabledProvider,
                 reasoningSummariesEnabledProvider: reasoningSummariesEnabledProvider,
                 computerUseEnabledProvider: computerUseEnabledProvider,
-                shellToolEnabled: shellToolEnabled
+                shellToolEnabled: shellToolEnabled,
+                readOnlyCompanion: readOnlyCompanion
             )
+        }
+    }
+
+    /// What a controller needs to launch the read-only companion: the server entry, and the MCP
+    /// host's grant registration. Only the credential digest crosses to the host.
+    package struct ReadOnlyCompanionLaunch {
+        package let serverName: String
+        let server: RepoPromptMCPServerConfiguration
+        let registerGrant: @Sendable (_ runID: UUID, _ credentialDigest: String) async -> Void
+        let clearGrant: @Sendable (_ runID: UUID, _ credentialDigest: String?) async -> Void
+
+        package init(
+            serverName: String = MCPCodeModeEligibility.codexReadOnlyCompanionServerName,
+            mcpHost: any AgentMCPHosting
+        ) {
+            self.init(
+                serverName: serverName,
+                server: .repoPrompt,
+                registerGrant: { runID, digest in
+                    await mcpHost.registerCompanionGrant(runID: runID, credentialDigest: digest)
+                },
+                clearGrant: { runID, digest in
+                    await mcpHost.clearCompanionGrant(runID: runID, credentialDigest: digest)
+                }
+            )
+        }
+
+        init(
+            serverName: String,
+            server: RepoPromptMCPServerConfiguration,
+            registerGrant: @escaping @Sendable (_ runID: UUID, _ credentialDigest: String) async -> Void,
+            clearGrant: @escaping @Sendable (_ runID: UUID, _ credentialDigest: String?) async -> Void
+        ) {
+            self.serverName = serverName
+            self.server = server
+            self.registerGrant = registerGrant
+            self.clearGrant = clearGrant
         }
     }
 
@@ -651,6 +705,21 @@ package final class CodexNativeSessionController {
     package var runHasNativeShell: Bool {
         options.shellToolEnabled ?? false
     }
+
+    package var readOnlyCompanionServerName: String? {
+        options.readOnlyCompanion?.serverName
+    }
+
+    private struct CompanionCredentialState {
+        let credential: String
+        let digest: String
+        let transportGeneration: UInt64
+    }
+
+    /// The companion credential of the current transport launch; minted once per actual
+    /// app-server transport generation and reused by every start/resume on that transport.
+    /// Guarded by the events-state lock. Never logged.
+    private var companionCredentialState: CompanionCredentialState?
 
     private let clientShutdownBehavior: ClientShutdownBehavior
     private let expectedMCPClientName: String?
@@ -866,8 +935,11 @@ package final class CodexNativeSessionController {
         let client = client
         let shouldClearExpectedPID = expectedMCPClientName != nil
         let shouldStopClient = clientShutdownBehavior == .stopOnShutdown
-        if shouldClearExpectedPID || shouldStopClient {
+        // Digest-matched, so a newer controller's grant for a reused run ID is never removed.
+        let companionGrantClear = takeReadOnlyCompanionGrantClear()
+        if shouldClearExpectedPID || shouldStopClient || companionGrantClear != nil {
             Task.detached {
+                await companionGrantClear?()
                 if shouldClearExpectedPID {
                     await client.clearExpectedAgentPIDRegistration()
                 }
@@ -1175,7 +1247,11 @@ package final class CodexNativeSessionController {
             try await client.startIfNeeded()
             await ensureInboundStreamsStarted()
 
-            let configOverrides = await options.configOverridesProvider()
+            // Start and resume carry the same companion entry; its credential belongs to the
+            // transport that will launch the companion.
+            let configOverrides = try await readOnlyCompanionConfigOverrides(
+                merging: options.configOverridesProvider()
+            )
             let pathValue = existing?.rolloutPath
             let snapshot: ThreadSnapshot
 
@@ -1265,11 +1341,73 @@ package final class CodexNativeSessionController {
         } catch {
             await cancelBindingSessionIgnoringTaskCancellation()
             markStartOrResumeFailed()
+            await takeReadOnlyCompanionGrantClear()?()
             if expectedMCPClientName != nil {
                 await client.clearExpectedAgentPIDRegistration()
             }
             throw error
         }
+    }
+
+    // MARK: - Read-only companion grant (plan §6 D3 Codex row)
+
+    /// Merges the companion server into this launch's config overrides. The credential is minted
+    /// once per actual app-server transport generation and registered (by digest only) as the
+    /// run's grant before Codex can launch the companion; a later start/resume on the same
+    /// transport reuses it, and a new transport replaces it, disconnecting older companions.
+    ///
+    /// The pending credential is published before the registration await, so a concurrent
+    /// shutdown (or deinit) owns and clears it. When registration returns after this controller
+    /// lost the state or left `.binding`, it clears its exact digest itself (idempotent with the
+    /// shutdown's clear, never a newer grant) and throws before any thread RPC.
+    private func readOnlyCompanionConfigOverrides(merging base: [String: Any]) async throws -> [String: Any] {
+        guard let companion = options.readOnlyCompanion else { return base }
+        let generation = await client.currentTransportGeneration()
+        let current = withEventsStateLock { companionCredentialState }
+        let credential: String
+        if let current, current.transportGeneration == generation {
+            credential = current.credential
+        } else {
+            credential = MCPBootstrapCompanionCredential.mint()
+            let digest = MCPBootstrapCompanionCredential.digest(of: credential)
+            withEventsStateLock {
+                companionCredentialState = CompanionCredentialState(
+                    credential: credential,
+                    digest: digest,
+                    transportGeneration: generation
+                )
+            }
+            await companion.registerGrant(runID, digest)
+            let stillOwned = withEventsStateLock {
+                companionCredentialState?.digest == digest && lifecycleState == .binding
+            }
+            guard stillOwned else {
+                await companion.clearGrant(runID, digest)
+                throw CodexSessionControllerError.invalidLifecycleState("shutting down")
+            }
+        }
+        try ensureBindingCanComplete()
+        return CodexOverrides.mergingReadOnlyCompanionServer(
+            into: base,
+            serverName: companion.serverName,
+            server: companion.server,
+            credentialEnvironmentKey: MCPBootstrapCompanionCredential.environmentKey,
+            credential: credential
+        )
+    }
+
+    /// Forgets this controller's companion credential and returns the digest-matched grant
+    /// clear, or nil when nothing was registered.
+    private func takeReadOnlyCompanionGrantClear() -> (@Sendable () async -> Void)? {
+        guard let companion = options.readOnlyCompanion else { return nil }
+        let state = withEventsStateLock { () -> CompanionCredentialState? in
+            defer { companionCredentialState = nil }
+            return companionCredentialState
+        }
+        guard let digest = state?.digest else { return nil }
+        let runID = runID
+        let clearGrant = companion.clearGrant
+        return { await clearGrant(runID, digest) }
     }
 
     // MARK: - Resume history policy and turn-list reconciliation
@@ -2275,6 +2413,7 @@ package final class CodexNativeSessionController {
         terminalFileChangeItemIDs.removeAll(keepingCapacity: false)
         commandExecutionMirrorStateByItemID.removeAll(keepingCapacity: false)
         finishEventsStreamIfNeeded()
+        await takeReadOnlyCompanionGrantClear()?()
         if expectedMCPClientName != nil {
             await client.clearExpectedAgentPIDRegistration()
         }

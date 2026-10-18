@@ -9,11 +9,26 @@ package enum MCPCodeModeEligibility: Equatable {
     /// RepoPrompt tools are called directly, with optional `code_mode` alongside them.
     case directTools
     /// Codex: a second, read-only RepoPrompt server entry listed in the thread-level
-    /// `features.code_mode.direct_only_tool_namespaces`. Not resolved by any production launch yet.
+    /// `features.code_mode.direct_only_tool_namespaces`. The run's primary connection stays
+    /// native; only the run's authenticated companion connection gets the four exploration
+    /// tools plus `code_mode`. Resolved only when a Codex controller launched that companion.
     case codexReadOnlyCompanion(serverName: String)
 
-    /// The RepoPrompt-owned executor tool name, gated by `.directTools` eligibility.
+    /// The RepoPrompt-owned executor tool name, gated by `.directTools` eligibility or, for a
+    /// Codex companion run, by the connection being that run's authenticated companion.
     package static let codeModeToolName = MCPWindowToolName.codeMode
+
+    /// Default Codex companion server entry name; its Codex tool namespace is
+    /// `mcp__RepoPromptCE_Direct`.
+    package static let codexReadOnlyCompanionServerName = "RepoPromptCE-Direct"
+
+    /// The direct exploration tools a Codex read-only companion may offer (with `code_mode`).
+    package static let readOnlyCompanionToolNames: Set<String> = [
+        MCPWindowToolName.readFile,
+        MCPWindowToolName.search,
+        MCPWindowToolName.getCodeStructure,
+        MCPWindowToolName.getFileTree
+    ]
 
     /// Knowledge and non-Agent Mode runs (Context Builder discovery, unknown) never get `code_mode`.
     package static func normalized(

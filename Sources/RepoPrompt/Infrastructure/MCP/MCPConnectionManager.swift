@@ -1361,6 +1361,16 @@ actor ServerNetworkManager {
     private var windowAssignmentByConnection: [UUID: Int] = [:]
     private var preassignedConnections: Set<UUID> = []
 
+    /// Read-only companion (plan §6 D3 Codex row). A run's current transport launch holds at most
+    /// one grant (credential digest only). A companion connection's role is recorded at bootstrap
+    /// admission, before its MCP server starts, and it never enters `runIDByConnectionID`,
+    /// pending-policy, admitted-run or live-affinity state, so it can never take the primary's route.
+    private var companionGrantByRunID: [UUID: CompanionGrant] = [:]
+    private var companionGrantGenerationCounter: UInt64 = 0
+    private var companionRoleByConnectionID: [UUID: CompanionConnectionRole] = [:]
+    /// Session tokens admitted as a companion stay pinned to that run until its grant ends.
+    private var companionRunIDBySessionToken: [String: UUID] = [:]
+
     /// Tracks the window count at the time each connection was established.
     /// Connections established during single-window mode are auto-bound to that window
     /// and stay bound even when multi-window mode becomes active.
@@ -2371,6 +2381,7 @@ actor ServerNetworkManager {
             connectionID: connectionID,
             lifecycleGeneration: lifecycleGeneration
         )
+        discardUnregisteredCompanionAdmission(connectionID: connectionID)
         await reservation?.committingConnection?.stop()
     }
 
@@ -2408,6 +2419,7 @@ actor ServerNetworkManager {
                     connectionID: id,
                     lifecycleGeneration: reservation.lifecycleGeneration
                 )
+                discardUnregisteredCompanionAdmission(connectionID: id)
             }
         }
     }
@@ -3058,6 +3070,9 @@ actor ServerNetworkManager {
     }
 
     private func effectivePolicyState(for connectionID: UUID) -> (restricted: Set<String>, additional: Set<String>, allowedToolsOverride: Set<String>?, sessionProfile: AgentSessionProfile, preassigned: Bool, purpose: MCPRunPurpose, taskLabelKind: AgentModelCatalog.TaskLabelKind?, allowsAgentExternalControlTools: Bool) {
+        if let role = companionRoleByConnectionID[connectionID] {
+            return companionEffectivePolicyState(for: role)
+        }
         let restricted = restrictedToolsByConnection[connectionID] ?? []
         let additional = additionalToolsByConnection[connectionID] ?? []
         let preassigned = preassignedConnections.contains(connectionID)
@@ -3322,7 +3337,10 @@ actor ServerNetworkManager {
 
     /// Returns the run purpose for a connection, used for UI routing (e.g., ask_user).
     func runPurpose(for connectionID: UUID) -> MCPRunPurpose {
-        runPurposeByConnection[connectionID] ?? .unknown
+        if companionRoleByConnectionID[connectionID] != nil {
+            return .agentModeRun
+        }
+        return runPurposeByConnection[connectionID] ?? .unknown
     }
 
     /// Session profile of the tool policy currently enforced for a connection (the same value the
@@ -3335,6 +3353,9 @@ actor ServerNetworkManager {
     /// standard Agent Mode run policy (unknown, Knowledge, discovery, externally-installed default)
     /// is `.native`, re-normalized here against the connection's effective purpose and profile.
     func effectiveCodeModeEligibility(for connectionID: UUID) -> MCPCodeModeEligibility {
+        if let role = companionRoleByConnectionID[connectionID] {
+            return liveCompanionRunPolicyState(for: role)?.codeModeEligibility ?? .native
+        }
         let policy = effectivePolicyState(for: connectionID)
         let runState = runIDByConnectionID[connectionID].flatMap { runPolicyStateByRunID[$0] }
         let staged = codeModeEligibilityByConnection[connectionID] ?? runState?.codeModeEligibility ?? .native
@@ -3342,10 +3363,306 @@ actor ServerNetworkManager {
     }
 
     /// `code_mode` is advertised and executable only on a connection whose installed run policy
-    /// opted into direct RepoPrompt tools (`direct + code_mode`). A Codex read-only companion is not
-    /// supported yet and stays denied.
+    /// opted into direct RepoPrompt tools (`direct + code_mode`), or on the authenticated read-only
+    /// companion of a run whose policy resolved `.codexReadOnlyCompanion`. That run's primary
+    /// connection never gets it.
     func isCodeModeExposureAllowed(for connectionID: UUID) -> Bool {
-        effectiveCodeModeEligibility(for: connectionID) == .directTools
+        switch effectiveCodeModeEligibility(for: connectionID) {
+        case .directTools:
+            true
+        case .codexReadOnlyCompanion:
+            companionRoleByConnectionID[connectionID] != nil
+        case .native:
+            false
+        }
+    }
+
+    // MARK: - Read-only companion (plan §6 D3 Codex row)
+
+    /// One run's current companion grant: the digest of the credential minted for one actual
+    /// transport launch, plus a generation that fences connections admitted under older grants.
+    struct CompanionGrant: Equatable {
+        let credentialDigest: String
+        let generation: UInt64
+    }
+
+    /// The pinned role of an admitted companion connection. A revoked role is a tombstone kept
+    /// until its admission definitively terminates (reservation rolled back, abandoned or expired,
+    /// or the registered connection removed), so a still-pending admission can never commit or
+    /// initialize as an ordinary client once its grant was replaced, cleared or superseded.
+    struct CompanionConnectionRole: Equatable {
+        let runID: UUID
+        let grantGeneration: UInt64
+        let sessionToken: String
+        var isRevoked = false
+    }
+
+    enum CompanionAdmissionDecision: Equatable {
+        case notCompanion
+        case companion(runID: UUID, grantGeneration: UInt64)
+        case rejected(reason: String)
+    }
+
+    nonisolated static let companionUnavailableMessage =
+        "The RepoPrompt read-only companion is not available for this run right now. Use the primary RepoPrompt tools instead."
+
+    nonisolated static let companionRoutingOverrideDenial = (
+        code: "companion_routing_override",
+        message: "This read-only RepoPrompt companion is pinned to its agent run and cannot be routed (context_id, _tabID, _windowID, window_id). Call the tool without routing arguments."
+    )
+
+    nonisolated static func companionToolNotAllowedMessage(forCanonicalToolName toolName: String) -> String {
+        "Tool '\(toolName)' is not available on the read-only RepoPrompt companion. Use the primary RepoPrompt server for it."
+    }
+
+    /// Registers or replaces the companion grant for one run's current transport launch. A new
+    /// digest revokes every companion admitted under the previous grant.
+    func registerCompanionGrant(runID: UUID, credentialDigest: String) async {
+        let digest = credentialDigest.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !digest.isEmpty else { return }
+        if let existing = companionGrantByRunID[runID], Self.constantTimeEquals(existing.credentialDigest, digest) {
+            return
+        }
+        companionGrantGenerationCounter &+= 1
+        let generation = companionGrantGenerationCounter
+        companionGrantByRunID[runID] = CompanionGrant(credentialDigest: digest, generation: generation)
+        unpinCompanionSessionTokens(runID: runID)
+        mcpPolicyLog("registered companion grant runID=\(runID.uuidString) generation=\(generation)")
+        await disconnectCompanionConnections(runID: runID, keepingGrantGeneration: generation, reason: "companion_grant_replaced")
+    }
+
+    /// Clears the run's companion grant when it still carries `credentialDigest` (nil clears any)
+    /// and disconnects its companions. A stale digest from an older launch never clears a newer grant.
+    func clearCompanionGrant(runID: UUID, credentialDigest: String?) async {
+        guard let grant = companionGrantByRunID[runID] else { return }
+        if let credentialDigest {
+            let digest = credentialDigest.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard Self.constantTimeEquals(grant.credentialDigest, digest) else { return }
+        }
+        companionGrantByRunID.removeValue(forKey: runID)
+        unpinCompanionSessionTokens(runID: runID)
+        mcpPolicyLog("cleared companion grant runID=\(runID.uuidString) generation=\(grant.generation)")
+        await disconnectCompanionConnections(runID: runID, keepingGrantGeneration: nil, reason: "companion_grant_cleared")
+    }
+
+    /// The run a connection serves as authenticated read-only companion, or nil.
+    func companionRunID(for connectionID: UUID) -> UUID? {
+        companionRoleByConnectionID[connectionID]?.runID
+    }
+
+    private func unpinCompanionSessionTokens(runID: UUID) {
+        companionRunIDBySessionToken = companionRunIDBySessionToken.filter { $0.value != runID }
+    }
+
+    private func disconnectCompanionConnections(
+        runID: UUID,
+        keepingGrantGeneration: UInt64?,
+        reason: String,
+        excluding excludedConnectionID: UUID? = nil
+    ) async {
+        let stale = companionRoleByConnectionID.compactMap { connectionID, role -> UUID? in
+            guard role.runID == runID, connectionID != excludedConnectionID else { return nil }
+            if let keepingGrantGeneration, role.grantGeneration == keepingGrantGeneration, excludedConnectionID == nil {
+                return nil
+            }
+            return connectionID
+        }
+        for connectionID in stale {
+            if connections[connectionID] == nil, connectionTasks[connectionID] == nil {
+                guard bootstrapReservations[connectionID] != nil else {
+                    // Admission already terminated without registering: nothing can commit.
+                    discardUnregisteredCompanionAdmission(connectionID: connectionID)
+                    continue
+                }
+                // Admitted, accept still in flight: keep a revoked tombstone. Its deferred commit
+                // is fenced on the live role and abandons (closing the transferred descriptor);
+                // rollback or expiry discards it. Dropping the role here would let the commit
+                // proceed as an ordinary client.
+                companionRoleByConnectionID[connectionID]?.isRevoked = true
+                continue
+            }
+            await removeConnection(connectionID, context: MCPConnectionCloseContext(reason: reason, initiator: .app))
+        }
+    }
+
+    /// The run policy a companion currently serves, or nil while it is parked: its grant was
+    /// replaced or cleared, no standard Agent Mode run policy is installed, or that policy did
+    /// not resolve the read-only companion.
+    private func liveCompanionRunPolicyState(for role: CompanionConnectionRole) -> RunConnectionPolicyState? {
+        guard !role.isRevoked,
+              companionGrantByRunID[role.runID]?.generation == role.grantGeneration,
+              let state = runPolicyStateByRunID[role.runID],
+              state.purpose == .agentModeRun,
+              state.sessionProfile != .knowledge,
+              case .codexReadOnlyCompanion = state.codeModeEligibility
+        else { return nil }
+        return state
+    }
+
+    /// Companion policy, derived on every read from the run's current policy so a reseeded,
+    /// cleaned-up or replaced run policy is reflected without copying: at most the four exploration
+    /// tools plus `code_mode`, within the run's restrictions and positive ceiling. A parked
+    /// companion has an empty ceiling.
+    private func companionEffectivePolicyState(
+        for role: CompanionConnectionRole
+    ) -> (restricted: Set<String>, additional: Set<String>, allowedToolsOverride: Set<String>?, sessionProfile: AgentSessionProfile, preassigned: Bool, purpose: MCPRunPurpose, taskLabelKind: AgentModelCatalog.TaskLabelKind?, allowsAgentExternalControlTools: Bool) {
+        guard let state = liveCompanionRunPolicyState(for: role) else {
+            return ([], [], [], .standard, true, .agentModeRun, nil, false)
+        }
+        var ceiling = MCPCodeModeEligibility.readOnlyCompanionToolNames
+        ceiling.insert(MCPCodeModeEligibility.codeModeToolName)
+        if let runCeiling = state.allowedToolsOverride {
+            ceiling.formIntersection(runCeiling)
+        }
+        ceiling.subtract(state.restrictedTools)
+        return (state.restrictedTools, [], ceiling, state.sessionProfile, true, .agentModeRun, state.taskLabelKind, false)
+    }
+
+    /// Pins the companion to its run's window; never persisted to client routing records.
+    private func refreshCompanionWindowMapping(_ connectionID: UUID) {
+        guard let role = companionRoleByConnectionID[connectionID],
+              let state = liveCompanionRunPolicyState(for: role)
+        else { return }
+        connectionWindowMap[connectionID] = state.windowID
+        windowAssignmentByConnection[connectionID] = state.windowID
+    }
+
+    /// Nil when a companion call may proceed past policy (or the connection is not a companion).
+    private func companionToolCallDenial(
+        connectionID: UUID,
+        canonicalToolName toolName: String
+    ) -> (code: String, message: String)? {
+        guard let role = companionRoleByConnectionID[connectionID] else { return nil }
+        guard liveCompanionRunPolicyState(for: role) != nil else {
+            return ("companion_unavailable", Self.companionUnavailableMessage)
+        }
+        let policy = companionEffectivePolicyState(for: role)
+        guard policy.allowedToolsOverride?.contains(toolName) == true else {
+            return ("companion_tool_not_allowed", Self.companionToolNotAllowedMessage(forCanonicalToolName: toolName))
+        }
+        return nil
+    }
+
+    /// Bootstrap-time role decision. The role comes only from a credential whose digest matches a
+    /// live grant, presented by a kernel-observed peer that descends from the run's registered
+    /// agent process; the client name and any other marker never grant it.
+    private func companionAdmissionDecision(
+        sessionToken: String,
+        companionCredential: String?,
+        gatewayCredential: String?,
+        observedPeerPID: Int?
+    ) -> CompanionAdmissionDecision {
+        let pinnedRunID = companionRunIDBySessionToken[sessionToken]
+        let credential = companionCredential?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !credential.isEmpty else {
+            return pinnedRunID == nil
+                ? .notCompanion
+                : .rejected(reason: "a companion session token reconnected without its credential")
+        }
+        let gateway = gatewayCredential?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard gateway.isEmpty else {
+            return .rejected(reason: "companion and gateway credentials are exclusive")
+        }
+        guard let observedPeerPID, observedPeerPID > 1 else {
+            return .rejected(reason: "companion admission requires a kernel-observed peer pid")
+        }
+        let digest = MCPBootstrapCompanionCredential.digest(of: credential)
+        guard let match = companionGrantByRunID.first(where: {
+            Self.constantTimeEquals($0.value.credentialDigest, digest)
+        }) else {
+            return .rejected(reason: "unknown or revoked companion credential")
+        }
+        let runID = match.key
+        let grant = match.value
+        if let pinnedRunID, pinnedRunID != runID {
+            return .rejected(reason: "companion session token is pinned to another run")
+        }
+        if pinnedRunID == nil, existingConnectionID(forSessionToken: sessionToken) != nil {
+            return .rejected(reason: "session token already belongs to a non-companion connection")
+        }
+        let expectedPIDs = expectedAgentPIDsByRunID[runID] ?? []
+        guard !expectedPIDs.isEmpty,
+              isAncestor(expectedPIDs: expectedPIDs, ofPid: pid_t(observedPeerPID))
+        else {
+            return .rejected(reason: "companion peer does not descend from the run's agent process")
+        }
+        return .companion(runID: runID, grantGeneration: grant.generation)
+    }
+
+    /// Records an admitted companion's role before its MCP server can start.
+    private func recordAdmittedCompanion(
+        connectionID: UUID,
+        sessionToken: String,
+        runID: UUID,
+        grantGeneration: UInt64
+    ) -> Bool {
+        guard companionGrantByRunID[runID]?.generation == grantGeneration else { return false }
+        companionRoleByConnectionID[connectionID] = CompanionConnectionRole(
+            runID: runID,
+            grantGeneration: grantGeneration,
+            sessionToken: sessionToken
+        )
+        companionRunIDBySessionToken[sessionToken] = runID
+        runPurposeByConnection[connectionID] = .agentModeRun
+        preassignedConnections.insert(connectionID)
+        return true
+    }
+
+    /// True when a deferred bootstrap commit may publish this connection: an ordinary admission
+    /// never carries a role, and a companion admission still holds its exact unrevoked role under
+    /// the captured, still-current grant generation. A missing role never means "ordinary".
+    private func isCompanionCommitAdmissible(
+        connectionID: UUID,
+        expected: (runID: UUID, grantGeneration: UInt64)?
+    ) -> Bool {
+        guard let expected else {
+            return companionRoleByConnectionID[connectionID] == nil
+        }
+        guard let role = companionRoleByConnectionID[connectionID],
+              !role.isRevoked,
+              role.runID == expected.runID,
+              role.grantGeneration == expected.grantGeneration,
+              companionGrantByRunID[expected.runID]?.generation == expected.grantGeneration
+        else { return false }
+        return true
+    }
+
+    /// Drops the role of a companion admission that never registered a connection.
+    private func discardUnregisteredCompanionAdmission(connectionID: UUID) {
+        guard connections[connectionID] == nil else { return }
+        companionRoleByConnectionID.removeValue(forKey: connectionID)
+        runPurposeByConnection.removeValue(forKey: connectionID)
+        preassignedConnections.remove(connectionID)
+    }
+
+    /// MCP initialize for a companion: never waits for, consumes or replaces the primary's pending
+    /// policy, run route or connection waiters. The newest companion of a grant wins.
+    private func attachCompanionAtInitialize(connectionID: UUID) async -> Bool {
+        guard let role = companionRoleByConnectionID[connectionID],
+              !role.isRevoked,
+              companionGrantByRunID[role.runID]?.generation == role.grantGeneration
+        else { return false }
+        await disconnectCompanionConnections(
+            runID: role.runID,
+            keepingGrantGeneration: role.grantGeneration,
+            reason: "companion_superseded",
+            excluding: connectionID
+        )
+        guard companionRoleByConnectionID[connectionID] == role,
+              companionGrantByRunID[role.runID]?.generation == role.grantGeneration,
+              connections[connectionID] != nil
+        else { return false }
+        refreshCompanionWindowMapping(connectionID)
+        mcpPolicyLog("attached read-only companion connection=\(connectionID) runID=\(role.runID.uuidString)")
+        return true
+    }
+
+    private func notifyCompanionToolListChanged(runID: UUID) async {
+        let companionIDs = companionRoleByConnectionID.compactMap { $0.value.runID == runID ? $0.key : nil }
+        for connectionID in companionIDs where connections[connectionID] != nil {
+            refreshCompanionWindowMapping(connectionID)
+            await notifyToolListChanged(connectionID: connectionID)
+        }
     }
 
     func setRunPurpose(_ purpose: MCPRunPurpose, for connectionID: UUID) {
@@ -3362,7 +3679,9 @@ actor ServerNetworkManager {
 
     private func reusableWindowForClient(newConnectionID: UUID, clientName: String) async -> Int? {
         for (existingID, windowID) in connectionWindowMap where existingID != newConnectionID {
-            guard MCPClientIdentity.matches(clientIDByConnection[existingID], clientName) else { continue }
+            guard companionRoleByConnectionID[existingID] == nil,
+                  MCPClientIdentity.matches(clientIDByConnection[existingID], clientName)
+            else { continue }
             if let existingManager = connections[existingID] {
                 let existingViable = await existingManager.isViableForRetention()
                 if existingViable {
@@ -3381,6 +3700,11 @@ actor ServerNetworkManager {
     /// Get the runID associated with a connection (if any)
     /// Fast path uses actor-local cache; fallback scans all windows for resilient recovery.
     func runIDForConnection(_ connectionID: UUID) async -> UUID? {
+        // A companion's tool events and cancellation belong to its pinned run, but it never gets
+        // a run route of its own: nothing here may write `runIDByConnectionID` for it.
+        if let companionRunID = companionRoleByConnectionID[connectionID]?.runID {
+            return companionRunID
+        }
         if let cachedRunID = runIDByConnectionID[connectionID] {
             return cachedRunID
         }
@@ -3464,6 +3788,10 @@ actor ServerNetworkManager {
         persistWindowBinding: Bool = true,
         signalRouting: Bool = true
     ) async -> Bool {
+        guard companionRoleByConnectionID[connectionID] == nil else {
+            log.warning("mapConnectionToRunID: refusing to route read-only companion \(connectionID) to run \(runID)")
+            return false
+        }
         let resolvedWindowID: Int? = if let explicitWindowID {
             explicitWindowID
         } else if let mappedWindowID = connectionWindowMap[connectionID] {
@@ -3560,6 +3888,7 @@ actor ServerNetworkManager {
         runID: UUID,
         windowID: Int
     ) async -> MCPServerViewModel.PendingPolicyRunIDMappingToken? {
+        guard companionRoleByConnectionID[connectionID] == nil else { return nil }
         let token = await MainActor.run { () -> MCPServerViewModel.PendingPolicyRunIDMappingToken? in
             guard let window = WindowStatesManager.shared.window(withID: windowID) else {
                 log.warning("mapConnectionToRunIDForPendingPolicy: window \(windowID) not found for connection \(connectionID)")
@@ -3865,7 +4194,9 @@ actor ServerNetworkManager {
         connectionID: UUID,
         persistWindowBinding: Bool = true
     ) async {
-        guard let cached = runPolicyStateByRunID[runID] else { return }
+        guard companionRoleByConnectionID[connectionID] == nil,
+              let cached = runPolicyStateByRunID[runID]
+        else { return }
 
         restrictedToolsByConnection[connectionID] = cached.restrictedTools
         if let additional = cached.additionalTools {
@@ -3910,15 +4241,16 @@ actor ServerNetworkManager {
     }
 
     func connectionID(for clientName: String, windowID: Int) -> UUID? {
-        // Use canonical connectionWindowMap for consistency
+        // Use canonical connectionWindowMap for consistency. A read-only companion shares its
+        // primary's client name but is never "the" client connection of a window.
         if let active = activeConnectionsByClient[clientName] {
-            for id in active {
+            for id in active where companionRoleByConnectionID[id] == nil {
                 if connectionWindowMap[id] == windowID {
                     return id
                 }
             }
         }
-        for (id, pendingName) in pendingConnections where pendingName == clientName {
+        for (id, pendingName) in pendingConnections where pendingName == clientName && companionRoleByConnectionID[id] == nil {
             if connectionWindowMap[id] == windowID {
                 return id
             }
@@ -3932,7 +4264,8 @@ actor ServerNetworkManager {
 
     @discardableResult
     func rehydrateRunTabContextForConnectionIfPossible(_ connectionID: UUID) async -> Bool {
-        guard let runID = await runIDForConnection(connectionID),
+        guard companionRoleByConnectionID[connectionID] == nil,
+              let runID = await runIDForConnection(connectionID),
               let cached = runPolicyStateByRunID[runID],
               cached.purpose == .agentModeRun,
               cached.tabID != nil
@@ -4003,6 +4336,12 @@ actor ServerNetworkManager {
         for connectionID in connectionIDsForRun {
             runIDByConnectionID.removeValue(forKey: connectionID)
         }
+        // The run's companion parks (its derived ceiling is now empty) but stays connected: its
+        // grant is owned by the Codex controller that launched it and is disconnected when the
+        // controller clears it. It re-arms only if this run's policy is reseeded while that grant
+        // lives; Codex installs policy only at a transport start (a lost route forces a new
+        // controller, run and grant), so in practice the parked companion is never re-armed.
+        await notifyCompanionToolListChanged(runID: runID)
 
         await MainActor.run {
             let windows = WindowStatesManager.shared.allWindows.filter { window in
@@ -4352,6 +4691,8 @@ actor ServerNetworkManager {
                   connectionLifecycleGenerationByID[id] == expectedLifecycleGeneration
             else { continue }
             guard !excluding.contains(id) else { continue }
+            // A read-only companion never satisfies a primary connection waiter.
+            guard companionRoleByConnectionID[id] == nil else { continue }
 
             if let nameFilter = clientName {
                 // Prefer authoritative admission mapping
@@ -4394,7 +4735,9 @@ actor ServerNetworkManager {
     /// Notify waiters when a new connection arrives. Resumes the first matching waiter (FIFO).
     /// Called from handleBootstrapConnection after adding to connections.
     private func notifyConnectionWaiters(connectionID: UUID, clientName: String?, lifecycleGeneration expectedLifecycleGeneration: UInt64) {
-        guard isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else { return }
+        guard isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration),
+              companionRoleByConnectionID[connectionID] == nil
+        else { return }
         let actualName = clientName ?? "unknown"
         var matchedWaiterID: UUID?
 
@@ -4934,7 +5277,7 @@ actor ServerNetworkManager {
             #if DEBUG
                 print("[MCPStartup] calling BootstrapSocketServer.start socket=\(socketURL.path) generation=\(expectedLifecycleGeneration)")
             #endif
-            try await server.start { [weak self, weak server] clientFD, sessionToken, clientPid, clientName, gatewayCredential async -> BootstrapSocketServer.Admission in
+            try await server.start { [weak self, weak server] (clientFD: Int32, sessionToken: String, clientPid: Int, clientName: String?, credentials: BootstrapSocketServer.HandshakeCredentials) async -> BootstrapSocketServer.Admission in
                 guard let self, let server else {
                     return .reject(.rejected(reason: "Server unavailable", errorCode: "server_unavailable"))
                 }
@@ -4945,7 +5288,9 @@ actor ServerNetworkManager {
                     sessionToken: sessionToken,
                     clientPid: clientPid,
                     clientName: clientName,
-                    gatewayCredential: gatewayCredential
+                    gatewayCredential: credentials.gatewayCredential,
+                    companionCredential: credentials.companionCredential,
+                    observedPeerPID: credentials.observedPeerPID
                 )
             }
             guard isCurrentBootstrapListener(server, lifecycleGeneration: expectedLifecycleGeneration) else {
@@ -4993,7 +5338,9 @@ actor ServerNetworkManager {
         sessionToken: String,
         clientPid: Int,
         clientName: String?,
-        gatewayCredential: String?
+        gatewayCredential: String?,
+        companionCredential: String? = nil,
+        observedPeerPID: Int? = nil
     ) async -> BootstrapSocketServer.Admission {
         let connectionID = UUID()
         connectionLog("Bootstrap socket connection: \(connectionID) from '\(clientName ?? "unknown")' (pid=\(clientPid), session=\(sessionToken.prefix(8))...)")
@@ -5008,6 +5355,25 @@ actor ServerNetworkManager {
             break
         }
         let principal = principalDecision.principal
+
+        let companionAdmission: (runID: UUID, grantGeneration: UInt64)?
+        switch companionAdmissionDecision(
+            sessionToken: sessionToken,
+            companionCredential: companionCredential,
+            gatewayCredential: gatewayCredential,
+            observedPeerPID: observedPeerPID
+        ) {
+        case .notCompanion:
+            companionAdmission = nil
+        case let .companion(runID, grantGeneration):
+            companionAdmission = (runID, grantGeneration)
+        case let .rejected(reason):
+            log.warning("Rejecting bootstrap connection \(connectionID) - companion admission denied: \(reason)")
+            return .reject(.rejected(
+                reason: "Companion admission denied",
+                errorCode: MCPBootstrapErrorCode.approvalDenied.rawValue
+            ))
+        }
 
         guard isCurrentBootstrapListener(sourceListener, lifecycleGeneration: admissionLifecycleGeneration) else {
             return rejectBootstrapAdmissionBecauseStopped(connectionID: connectionID)
@@ -5037,13 +5403,18 @@ actor ServerNetworkManager {
             forSessionToken: sessionToken
         )
 
-        let policyReadiness = await awaitAgentBootstrapPolicyBeforeAcceptIfNeeded(
-            bootstrapClientName: clientName,
-            connectionID: connectionID,
-            sessionKey: sessionToken,
-            clientPid: clientPid,
-            isReplacementForSession: replacementBeforePolicyReadiness != nil
-        )
+        // A companion never waits on (or reserves) the primary's client-name policy gate.
+        let policyReadiness: AgentPolicyAdmissionReadiness = if companionAdmission == nil {
+            await awaitAgentBootstrapPolicyBeforeAcceptIfNeeded(
+                bootstrapClientName: clientName,
+                connectionID: connectionID,
+                sessionKey: sessionToken,
+                clientPid: clientPid,
+                isReplacementForSession: replacementBeforePolicyReadiness != nil
+            )
+        } else {
+            .notRequired
+        }
         if policyReadiness == .timedOut {
             return .reject(.rejected(
                 reason: "Agent policy admission timed out.",
@@ -5106,13 +5477,35 @@ actor ServerNetworkManager {
             )
             return rejectBootstrapAdmissionBecauseStopped(connectionID: connectionID)
         }
+        if let companionAdmission {
+            // Re-validated after every suspension above: a grant replaced or cleared meanwhile
+            // rejects rather than admitting under a stale launch.
+            guard recordAdmittedCompanion(
+                connectionID: connectionID,
+                sessionToken: sessionToken,
+                runID: companionAdmission.runID,
+                grantGeneration: companionAdmission.grantGeneration
+            ) else {
+                releaseBootstrapAdmissionClaim(
+                    sessionToken: sessionToken,
+                    connectionID: connectionID,
+                    lifecycleGeneration: admissionLifecycleGeneration
+                )
+                log.warning("Rejecting bootstrap connection \(connectionID) - companion grant changed during admission")
+                return .reject(.rejected(
+                    reason: "Companion admission denied",
+                    errorCode: MCPBootstrapErrorCode.approvalDenied.rawValue
+                ))
+            }
+        }
         return makeAcceptedBootstrapAdmission(
             connectionID: connectionID,
             lifecycleGeneration: admissionLifecycleGeneration,
             sessionToken: sessionToken,
             clientPid: clientPid,
             clientName: clientName,
-            principal: principal
+            principal: principal,
+            companionAdmission: companionAdmission
         )
     }
 
@@ -5184,7 +5577,8 @@ actor ServerNetworkManager {
         sessionToken: String,
         clientPid: Int,
         clientName: String?,
-        principal: MCPConnectionPrincipal
+        principal: MCPConnectionPrincipal,
+        companionAdmission: (runID: UUID, grantGeneration: UInt64)? = nil
     ) -> BootstrapSocketServer.Admission {
         guard reserveBootstrapSlot(
             connectionID: connectionID,
@@ -5196,6 +5590,7 @@ actor ServerNetworkManager {
                 connectionID: connectionID,
                 lifecycleGeneration: admissionLifecycleGeneration
             )
+            discardUnregisteredCompanionAdmission(connectionID: connectionID)
             log.error("Bootstrap admission \(connectionID) lost its durable-token claim before reservation")
             return .reject(.rejected(reason: "Server unavailable", errorCode: MCPBootstrapErrorCode.serverUnavailable.rawValue))
         }
@@ -5218,7 +5613,8 @@ actor ServerNetworkManager {
                     sessionToken: sessionToken,
                     clientPid: clientPid,
                     clientName: clientName,
-                    principal: principal
+                    principal: principal,
+                    companionAdmission: companionAdmission
                 )
             },
             onAcceptAborted: { [self] in
@@ -5237,7 +5633,8 @@ actor ServerNetworkManager {
         sessionToken: String,
         clientPid: Int,
         clientName: String?,
-        principal: MCPConnectionPrincipal
+        principal: MCPConnectionPrincipal,
+        companionAdmission: (runID: UUID, grantGeneration: UInt64)? = nil
     ) async {
         guard let reservation = bootstrapReservations[connectionID],
               reservation.lifecycleGeneration == admissionLifecycleGeneration,
@@ -5248,6 +5645,7 @@ actor ServerNetworkManager {
                 connectionID: connectionID,
                 lifecycleGeneration: admissionLifecycleGeneration
             )
+            discardUnregisteredCompanionAdmission(connectionID: connectionID)
             if isRunningState {
                 log.warning("commitAcceptedBootstrapConnection: no current reservation found for \(connectionID) while running")
             }
@@ -5314,6 +5712,18 @@ actor ServerNetworkManager {
                 connectionID: connectionID,
                 lifecycleGeneration: admissionLifecycleGeneration,
                 reason: "reservation invalidated during preparation"
+            )
+            return
+        }
+        // From here through publication there is no suspension, so this captured-generation
+        // fence holds at the exact commit: a revoked, superseded or re-granted companion
+        // admission is abandoned (descriptor closed) and never publishes as an ordinary client.
+        guard isCompanionCommitAdmissible(connectionID: connectionID, expected: companionAdmission) else {
+            await preparedConnection.stop()
+            await abandonPendingBootstrapCommit(
+                connectionID: connectionID,
+                lifecycleGeneration: admissionLifecycleGeneration,
+                reason: "companion role revoked before commit"
             )
             return
         }
@@ -5507,6 +5917,7 @@ actor ServerNetworkManager {
             connectionID: connectionID,
             lifecycleGeneration: lifecycleGeneration
         )
+        discardUnregisteredCompanionAdmission(connectionID: connectionID)
         await reservation?.committingConnection?.stop()
         connectionLog("Abandoned pending bootstrap commit \(connectionID) (\(reason))")
     }
@@ -5823,6 +6234,16 @@ actor ServerNetworkManager {
                     let approved = await approvalHandler(connectionID, clientInfo)
                     guard self.isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else { return false }
                     connectionLog("Approval handler returned \(approved) for \(connectionID)")
+                    if approved, self.companionRoleByConnectionID[connectionID] != nil {
+                        // Read-only companion: no policy wait, pending-policy consumption,
+                        // run route, live affinity or connection-waiter notification.
+                        let attached = await self.attachCompanionAtInitialize(connectionID: connectionID)
+                        guard self.isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else { return false }
+                        if !attached {
+                            self.pendingConnections.removeValue(forKey: connectionID)
+                        }
+                        return attached
+                    }
                     if approved {
                         #if DEBUG
                             let diagnosticPolicy = self.oldestPendingPolicyEntry(for: clientInfo.name) { policy in
@@ -6098,6 +6519,14 @@ actor ServerNetworkManager {
         for (connectionID, _) in connectionsToStop {
             terminalRecordClaimsByConnectionID.removeValue(forKey: connectionID)
         }
+        // Companion roles (live or revoked tombstones) left without a connection, task or
+        // reservation by the invalidation above: with this lifecycle's reservations and fds gone
+        // and its generation retired, none can commit or initialize. They are removed only after
+        // the drain below, mirroring `removeConnection`'s final role removal. Session-token pins
+        // stay grant-scoped (cleared with the grant), as in `removeConnection`.
+        let stoppedCompanionRoleIDs = companionRoleByConnectionID.keys.filter { id in
+            connections[id] == nil && connectionTasks[id] == nil && bootstrapReservations[id] == nil
+        }
 
         for (_, limiters) in limitersToStop {
             await limiters.cancelAll()
@@ -6144,6 +6573,13 @@ actor ServerNetworkManager {
                     )
                 }
             }
+        }
+        // Captured IDs are fresh per admission, so a replacement lifecycle's roles are never
+        // touched; re-check that each still has no connection, task or reservation.
+        for id in stoppedCompanionRoleIDs
+            where connections[id] == nil && connectionTasks[id] == nil && bootstrapReservations[id] == nil
+        {
+            companionRoleByConnectionID.removeValue(forKey: id)
         }
         emitDashboardUpdate()
     }
@@ -6989,6 +7425,9 @@ actor ServerNetworkManager {
         connections.removeValue(forKey: id)
         connectionLifecycleGenerationByID.removeValue(forKey: id)
         bootstrapPeerPIDByConnectionID.removeValue(forKey: id)
+        // The session-token pin outlives the connection (until the grant ends) so a reconnect
+        // keeps its companion role; the per-connection role does not.
+        companionRoleByConnectionID.removeValue(forKey: id)
         #if DEBUG
             debugHelperPeerIdentityByConnectionID.removeValue(forKey: id)
             debugLiveRunMappedOMPIdentityConnections.remove(id)
@@ -8022,6 +8461,13 @@ actor ServerNetworkManager {
                 )
             }
         #endif
+        // A companion that attached before this run's policy (either arrival order) derives its
+        // tools from the reseeded run state; tell it the list changed. This is the only suspension
+        // and runs after the seed and the primary's pending-policy enqueue, which stay one
+        // synchronous step, so a stalled companion write never delays the primary's policy.
+        if let runID {
+            await notifyCompanionToolListChanged(runID: runID)
+        }
     }
 
     @discardableResult
@@ -9836,6 +10282,97 @@ actor ServerNetworkManager {
                 return decision == .invalid ? nil : decision.principal
             }
 
+            /// The production companion admission decision, without side effects.
+            func debugCompanionAdmissionDecisionForTesting(
+                sessionToken: String,
+                companionCredential: String?,
+                gatewayCredential: String? = nil,
+                observedPeerPID: Int?
+            ) -> CompanionAdmissionDecision {
+                companionAdmissionDecision(
+                    sessionToken: sessionToken,
+                    companionCredential: companionCredential,
+                    gatewayCredential: gatewayCredential,
+                    observedPeerPID: observedPeerPID
+                )
+            }
+
+            /// Socket fixtures bypass the bootstrap listener: run the production decision and, when
+            /// it admits a companion, record the role exactly as bootstrap admission does.
+            func debugAdmitCompanionForSocketFixture(
+                connectionID: UUID,
+                sessionToken: String,
+                companionCredential: String?,
+                observedPeerPID: Int?
+            ) -> CompanionAdmissionDecision {
+                let decision = companionAdmissionDecision(
+                    sessionToken: sessionToken,
+                    companionCredential: companionCredential,
+                    gatewayCredential: nil,
+                    observedPeerPID: observedPeerPID
+                )
+                if case let .companion(runID, generation) = decision {
+                    _ = recordAdmittedCompanion(
+                        connectionID: connectionID,
+                        sessionToken: sessionToken,
+                        runID: runID,
+                        grantGeneration: generation
+                    )
+                }
+                return decision
+            }
+
+            /// The production initialize-time companion attach.
+            func debugAttachCompanionAtInitialize(connectionID: UUID) async -> Bool {
+                await attachCompanionAtInitialize(connectionID: connectionID)
+            }
+
+            /// Runs the production bootstrap admission (`handleBootstrapConnection`) against the
+            /// current listener, as the listener would after a handshake, and returns its admission
+            /// so a test controls when the accepted fd is published and the deferred commit runs.
+            func debugHandleBootstrapAdmissionThroughCurrentListenerForTesting(
+                clientFD: Int32,
+                sessionToken: String,
+                clientPid: Int,
+                clientName: String?,
+                companionCredential: String?,
+                observedPeerPID: Int?
+            ) async -> BootstrapSocketServer.Admission? {
+                guard let server = bootstrapSocketServer,
+                      let generation = bootstrapSocketServerLifecycleGeneration
+                else { return nil }
+                return await handleBootstrapConnection(
+                    sourceListener: server,
+                    lifecycleGeneration: generation,
+                    clientFD: clientFD,
+                    sessionToken: sessionToken,
+                    clientPid: clientPid,
+                    clientName: clientName,
+                    gatewayCredential: nil,
+                    companionCredential: companionCredential,
+                    observedPeerPID: observedPeerPID
+                )
+            }
+
+            /// Companion roles of one run: connection → revoked tombstone flag.
+            func debugCompanionRoles(runID: UUID) -> [UUID: Bool] {
+                companionRoleByConnectionID.reduce(into: [:]) { result, entry in
+                    if entry.value.runID == runID { result[entry.key] = entry.value.isRevoked }
+                }
+            }
+
+            func debugHasCompanionGrant(runID: UUID) -> Bool {
+                companionGrantByRunID[runID] != nil
+            }
+
+            func debugIsCompanionSessionTokenPinned(_ sessionToken: String) -> Bool {
+                companionRunIDBySessionToken[sessionToken] != nil
+            }
+
+            func debugCachedRunIDByConnection(_ connectionID: UUID) -> UUID? {
+                runIDByConnectionID[connectionID]
+            }
+
             func debugInstallIdentityContextForTesting(
                 connectionID: UUID,
                 clientName: String?,
@@ -10558,6 +11095,7 @@ actor ServerNetworkManager {
         connectionID: UUID,
         reason: String
     ) async -> Bool {
+        guard companionRoleByConnectionID[connectionID] == nil else { return false }
         let existingRestricted = restrictedToolsByConnection[connectionID] ?? []
         let existingAdditional = additionalToolsByConnection[connectionID] ?? []
         let existingPurpose = runPurposeByConnection[connectionID] ?? .unknown
@@ -11497,6 +12035,9 @@ actor ServerNetworkManager {
         runID: UUID,
         windowID: Int
     ) async -> Bool {
+        // A read-only companion never takes the run's tab binding: its reads resolve through the
+        // primary's context, and binding it would make the next primary "replace" (terminate) it.
+        guard companionRoleByConnectionID[connectionID] == nil else { return false }
         guard
             let cached = runPolicyStateByRunID[runID],
             let tabID = cached.tabID
@@ -11647,6 +12188,7 @@ actor ServerNetworkManager {
 
             connectionLog("Handling ListTools request for \(connectionID)")
             let clientIdentifier = await clientIdentifier(forConnection: connectionID)
+            await refreshCompanionWindowMapping(connectionID)
 
             // Safety net: ensure tool catalog is ready before returning list.
             // The primary readiness wait happens during handshake, but this catches edge cases.
@@ -11886,6 +12428,22 @@ actor ServerNetworkManager {
                     result: CallTool.Result.err(message)
                 )
             }
+            // A read-only companion runs only its derived exploration set, and nothing while parked.
+            if let companionDenial = await companionToolCallDenial(
+                connectionID: connectionID,
+                canonicalToolName: toolName
+            ) {
+                return await denyToolCall(
+                    connectionID: connectionID,
+                    invocationID: prePolicyInvocationID,
+                    toolName: toolName,
+                    args: params.arguments,
+                    code: companionDenial.code,
+                    message: companionDenial.message,
+                    result: CallTool.Result.err(companionDenial.message)
+                )
+            }
+            await refreshCompanionWindowMapping(connectionID)
             if let denialMessage = Self.positiveToolCeilingDenialMessage(
                 forCanonicalToolName: toolName,
                 allowedToolsOverride: earlyPolicy.allowedToolsOverride
@@ -12088,14 +12646,24 @@ actor ServerNetworkManager {
             // bound context, so a parent override is rejected before any route is resolved or
             // rebound rather than letting the script read a different window than its children.
             let isCodeModeParent = !invocationOrigin.isCodeModeChild && toolName == MCPWindowToolName.codeMode
-            if invocationOrigin.isCodeModeChild || isCodeModeParent,
+            // A companion is pinned to its run: its direct reads (and its code_mode) may not be
+            // routed either, so a companion call can never reach another window or tab.
+            let companionRunIDForCall = invocationOrigin.isCodeModeChild
+                ? nil
+                : await companionRunID(for: connectionID)
+            let isCompanionDirectCall = companionRunIDForCall != nil
+            if invocationOrigin.isCodeModeChild || isCodeModeParent || isCompanionDirectCall,
                extractedTabID != nil || extractedWindowID != nil || extractedContextID != nil
                || !normalized.encounteredRoutingKeys.isEmpty
                || !MCPCodeModeChildIngress.forbiddenRoutingArgumentKeys.isDisjoint(with: cleanedArguments.keys)
             {
-                let denial = isCodeModeParent
-                    ? MCPCodeModeChildIngress.parentRoutingOverrideDenial
-                    : MCPCodeModeChildIngress.routingOverrideDenial
+                let denial = if isCompanionDirectCall {
+                    Self.companionRoutingOverrideDenial
+                } else if isCodeModeParent {
+                    MCPCodeModeChildIngress.parentRoutingOverrideDenial
+                } else {
+                    MCPCodeModeChildIngress.routingOverrideDenial
+                }
                 return await denyToolCall(
                     connectionID: connectionID,
                     invocationID: invocationID,
@@ -14263,6 +14831,9 @@ actor ServerNetworkManager {
     /// Only persists routing/window affinity for token-backed clients; token-less clients are skipped
     /// to avoid incorrectly merging distinct client instances.
     private func updateRoutingRecordForConnection(_ connectionID: UUID, clientID: String) async {
+        // A companion shares its client name with the primary; it never writes live affinity or
+        // persisted routing that the primary (or a later client) could inherit.
+        guard companionRoleByConnectionID[connectionID] == nil else { return }
         guard let manager = connections[connectionID] else { return }
 
         let capability = manager.capabilityToken ?? capabilityTokenByConnection[connectionID]

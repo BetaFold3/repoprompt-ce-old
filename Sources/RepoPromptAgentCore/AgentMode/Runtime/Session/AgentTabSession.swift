@@ -893,6 +893,9 @@ package final class AgentTabSession: ObservableObject {
         var computerUseEnabled: Bool
         var goalSupportEnabled: Bool
         var reasoningSummariesEnabled: Bool
+        /// Whether the controller launched the read-only companion (plan §6 D3 Codex row). A
+        /// changed preference reconnects on the next send and resumes the same thread.
+        var readOnlyCompanionEnabled: Bool = false
     }
 
     package var pendingCodexComputerUseActivation: AgentCodexComputerUseActivation?

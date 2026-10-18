@@ -984,7 +984,12 @@ actor BootstrapSocketProxy {
             sessionToken: sessionToken,
             clientPid: Int(getpid()),
             clientName: clientName ?? ProcessInfo.processInfo.processName,
-            protocolVersion: kBootstrapProtocolVersion
+            protocolVersion: kBootstrapProtocolVersion,
+            // Re-sent on every (re)connect so the app can keep this session token pinned to its
+            // companion role; the value is never logged.
+            companionCredential: MCPBootstrapCompanionCredential.credential(
+                from: ProcessInfo.processInfo.environment
+            )
         )
 
         guard let jsonData = try? JSONEncoder().encode(request) else {

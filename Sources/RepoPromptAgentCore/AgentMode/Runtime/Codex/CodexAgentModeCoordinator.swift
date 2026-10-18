@@ -377,6 +377,9 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
     private let computerUseEnabled: @MainActor () -> Bool
     private let goalSupportEnabled: @MainActor () -> Bool
     private let reasoningSummariesEnabled: @MainActor () -> Bool
+    /// The Codex RepoPrompt-tools preference (plan §6 D3 Codex row); the controller factory
+    /// captures the same preference at creation.
+    private let readOnlyCompanionEnabled: @MainActor () -> Bool
     private let showBuiltInWorkflowCleanupGuidance: @MainActor () -> Bool
     private let globalCodeMapsDisabled: @MainActor () -> Bool
     private let codexModelPollingService: @MainActor () -> CodexModelPollingService
@@ -392,6 +395,7 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
         computerUseEnabled: @escaping @MainActor () -> Bool,
         goalSupportEnabled: @escaping @MainActor () -> Bool,
         reasoningSummariesEnabled: @escaping @MainActor () -> Bool,
+        readOnlyCompanionEnabled: @escaping @MainActor () -> Bool = { false },
         showBuiltInWorkflowCleanupGuidance: @escaping @MainActor () -> Bool,
         globalCodeMapsDisabled: @escaping @MainActor () -> Bool,
         codexModelPollingService: @escaping @MainActor () -> CodexModelPollingService,
@@ -419,6 +423,7 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
         self.computerUseEnabled = computerUseEnabled
         self.goalSupportEnabled = goalSupportEnabled
         self.reasoningSummariesEnabled = reasoningSummariesEnabled
+        self.readOnlyCompanionEnabled = readOnlyCompanionEnabled
         self.showBuiltInWorkflowCleanupGuidance = showBuiltInWorkflowCleanupGuidance
         self.globalCodeMapsDisabled = globalCodeMapsDisabled
         self.codexModelPollingService = codexModelPollingService
@@ -3370,7 +3375,8 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
         taskLabelKind: AgentModelCatalog.TaskLabelKind? = nil,
         allowsAgentExternalControlTools: Bool = false,
         additionalRestrictedTools: Set<String> = [],
-        runHasNativeShell: Bool = false
+        runHasNativeShell: Bool = false,
+        codeModeEligibility: MCPCodeModeEligibility = .native
     ) -> MCPBootstrapLease? {
         guard shouldManageCodexTooling else { return nil }
         viewModel?.bindPendingOracleReviewContext(tabID: tabID, runID: runID)
@@ -3384,7 +3390,8 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
             taskLabelKind: taskLabelKind,
             allowsAgentExternalControlTools: allowsAgentExternalControlTools,
             additionalRestrictedTools: additionalRestrictedTools,
-            runHasNativeShell: runHasNativeShell
+            runHasNativeShell: runHasNativeShell,
+            codeModeEligibility: codeModeEligibility
         )
         return MCPBootstrapLease(
             spec: leaseSpec,
@@ -3394,6 +3401,20 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
             },
             policyInstaller: MCPBootstrapLease.agentModePolicyInstaller(connectionPolicyInstaller)
         )
+    }
+
+    /// The read-only companion runs only for Standard-profile, non-MCP-safe sessions; Knowledge
+    /// and MCP-safe sessions stay native. The controller factory applies the same gate.
+    package static func codexReadOnlyCompanionAllowed(
+        sessionProfile: AgentSessionProfile,
+        permissionProfile: AgentProviderPermissionProfile
+    ) -> Bool {
+        sessionProfile == .standard && permissionProfile != .mcpSafeDefaults
+    }
+
+    static func codexCodeModeEligibility(companionServerName: String?) -> MCPCodeModeEligibility {
+        guard let companionServerName else { return .native }
+        return .codexReadOnlyCompanion(serverName: companionServerName)
     }
 
     private static func resumeRecoveryMessage() -> String {
@@ -4020,6 +4041,9 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
         if previous.reasoningSummariesEnabled != desired.reasoningSummariesEnabled {
             return desired.reasoningSummariesEnabled ? "reasoning-summaries-enabled" : "reasoning-summaries-disabled"
         }
+        if previous.readOnlyCompanionEnabled != desired.readOnlyCompanionEnabled {
+            return desired.readOnlyCompanionEnabled ? "read-only-companion-enabled" : "read-only-companion-disabled"
+        }
         return "feature-state-unknown"
     }
 
@@ -4232,7 +4256,12 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
         let desiredFeatureState = AgentTabSession.CodexControllerFeatureState(
             computerUseEnabled: wantsComputerUse,
             goalSupportEnabled: wantsGoalSupport,
-            reasoningSummariesEnabled: wantsReasoningSummaries
+            reasoningSummariesEnabled: wantsReasoningSummaries,
+            readOnlyCompanionEnabled: Self.codexReadOnlyCompanionAllowed(
+                sessionProfile: session.profile,
+                permissionProfile: session.permissionProfile
+            )
+                && readOnlyCompanionEnabled()
         )
         if let existingController = session.codexController,
            session.codexControllerFeatureState != desiredFeatureState
@@ -4307,7 +4336,11 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
                 session.codexControllerSessionProfile = session.profile
                 session.codexControllerTaskLabelKind = currentTaskLabelKind
                 session.codexControllerWorkspacePath = runtimeWorkspacePath
-                session.codexControllerFeatureState = desiredFeatureState
+                // Record what the controller actually launches, so a preference read that raced
+                // the factory still reconnects on the next send instead of drifting.
+                var launchedFeatureState = desiredFeatureState
+                launchedFeatureState.readOnlyCompanionEnabled = controller.readOnlyCompanionServerName != nil
+                session.codexControllerFeatureState = launchedFeatureState
             }
             guard let controller = session.codexController else { return nil }
             session.beginCodexUsageExecutionIfNeeded()
@@ -4444,7 +4477,12 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
                 // The controller prepared above captured its shell-tool launch value; the
                 // policy installs at this transport start, so both describe the same process.
                 runHasNativeShell: session.profile == .standard
-                    && (session.codexController?.runHasNativeShell ?? false)
+                    && (session.codexController?.runHasNativeShell ?? false),
+                // Same controller, same transport start: the companion eligibility describes the
+                // companion entry this launch carries (Knowledge normalizes to native).
+                codeModeEligibility: Self.codexCodeModeEligibility(
+                    companionServerName: session.codexController?.readOnlyCompanionServerName
+                )
             ) else { return }
             let acquired = await lease.acquire()
             guard acquired else { return }

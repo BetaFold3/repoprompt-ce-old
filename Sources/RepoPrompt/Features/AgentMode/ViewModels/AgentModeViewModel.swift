@@ -2292,6 +2292,15 @@ final class AgentModeViewModel: ObservableObject {
         let codexControllerFactory: CodexAgentModeCoordinator.CodexControllerFactory = { runID, tabID, windowID, workspacePath, permissionProfile, sessionProfile, _, computerUseEnabled in
             let client = CodexAppServerClient(mcpHost: ServerNetworkManager.shared)
             let isKnowledge = sessionProfile == .knowledge
+            // Captured once per controller; the coordinator reconnects (and resumes the thread)
+            // when the preference no longer matches what this controller launched.
+            let readOnlyCompanion: CodexNativeSessionController.ReadOnlyCompanionLaunch? =
+                CodexAgentModeCoordinator.codexReadOnlyCompanionAllowed(
+                    sessionProfile: sessionProfile,
+                    permissionProfile: permissionProfile
+                ) && GlobalSettingsStore.shared.codexRepoPromptToolsMode() == .directCodeMode
+                ? .init(mcpHost: ServerNetworkManager.shared)
+                : nil
             let options = CodexNativeSessionController.Options.agentModeDefault(
                 forceExperimentalSteering: true,
                 approvalPolicyProvider: { permissionProfile.codexApprovalPolicy },
@@ -2305,7 +2314,8 @@ final class AgentModeViewModel: ObservableObject {
                     isKnowledge || permissionProfile == .mcpSafeDefaults
                         ? false
                         : computerUseEnabled
-                }
+                },
+                readOnlyCompanion: readOnlyCompanion
             )
             return CodexNativeSessionController(
                 client: client,
@@ -2372,6 +2382,7 @@ final class AgentModeViewModel: ObservableObject {
             computerUseEnabled: { CodexComputerUseWorkflow.isEnabled },
             goalSupportEnabled: { CodexGoalSupport.isEnabled },
             reasoningSummariesEnabled: { CodexReasoningSummaries.isEnabled },
+            readOnlyCompanionEnabled: { GlobalSettingsStore.shared.codexRepoPromptToolsMode() == .directCodeMode },
             showBuiltInWorkflowCleanupGuidance: { GlobalSettingsStore.shared.showBuiltInWorkflowCleanupGuidance() },
             globalCodeMapsDisabled: { GlobalSettingsStore.shared.globalCodeMapsDisabled() },
             codexModelPollingService: { CodexModelPollingService.shared },
@@ -2512,6 +2523,7 @@ final class AgentModeViewModel: ObservableObject {
             testCodexStallWatchdogInactivityThreshold: TimeInterval? = nil,
             testCodexTransportClosedRecoveryGraceInterval: TimeInterval? = nil,
             testCodexAuthRecovery: (any CodexManagedAuthRecovering)? = nil,
+            testCodexReadOnlyCompanionEnabled: (@MainActor () -> Bool)? = nil,
             testUsesProductionAgentDefaultsAndModelPolling: Bool = false,
             remoteHostRegistry: RemoteHostRegistry = .shared,
             remoteHostCatalog: RemoteHostCatalog = .shared,
@@ -2576,6 +2588,7 @@ final class AgentModeViewModel: ObservableObject {
                 computerUseEnabled: { CodexComputerUseWorkflow.isEnabled },
                 goalSupportEnabled: { CodexGoalSupport.isEnabled },
                 reasoningSummariesEnabled: { CodexReasoningSummaries.isEnabled },
+                readOnlyCompanionEnabled: testCodexReadOnlyCompanionEnabled ?? { false },
                 showBuiltInWorkflowCleanupGuidance: { GlobalSettingsStore.shared.showBuiltInWorkflowCleanupGuidance() },
                 globalCodeMapsDisabled: { GlobalSettingsStore.shared.globalCodeMapsDisabled() },
                 codexModelPollingService: { CodexModelPollingService.shared },

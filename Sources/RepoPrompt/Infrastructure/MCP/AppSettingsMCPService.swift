@@ -970,6 +970,21 @@ private enum AppSettingsMCPRegistry {
                 store.setClaudeRepoPromptToolsMode(mode)
             }
         ),
+        stringEnumSetting(
+            key: "agent_mode.codex_repoprompt_tools",
+            group: "agent_mode",
+            label: "Codex RepoPrompt Tools",
+            description: "How RepoPrompt tools are offered to Codex Agent Mode runs. 'native' (default) keeps the single RepoPrompt server with no added config; 'direct_code_mode' also launches a read-only companion server (RepoPromptCE-Direct) offering read_file, file_search, get_code_structure, get_file_tree and code_mode on Standard-profile runs. Experimental: live compatibility of the direct-only tool namespace with the installed Codex runtime is unverified; a Codex build that ignores it may run the companion's tools inside its own code mode, at higher cost. Knowledge and MCP-safe sessions stay native. A change applies from the next send, which reconnects and resumes the same thread.",
+            allowedValues: RepoPromptToolsMode.allCases.map(\.rawValue),
+            read: { .string($0.codexRepoPromptToolsMode().rawValue) },
+            write: { store, value in
+                let raw = try requiredString(from: value)
+                guard let mode = RepoPromptToolsMode(rawValue: raw) else {
+                    throw MCPError.invalidParams("Invalid value for 'agent_mode.codex_repoprompt_tools'.")
+                }
+                store.setCodexRepoPromptToolsMode(mode)
+            }
+        ),
 
         // File-system / ignore preferences. Local .repo_ignore file content remains
         // repository content; this group exposes app-wide scalar behavior only.

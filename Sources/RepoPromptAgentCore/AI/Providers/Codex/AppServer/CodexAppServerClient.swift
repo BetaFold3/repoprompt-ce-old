@@ -3,6 +3,7 @@ import Darwin.POSIX.fcntl
 import Foundation
 import OSLog
 import RepoPromptPlatform
+import RepoPromptShared
 
 package enum CodexJSONValue: Equatable {
     case string(String)
@@ -1655,7 +1656,13 @@ package actor CodexAppServerClient {
         let data = try JSONSerialization.data(withJSONObject: payload, options: [])
         if config.enableDebugLogging {
             if let line = String(data: data, encoding: .utf8) {
-                print("[CodexAppServer] -> \(line)")
+                // A thread start/resume config can carry the read-only companion's launch
+                // credential in its server environment; never print that frame.
+                if line.contains(MCPBootstrapCompanionCredential.environmentKey) {
+                    print("[CodexAppServer] -> \(method ?? "<response>") (frame redacted: companion credential)")
+                } else {
+                    print("[CodexAppServer] -> \(line)")
+                }
             }
         }
         guard let stdinDescriptor = process.stdinDescriptor else {

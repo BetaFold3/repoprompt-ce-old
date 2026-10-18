@@ -171,6 +171,38 @@ enum CodexOverrides {
         return overrides
     }
 
+    /// Adds the read-only companion server (plan §6 D3 Codex row) to one thread start/resume
+    /// config: the bundled RepoPrompt MCP client under `serverName`, enabled, with the launch's
+    /// companion credential only in that server's environment. Any key the MCP enablement policy
+    /// already wrote for the same server is replaced, so suppression of third-party servers never
+    /// disables (or duplicates) the companion. A nil credential or empty name leaves the map as is.
+    static func mergingReadOnlyCompanionServer(
+        into overrides: [String: Any],
+        serverName: String,
+        server: RepoPromptMCPServerConfiguration,
+        credentialEnvironmentKey: String,
+        credential: String?
+    ) -> [String: Any] {
+        guard !serverName.isEmpty, let credential, !credential.isEmpty else { return overrides }
+        let component = MCPIntegrationHelper.codexCLIPathComponent(forNormalizedServerName: serverName)
+        let prefix = "mcp_servers.\(component)"
+        var merged = overrides.filter { key, _ in key != prefix && !key.hasPrefix(prefix + ".") }
+        var environment = server.environmentDictionary
+        environment[credentialEnvironmentKey] = credential
+        // Same per-server tool timeout and parallelism as the primary's config.toml entry, so Codex
+        // never cuts a companion `code_mode` call off at its own default before the executor's
+        // wall budget settles it.
+        merged[prefix] = [
+            "command": server.command,
+            "args": server.args,
+            "env": environment,
+            "enabled": true,
+            "tool_timeout_sec": CodexIntegrationConfiguration.desiredToolTimeoutSeconds,
+            "supports_parallel_tool_calls": CodexIntegrationConfiguration.desiredSupportsParallelToolCalls
+        ] as [String: Any]
+        return merged
+    }
+
     static func cliMCPServerArgs(
         entries: [MCPIntegrationHelper.CodexServerEntry],
         policy: MCPPolicy

@@ -219,10 +219,19 @@ actor BootstrapSocketServer {
         }
     }
 
+    /// Launch credentials and kernel-observed provenance carried by one handshake.
+    struct HandshakeCredentials {
+        let gatewayCredential: String?
+        let companionCredential: String?
+        /// `LOCAL_PEERPID` of the socket peer, or nil when the kernel could not report it.
+        /// Unlike the effective client pid this never falls back to the self-reported value.
+        let observedPeerPID: Int?
+    }
+
     /// Callback when a new CLI connects and completes handshake.
-    /// Parameters: (clientFD, sessionToken, clientPid, clientName, gatewayCredential)
+    /// Parameters: (clientFD, sessionToken, clientPid, clientName, credentials)
     /// Returns: Admission decision with optional postAccept hook for MCP startup
-    private var onNewConnection: ((Int32, String, Int, String?, String?) async -> Admission)?
+    private var onNewConnection: ((Int32, String, Int, String?, HandshakeCredentials) async -> Admission)?
 
     init(socketURL: URL = MCPFilesystemConstants.bootstrapSocketURL(), logger: Logger? = nil) {
         self.socketURL = socketURL
@@ -243,7 +252,7 @@ actor BootstrapSocketServer {
     /// - Parameter onNewConnection: Callback invoked for each new CLI connection.
     ///   Return an Admission with postAccept closure for MCP startup.
     func start(onNewConnection: @escaping (Int32, String, Int, String?) async -> Admission) throws {
-        try start { clientFD, sessionToken, clientPid, clientName, _ in
+        try start { (clientFD: Int32, sessionToken: String, clientPid: Int, clientName: String?, _: HandshakeCredentials) in
             await onNewConnection(clientFD, sessionToken, clientPid, clientName)
         }
     }
@@ -251,6 +260,16 @@ actor BootstrapSocketServer {
     /// Starts listening on the bootstrap socket and passes the optional gateway credential
     /// from the local handshake to the admission layer.
     func start(onNewConnection: @escaping (Int32, String, Int, String?, String?) async -> Admission) throws {
+        try start { (clientFD: Int32, sessionToken: String, clientPid: Int, clientName: String?, credentials: HandshakeCredentials) in
+            await onNewConnection(clientFD, sessionToken, clientPid, clientName, credentials.gatewayCredential)
+        }
+    }
+
+    /// Starts listening on the bootstrap socket and passes every handshake credential plus the
+    /// kernel-observed peer pid to the admission layer.
+    func start(
+        onNewConnection: @escaping (Int32, String, Int, String?, HandshakeCredentials) async -> Admission
+    ) throws {
         #if DEBUG
             print("[MCPStartup] BootstrapSocketServer.start entered socket=\(socketURL.path)")
         #endif
@@ -805,7 +824,17 @@ actor BootstrapSocketServer {
             EditFlowPerf.Stage.Bootstrap.admission,
             EditFlowPerf.Dimensions(activeCount: inFlightHandshakeSockets.count)
         )
-        let admission = await handler(clientFD, request.sessionToken, effectivePid, request.clientName, request.gatewayCredential)
+        let admission = await handler(
+            clientFD,
+            request.sessionToken,
+            effectivePid,
+            request.clientName,
+            HandshakeCredentials(
+                gatewayCredential: request.gatewayCredential,
+                companionCredential: request.companionCredential,
+                observedPeerPID: peerPid
+            )
+        )
         EditFlowPerf.end(
             EditFlowPerf.Stage.Bootstrap.admission,
             admissionState,

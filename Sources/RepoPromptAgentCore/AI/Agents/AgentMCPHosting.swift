@@ -56,7 +56,23 @@ package protocol AgentMCPHosting: Sendable {
 
     func unregisterToolObservers(for runID: UUID) async
 
+    /// Registers or replaces the read-only companion grant for one run's current transport launch.
+    /// Only the credential digest crosses this boundary. Replacing a grant revokes the previous
+    /// launch's companion connection.
+    func registerCompanionGrant(runID: UUID, credentialDigest: String) async
+
+    /// Clears the run's companion grant when it still carries `credentialDigest` (nil clears any
+    /// grant) and disconnects its companion connection.
+    func clearCompanionGrant(runID: UUID, credentialDigest: String?) async
+
     #if DEBUG
         func debugRecordRunRoutingEvent(runID: UUID, event: String, connectionID: UUID?, fields: [String: String]) async
     #endif
+}
+
+package extension AgentMCPHosting {
+    /// Hosts without companion support never admit one: with no grant every companion fails closed.
+    func registerCompanionGrant(runID _: UUID, credentialDigest _: String) async {}
+
+    func clearCompanionGrant(runID _: UUID, credentialDigest _: String?) async {}
 }

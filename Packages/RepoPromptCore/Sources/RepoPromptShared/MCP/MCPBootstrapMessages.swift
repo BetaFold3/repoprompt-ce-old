@@ -6,6 +6,7 @@
 //  Used by the app bootstrap server and bootstrap MCP clients.
 //
 
+import CryptoKit
 import Foundation
 
 // MARK: - Protocol Version
@@ -53,12 +54,19 @@ public struct MCPBootstrapRequest: Codable, Sendable {
     /// passed through command-line arguments.
     public let gatewayCredential: String?
 
+    /// Optional launch-generation credential proving this bootstrap client is the read-only
+    /// companion server an app-owned agent transport was configured with. Like
+    /// `gatewayCredential`, it travels only inside the local UNIX-socket handshake; the app
+    /// keeps a digest, never the raw value, and the client never logs it.
+    public let companionCredential: String?
+
     public init(
         sessionToken: String,
         clientPid: Int,
         clientName: String?,
         protocolVersion: Int = MCPBootstrapProtocol.currentVersion,
-        gatewayCredential: String? = nil
+        gatewayCredential: String? = nil,
+        companionCredential: String? = nil
     ) {
         type = "connect"
         self.sessionToken = sessionToken
@@ -66,6 +74,39 @@ public struct MCPBootstrapRequest: Codable, Sendable {
         self.clientName = clientName
         self.protocolVersion = protocolVersion
         self.gatewayCredential = gatewayCredential
+        self.companionCredential = companionCredential
+    }
+}
+
+// MARK: - Companion Credential Transport
+
+/// Environment handoff for the read-only companion credential. The app places the credential
+/// only in the companion server's launch environment; the bundled MCP client reads it once and
+/// forwards it inside the bootstrap handshake.
+public enum MCPBootstrapCompanionCredential {
+    public static let environmentKey = "REPOPROMPT_MCP_COMPANION_CREDENTIAL"
+
+    /// Returns the trimmed, non-empty credential from `environment`, or nil.
+    public static func credential(from environment: [String: String]) -> String? {
+        guard let raw = environment[environmentKey] else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    /// Mints one launch-generation credential: 32 bytes from CryptoKit's secure key generator
+    /// (already a `RepoPromptShared` dependency on its macOS-only platform), base64url, unpadded.
+    public static func mint() -> String {
+        let key = SymmetricKey(size: .bits256)
+        return key.withUnsafeBytes { Data($0) }.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+
+    /// Lowercase hex SHA-256 of the trimmed credential. The app stores and compares only this.
+    public static func digest(of credential: String) -> String {
+        let trimmed = credential.trimmingCharacters(in: .whitespacesAndNewlines)
+        return SHA256.hash(data: Data(trimmed.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 }
 

@@ -295,6 +295,7 @@ package enum CodexAgentToolPreferences {
     private static let sandboxModeKey = "codexAgentTools.bash.sandboxMode"
     private static let approvalReviewerKey = "codexAgentTools.approvalsReviewer"
     private static let mcpServerTogglesKey = "codexAgentTools.mcpServerToggles"
+    private static let repoPromptToolsModeKey = "codexAgentTools.repoPromptToolsMode"
     private static let lastUsedReasoningEffortKey = "codexAgent.reasoning.lastUsedEffort"
     private static let legacyLastUsedReasoningEffortKey = "agentMode.codex.lastUsedReasoningEffort"
     private static let lastUsedReasoningEffortByModelSlugKey = "codexAgent.reasoning.lastUsedEffortByModelSlug"
@@ -352,6 +353,20 @@ package enum CodexAgentToolPreferences {
 
     package static func setSearchToolEnabled(_ isEnabled: Bool, defaults: UserDefaults = .standard) {
         defaults.set(isEnabled, forKey: searchToolEnabledKey)
+    }
+
+    // MARK: - RepoPrompt tools mode
+
+    /// How RepoPrompt tools are offered to Codex Agent Mode runs (plan §6 D3 Codex row).
+    /// Defaults to `.native` (the primary server only, no added config); `.directCodeMode` also
+    /// launches the read-only companion. Captured per controller; a missing or unknown value is
+    /// `.native`.
+    package static func repoPromptToolsMode(defaults: UserDefaults = .standard) -> RepoPromptToolsMode {
+        defaults.string(forKey: repoPromptToolsModeKey).flatMap(RepoPromptToolsMode.init(rawValue:)) ?? .native
+    }
+
+    package static func setRepoPromptToolsMode(_ mode: RepoPromptToolsMode, defaults: UserDefaults = .standard) {
+        defaults.set(mode.rawValue, forKey: repoPromptToolsModeKey)
     }
 
     package static func approvalPolicy(

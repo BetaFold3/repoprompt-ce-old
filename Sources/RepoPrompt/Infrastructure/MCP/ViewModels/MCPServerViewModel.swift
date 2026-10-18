@@ -3529,7 +3529,9 @@ final class MCPServerViewModel: ObservableObject {
 
         // Generate a unique token for this tool execution to prevent cleanup races
         let toolToken = UUID()
-        let capturedConnectionID = metadata.connectionID
+        // A read-only companion resolves context through its run's primary, but executes, is
+        // cancelled, and dispatches `code_mode` children as its own connection.
+        let capturedConnectionID = await currentRequestDispatchConnectionID(contextConnectionID: metadata.connectionID)
         let serverViewModelIdentity = ObjectIdentifier(self)
         let dispatchAuthorization = ServerNetworkManager.currentToolDispatchAuthorization
         if let dispatchAuthorization {

@@ -1502,6 +1502,41 @@ extension MCPServerViewModel {
         }
     }
 
+    /// The connection whose tab context serves the current request. A Codex read-only companion
+    /// reads (and auto-selects) through its run's primary connection in this window, so its
+    /// effects land in the primary's tab; with no live primary mapping it keeps its own ID, which
+    /// has no context and fails closed. Dispatch authorization and the task-local connection stay
+    /// the companion's own.
+    @MainActor
+    func currentRequestContextConnectionID() async -> UUID? {
+        guard let connectionID = await service.currentRequestConnectionID() else { return nil }
+        guard let companionRunID = await ServerNetworkManager.shared.companionRunID(for: connectionID) else {
+            return connectionID
+        }
+        if let primaryConnectionID = connectionIDByRunID[companionRunID],
+           primaryConnectionID != connectionID,
+           tabContextByConnectionID[primaryConnectionID]?.runID == companionRunID
+        {
+            return primaryConnectionID
+        }
+        return connectionID
+    }
+
+    /// The connection that owns the current request's execution (task-local connection, active
+    /// tool and execution registration, `code_mode` child dispatch). For a read-only companion
+    /// this stays its own ID even when `contextConnectionID` aliases its run's primary; every
+    /// other request keeps `contextConnectionID` unchanged.
+    @MainActor
+    func currentRequestDispatchConnectionID(contextConnectionID: UUID?) async -> UUID? {
+        guard let ownConnectionID = await service.currentRequestConnectionID(),
+              ownConnectionID != contextConnectionID,
+              await ServerNetworkManager.shared.companionRunID(for: ownConnectionID) != nil
+        else {
+            return contextConnectionID
+        }
+        return ownConnectionID
+    }
+
     @MainActor
     func captureRequestMetadata() async -> RequestMetadata {
         #if DEBUG
@@ -1509,7 +1544,7 @@ extension MCPServerViewModel {
                 return requestMetadataOverrideForTesting
             }
         #endif
-        let connectionID = await service.currentRequestConnectionID()
+        let connectionID = await currentRequestContextConnectionID()
         let runPurpose: MCPRunPurpose? = if let connectionID {
             await ServerNetworkManager.shared.runPurpose(for: connectionID)
         } else {
@@ -3168,7 +3203,7 @@ extension MCPServerViewModel {
 
     @MainActor
     private func contextForCurrentRequest(toolName: String) async throws -> (UUID, TabContextSnapshot) {
-        guard let connectionID = await service.currentRequestConnectionID() else {
+        guard let connectionID = await currentRequestContextConnectionID() else {
             throw MCPError.invalidParams("No active connection for \(toolName)")
         }
 
