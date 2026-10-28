@@ -267,26 +267,102 @@ final class AgentRecoveryCrashHoldProofTests: XCTestCase {
         XCTAssertEqual(outcome, .resolved(Text.confirmed))
     }
 
-    /// A hold that also covers uncertain input (a send left dispatching) is never confirmed automatically.
-    func testHoldWithUncertainInputIsNotConfirmed() async throws {
+    /// O43 (deliberate contract change from "any uncertain input refuses"): uncertain input whose
+    /// attempt isn't tied to a run attempt (a send left dispatching with no run reference) is never
+    /// settled, so the hold is not confirmed automatically.
+    func testHoldWithUncertainInputNotTiedToTheRunIsNotConfirmed() async throws {
         let earlier = launch()
         let home = try makeWorkspace("home")
         let held = try await heldSession(earlier, in: home)
         try seedRecord(held, state: .exited)
+        let intentID = try await dispatchingIntent(earlier, held, runAttemptID: nil)
+
+        let now = launch()
+        let coordinator = try await startedCoordinator(now, workspaces: [home])
+        let outcome = try await check(coordinator, held)
+
+        XCTAssertEqual(outcome, Text.needsYou(Text.messageNotOnProvenRun))
+        await assertNotConfirmed(coordinator, now, held)
+        let state = await deliveryState(now, held, intentID)
+        XCTAssertEqual(state, .dispatching)
+    }
+
+    /// O43, the Claude shape: an earlier launch's registered run with a message still `dispatching`
+    /// on it (Claude acceptance arrives only with the turn's result). With every process of the run
+    /// proven exited, Check confirms the hold, lifts it, and in the same write settles the message
+    /// to `deliveryUnknown`; its card becomes informational and never offers a resend.
+    func testClaudeShapedHoldWithADispatchingMessageIsConfirmedAndSettled() async throws {
+        let earlier = launch()
+        let home = try makeWorkspace("home")
+        let held = try await heldSession(earlier, in: home)
+        try seedRecord(held, state: .exited)
+        let intentID = try await dispatchingIntent(earlier, held, runAttemptID: held.runAttemptID)
+
+        let now = launch()
+        let coordinator = try await startedCoordinator(now, workspaces: [home])
+        let hold = try XCTUnwrap(coordinator.crashHold(for: held.load.session.id))
+        XCTAssertEqual(hold.uncertainIntentIDs, [intentID])
+        let itemID = "intent-\(held.load.session.id.uuidString)-\(intentID.uuidString)"
+        XCTAssertEqual(coordinator.catalog.item(id: itemID)?.attention, .needsAction, "before the proof it needs a decision")
+
+        let outcome = try await check(coordinator, held)
+
+        XCTAssertEqual(outcome, .resolved(Text.confirmed))
+        XCTAssertNil(coordinator.blockingCrashHold(for: held.binding), "sending is no longer paused")
+        let record = await now.store.read(sessionID: held.load.session.id).record
+        XCTAssertTrue(hold.isCovered(by: record?.crashHoldAcknowledgement))
+        XCTAssertEqual(record?.intent(id: intentID)?.deliveryState, .deliveryUnknown)
+        XCTAssertEqual(record?.intent(id: intentID)?.payload.text, "uncertain send", "the message text is kept")
+        XCTAssertEqual(record?.attempts(forIntent: intentID).map(\.outcome?.outcome), [.deliveryUnknown])
+        let settled = await waitUntil {
+            coordinator.catalog.item(id: itemID)?.actionFacts.settledByExitProof == true
+        }
+        XCTAssertTrue(settled)
+        XCTAssertEqual(coordinator.catalog.item(id: itemID)?.attention, .informational)
+
+        let next = try await startedCoordinator(launch(), workspaces: [home])
+        XCTAssertNil(next.blockingCrashHold(for: held.binding), "the identical hold stays acknowledged")
+        let informationalNextLaunch = await waitUntil { next.catalog.item(id: itemID)?.attention == .informational }
+        XCTAssertTrue(informationalNextLaunch, "the next launch still shows it as a note")
+    }
+
+    /// O43: the same shape with a process of the run still alive is refused; nothing is settled.
+    func testDispatchingMessageOfARunWithALiveProcessIsNotSettled() async throws {
+        let earlier = launch()
+        let home = try makeWorkspace("home")
+        let held = try await heldSession(earlier, in: home)
+        try seedRecord(held, state: .exited)
+        try seedLiveWriter(
+            session: AgentRuntimeSessionAssociation(lifecycle: held.binding, runAttemptID: held.runAttemptID, processRunID: nil),
+            conversationID: Self.conversation,
+            worktreePath: Self.worktree
+        )
+        let intentID = try await dispatchingIntent(earlier, held, runAttemptID: held.runAttemptID)
+
+        let now = launch()
+        let coordinator = try await startedCoordinator(now, workspaces: [home])
+        let outcome = try await check(coordinator, held)
+
+        XCTAssertEqual(outcome, Text.needsYou(Text.mayBeRunning))
+        await assertNotConfirmed(coordinator, now, held)
+        let state = await deliveryState(now, held, intentID)
+        XCTAssertEqual(state, .dispatching)
+    }
+
+    /// O43: a `queued` message of the same session is not part of the hold and stays untouched.
+    func testQueuedMessageBesideTheSettledOneIsUntouched() async throws {
+        let earlier = launch()
+        let home = try makeWorkspace("home")
+        let held = try await heldSession(earlier, in: home)
+        try seedRecord(held, state: .exited)
+        let intentID = try await dispatchingIntent(earlier, held, runAttemptID: held.runAttemptID)
+        let queued = Support.submission("still queued")
         try await transact(earlier, held.load) { store, binding in
-            let submission = Support.submission("uncertain send")
             _ = try await store.commitQueuedIntent(
                 binding: binding,
                 expectedRevision: store.currentRevision(sessionID: binding.sessionID),
-                submission: submission,
+                submission: queued,
                 consumption: nil
-            )
-            _ = try await store.beginDispatch(
-                binding: binding,
-                expectedRevision: store.currentRevision(sessionID: binding.sessionID),
-                intentID: submission.intentID,
-                attempt: AgentRecoveryAttemptStart(attemptID: UUID()),
-                authorization: .liveQueue
             )
         }
 
@@ -294,8 +370,63 @@ final class AgentRecoveryCrashHoldProofTests: XCTestCase {
         let coordinator = try await startedCoordinator(now, workspaces: [home])
         let outcome = try await check(coordinator, held)
 
-        XCTAssertEqual(outcome, Text.needsYou(Text.notOnlyRuns))
-        await assertNotConfirmed(coordinator, now, held)
+        XCTAssertEqual(outcome, .resolved(Text.confirmed))
+        let settledState = await deliveryState(now, held, intentID)
+        XCTAssertEqual(settledState, .deliveryUnknown)
+        let queuedState = await deliveryState(now, held, queued.intentID)
+        XCTAssertEqual(queuedState, .queued)
+        let queuedItem = coordinator.catalog.item(id: "intent-\(held.load.session.id.uuidString)-\(queued.intentID.uuidString)")
+        XCTAssertEqual(queuedItem?.actionFacts.settledByExitProof, false)
+        XCTAssertEqual(queuedItem?.attention, .needsAction)
+    }
+
+    /// O46: "It stopped" goes through the same settle as the proof (one row state).
+    func testItStoppedSettlesTheRunsDispatchingMessageInTheSameWrite() async throws {
+        let earlier = launch()
+        let home = try makeWorkspace("home")
+        let held = try await heldSession(earlier, in: home)
+        let intentID = try await dispatchingIntent(earlier, held, runAttemptID: held.runAttemptID)
+
+        let now = launch()
+        let coordinator = try await startedCoordinator(now, workspaces: [home])
+        let hold = try XCTUnwrap(coordinator.crashHold(for: held.load.session.id))
+        let lane = try await openLane(now, coordinator, held, in: home)
+
+        let confirmed = await coordinator.confirmCrashHold(hold, lane: lane)
+
+        XCTAssertTrue(confirmed)
+        XCTAssertNil(coordinator.blockingCrashHold(for: lane.binding))
+        let record = await now.store.read(sessionID: held.load.session.id).record
+        XCTAssertTrue(hold.isCovered(by: record?.crashHoldAcknowledgement))
+        XCTAssertEqual(record?.intent(id: intentID)?.deliveryState, .deliveryUnknown)
+        XCTAssertEqual(record?.isSettledByCrashHoldExitProof(intentID: intentID), true)
+    }
+
+    /// Review B P2-3: Remove on the settled message narrows the next launch's hold (the run stays
+    /// open evidence, the message is no longer uncertain). The narrower hold is covered by the
+    /// acknowledgement, so sending isn't paused again for the same run.
+    func testRemovingTheSettledMessageKeepsTheNarrowerHoldAcknowledgedOnTheNextLaunch() async throws {
+        let earlier = launch()
+        let home = try makeWorkspace("home")
+        let held = try await heldSession(earlier, in: home)
+        try seedRecord(held, state: .exited)
+        let intentID = try await dispatchingIntent(earlier, held, runAttemptID: held.runAttemptID)
+
+        let now = launch()
+        let coordinator = try await startedCoordinator(now, workspaces: [home])
+        let outcome = try await check(coordinator, held)
+        XCTAssertEqual(outcome, .resolved(Text.confirmed))
+        let lane = try await openLane(now, coordinator, held, in: home)
+        let removed = await lane.withdraw(intentID: intentID)
+        guard case .success = removed else { return XCTFail("Remove failed: \(removed)") }
+        let state = await deliveryState(now, held, intentID)
+        XCTAssertEqual(state, .withdrawn)
+
+        let next = try await startedCoordinator(launch(), workspaces: [home])
+        let hold = try XCTUnwrap(next.crashHold(for: held.load.session.id), "the run is still open evidence")
+        XCTAssertEqual(hold.uncertainRunAttemptIDs, [held.runAttemptID])
+        XCTAssertTrue(hold.uncertainIntentIDs.isEmpty, "the removed message is no longer part of the hold")
+        XCTAssertNil(next.blockingCrashHold(for: held.binding), "the narrower hold stays acknowledged")
     }
 
     /// Before activation nothing is confirmed: the hold is reported as the user's choice.
@@ -643,6 +774,31 @@ final class AgentRecoveryCrashHoldProofTests: XCTestCase {
         let binding = try launch.service.recoveryLifecycleGate(for: load.persistenceState).binding
         let runAttemptID = try await openRun(launch, load, marked: marked)
         return Held(load: load, binding: binding, runAttemptID: runAttemptID)
+    }
+
+    /// A message of `launch` left `dispatching`, its one attempt on `runAttemptID` (none: untied).
+    private func dispatchingIntent(_ launch: Launch, _ held: Held, runAttemptID: UUID?) async throws -> UUID {
+        let submission = Support.submission("uncertain send")
+        try await transact(launch, held.load) { store, binding in
+            _ = try await store.commitQueuedIntent(
+                binding: binding,
+                expectedRevision: store.currentRevision(sessionID: binding.sessionID),
+                submission: submission,
+                consumption: nil
+            )
+            _ = try await store.beginDispatch(
+                binding: binding,
+                expectedRevision: store.currentRevision(sessionID: binding.sessionID),
+                intentID: submission.intentID,
+                attempt: AgentRecoveryAttemptStart(attemptID: UUID(), runAttemptID: runAttemptID),
+                authorization: .liveQueue
+            )
+        }
+        return submission.intentID
+    }
+
+    private func deliveryState(_ launch: Launch, _ held: Held, _ intentID: UUID) async -> AgentRecoveryDeliveryState? {
+        await launch.store.read(sessionID: held.load.session.id).record?.intent(id: intentID)?.deliveryState
     }
 
     /// Records an open run attempt as `launch` (that launch's app instance owns it).

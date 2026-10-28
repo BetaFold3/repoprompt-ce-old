@@ -1579,11 +1579,17 @@ package actor AgentRecoveryStore {
     /// Durably records the user's explicit acknowledgement of exactly one displayed crash hold
     /// (F-2). The hold must belong to `binding` (same incarnation and reset generation) and every
     /// run attempt and intent it names must still be in the record (a stale display is refused).
-    /// An identical acknowledgement is unchanged; a different one replaces it (a newer decision
-    /// about a changed uncertainty set). Nothing else in the record changes: no run is closed,
-    /// no delivery state or outcome is touched. Creates the record when absent (a hold of legacy
-    /// interrupted turns only). With `undismissedCard` (Check and resolve), refuses with `.cardChanged`
-    /// when that card was dismissed in exactly that state.
+    /// An identical acknowledgement with nothing left to settle is unchanged; a different one
+    /// replaces it (a newer decision about a changed uncertainty set). No run is closed. Without
+    /// `settlement` no delivery state or outcome is touched. With it (O43/O46), the same write
+    /// settles the listed intents that qualify against `runAttemptIDs` as the exited runs
+    /// (`AgentRecoveryRecord.crashHoldSettlementQualifies`, evaluated on the current record): a
+    /// `dispatching` intent becomes `deliveryUnknown` and each open attempt of it gets a
+    /// `.deliveryUnknown` outcome with the settlement's message; payloads stay. `.everyIntent`
+    /// refuses with `.intentConflict` (nothing written) when a listed intent doesn't qualify.
+    /// Creates the record when absent (a hold of legacy interrupted turns only). With
+    /// `undismissedCard` (Check and resolve), refuses with `.cardChanged` when that card was
+    /// dismissed in exactly that state.
     package func recordCrashHoldAcknowledgement(
         binding: AgentRecoveryLifecycleBinding,
         expectedRevision: AgentRecoveryRecordRevision?,
@@ -1592,7 +1598,8 @@ package actor AgentRecoveryStore {
         runAttemptIDs: Set<UUID>,
         intentIDs: Set<UUID>,
         transcriptTurnIDs: Set<UUID>,
-        undismissedCard: (key: AgentRecoveryCardKey, freshness: AgentRecoveryCardFreshness)? = nil
+        undismissedCard: (key: AgentRecoveryCardKey, freshness: AgentRecoveryCardFreshness)? = nil,
+        settlement: AgentRecoveryCrashHoldIntentSettlement? = nil
     ) throws -> AgentRecoveryLocalReceipt {
         guard binding.incarnationID == incarnationID,
               binding.transcriptResetGeneration == transcriptResetGeneration
@@ -1613,7 +1620,37 @@ package actor AgentRecoveryStore {
         for intentID in intentIDs where current?.intent(id: intentID) == nil {
             throw AgentRecoveryStoreError.intentNotFound(intentID)
         }
-        if let current, current.crashHoldAcknowledgement?.covers(
+        var intents = current?.intents ?? []
+        var attempts = current?.attempts ?? []
+        var settledAny = false
+        if let settlement, let current {
+            let outcome = AgentRecoveryAttemptOutcome(
+                outcome: .deliveryUnknown,
+                recordedAt: AgentRecoveryTimestamp(now()),
+                extras: [AgentRecoveryAttemptOutcome.deliveryUnknownMessageExtrasKey: .string(settlement.message)]
+            )
+            for intentID in intentIDs.sorted(by: { $0.uuidString < $1.uuidString }) {
+                guard current.crashHoldSettlementQualifies(
+                    intentID: intentID,
+                    exitedRunAttemptIDs: runAttemptIDs,
+                    currentInstanceID: appInstanceID
+                ) else {
+                    if settlement == .everyIntent { throw AgentRecoveryStoreError.intentConflict(intentID) }
+                    continue
+                }
+                if let index = intents.firstIndex(where: { $0.intentID == intentID }),
+                   intents[index].deliveryState == .dispatching
+                {
+                    intents[index].deliveryState = .deliveryUnknown
+                    settledAny = true
+                }
+                for index in attempts.indices where attempts[index].intentID == intentID && attempts[index].outcome == nil {
+                    attempts[index].outcome = outcome
+                    settledAny = true
+                }
+            }
+        }
+        if let current, !settledAny, current.crashHoldAcknowledgement?.covers(
             incarnationID: incarnationID,
             transcriptResetGeneration: transcriptResetGeneration,
             runAttemptIDs: runAttemptIDs,
@@ -1641,8 +1678,8 @@ package actor AgentRecoveryStore {
             current,
             binding: binding,
             composer: current?.composer,
-            intents: current?.intents ?? [],
-            attempts: current?.attempts ?? [],
+            intents: intents,
+            attempts: attempts,
             runAttempts: current?.runAttempts ?? [],
             crashHoldAcknowledgement: .some(acknowledgement)
         )

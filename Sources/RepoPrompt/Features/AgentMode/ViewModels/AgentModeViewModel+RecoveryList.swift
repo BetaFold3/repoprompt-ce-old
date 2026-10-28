@@ -304,9 +304,14 @@ extension AgentModeViewModel {
                 actions: runActions + children.actions + dismiss + openAction
             )
         case let .intent(intent, context):
-            var detail = context.isRemote && intent.deliveryState == .deliveryUnknown
-                ? Self.recoveryListRemoteUncertainty
-                : Self.recoveryListCertainty(of: intent.deliveryState, earlierLaunch: context.isEarlierLaunch)
+            let settled = item.actionFacts.settledByExitProof
+            var detail = if settled {
+                Self.recoveryListSettledByExitProofDetail
+            } else if context.isRemote && intent.deliveryState == .deliveryUnknown {
+                Self.recoveryListRemoteUncertainty
+            } else {
+                Self.recoveryListCertainty(of: intent.deliveryState, earlierLaunch: context.isEarlierLaunch)
+            }
             if let heldReason = context.heldReason {
                 detail += " \(heldReason)"
             } else if !context.isEarlierLaunch {
@@ -316,7 +321,11 @@ extension AgentModeViewModel {
                 detail += " It was written before the conversation was cleared, so it can't be moved into it."
             }
             let actions = isActive
-                ? recoveryIntentActions(intent, facts: item.actionFacts) + Self.recoveryListIntentActions(intent.deliveryState, sameGeneration: context.sameGeneration)
+                ? recoveryIntentActions(intent, facts: item.actionFacts) + Self.recoveryListIntentActions(
+                    intent.deliveryState,
+                    sameGeneration: context.sameGeneration,
+                    settledByExitProof: settled
+                )
                 : openAction
             return row(
                 Self.recoveryListTitle(of: intent.deliveryState),
@@ -629,19 +638,26 @@ extension AgentModeViewModel {
         }
     }
 
+    /// O46: the detail of a saved message a crash-hold confirmation settled (title unchanged).
+    /// Path-neutral: Check's process proof and the user's "It stopped" produce the same row.
+    static let recoveryListSettledByExitProofDetail =
+        "Its run stopped before the provider confirmed it. It won't be sent again."
+
     /// Actions the store can honour (F-12): Edit moves the text into the message box and withdraws
-    /// the intent, so it is offered only for input that was never delivered (`queued`, `failed`);
-    /// possibly delivered input (`deliveryUnknown`) can only be removed; a handoff still in progress
-    /// (`dispatching`) is view-only.
-    private static func recoveryListIntentActions(
+    /// the intent, so it is offered only for input that was never delivered (`queued`, `failed`)
+    /// or, O46, for possibly delivered input whose run is settled as exited (the user decides
+    /// whether to send it again); other possibly delivered input (`deliveryUnknown`) can only be
+    /// removed; a handoff still in progress (`dispatching`) is view-only. Never Send saved.
+    static func recoveryListIntentActions(
         _ state: AgentRecoveryDeliveryState,
-        sameGeneration: Bool
+        sameGeneration: Bool,
+        settledByExitProof: Bool = false
     ) -> [AgentRecoveryListRowProps.Action] {
         switch state {
         case .queued, .failed:
             sameGeneration ? [.edit, .remove] : [.remove]
         case .deliveryUnknown:
-            [.remove]
+            settledByExitProof && sameGeneration ? [.edit, .remove] : [.remove]
         case .dispatching, .providerAccepted, .withdrawn:
             []
         }
@@ -1504,7 +1520,11 @@ extension AgentModeViewModel {
         guard intent.transcriptResetGeneration == lane.binding.transcriptResetGeneration else {
             return "This message was written before the conversation was cleared, so it can't be moved into it. You can still view or remove it."
         }
-        guard intent.deliveryState == .queued || intent.deliveryState == .failed else {
+        // O46: a message settled by a crash-hold confirmation may move too (the user decides
+        // whether to send it again); other possibly delivered input stays view-or-remove.
+        let settled = intent.deliveryState == .deliveryUnknown
+            && recoveryListCatalogItem(rowID)?.actionFacts.settledByExitProof == true
+        guard intent.deliveryState == .queued || intent.deliveryState == .failed || settled else {
             return "This message may already have been delivered, so it can only be viewed or removed."
         }
         func composerIsEmpty() -> Bool {

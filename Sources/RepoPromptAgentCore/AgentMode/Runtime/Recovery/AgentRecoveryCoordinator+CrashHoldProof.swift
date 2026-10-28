@@ -4,8 +4,10 @@ import Foundation
 // records, never from an empty registry. The proof (all must hold):
 //   (a) checks are active and the registry is healthy: started, no storage failure, no unidentified
 //       record, no unreadable record naming the session or what it touches;
-//   (b) the hold consists of run attempts only (no uncertain intent, no legacy turn), each carrying
-//       the run-start registration mark (`AgentRecoveryRunAttempt.recordedRuntimeRegistrationRaw`);
+//   (b) the hold has run attempts and no legacy turn, each run attempt carrying the run-start
+//       registration mark (`AgentRecoveryRunAttempt.recordedRuntimeRegistrationRaw`); every
+//       uncertain intent qualifies (O43: earlier launch, every attempt on a held run attempt or on
+//       one with recorded terminal evidence, `AgentRecoveryRecord.crashHoldSettlementQualifies`);
 //   (c) each held attempt is named by an earlier-launch registry record;
 //   (d) no earlier-launch record that names the session (any incarnation), names no session, or
 //       shares one of its conversations or worktrees is still possibly running (`.exited` and
@@ -17,8 +19,10 @@ import Foundation
 // answer can't go stale); (b) is read before it; (e) and (f) are re-checked after it and before
 // every commit attempt, and the card is checked again atomically with the write (the store refuses
 // a card dismissed meanwhile). The only write is the exact crash-hold acknowledgement "It stopped"
-// writes: through the session's live lane when one is open, otherwise under the closed-session gate
-// (the session is never opened). Publication after the commit is shared with "It stopped"
+// writes, settling the hold's uncertain intents to `deliveryUnknown` in the same write (O46; the
+// store re-checks the qualification there and refuses the whole write if one no longer qualifies):
+// through the session's live lane when one is open, otherwise under the closed-session gate (the
+// session is never opened). Publication after the commit is shared with "It stopped"
 // (`publishCrashHoldConfirmation`).
 
 /// Check and resolve's crash-hold texts (one fixed set).
@@ -37,6 +41,9 @@ package enum AgentRecoveryCrashHoldCheckText {
     package static let ownershipUncertain = "process ownership is uncertain"
     package static let ownershipUpdating = "process ownership is still being updated"
     package static let notOnlyRuns = "it has a saved message or an older interrupted turn"
+    /// O43: an uncertain message has an attempt without a run-attempt reference, or on a run the
+    /// proof doesn't cover.
+    package static let messageNotOnProvenRun = "a saved message's attempt isn't tied to a proven run"
     package static let openToConfirm = "open this session to confirm it"
 
     /// The needs-you choice with its reason.
@@ -63,11 +70,20 @@ extension AgentRecoveryCoordinator {
         guard let registry = processRegistry else { return Text.needsYou(Text.ownershipUncertain) }
         guard let captured = item.acknowledgement else { return .couldNotCheck(Text.changed) }
         let card = (key: captured.key, freshness: captured.freshness)
-        // (b) run attempts only, each registered at run start.
-        guard !hold.uncertainRunAttemptIDs.isEmpty, hold.uncertainIntentIDs.isEmpty, hold.uncertainTranscriptTurnIDs.isEmpty else {
+        // (b) run attempts, each registered at run start, and only qualifying uncertain intents.
+        guard !hold.uncertainRunAttemptIDs.isEmpty, hold.uncertainTranscriptTurnIDs.isEmpty else {
             return Text.needsYou(Text.notOnlyRuns)
         }
-        let attempts = reconciliation.resolution(for: hold.sessionID)?.record?.record.runAttempts ?? []
+        let record = reconciliation.resolution(for: hold.sessionID)?.record?.record
+        let qualifies = hold.uncertainIntentIDs.allSatisfy { intentID in
+            record?.crashHoldSettlementQualifies(
+                intentID: intentID,
+                exitedRunAttemptIDs: hold.uncertainRunAttemptIDs,
+                currentInstanceID: store.appInstanceID
+            ) == true
+        }
+        guard qualifies else { return Text.needsYou(Text.messageNotOnProvenRun) }
+        let attempts = record?.runAttempts ?? []
         let registered = hold.uncertainRunAttemptIDs.allSatisfy { runAttemptID in
             attempts.first { $0.runAttemptID == runAttemptID }?.recordedRuntimeRegistrationRaw
                 == AgentRecoveryRunAttempt.registeredRuntimeRegistration
@@ -135,6 +151,9 @@ extension AgentRecoveryCoordinator {
                 continue
             case .failure(.store(.cardChanged)):
                 return .couldNotCheck(Text.changed)
+            case .failure(.store(.intentConflict)):
+                // The store's in-write re-check: an uncertain message no longer qualifies.
+                return Text.needsYou(Text.messageNotOnProvenRun)
             case .failure:
                 return .failed(Text.saveFailed)
             }
@@ -219,7 +238,8 @@ extension AgentRecoveryCoordinator {
                 runAttemptIDs: runAttemptIDs,
                 intentIDs: intentIDs,
                 transcriptTurnIDs: turnIDs,
-                undismissedCard: (cardKey, cardFreshness)
+                undismissedCard: (cardKey, cardFreshness),
+                settlement: .everyIntent
             )
         }
     }
@@ -251,7 +271,8 @@ extension AgentRecoveryCoordinator {
                     runAttemptIDs: runAttemptIDs,
                     intentIDs: intentIDs,
                     transcriptTurnIDs: turnIDs,
-                    undismissedCard: (cardKey, cardFreshness)
+                    undismissedCard: (cardKey, cardFreshness),
+                    settlement: .everyIntent
                 )
             })
         } catch let error as AgentRecoveryStoreError {

@@ -2231,6 +2231,72 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
         XCTAssertEqual(otherWindow.recoveryContinuationDraft(rowID: itemID), typed)
     }
 
+    /// O46: a saved message settled by a crash-hold confirmation keeps its title, says its run
+    /// exited and it won't be sent again, is informational, and offers View (its kept text), Edit,
+    /// Remove and Dismiss. Send saved is never offered for possibly delivered input.
+    func testSettledMessageRowIsInformationalAndNeverOffersSendSaved() async throws {
+        let harness = try await makeProducerHarness(windowID: 5095)
+        let viewModel = harness.viewModel
+        let coordinator = try XCTUnwrap(viewModel.recoveryCoordinator)
+        let sessionID = harness.lane.sessionID
+        let intent = AgentRecoveryIntent(
+            intentID: UUID(), userItemID: UUID(), origin: .composer, target: .session,
+            createdAt: AgentRecoveryTimestamp(millisecondsSince1970: 1), appInstanceID: UUID(),
+            transcriptResetGeneration: harness.lane.binding.transcriptResetGeneration, deliveryState: .deliveryUnknown,
+            payload: RecoveryTestSupport.content("possibly delivered"), scheduleReference: nil
+        )
+        func item(settled: Bool) -> AgentRecoveryCatalogItem {
+            AgentRecoveryCatalogItem(
+                id: "intent-\(sessionID.uuidString)-\(intent.intentID.uuidString)",
+                kind: .savedInput,
+                sessionID: sessionID,
+                workspaceID: nil,
+                sessionName: nil,
+                composeTabID: harness.session.tabID,
+                payload: .intent(intent, AgentRecoveryCatalogIntentContext(
+                    isEarlierLaunch: true, heldReason: nil, sameGeneration: true, isRemote: false
+                )),
+                acknowledgement: AgentRecoveryCatalogAcknowledgement(
+                    key: AgentRecoveryCardKey(
+                        kind: .savedInput, incarnationID: harness.lane.binding.incarnationID,
+                        transcriptResetGeneration: intent.transcriptResetGeneration, entityID: intent.intentID.uuidString
+                    ),
+                    freshness: AgentRecoveryCatalogProjection.intentFreshness(intent, held: false),
+                    isAcknowledged: false
+                ),
+                actionFacts: AgentRecoveryCatalogActionFacts(settledByExitProof: settled)
+            )
+        }
+        let settled = item(settled: true)
+        let settledRow = viewModel.recoveryListRow(for: settled, coordinator: coordinator, activeSession: harness.session)
+        XCTAssertEqual(settled.attention, .informational)
+        XCTAssertFalse(settled.isOpenNeedsAction, "not counted as needing the user")
+        XCTAssertEqual(settledRow.title, "Message may have been delivered")
+        XCTAssertEqual(settledRow.detail, AgentModeViewModel.recoveryListSettledByExitProofDetail)
+        XCTAssertEqual(settledRow.text, "possibly delivered", "View shows the kept text")
+        XCTAssertEqual(settledRow.actions, [.edit, .remove, .dismiss])
+
+        let unsettled = item(settled: false)
+        XCTAssertEqual(unsettled.attention, .needsAction)
+        XCTAssertEqual(
+            viewModel.recoveryListRow(for: unsettled, coordinator: coordinator, activeSession: harness.session).actions,
+            [.remove, .dismiss]
+        )
+        for state in AgentRecoveryDeliveryState.allCases {
+            for settledByExitProof in [false, true] {
+                for sameGeneration in [false, true] {
+                    XCTAssertFalse(
+                        AgentModeViewModel.recoveryListIntentActions(
+                            state, sameGeneration: sameGeneration, settledByExitProof: settledByExitProof
+                        ).contains(.sendSaved),
+                        "\(state)"
+                    )
+                }
+            }
+        }
+        XCTAssertFalse(viewModel.recoveryIntentActions(intent, facts: settled.actionFacts).contains(.sendSaved))
+    }
+
     /// Review A LIST-02, B L3: through the real `performRecoveryListContinuation` (runner result
     /// controlled), a recorded outcome whose record holds the text clears the sent draft, and an
     /// edit made during the await is newer and survives. Nothing goes to the message box.

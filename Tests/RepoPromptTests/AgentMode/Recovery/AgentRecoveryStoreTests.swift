@@ -1367,6 +1367,250 @@ final class AgentRecoveryStoreTests: XCTestCase {
         XCTAssertTrue(afterUnrelated.isCardAcknowledged(key, freshness: freshness))
     }
 
+    // MARK: - Crash-hold settlement (9-live O43/O46)
+
+    /// One earlier-launch session for the settlement tests: an open run `open`, a finished run
+    /// `finished`, and intents in every relevant state.
+    private struct SettlementFixture {
+        let session: AgentRecoveryLifecycleBinding
+        let open: UUID
+        let dispatching: UUID
+        let dispatchingAttempt: UUID
+        let unknown: UUID
+        let unknownAttempt: UUID
+        let onFinishedRun: UUID
+        let queued: UUID
+        let accepted: UUID
+    }
+
+    private func settlementFixture(_ earlier: AgentRecoveryStore) async throws -> SettlementFixture {
+        let session = binding(UUID(), UUID())
+        let open = Support.ownership(sessionID: session.sessionID)
+        let finished = Support.ownership(sessionID: session.sessionID)
+        func revision() async throws -> AgentRecoveryRecordRevision? {
+            try await earlier.currentRevision(sessionID: session.sessionID)
+        }
+        for ownership in [open, finished] {
+            _ = try await earlier.ensureRunAttempt(
+                binding: session, expectedRevision: revision(), ownership: ownership, processRunID: nil, transcriptTurnID: nil,
+                providerKindRaw: nil
+            )
+        }
+        func dispatch(_ text: String, on runAttemptID: UUID) async throws -> (intentID: UUID, attemptID: UUID) {
+            let submission = Support.submission(text)
+            _ = try await earlier.commitQueuedIntent(binding: session, expectedRevision: revision(), submission: submission, consumption: nil)
+            let attempt = AgentRecoveryAttemptStart(attemptID: UUID(), runAttemptID: runAttemptID)
+            _ = try await earlier.beginDispatch(
+                binding: session, expectedRevision: revision(), intentID: submission.intentID, attempt: attempt, authorization: .liveQueue
+            )
+            return (submission.intentID, attempt.attemptID)
+        }
+        let dispatching = try await dispatch("dispatching", on: open.attemptID)
+        let unknown = try await dispatch("unknown", on: open.attemptID)
+        _ = try await earlier.recordDeliveryOutcome(
+            binding: session, expectedRevision: revision(), intentID: unknown.intentID, attemptID: unknown.attemptID, outcome: .deliveryUnknown
+        )
+        let accepted = try await dispatch("accepted", on: open.attemptID)
+        _ = try await earlier.recordDeliveryOutcome(
+            binding: session, expectedRevision: revision(), intentID: accepted.intentID, attemptID: accepted.attemptID, outcome: .providerAccepted
+        )
+        // A T4-style retry: its attempt is on a run whose terminal commit is recorded.
+        let onFinishedRun = try await dispatch("retry", on: finished.attemptID)
+        _ = try await earlier.recordRunTerminal(
+            binding: session, expectedRevision: revision(), commit: Support.terminalCommit(ownership: finished, state: .failed)
+        )
+        let queued = Support.submission("queued")
+        _ = try await earlier.commitQueuedIntent(binding: session, expectedRevision: revision(), submission: queued, consumption: nil)
+        return SettlementFixture(
+            session: session,
+            open: open.attemptID,
+            dispatching: dispatching.intentID,
+            dispatchingAttempt: dispatching.attemptID,
+            unknown: unknown.intentID,
+            unknownAttempt: unknown.attemptID,
+            onFinishedRun: onFinishedRun.intentID,
+            queued: queued.intentID,
+            accepted: accepted.intentID
+        )
+    }
+
+    /// Check's write settles the earlier launch's uncertain intents of the exited run (and the
+    /// retry on a finished run) to `deliveryUnknown` in the acknowledgement's own write: open
+    /// attempts get the outcome with its message, payloads stay, `queued` and `providerAccepted`
+    /// are untouched, and the acknowledgement lists the settled intents.
+    func testCrashHoldAcknowledgementSettlesUncertainIntentsOfTheExitedRun() async throws {
+        let fixture = try await settlementFixture(makeStore(instance: instanceA))
+        let store = makeStore(instance: instanceB)
+        let session = fixture.session
+        let before = try await loadRecord(store, session.sessionID)
+        let unknownOutcomeBefore = before.attempts.first { $0.attemptID == fixture.unknownAttempt }?.outcome
+        let intentIDs: Set = [fixture.dispatching, fixture.unknown, fixture.onFinishedRun]
+
+        let receipt = try await store.recordCrashHoldAcknowledgement(
+            binding: session,
+            expectedRevision: store.currentRevision(sessionID: session.sessionID),
+            incarnationID: session.incarnationID,
+            transcriptResetGeneration: 0,
+            runAttemptIDs: [fixture.open],
+            intentIDs: intentIDs,
+            transcriptTurnIDs: [],
+            settlement: .everyIntent
+        )
+
+        XCTAssertEqual(receipt.disposition, .committed)
+        let record = try await loadRecord(store, session.sessionID)
+        for intentID in intentIDs {
+            XCTAssertEqual(record.intent(id: intentID)?.deliveryState, .deliveryUnknown)
+            XCTAssertEqual(record.intent(id: intentID)?.payload, before.intent(id: intentID)?.payload, "the message text is kept")
+            XCTAssertTrue(record.isSettledByCrashHoldExitProof(intentID: intentID))
+        }
+        let settledAttempt = try XCTUnwrap(record.attempts.first { $0.attemptID == fixture.dispatchingAttempt }?.outcome)
+        XCTAssertEqual(settledAttempt.outcome, .deliveryUnknown)
+        XCTAssertEqual(
+            settledAttempt.extras[AgentRecoveryAttemptOutcome.deliveryUnknownMessageExtrasKey],
+            .string(AgentRecoveryCrashHoldIntentSettlement.provenExitMessage)
+        )
+        XCTAssertEqual(
+            record.attempts.first { $0.attemptID == fixture.unknownAttempt }?.outcome,
+            unknownOutcomeBefore,
+            "an attempt already closed keeps its outcome"
+        )
+        XCTAssertEqual(record.intent(id: fixture.queued)?.deliveryState, .queued)
+        XCTAssertEqual(record.intent(id: fixture.accepted)?.deliveryState, .providerAccepted)
+        XCTAssertFalse(record.isSettledByCrashHoldExitProof(intentID: fixture.queued))
+        XCTAssertEqual(record.crashHoldAcknowledgement?.intentIDs, intentIDs)
+        XCTAssertEqual(record.crashHoldAcknowledgement?.runAttemptIDs, [fixture.open])
+        XCTAssertNil(record.runAttempt(id: fixture.open)?.terminal, "no run is closed")
+
+        // The reread round-trips the outcome's message (a forward-compatible extras member).
+        let reread = try await loadRecord(makeStore(instance: instanceB), session.sessionID)
+        XCTAssertEqual(reread.attempts, record.attempts)
+
+        // Repeating the identical write has nothing left to settle.
+        let repeated = try await store.recordCrashHoldAcknowledgement(
+            binding: session,
+            expectedRevision: store.currentRevision(sessionID: session.sessionID),
+            incarnationID: session.incarnationID,
+            transcriptResetGeneration: 0,
+            runAttemptIDs: [fixture.open],
+            intentIDs: intentIDs,
+            transcriptTurnIDs: [],
+            settlement: .everyIntent
+        )
+        XCTAssertEqual(repeated.disposition, .unchanged)
+    }
+
+    /// Check's write refuses the whole hold (nothing written) when an uncertain intent's attempt is on
+    /// a run the proof doesn't cover, or has no run-attempt reference; "It stopped" settles the
+    /// qualifying ones and only acknowledges the rest.
+    func testCrashHoldSettlementRefusesUncoveredAttemptsForCheckAndSkipsThemForItStopped() async throws {
+        let earlier = makeStore(instance: instanceA)
+        let fixture = try await settlementFixture(earlier)
+        let session = fixture.session
+        let untied = Support.submission("untied")
+        _ = try await earlier.commitQueuedIntent(
+            binding: session, expectedRevision: earlier.currentRevision(sessionID: session.sessionID), submission: untied, consumption: nil
+        )
+        _ = try await earlier.beginDispatch(
+            binding: session,
+            expectedRevision: earlier.currentRevision(sessionID: session.sessionID),
+            intentID: untied.intentID,
+            attempt: AgentRecoveryAttemptStart(attemptID: UUID()),
+            authorization: .liveQueue
+        )
+        let store = makeStore(instance: instanceB)
+        let before = try await loadRecord(store, session.sessionID)
+
+        // The open run isn't among the exited ones.
+        await assertStoreError(.intentConflict(fixture.dispatching)) {
+            try await store.recordCrashHoldAcknowledgement(
+                binding: session,
+                expectedRevision: store.currentRevision(sessionID: session.sessionID),
+                incarnationID: session.incarnationID,
+                transcriptResetGeneration: 0,
+                runAttemptIDs: [],
+                intentIDs: [fixture.dispatching],
+                transcriptTurnIDs: [],
+                settlement: .everyIntent
+            )
+        }
+        // An attempt without a run-attempt reference.
+        await assertStoreError(.intentConflict(untied.intentID)) {
+            try await store.recordCrashHoldAcknowledgement(
+                binding: session,
+                expectedRevision: store.currentRevision(sessionID: session.sessionID),
+                incarnationID: session.incarnationID,
+                transcriptResetGeneration: 0,
+                runAttemptIDs: [fixture.open],
+                intentIDs: [fixture.dispatching, untied.intentID],
+                transcriptTurnIDs: [],
+                settlement: .everyIntent
+            )
+        }
+        let afterRefusals = try await loadRecord(store, session.sessionID)
+        XCTAssertEqual(afterRefusals.revision, before.revision, "a refused settlement writes nothing")
+
+        // "It stopped": the qualifying intent is settled, the untied one is acknowledged only.
+        _ = try await store.recordCrashHoldAcknowledgement(
+            binding: session,
+            expectedRevision: store.currentRevision(sessionID: session.sessionID),
+            incarnationID: session.incarnationID,
+            transcriptResetGeneration: 0,
+            runAttemptIDs: [fixture.open],
+            intentIDs: [fixture.dispatching, untied.intentID],
+            transcriptTurnIDs: [],
+            settlement: .qualifyingIntents
+        )
+        let record = try await loadRecord(store, session.sessionID)
+        XCTAssertEqual(record.intent(id: fixture.dispatching)?.deliveryState, .deliveryUnknown)
+        XCTAssertEqual(
+            record.attempts.first { $0.attemptID == fixture.dispatchingAttempt }?.outcome?
+                .extras[AgentRecoveryAttemptOutcome.deliveryUnknownMessageExtrasKey],
+            .string(AgentRecoveryCrashHoldIntentSettlement.userConfirmedStopMessage)
+        )
+        XCTAssertEqual(record.intent(id: untied.intentID)?.deliveryState, .dispatching, "an untied attempt is never settled")
+        XCTAssertFalse(record.isSettledByCrashHoldExitProof(intentID: untied.intentID))
+        XCTAssertEqual(record.crashHoldAcknowledgement?.intentIDs, [fixture.dispatching, untied.intentID])
+    }
+
+    /// The settlement is never evaluated against this launch's own input, and a stale revision is
+    /// refused before anything is written.
+    func testCrashHoldSettlementRefusesCurrentLaunchInputAndRevisionConflicts() async throws {
+        let fixture = try await settlementFixture(makeStore(instance: instanceA))
+        let session = fixture.session
+        // The same launch that dispatched it: not an earlier launch's input.
+        let sameLaunch = makeStore(instance: instanceA)
+        await assertStoreError(.intentConflict(fixture.dispatching)) {
+            try await sameLaunch.recordCrashHoldAcknowledgement(
+                binding: session,
+                expectedRevision: sameLaunch.currentRevision(sessionID: session.sessionID),
+                incarnationID: session.incarnationID,
+                transcriptResetGeneration: 0,
+                runAttemptIDs: [fixture.open],
+                intentIDs: [fixture.dispatching],
+                transcriptTurnIDs: [],
+                settlement: .everyIntent
+            )
+        }
+        let store = makeStore(instance: instanceB)
+        let before = try await loadRecord(store, session.sessionID)
+        await assertStoreErrorCategory(.revisionConflict) {
+            try await store.recordCrashHoldAcknowledgement(
+                binding: session,
+                expectedRevision: .make(),
+                incarnationID: session.incarnationID,
+                transcriptResetGeneration: 0,
+                runAttemptIDs: [fixture.open],
+                intentIDs: [fixture.dispatching],
+                transcriptTurnIDs: [],
+                settlement: .everyIntent
+            )
+        }
+        let after = try await loadRecord(store, session.sessionID)
+        XCTAssertEqual(after.revision, before.revision)
+        XCTAssertEqual(after.intent(id: fixture.dispatching)?.deliveryState, .dispatching)
+    }
+
     // MARK: - Helpers
 
     private func managedFiles(_ directory: URL) throws -> [String] {

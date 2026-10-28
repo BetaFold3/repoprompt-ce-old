@@ -442,9 +442,13 @@ final class AgentRecoveryCoordinatorTests: XCTestCase {
         guard case .success = confirmed else {
             return XCTFail("admission opens after explicit confirmation, got \(confirmed)")
         }
-        // Confirmation is not a retry: the uncertain intent keeps its state.
-        let intent = await store.read(sessionID: load.session.id).record?.intent(id: submission.intentID)
-        XCTAssertEqual(intent?.deliveryState, .dispatching)
+        // Confirmation is not a retry. O46 (deliberate contract change): the same write settles the
+        // held run's uncertain message to delivery unknown; it keeps its text and is never resent.
+        let intentRecord = await store.read(sessionID: load.session.id).record
+        let intent = intentRecord?.intent(id: submission.intentID)
+        XCTAssertEqual(intent?.deliveryState, .deliveryUnknown)
+        XCTAssertEqual(intent?.payload, submission.payload)
+        XCTAssertEqual(intentRecord?.attempts(forIntent: submission.intentID).count, 1, "nothing was dispatched again")
 
         // A later launch with the identical uncertainty does not ask again; changed uncertainty is
         // not covered by this decision.
@@ -1779,7 +1783,7 @@ final class AgentRecoveryCoordinatorTests: XCTestCase {
     /// Every payload's class: run cards are informational notes, everything else needs action
     /// (including a closed session's draft and an unchecked schedule index). The classifier's switch
     /// is exhaustive, so this table covers every case that compiles.
-    func testCatalogAttentionClassifiesEveryPayload() {
+    func testCatalogAttentionClassifiesEveryPayload() throws {
         let id = UUID()
         let stamp = AgentRecoveryTimestamp(millisecondsSince1970: 1000)
         let run = AgentRecoveryRunAttempt(runAttemptID: id, transcriptResetGeneration: 0, processRunID: nil, transcriptTurnID: nil, startedAt: stamp)
@@ -1856,6 +1860,16 @@ final class AgentRecoveryCoordinatorTests: XCTestCase {
         // Other facts never promote a run note.
         let resolved = AgentRecoveryCatalogActionFacts(resolvedByAction: true, runNeverHandedOff: true)
         XCTAssertEqual(AgentRecoveryCatalogProjection.attention(for: .recoveryOnlyRun(run), facts: resolved), .informational)
+        // O46: a saved message settled by a crash-hold confirmation is a note unless an action on
+        // it is unfinished; the fact never changes another payload's classification.
+        let settled = AgentRecoveryCatalogActionFacts(settledByExitProof: true)
+        for (name, payload, expected) in table {
+            let isIntent = if case .intent = payload { true } else { false }
+            XCTAssertEqual(AgentRecoveryCatalogProjection.attention(for: payload, facts: settled), isIntent ? .informational : expected, name)
+        }
+        let settledUnfinished = AgentRecoveryCatalogActionFacts(hasUnfinishedAction: true, settledByExitProof: true)
+        let intentPayload = try XCTUnwrap(table.first { $0.0 == "intent" }?.1)
+        XCTAssertEqual(AgentRecoveryCatalogProjection.attention(for: intentPayload, facts: settledUnfinished), .needsAction)
     }
 
     /// A run card is a note until a recovery action reserved on it has no recorded outcome ("Resume

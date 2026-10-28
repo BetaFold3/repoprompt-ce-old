@@ -222,6 +222,11 @@ package struct AgentRecoveryCatalogActionFacts: Equatable {
     /// Step 5b: delegated sessions `agent_run.start` linked under the run card's attempt, in commit
     /// order. Discovery only: a link is not proof the child started, and nothing is replayed.
     package var delegatedChildLinks: [AgentRecoveryDelegatedChildLink] = []
+    /// O46, saved-input cards only: the record's crash-hold acknowledgement settled this message
+    /// to `deliveryUnknown` because every process of its run exited
+    /// (`AgentRecoveryRecord.isSettledByCrashHoldExitProof`). The card is informational; it is
+    /// never resent.
+    package var settledByExitProof = false
 
     package init(
         resolvedByAction: Bool = false,
@@ -231,8 +236,10 @@ package struct AgentRecoveryCatalogActionFacts: Equatable {
         automaticClear: AgentRecoveryCatalogAutomaticClear? = nil,
         runNeverHandedOff: Bool = false,
         runTranscriptResetGeneration: UInt64? = nil,
-        delegatedChildLinks: [AgentRecoveryDelegatedChildLink] = []
+        delegatedChildLinks: [AgentRecoveryDelegatedChildLink] = [],
+        settledByExitProof: Bool = false
     ) {
+        self.settledByExitProof = settledByExitProof
         self.resolvedByAction = resolvedByAction
         self.hasUnfinishedAction = hasUnfinishedAction
         self.hasUnsentContinuation = hasUnsentContinuation
@@ -322,8 +329,9 @@ package enum AgentRecoveryCatalogProjection {
 
     /// O34-3: exhaustive per-payload classification (a new payload must be classified to compile).
     /// Run cards are notes (the transcript is saved and the crash hold is its own item) unless a
-    /// recovery action on them is unfinished or their latest typed continuation was not sent;
-    /// everything else asks the user for a decision.
+    /// recovery action on them is unfinished or their latest typed continuation was not sent; a
+    /// saved message settled by a crash-hold confirmation (O46) is a note unless an action on it is
+    /// unfinished; everything else asks the user for a decision.
     package nonisolated static func attention(
         for payload: AgentRecoveryCatalogPayload,
         facts: AgentRecoveryCatalogActionFacts
@@ -331,8 +339,10 @@ package enum AgentRecoveryCatalogProjection {
         switch payload {
         case .turn, .outcomeTurn, .recoveryOnlyRun:
             facts.hasUnfinishedAction || facts.hasUnsentContinuation ? .needsAction : .informational
+        case .intent:
+            facts.settledByExitProof && !facts.hasUnfinishedAction ? .informational : .needsAction
         case .workspaceFailure, .nonactionable, .duplicateDestination, .noDestination,
-             .crashHold, .scheduleTransfer, .intent, .question, .editProposal,
+             .crashHold, .scheduleTransfer, .question, .editProposal,
              .heldDraft, .closedSessionDraft,
              .composerRestoreFailed, .unsavedPredecessor, .composerWriteFailed, .ownerlessDraft,
              .composerPreparationFailed, .questionSaveFailed,
@@ -469,6 +479,9 @@ package enum AgentRecoveryCatalogProjection {
                 facts.hasUnfinishedAction = facts.hasUnfinishedAction || record.unresolvedAction(for: key) != nil
                 facts.unsentContinuationText = record.unsentContinuationText(for: key)
                 facts.hasUnsentContinuation = facts.unsentContinuationText != nil
+                if key.kindRaw == AgentRecoveryCardKey.Kind.savedInput.rawValue, let intentID = UUID(uuidString: key.entityID) {
+                    facts.settledByExitProof = record.isSettledByCrashHoldExitProof(intentID: intentID)
+                }
                 if key.kindRaw == AgentRecoveryCardKey.Kind.run.rawValue {
                     let runAttemptID = UUID(uuidString: key.entityID)
                     facts.runNeverHandedOff = record.isVerifiedNeverHandedOff(runAttemptID: runAttemptID)

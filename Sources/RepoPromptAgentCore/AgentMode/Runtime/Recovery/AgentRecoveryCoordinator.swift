@@ -1617,7 +1617,8 @@ package final class AgentRecoveryCoordinator {
     /// live lane, same lifecycle as the hold): the displayed hold is revalidated, the exact
     /// acknowledgement is committed under the lifecycle gate, and only after that commit succeeds
     /// is the hold published as confirmed. `false` for a stale hold or a failed commit (nothing is
-    /// lifted). The acknowledgement closes no run and changes no delivery certainty.
+    /// lifted). The acknowledgement closes no run; in the same write it settles the hold's qualifying
+    /// `dispatching` messages to `deliveryUnknown` (O46), never resending them.
     package func confirmCrashHold(_ hold: AgentRecoveryCrashHold, lane: AgentRecoverySessionLane) async -> Bool {
         func isCurrent() -> Bool {
             crashHolds[hold.sessionID] == hold
@@ -3101,6 +3102,8 @@ package final class AgentRecoverySessionLane {
     }
 
     /// Commits the exact acknowledgement of `hold` (see `AgentRecoveryCoordinator.confirmCrashHold`).
+    /// O46: "It stopped" settles the hold's qualifying delivery-uncertain messages in the same write
+    /// as Check and resolve does; a message that doesn't qualify is acknowledged only.
     package func recordCrashHoldAcknowledgement(
         _ hold: AgentRecoveryCrashHold
     ) async -> Result<AgentRecoveryLocalReceipt, AgentRecoveryControllerFailure> {
@@ -3112,7 +3115,8 @@ package final class AgentRecoverySessionLane {
                 transcriptResetGeneration: hold.transcriptResetGeneration,
                 runAttemptIDs: hold.uncertainRunAttemptIDs,
                 intentIDs: hold.uncertainIntentIDs,
-                transcriptTurnIDs: hold.uncertainTranscriptTurnIDs
+                transcriptTurnIDs: hold.uncertainTranscriptTurnIDs,
+                settlement: .qualifyingIntents
             )
         }
     }

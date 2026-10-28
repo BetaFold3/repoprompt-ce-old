@@ -560,6 +560,10 @@ package enum AgentRecoveryDeliveryOutcome: Equatable {
 }
 
 package struct AgentRecoveryAttemptOutcome: Equatable {
+    /// Extras member carrying the explanation of a `.deliveryUnknown` outcome (a `.failed` outcome
+    /// keeps its own message). A forward-compatible member: no schema change.
+    package static let deliveryUnknownMessageExtrasKey = "message"
+
     package let outcome: AgentRecoveryDeliveryOutcome
     package let recordedAt: AgentRecoveryTimestamp
     package var extras: AgentRecoveryExtras
@@ -802,9 +806,12 @@ package struct AgentRecoveryRunAttempt: Equatable {
 
 /// The user's explicit acknowledgement of one exact prior-run crash hold ("I acknowledged this
 /// prior-run warning and chose to continue"). It never marks a run completed, cancelled or
-/// aborted, never changes delivery certainty, hides no recovery row, and authorizes no replay of
-/// uncertain input. A later startup treats a hold as acknowledged only when this matches it
-/// exactly (incarnation, reset generation, and every uncertain identity); additional or changed
+/// aborted, hides no recovery row, and authorizes no replay of uncertain input. The write that
+/// records it may settle the hold's qualifying `dispatching` messages to `deliveryUnknown`
+/// (`AgentRecoveryCrashHoldIntentSettlement`, O43/O46); their rows become informational. A later
+/// startup treats a hold as acknowledged when this covers it: same incarnation and reset
+/// generation, and every uncertain identity of the hold is in this decision (an identity that left
+/// the hold since, such as a withdrawn message, needs no new decision); additional or changed
 /// uncertainty asks again. ID sets are encoded sorted, so the value round-trips deterministically.
 package struct AgentRecoveryCrashHoldAcknowledgement: Equatable {
     package let decisionID: UUID
@@ -836,7 +843,9 @@ package struct AgentRecoveryCrashHoldAcknowledgement: Equatable {
         self.extras = extras
     }
 
-    /// Whether this decision acknowledged exactly the uncertainty described by these identities.
+    /// Whether this decision acknowledged all of the uncertainty described by these identities (the
+    /// same lifecycle, and each set a subset of the acknowledged one). 9-live review B P2-3: Edit or
+    /// Remove of a settled message shrinks the next launch's hold and must not ask again.
     package func covers(
         incarnationID: UUID,
         transcriptResetGeneration: UInt64,
@@ -846,9 +855,35 @@ package struct AgentRecoveryCrashHoldAcknowledgement: Equatable {
     ) -> Bool {
         self.incarnationID == incarnationID
             && self.transcriptResetGeneration == transcriptResetGeneration
-            && self.runAttemptIDs == runAttemptIDs
-            && self.intentIDs == intentIDs
-            && self.transcriptTurnIDs == transcriptTurnIDs
+            && runAttemptIDs.isSubset(of: self.runAttemptIDs)
+            && intentIDs.isSubset(of: self.intentIDs)
+            && transcriptTurnIDs.isSubset(of: self.transcriptTurnIDs)
+    }
+}
+
+/// O43/O46: how a crash-hold acknowledgement settles the hold's delivery-uncertain messages in the
+/// same write. A qualifying `dispatching` intent becomes `deliveryUnknown` (one already
+/// `deliveryUnknown` stays so) and each of its open attempts gets a `.deliveryUnknown` outcome with
+/// `message`; the payload is never removed and nothing is resent
+/// (`AgentRecoveryRecord.crashHoldSettlementQualifies`).
+package enum AgentRecoveryCrashHoldIntentSettlement: Equatable {
+    /// Check and resolve's registry proof: every listed intent must qualify, otherwise the write is
+    /// refused (`AgentRecoveryStoreError.intentConflict`) and nothing is written.
+    case everyIntent
+    /// "It stopped": qualifying intents are settled; any other stays as it is (acknowledged only).
+    case qualifyingIntents
+
+    package static let provenExitMessage =
+        "Process records show every process of this run exited before the provider confirmed the message."
+    package static let userConfirmedStopMessage =
+        "You confirmed the run stopped before the provider confirmed the message."
+
+    /// The explanation recorded on each settled attempt.
+    package var message: String {
+        switch self {
+        case .everyIntent: Self.provenExitMessage
+        case .qualifyingIntents: Self.userConfirmedStopMessage
+        }
     }
 }
 
@@ -1044,6 +1079,45 @@ package struct AgentRecoveryRecord: Equatable {
 
     package func runAttempt(id: UUID) -> AgentRecoveryRunAttempt? {
         runAttempts.first { $0.runAttemptID == id }
+    }
+
+    /// O43: the intent has at least one delivery attempt and every one references a run attempt in
+    /// `exitedRunAttemptIDs` or one with recorded terminal evidence (a T4-style retry on a finished
+    /// run). An attempt without a run-attempt reference is never covered.
+    package func intentAttemptsAreOnExitedRuns(intentID: UUID, exitedRunAttemptIDs: Set<UUID>) -> Bool {
+        let attempts = attempts(forIntent: intentID)
+        return !attempts.isEmpty && attempts.allSatisfy { attempt in
+            guard let runAttemptID = attempt.runAttemptID else { return false }
+            return exitedRunAttemptIDs.contains(runAttemptID) || runAttempt(id: runAttemptID)?.terminal != nil
+        }
+    }
+
+    /// O43 qualification: a crash-hold confirmation whose run attempts `exitedRunAttemptIDs` exited
+    /// may settle this intent: it is delivery-uncertain (`dispatching` or `deliveryUnknown`), it and
+    /// every attempt of it were started by an earlier launch than `currentInstanceID`, and its
+    /// attempts are on exited runs (`intentAttemptsAreOnExitedRuns`).
+    package func crashHoldSettlementQualifies(
+        intentID: UUID,
+        exitedRunAttemptIDs: Set<UUID>,
+        currentInstanceID: UUID
+    ) -> Bool {
+        guard let intent = intent(id: intentID),
+              intent.deliveryState == .dispatching || intent.deliveryState == .deliveryUnknown,
+              intent.appInstanceID != currentInstanceID,
+              attempts(forIntent: intentID).allSatisfy({ $0.appInstanceID != currentInstanceID })
+        else { return false }
+        return intentAttemptsAreOnExitedRuns(intentID: intentID, exitedRunAttemptIDs: exitedRunAttemptIDs)
+    }
+
+    /// O46: the intent was settled by the stored crash-hold acknowledgement: it lists the intent,
+    /// the intent is `deliveryUnknown`, and its attempts are on the acknowledged (or finished) runs.
+    package func isSettledByCrashHoldExitProof(intentID: UUID) -> Bool {
+        guard let acknowledgement = crashHoldAcknowledgement,
+              acknowledgement.incarnationID == incarnationID,
+              acknowledgement.intentIDs.contains(intentID),
+              intent(id: intentID)?.deliveryState == .deliveryUnknown
+        else { return false }
+        return intentAttemptsAreOnExitedRuns(intentID: intentID, exitedRunAttemptIDs: acknowledgement.runAttemptIDs)
     }
 
     package func delegatedChildLink(invocationID: UUID) -> AgentRecoveryDelegatedChildLink? {
