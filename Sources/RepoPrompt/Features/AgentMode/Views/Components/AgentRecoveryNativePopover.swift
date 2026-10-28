@@ -5,18 +5,25 @@ import SwiftUI
 ///
 /// SwiftUI's `.popover` swallows the outside click that dismisses it, so the user has to click
 /// twice. The native popover instead closes from a local event monitor and hands the click on.
+///
+/// The popover's window doesn't become the key window, even with `makeKey()` (P5), so Escape
+/// arrives in the anchor's window: the composer's window under the banner, or the Needs Attention
+/// sheet. The monitor closes the popover on Escape there and swallows it, so the composer and the
+/// sheet don't also act on that press.
 enum AgentRecoveryNativePopoverEventDecision: Equatable {
     /// Keep the popover open and deliver the event normally.
     case ignore
     /// Close the popover, then deliver the event to whatever was clicked.
     case closeAndDeliver
-    /// Close the popover and swallow the event (a click on the anchor toggles it closed; Escape).
+    /// Close the popover and swallow the event (a click on the anchor toggles it closed; Escape in
+    /// the popover's or the anchor's window).
     case closeAndConsume
 
     static func decide(
         isMouseDown: Bool,
         isEscapeKey: Bool,
         isInPopoverWindow: Bool,
+        isInAnchorWindow: Bool,
         isOnAnchor: Bool
     ) -> Self {
         if isMouseDown {
@@ -25,48 +32,10 @@ enum AgentRecoveryNativePopoverEventDecision: Equatable {
             // matching the toggle of the previous SwiftUI popover.
             return isOnAnchor ? .closeAndConsume : .closeAndDeliver
         }
-        if isEscapeKey, isInPopoverWindow { return .closeAndConsume }
+        // Not any window: Escape in another window (a dialog above the sheet, a window reached
+        // with Cmd-`) still goes to that window.
+        if isEscapeKey, isInPopoverWindow || isInAnchorWindow { return .closeAndConsume }
         return .ignore
-    }
-}
-
-/// The window operations `AgentRecoveryNativePopoverKeyFocus` needs; `NSWindow` provides them.
-@MainActor
-protocol AgentRecoveryNativePopoverKeyWindow: AnyObject {
-    var isVisible: Bool { get }
-    var canBecomeKey: Bool { get }
-    var isKeyWindow: Bool { get }
-    func makeKey()
-}
-
-extension NSWindow: AgentRecoveryNativePopoverKeyWindow {}
-
-/// Keyboard focus while a native recovery popover is open.
-///
-/// Escape is handled only in the popover's own window, and an `.applicationDefined` popover does not
-/// take key when shown, so Escape pressed straight after opening went to the window behind (P5).
-/// The popover therefore takes key when shown and gives it back to the window that had it when it
-/// closes, so focus ends where it was before the popover opened.
-@MainActor
-enum AgentRecoveryNativePopoverKeyFocus {
-    /// Right after `show`: makes the popover's window key.
-    static func takeKey(popoverWindow: (any AgentRecoveryNativePopoverKeyWindow)?) {
-        guard let popoverWindow, !popoverWindow.isKeyWindow, popoverWindow.canBecomeKey else { return }
-        popoverWindow.makeKey()
-    }
-
-    /// On close, before the popover's window goes away: if it is still key, makes the window that
-    /// was key when the popover opened key again. Otherwise focus has already moved (the user made
-    /// another window key, or AppKit ordered the popover out) and is left alone.
-    static func returnKey(
-        from popoverWindow: (any AgentRecoveryNativePopoverKeyWindow)?,
-        to previousKeyWindow: (any AgentRecoveryNativePopoverKeyWindow)?
-    ) {
-        guard let popoverWindow, popoverWindow.isKeyWindow,
-              let previousKeyWindow, previousKeyWindow !== popoverWindow,
-              previousKeyWindow.isVisible, previousKeyWindow.canBecomeKey
-        else { return }
-        previousKeyWindow.makeKey()
     }
 }
 
@@ -238,8 +207,6 @@ private struct AgentRecoveryNativePopoverAnchor<PopoverContent: View>: NSViewRep
         private var eventMonitor: Any?
         private var resignActiveObserver: NSObjectProtocol?
         private weak var anchor: NSView?
-        /// The window that was key when the popover opened; it gets key back when the popover closes.
-        private weak var previousKeyWindow: NSWindow?
         private weak var region: AgentRecoveryNativePopoverRegion?
         private var isPresented: Binding<Bool>?
 
@@ -279,7 +246,6 @@ private struct AgentRecoveryNativePopoverAnchor<PopoverContent: View>: NSViewRep
             popover.delegate = self
             self.host = host
             self.popover = popover
-            previousKeyWindow = NSApp.keyWindow
             installMonitors()
             // Outside the rows' region when there is one and the screen has room beside it: shown
             // against the whole region, so whichever edge AppKit settles on stays outside it (the
@@ -300,12 +266,6 @@ private struct AgentRecoveryNativePopoverAnchor<PopoverContent: View>: NSViewRep
                 // The popover may then cover other rows.
                 popover.show(relativeTo: anchor.bounds, of: anchor, preferredEdge: preferredEdge)
             }
-            // So Escape, handled only in the popover's window, works without clicking inside first.
-            // One main-queue turn later, outside the SwiftUI update that showed it.
-            DispatchQueue.main.async { [weak self, weak popover] in
-                guard let self, let popover, self.popover === popover else { return }
-                AgentRecoveryNativePopoverKeyFocus.takeKey(popoverWindow: popover.contentViewController?.view.window)
-            }
         }
 
         /// Closes the popover (if shown) and reports it closed through the binding. Idempotent.
@@ -314,11 +274,6 @@ private struct AgentRecoveryNativePopoverAnchor<PopoverContent: View>: NSViewRep
             let popover = popover
             self.popover = nil
             host = nil
-            AgentRecoveryNativePopoverKeyFocus.returnKey(
-                from: popover?.contentViewController?.view.window,
-                to: previousKeyWindow
-            )
-            previousKeyWindow = nil
             popover?.delegate = nil
             popover?.close()
             guard let isPresented else { return }
@@ -346,8 +301,8 @@ private struct AgentRecoveryNativePopoverAnchor<PopoverContent: View>: NSViewRep
                 let consume = MainActor.assumeIsolated { self?.shouldConsume(event) ?? false }
                 return consume ? nil : event
             }
-            // `will`, not `did`: the popover's window is still key, so `close` gives key back to the
-            // window that had it and AppKit restores that window when the app is reactivated.
+            // Closes on app switch. This doesn't move key, so AppKit restores the window that was
+            // key when the app is reactivated.
             resignActiveObserver = NotificationCenter.default.addObserver(
                 forName: NSApplication.willResignActiveNotification,
                 object: nil,
@@ -369,10 +324,13 @@ private struct AgentRecoveryNativePopoverAnchor<PopoverContent: View>: NSViewRep
             guard let popover else { return false }
             let popoverWindow = popover.contentViewController?.view.window
             let isMouseDown = event.type != .keyDown
+            // Esc cancels an input-method composition in progress first; the next Esc closes the popover.
+            let isComposing = (event.window?.firstResponder as? NSTextInputClient)?.hasMarkedText() ?? false
             let decision = AgentRecoveryNativePopoverEventDecision.decide(
                 isMouseDown: isMouseDown,
-                isEscapeKey: event.type == .keyDown && event.keyCode == 53,
+                isEscapeKey: event.type == .keyDown && event.keyCode == 53 && !isComposing,
                 isInPopoverWindow: event.window != nil && event.window === popoverWindow,
+                isInAnchorWindow: event.window != nil && event.window === anchor?.window,
                 isOnAnchor: isMouseDown && isOnAnchor(event)
             )
             switch decision {
@@ -383,10 +341,9 @@ private struct AgentRecoveryNativePopoverAnchor<PopoverContent: View>: NSViewRep
                 return true
             case .closeAndDeliver:
                 close()
-                // `close` gave key back to the window that had it. If the click is on the anchor's
-                // window and that is still not key, make it key before AppKit
-                // dispatches the event, so it is delivered as a normal click rather than spent
-                // activating the window. Other windows keep normal macOS first-click activation,
+                // If the click is on the anchor's window and that is not key, make it key before
+                // AppKit dispatches the event, so it is delivered as a normal click rather than
+                // spent activating the window. Other windows keep normal macOS first-click activation,
                 // so sheets, panels and window order are left to AppKit.
                 if let window = event.window, window === anchor?.window, !window.isKeyWindow {
                     window.makeKey()

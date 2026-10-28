@@ -9,13 +9,21 @@ final class AgentRecoveryNativePopoverEventDecisionTests: XCTestCase {
         mouseDown: Bool = false,
         escape: Bool = false,
         inPopover: Bool = false,
+        inAnchorWindow: Bool = false,
         onAnchor: Bool = false
     ) -> AgentRecoveryNativePopoverEventDecision {
-        .decide(isMouseDown: mouseDown, isEscapeKey: escape, isInPopoverWindow: inPopover, isOnAnchor: onAnchor)
+        .decide(
+            isMouseDown: mouseDown,
+            isEscapeKey: escape,
+            isInPopoverWindow: inPopover,
+            isInAnchorWindow: inAnchorWindow,
+            isOnAnchor: onAnchor
+        )
     }
 
     func testOutsideClickClosesAndIsDelivered() {
         XCTAssertEqual(decide(mouseDown: true), .closeAndDeliver)
+        XCTAssertEqual(decide(mouseDown: true, inAnchorWindow: true), .closeAndDeliver)
     }
 
     func testClickInsidePopoverKeepsItOpen() {
@@ -23,15 +31,26 @@ final class AgentRecoveryNativePopoverEventDecisionTests: XCTestCase {
     }
 
     func testClickOnAnchorTogglesClosedWithoutReopening() {
-        XCTAssertEqual(decide(mouseDown: true, onAnchor: true), .closeAndConsume)
+        XCTAssertEqual(decide(mouseDown: true, inAnchorWindow: true, onAnchor: true), .closeAndConsume)
     }
 
     func testEscapeInPopoverCloses() {
         XCTAssertEqual(decide(escape: true, inPopover: true), .closeAndConsume)
     }
 
-    func testKeysElsewhereAreIgnored() {
+    /// Verifier P5 (9-live R6): the popover never becomes the key window, so Escape arrives in the
+    /// anchor's window (the composer's window, or the Needs Attention sheet). It closes the popover
+    /// and is swallowed, so neither the composer nor the sheet acts on that press.
+    func testEscapeInAnchorWindowClosesAndIsConsumed() {
+        XCTAssertEqual(decide(escape: true, inAnchorWindow: true), .closeAndConsume)
+    }
+
+    func testEscapeInAnUnrelatedWindowIsIgnored() {
         XCTAssertEqual(decide(escape: true), .ignore)
+    }
+
+    func testOtherKeysAreIgnored() {
+        XCTAssertEqual(decide(inAnchorWindow: true), .ignore)
         XCTAssertEqual(decide(inPopover: true), .ignore)
         XCTAssertEqual(decide(), .ignore)
     }
@@ -77,77 +96,6 @@ final class AgentRecoveryNativePopoverEventDecisionTests: XCTestCase {
         // A banner filling the screen's height.
         let banner = NSRect(x: 0, y: 0, width: 1024, height: 700)
         XCTAssertEqual(Region.placement(region: banner, popover: popover, visibleFrame: small, preferredEdge: .maxY), .anchor)
-    }
-
-    /// Verifier P5: Escape straight after opening closes the popover. Escape is handled only in the
-    /// popover's window, so that window takes key when shown and gives it back when closed.
-    @MainActor
-    private final class FakeWindow: AgentRecoveryNativePopoverKeyWindow {
-        var isVisible = true
-        var canBecomeKey = true
-        var isKeyWindow = false
-        private(set) var makeKeyCount = 0
-        func makeKey() {
-            makeKeyCount += 1
-            isKeyWindow = true
-        }
-    }
-
-    private typealias KeyFocus = AgentRecoveryNativePopoverKeyFocus
-
-    @MainActor
-    func testShownPopoverTakesKeySoEscapeReachesIt() {
-        let popoverWindow = FakeWindow()
-        KeyFocus.takeKey(popoverWindow: popoverWindow)
-        XCTAssertEqual(popoverWindow.makeKeyCount, 1)
-        // With its window key, Escape there closes it with one press.
-        XCTAssertEqual(decide(escape: true, inPopover: popoverWindow.isKeyWindow), .closeAndConsume)
-    }
-
-    @MainActor
-    func testShownPopoverDoesNotTakeKeyWhenItCannotOrAlreadyHasIt() {
-        let alreadyKey = FakeWindow()
-        alreadyKey.isKeyWindow = true
-        KeyFocus.takeKey(popoverWindow: alreadyKey)
-        XCTAssertEqual(alreadyKey.makeKeyCount, 0)
-        let cannot = FakeWindow()
-        cannot.canBecomeKey = false
-        KeyFocus.takeKey(popoverWindow: cannot)
-        XCTAssertEqual(cannot.makeKeyCount, 0)
-        KeyFocus.takeKey(popoverWindow: nil)
-    }
-
-    @MainActor
-    func testClosingAKeyPopoverGivesKeyBackToThePreviousWindow() {
-        let previous = FakeWindow()
-        let popoverWindow = FakeWindow()
-        popoverWindow.isKeyWindow = true
-        KeyFocus.returnKey(from: popoverWindow, to: previous)
-        XCTAssertEqual(previous.makeKeyCount, 1)
-    }
-
-    @MainActor
-    func testClosingLeavesFocusAloneWhenThePopoverIsNotKeyOrThePreviousWindowCannotTakeIt() {
-        // Focus already moved (app deactivated, or another window made key).
-        let previous = FakeWindow()
-        KeyFocus.returnKey(from: FakeWindow(), to: previous)
-        XCTAssertEqual(previous.makeKeyCount, 0)
-
-        let keyPopover = FakeWindow()
-        keyPopover.isKeyWindow = true
-        let hidden = FakeWindow()
-        hidden.isVisible = false
-        KeyFocus.returnKey(from: keyPopover, to: hidden)
-        XCTAssertEqual(hidden.makeKeyCount, 0)
-        let cannot = FakeWindow()
-        cannot.canBecomeKey = false
-        KeyFocus.returnKey(from: keyPopover, to: cannot)
-        XCTAssertEqual(cannot.makeKeyCount, 0)
-        KeyFocus.returnKey(from: keyPopover, to: keyPopover)
-        XCTAssertEqual(keyPopover.makeKeyCount, 0)
-        KeyFocus.returnKey(from: keyPopover, to: nil)
-        KeyFocus.returnKey(from: nil, to: previous)
-        XCTAssertEqual(previous.makeKeyCount, 0)
     }
 
     func testRegionPlacementCountsTheArrowAndBorder() {
