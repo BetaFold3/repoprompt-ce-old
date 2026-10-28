@@ -9820,6 +9820,10 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
         isError: Bool?,
         session: AgentTabSession
     ) {
+        // Claude-native tool results carry no args and Claude has no live bash execution, so this
+        // reconcile could only anchor an args-less signature to an unrelated (restored) bash row and
+        // overwrite its saved outcome (9-live R3).
+        guard !session.selectedAgent.usesClaudeNativeRuntime else { return }
         let observedAt = Date()
         if Self.normalizedExternalToolName(toolName) == "write_stdin",
            let runningUpdate = CodexNativeSessionController.commandExecutionRunningUpdate(

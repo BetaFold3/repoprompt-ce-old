@@ -20374,13 +20374,7 @@ final class AgentModeViewModel: ObservableObject {
         } else {
             let outputJSON = result.toolResultJSON ?? result.toolOutput ?? ""
             addToolOutputTokens(outputJSON, for: session)
-            codexCoordinator.reconcileCodexCommandExecutionRunningUpdate(
-                toolName: toolName,
-                argsJSON: argsJSON,
-                resultJSON: outputJSON,
-                isError: result.toolIsError,
-                session: session
-            )
+            // No Codex live-bash reconcile: it never applies to Claude-native results (9-live R3).
         }
         insertClaudeLiveTranscriptRow(canonicalItem, ledgerItem: ledgerItem, producer: producer, session: session)
         return true

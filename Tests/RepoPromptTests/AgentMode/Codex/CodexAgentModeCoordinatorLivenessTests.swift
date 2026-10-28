@@ -1599,6 +1599,54 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         try assertFailedWithExitCode2(rowID: rowID, in: session)
     }
 
+    /// 9-live R3: a restored (args-less) interrupted Claude bash row keeps its saved outcome when a
+    /// later turn's Claude bash result arrives. Claude results carry no args, so the Codex live-bash
+    /// reconcile used to anchor the args-less signature to the restored row and save it as success.
+    func testLaterClaudeBashResultDoesNotRewriteRestoredInterruptedBashRow() async throws {
+        let viewModel = makeViewModel(controller: LivenessFakeCodexController(snapshot: .active(activeFlags: [])))
+        let session = try XCTUnwrap(viewModel.session(for: UUID(), createIfNeeded: true))
+        session.selectedAgent = .claudeCode
+        session.appendItem(restoredInterruptedBashRow(toolName: "Bash"))
+        let restored = try XCTUnwrap(session.items.last)
+        let runID = UUID()
+        session.runID = runID
+        session.runState = .running
+        session.beginRunAttempt(source: "test.claudeRestoredBashRow")
+        let runAttemptID = try XCTUnwrap(session.activeRunAttemptID)
+        let invocationID = UUID()
+        let argsJSON = #"{"command":"echo go; sleep 60; echo done"}"#
+
+        await viewModel.test_handleStreamResult(
+            AIStreamResult(
+                type: "tool_call", text: nil, toolName: "Bash", toolArgs: argsJSON,
+                toolInvocationID: invocationID, toolArgsJSON: argsJSON
+            ),
+            session: session, runID: runID, runAttemptID: runAttemptID
+        )
+        await viewModel.test_handleStreamResult(
+            AIStreamResult(
+                type: "tool_result", text: nil, toolName: "Bash", toolOutput: "go\ndone",
+                toolInvocationID: invocationID, toolResultJSON: "go\ndone", toolIsError: false
+            ),
+            session: session, runID: runID, runAttemptID: runAttemptID
+        )
+
+        let current = try XCTUnwrap(session.items.first { $0.id == restored.id })
+        XCTAssertEqual(current, restored, "the restored row is untouched")
+        let persisted = try XCTUnwrap(AgentToolResultPersistencePolicy.sanitizedToolResult(for: current))
+        XCTAssertEqual(persisted.persistedStatusWord, "cancelled")
+        let live = try XCTUnwrap(session.items.first { $0.toolInvocationID == invocationID })
+        XCTAssertNotEqual(live.id, restored.id)
+        XCTAssertEqual(live.toolResultJSON, "go\ndone")
+        XCTAssertEqual(live.toolIsError, false)
+        XCTAssertEqual(
+            session.items.map { $0.toolName?.lowercased() },
+            ["bash", "bash"],
+            "only the restored row and the new call's row; no extra anchor row"
+        )
+        XCTAssertTrue(session.bashLiveExecutionByKey.isEmpty)
+    }
+
     func testStaleCompletionBeforeObservedStartPreservesPendingTurnThenMatchingTurnFinalizes() async {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller)
@@ -2574,6 +2622,21 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         )
         XCTAssertEqual(persisted.persistedStatusWord, "cancelled", file: file, line: line)
         XCTAssertEqual(persisted.transcriptStatus, .cancelled, file: file, line: line)
+    }
+
+    /// A bash row as a cold restore leaves an interrupted command: saved rows keep no args.
+    private func restoredInterruptedBashRow(toolName: String) -> AgentChatItem {
+        let resultJSON = #"{"status":"cancelled","summary_only":true,"summary_text":"bash • cancelled","type":"commandExecution"}"#
+        return AgentChatItem(
+            timestamp: Date().addingTimeInterval(-3600),
+            kind: .toolResult,
+            text: resultJSON,
+            toolName: toolName,
+            toolInvocationID: UUID(),
+            toolArgsJSON: nil,
+            toolResultJSON: resultJSON,
+            toolIsError: true
+        )
     }
 
     /// A saved running Codex command row, older than the liveness poll's quiet-signal grace.
