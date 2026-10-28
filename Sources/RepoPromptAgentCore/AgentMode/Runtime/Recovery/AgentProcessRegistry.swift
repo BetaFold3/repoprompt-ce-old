@@ -58,6 +58,12 @@ package actor AgentProcessRegistry {
     private var watchGeneration: UInt64 = 0
     private var refreshTask: Task<Void, Never>?
     private var refreshRequestedDuringPass = false
+    /// History-lookup refreshes spent on each Claude runtime still missing its home (O42).
+    private var homeRefreshAttempts: [UUID: Int] = [:]
+    /// Claude runtimes where a pass observed a non-root writer with a readable environment and no
+    /// `CLAUDE_CONFIG_DIR`: another refresh can't record a home for them.
+    private var homeSettledRuntimeIDs: Set<UUID> = []
+    static let maxHomeRefreshesPerRuntime = 3
 
     private var changeHandler: (@Sendable (AgentRuntimeRestrictionSnapshot) -> Void)?
     private var lastPublished: AgentRuntimeRestrictionSnapshot?
@@ -389,6 +395,7 @@ package actor AgentProcessRegistry {
                 refreshRequestedDuringPass = true
                 continue
             }
+            if family.observedHomelessWriter { homeSettledRuntimeIDs.insert(current.runtimeID) }
             var next = current
             next.members = family.members
             if next.providerHome == nil { next.providerHome = family.providerHome }
@@ -414,6 +421,8 @@ package actor AgentProcessRegistry {
         var toolAlive: Bool
         var isComplete: Bool
         var providerHome: String?
+        /// A Claude family's non-root writer was observed with a readable environment and no home.
+        var observedHomelessWriter = false
     }
 
     private enum Lifetime {
@@ -521,20 +530,31 @@ package actor AgentProcessRegistry {
             decisive = false
         }
 
-        // 3. Reclassify observed members: an exec into a writer upgrades a tool; nothing demotes.
-        var providerHome: String?
+        // 3. Reclassify observed members: an exec into a writer upgrades a tool or an unknown member;
+        // nothing demotes.
         for (identity, entry) in membersByIdentity {
             guard let observation = observationsByIdentity[identity] else { continue }
             let observed = classifyNewMember(observation, record: record)
-            if entry.role == .tool, observed != .tool {
+            if (entry.role == .tool && observed != .tool) || (entry.role == .unknown && observed == .writer) {
                 membersByIdentity[identity] = (observed, entry.group)
             }
-            let role = membersByIdentity[identity]?.role
-            if role == .writer, providerHome == nil, Self.isClaude(record.family),
-               case let .available(environment) = observation.environment
-            {
-                providerHome = environment.claudeConfigDirectory
-            }
+        }
+        let providerHome = Self.isClaude(record.family)
+            ? Self.closestWriterHome(
+                root: record.root,
+                roles: membersByIdentity.mapValues(\.role),
+                observations: observationsByIdentity
+            )
+            : nil
+        // Settles the home lookup only for a writer that home attribution would accept (same
+        // ancestry rule): a nested or uncertain-ancestry homeless writer never ends the retries.
+        let observedHomelessWriter = Self.isClaude(record.family) && Self.rootLinkedWriters(
+            root: record.root,
+            roles: membersByIdentity.mapValues(\.role),
+            observations: observationsByIdentity
+        ).contains { writer in
+            guard case let .available(environment) = writer.observation.environment else { return false }
+            return (environment.claudeConfigDirectory ?? "").isEmpty
         }
 
         let root = record.root
@@ -557,7 +577,8 @@ package actor AgentProcessRegistry {
             writerAlive: membersByIdentity.values.contains { $0.role != .tool },
             toolAlive: membersByIdentity.values.contains { $0.role == .tool },
             isComplete: decisive,
-            providerHome: providerHome
+            providerHome: providerHome,
+            observedHomelessWriter: observedHomelessWriter
         )
     }
 
@@ -588,11 +609,83 @@ package actor AgentProcessRegistry {
         else { return .unknown }
         let basename = URL(fileURLWithPath: path).lastPathComponent
         if familyQualification.writerExecutableBasenames.contains(basename) { return .writer }
+        // O42: the native-installer Claude CLI runs from `…/claude/versions/<version>` (basename is the
+        // version). Only in a Claude family and only with this family's own marker, so a non-Claude
+        // descendant at a similar path never becomes a writer.
+        if Self.isClaude(record.family), Self.isClaudeNativeInstallerExecutable(path),
+           case let .available(environment) = observation.environment, environment.runtimeID == record.runtimeID
+        {
+            return .writer
+        }
         // Only explicit, qualified tool evidence makes a tool; anything unmatched stays unknown.
         guard familyQualification.toolExecutableBasenames.contains(basename), case .available = observation.environment else {
             return .unknown
         }
         return .tool
+    }
+
+    /// The `CLAUDE_CONFIG_DIR` of the writer closest to the root (O42): the root's own, else that of
+    /// the earliest-born writer whose nearest writer ancestor, following observed parent links, is
+    /// the root (the CLI a shim starts). A writer under another non-root writer (a nested `claude`
+    /// a tool ran) never supplies it, nor does one whose parent chain doesn't reach the root.
+    static func closestWriterHome(
+        root: AgentRuntimeProcessIdentity?,
+        roles: [AgentRuntimeProcessIdentity: AgentRuntimeMember.Role],
+        observations: [AgentRuntimeProcessIdentity: ProcessObservation]
+    ) -> String? {
+        func home(_ observation: ProcessObservation) -> String? {
+            guard case let .available(environment) = observation.environment,
+                  let directory = environment.claudeConfigDirectory, !directory.isEmpty
+            else { return nil }
+            return directory
+        }
+        guard let root else { return nil }
+        if let observation = observations[root], let directory = home(observation) { return directory }
+        return rootLinkedWriters(root: root, roles: roles, observations: observations)
+            .lazy.compactMap { home($0.observation) }
+            .first
+    }
+
+    /// Observed non-root writers whose nearest writer ancestor, following observed parent links, is
+    /// the root, earliest-born first. Only a positively qualified tool is traversed on the way up.
+    static func rootLinkedWriters(
+        root: AgentRuntimeProcessIdentity?,
+        roles: [AgentRuntimeProcessIdentity: AgentRuntimeMember.Role],
+        observations: [AgentRuntimeProcessIdentity: ProcessObservation]
+    ) -> [(identity: AgentRuntimeProcessIdentity, observation: ProcessObservation)] {
+        guard let root else { return [] }
+        func parent(of identity: AgentRuntimeProcessIdentity) -> AgentRuntimeProcessIdentity? {
+            guard let observation = observations[identity] else { return nil }
+            return roles.keys.first { candidate in
+                candidate != identity && candidate.pid == observation.parentPID
+                    && candidate.bootSessionID == identity.bootSessionID
+                    && (candidate.startSeconds, candidate.startMicroseconds) <= (identity.startSeconds, identity.startMicroseconds)
+            }
+        }
+        func nearestWriterAncestorIsRoot(_ identity: AgentRuntimeProcessIdentity) -> Bool {
+            var current = identity
+            for _ in 0 ..< roles.count {
+                guard let next = parent(of: current) else { return false }
+                if next == root { return true }
+                // A writer or an unknown member (possibly the real CLI, still unreadable) between
+                // it and the root: ancestry is uncertain, so no home is attributed (the locator
+                // handles it). Only a positively qualified tool is traversed.
+                if roles[next] != .tool { return false }
+                current = next
+            }
+            return false
+        }
+        return observations
+            .filter { $0.key != root && roles[$0.key] == .writer && nearestWriterAncestorIsRoot($0.key) }
+            .sorted { ($0.key.startSeconds, $0.key.startMicroseconds, $0.key.pid) < ($1.key.startSeconds, $1.key.startMicroseconds, $1.key.pid) }
+            .map { (identity: $0.key, observation: $0.value) }
+    }
+
+    /// `…/claude/versions/<version>`: the last two parent components are `claude/versions`.
+    static func isClaudeNativeInstallerExecutable(_ path: String) -> Bool {
+        let components = URL(fileURLWithPath: path).standardizedFileURL.pathComponents
+        guard components.count >= 3 else { return false }
+        return components[components.count - 2] == "versions" && components[components.count - 3] == "claude"
     }
 
     private static func group(of observation: ProcessObservation) -> Int32? {
@@ -1174,6 +1267,43 @@ package extension AgentProcessRegistry {
     func claudeProviderHomes(conversationID: String) -> [String] {
         let homes = records.values
             .filter { Self.isClaude($0.family) && $0.conversationIDs.contains(conversationID) }
+            .compactMap(\.providerHome)
+            .filter { !$0.isEmpty }
+        return Array(Set(homes)).sorted()
+    }
+
+    /// `claudeProviderHomes(conversationID:)`, after one discovery pass when none is recorded yet and
+    /// a spawned, still-unresolved Claude runtime of this conversation may still reveal its home: no
+    /// pass has observed its root-linked writer without one (`homeSettledRuntimeIDs`), and fewer
+    /// than `maxHomeRefreshesPerRuntime` lookups refreshed for it. Each lookup runs at most one pass;
+    /// a runtime gets at most that many over its lifetime. Discovery has no timer and no spawn
+    /// event, so a pass that saw only the shim must not end the retries.
+    func claudeProviderHomesRefreshingIfPending(conversationID: String) async -> [String] {
+        let recorded = claudeProviderHomes(conversationID: conversationID)
+        guard recorded.isEmpty else { return recorded }
+        let pending = records.values.filter { record in
+            guard Self.isClaude(record.family), record.conversationIDs.contains(conversationID), record.providerHome == nil,
+                  !homeSettledRuntimeIDs.contains(record.runtimeID),
+                  homeRefreshAttempts[record.runtimeID, default: 0] < Self.maxHomeRefreshesPerRuntime
+            else { return false }
+            switch record.state {
+            case .exited, .stopped, .reserved: return false
+            case .live, .unknown, .detachedAtQuit, .toolsRemaining: return true
+            }
+        }
+        guard !pending.isEmpty else { return [] }
+        for record in pending {
+            homeRefreshAttempts[record.runtimeID, default: 0] += 1
+        }
+        await refresh()
+        return claudeProviderHomes(conversationID: conversationID)
+    }
+
+    /// Every Claude configuration directory recorded on any Claude runtime (any conversation): the
+    /// recorded candidates of the history locator's fallback search (O42).
+    func allClaudeProviderHomes() -> [String] {
+        let homes = records.values
+            .filter { Self.isClaude($0.family) }
             .compactMap(\.providerHome)
             .filter { !$0.isEmpty }
         return Array(Set(homes)).sorted()

@@ -1710,6 +1710,94 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
         XCTAssertNil(cursor)
     }
 
+    /// O42: no home recorded yet at the first read; one registry refresh later it is, and the
+    /// baseline is captured from it.
+    func testBaselineRetriesTheRecordedHomeOnceThenCaptures() async throws {
+        let harness = try await makeProducerHarness(windowID: 4976)
+        try harness.appendHistory([historyEntry("user", uuid: "u1", parent: nil, text: "hi")])
+        let homePath = harness.home.path
+        var lookups = 0
+        var refreshes = 0
+        // The home becomes recorded only through the refresh: removing it fails this test.
+        harness.viewModel.test_recoveryRefreshHistoryRegistry = { refreshes += 1 }
+        harness.viewModel.test_recoveryClaudeHistoryHomes = { _ in
+            lookups += 1
+            return refreshes > 0 ? [homePath] : []
+        }
+        harness.viewModel.test_recoveryClaudeHistoryLocatorHomes = {
+            XCTFail("a home recorded after the refresh never reaches the fallback search")
+            return []
+        }
+        let identity = AgentDispatchBaselineIdentity(dispatchID: UUID(), runAttemptID: UUID(), userItemIDs: [UUID()])
+        let admission = await harness.viewModel.captureClaudeDispatchBaseline(identity, session: harness.session)
+        XCTAssertEqual(admission, .committed)
+        XCTAssertEqual(refreshes, 1, "exactly one refresh")
+        XCTAssertEqual(lookups, 2, "exactly one re-read after the refresh")
+        XCTAssertEqual(harness.session.providerHistoryRecovery?.dispatchBaseline(dispatchID: identity.dispatchID)?.status, .captured)
+    }
+
+    /// O42: with no recorded home, the fallback search's single hit is the history root.
+    func testBaselineFallsBackToTheLocatorsSingleHome() async throws {
+        let harness = try await makeProducerHarness(windowID: 4977)
+        try harness.appendHistory([historyEntry("user", uuid: "u1", parent: nil, text: "hi")])
+        let emptyHome = try RecoveryTestSupport.makeTemporaryRoot("AgentRecoveryBaselineEmptyHome")
+        addTeardownBlock { try? FileManager.default.removeItem(at: emptyHome) }
+        let candidates = [emptyHome.path, harness.home.path]
+        harness.viewModel.test_recoveryClaudeHistoryHomes = { _ in [] }
+        harness.viewModel.test_recoveryClaudeHistoryLocatorHomes = { candidates }
+        let identity = AgentDispatchBaselineIdentity(dispatchID: UUID(), runAttemptID: UUID(), userItemIDs: [UUID()])
+        let admission = await harness.viewModel.captureClaudeDispatchBaseline(identity, session: harness.session)
+        XCTAssertEqual(admission, .committed)
+        let baseline = try XCTUnwrap(harness.session.providerHistoryRecovery?.dispatchBaseline(dispatchID: identity.dispatchID))
+        XCTAssertEqual(baseline.status, .captured)
+        XCTAssertNotNil(baseline.file)
+        XCTAssertEqual(baseline.completeLineOffset, try UInt64(Data(contentsOf: harness.historyFile).count))
+    }
+
+    /// O42: the same conversation file under two homes is refused (recorded unsupported), never guessed.
+    func testBaselineRefusesAConversationFileFoundUnderTwoHomes() async throws {
+        let harness = try await makeProducerHarness(windowID: 4978)
+        try harness.appendHistory([historyEntry("user", uuid: "u1", parent: nil, text: "hi")])
+        let copyHome = try RecoveryTestSupport.makeTemporaryRoot("AgentRecoveryBaselineCopyHome")
+        addTeardownBlock { try? FileManager.default.removeItem(at: copyHome) }
+        let copy = copyHome.appendingPathComponent("projects/-fixture-project", isDirectory: true)
+        try FileManager.default.createDirectory(at: copy, withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: harness.historyFile, to: copy.appendingPathComponent(harness.historyFile.lastPathComponent))
+        let candidates = [harness.home.path, copyHome.path]
+        harness.viewModel.test_recoveryClaudeHistoryHomes = { _ in [] }
+        harness.viewModel.test_recoveryClaudeHistoryLocatorHomes = { candidates }
+        let identity = AgentDispatchBaselineIdentity(dispatchID: UUID(), runAttemptID: UUID(), userItemIDs: [UUID()])
+        let admission = await harness.viewModel.captureClaudeDispatchBaseline(identity, session: harness.session)
+        XCTAssertEqual(admission, .unsupported(AgentModeViewModel.recoveryClaudeHistoryAmbiguousReason))
+        XCTAssertTrue(admission.admitsWrite, "the ordinary send proceeds")
+        XCTAssertEqual(
+            harness.session.providerHistoryRecovery?.dispatchBaseline(dispatchID: identity.dispatchID)?.status,
+            .unsupported(AgentModeViewModel.recoveryClaudeHistoryAmbiguousReason)
+        )
+    }
+
+    /// O42 review A P2: a fallback candidate that couldn't be inspected leaves a single hit unproven:
+    /// recorded unsupported, the send still allowed.
+    func testBaselineRecordsUnsupportedWhenAFallbackCandidateCantBeInspected() async throws {
+        let harness = try await makeProducerHarness(windowID: 4985)
+        try harness.appendHistory([historyEntry("user", uuid: "u1", parent: nil, text: "hi")])
+        let lockedHome = try RecoveryTestSupport.makeTemporaryRoot("AgentRecoveryBaselineLockedHome")
+        let lockedProjects = lockedHome.appendingPathComponent("projects", isDirectory: true)
+        try FileManager.default.createDirectory(at: lockedProjects, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: lockedProjects.path)
+        addTeardownBlock {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: lockedProjects.path)
+            try? FileManager.default.removeItem(at: lockedHome)
+        }
+        let candidates = [lockedHome.path, harness.home.path]
+        harness.viewModel.test_recoveryClaudeHistoryHomes = { _ in [] }
+        harness.viewModel.test_recoveryClaudeHistoryLocatorHomes = { candidates }
+        let identity = AgentDispatchBaselineIdentity(dispatchID: UUID(), runAttemptID: UUID(), userItemIDs: [UUID()])
+        let admission = await harness.viewModel.captureClaudeDispatchBaseline(identity, session: harness.session)
+        XCTAssertEqual(admission, .unsupported(AgentModeViewModel.recoveryClaudeHistoryUninspectableReason))
+        XCTAssertTrue(admission.admitsWrite, "the ordinary send proceeds")
+    }
+
     func testFailedInspectionIsNotAnAbsentFileBaseline() async throws {
         let harness = try await makeProducerHarness(windowID: 4973)
         try Data("not a directory".utf8).write(to: harness.home.appendingPathComponent("projects"))

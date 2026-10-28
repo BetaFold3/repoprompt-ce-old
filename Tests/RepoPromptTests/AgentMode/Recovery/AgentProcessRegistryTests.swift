@@ -416,6 +416,260 @@ final class AgentProcessRegistryTests: XCTestCase {
         )
     }
 
+    /// O42: under a shim that sets `CLAUDE_CONFIG_DIR` only for its child, the real native-installer
+    /// CLI (`…/claude/versions/<version>`, basename = the version) is the writer, so its home is
+    /// recorded; the root's own environment has none.
+    func testNativeInstallerClaudeDescendantIsTheWriterAndRecordsItsHome() async throws {
+        let store = makeStore()
+        let registry = makeRegistry(store: store, qualification: AgentRecoveryActivation.claudeAndCodex.runtime)
+        await registry.start()
+        let launch = try newLaunch(registry, conversationID: "conv-H")
+        let runtimeID = try await launch.prepareSpawn()
+        processes.add(processes.observation(pid: 830, executable: "/opt/fixture/bin/node", group: 830, marker: runtimeID))
+        processes.add(processes.observation(
+            pid: 831,
+            start: 200,
+            parent: 830,
+            executable: "/Users/fixture/.local/share/claude/versions/2.1.302",
+            group: 830,
+            marker: runtimeID,
+            home: "/Users/fixture/.claude-rotator/profiles/a"
+        ))
+        try await launch.commitSpawn(pid: 830, processGroupID: 830)
+        XCTAssertNil(Fixtures.record(store, runtimeID)?.providerHome, "the shim's environment carries no home")
+
+        await registry.refresh()
+        let record = try XCTUnwrap(Fixtures.record(store, runtimeID))
+        XCTAssertEqual(record.members.map(\.identity.pid), [831])
+        XCTAssertEqual(record.members.map(\.role), [.writer])
+        XCTAssertEqual(record.providerHome, "/Users/fixture/.claude-rotator/profiles/a")
+        let homes = await registry.claudeProviderHomes(conversationID: "conv-H")
+        XCTAssertEqual(homes, ["/Users/fixture/.claude-rotator/profiles/a"])
+        let allHomes = await registry.allClaudeProviderHomes()
+        XCTAssertEqual(allHomes, ["/Users/fixture/.claude-rotator/profiles/a"])
+    }
+
+    /// O42 review B P1-2: a nested Claude that a tool started (shim → real CLI → bash → nested CLI,
+    /// all carrying the marker) is a writer, but only the writer closest to the root supplies the home.
+    func testANestedClaudeStartedByAToolNeverSuppliesTheHome() async throws {
+        let store = makeStore()
+        let registry = makeRegistry(store: store, qualification: AgentRecoveryActivation.claudeAndCodex.runtime)
+        await registry.start()
+        let launch = try newLaunch(registry, conversationID: "conv-nested")
+        let runtimeID = try await launch.prepareSpawn()
+        let versions = "/Users/fixture/.local/share/claude/versions/2.1.302"
+        processes.add(processes.observation(pid: 860, executable: "/opt/fixture/bin/node", group: 860, marker: runtimeID))
+        processes.add(processes.observation(
+            pid: 861, start: 200, parent: 860, executable: versions, group: 860, marker: runtimeID, home: "/fixture/home-a"
+        ))
+        processes.add(processes.observation(pid: 862, start: 300, parent: 861, executable: "/bin/bash", group: 862, marker: runtimeID))
+        processes.add(processes.observation(
+            pid: 863, start: 400, parent: 862, executable: versions, group: 862, marker: runtimeID, home: "/fixture/home-b"
+        ))
+        try await launch.commitSpawn(pid: 860, processGroupID: 860)
+
+        await registry.refresh()
+        let record = try XCTUnwrap(Fixtures.record(store, runtimeID))
+        XCTAssertEqual(record.members.map(\.identity.pid), [861, 862, 863])
+        XCTAssertEqual(record.members.map(\.role), [.writer, .unknown, .writer], "the nested CLI still counts as a possible writer")
+        XCTAssertEqual(record.providerHome, "/fixture/home-a")
+
+        // Without the session's CLI observed, the nested CLI (whose nearest writer ancestor is not the
+        // root) supplies nothing either.
+        let boot = UUID()
+        let nested = AgentRuntimeProcessIdentity(bootSessionID: boot, pid: 3, startSeconds: 3, startMicroseconds: 0, uid: 0)
+        XCTAssertNil(AgentProcessRegistry.closestWriterHome(
+            root: AgentRuntimeProcessIdentity(bootSessionID: boot, pid: 1, startSeconds: 1, startMicroseconds: 0, uid: 0),
+            roles: [nested: .writer],
+            observations: [nested: processes.observation(pid: 3, start: 3, parent: 2, executable: versions, home: "/fixture/home-b")]
+        ))
+    }
+
+    /// O42: a member first seen with an unreadable environment stays unknown with no home; once its
+    /// marker is readable it upgrades to the writer and supplies the home.
+    func testAnUnknownMemberUpgradesToTheWriterOnceItsEnvironmentIsReadable() async throws {
+        let store = makeStore()
+        let registry = makeRegistry(store: store, qualification: AgentRecoveryActivation.claudeAndCodex.runtime)
+        await registry.start()
+        let launch = try newLaunch(registry, conversationID: "conv-U")
+        let runtimeID = try await launch.prepareSpawn()
+        let versions = "/Users/fixture/.local/share/claude/versions/2.1.302"
+        processes.add(processes.observation(pid: 870, executable: "/opt/fixture/bin/node", group: 870, marker: runtimeID))
+        processes.add(processes.observation(pid: 871, start: 200, parent: 870, executable: versions, group: 870, environmentAvailable: false))
+        try await launch.commitSpawn(pid: 870, processGroupID: 870)
+
+        await registry.refresh()
+        var record = try XCTUnwrap(Fixtures.record(store, runtimeID))
+        XCTAssertEqual(record.members.map(\.role), [.unknown])
+        XCTAssertNil(record.providerHome)
+
+        processes.add(processes.observation(
+            pid: 871, start: 200, parent: 870, executable: versions, group: 870, marker: runtimeID, home: "/fixture/home-u"
+        ))
+        await registry.refresh()
+        record = try XCTUnwrap(Fixtures.record(store, runtimeID))
+        XCTAssertEqual(record.members.map(\.role), [.writer])
+        XCTAssertEqual(record.providerHome, "/fixture/home-u")
+    }
+
+    /// O42 review B P1-1 (round 1): discovery has no timer or spawn event, so a lookup that saw only
+    /// the shim doesn't end the retries: once the child appears, the next lookup refreshes and returns
+    /// its home. Reservations never refresh; a runtime whose writer was seen without a home stops
+    /// refreshing; otherwise at most `maxHomeRefreshesPerRuntime` lookups refresh.
+    func testHomeLookupRefreshesUntilTheWriterIsSeenWithinTheCap() async throws {
+        let store = makeStore()
+        let registry = makeRegistry(store: store, qualification: AgentRecoveryActivation.claudeAndCodex.runtime)
+        await registry.start()
+        let none = await registry.claudeProviderHomesRefreshingIfPending(conversationID: "conv-none")
+        XCTAssertEqual(none, [])
+        let versions = "/opt/fixture/claude/versions/2.1.302"
+        let launch = try newLaunch(registry, worktreePath: "/tmp/rpce-wt-r", conversationID: "conv-R")
+        let runtimeID = try await launch.prepareSpawn()
+        var before = processes.inventoryCalls
+        let reserved = await registry.claudeProviderHomesRefreshingIfPending(conversationID: "conv-R")
+        XCTAssertEqual(reserved, [])
+        XCTAssertEqual(processes.inventoryCalls, before, "a reservation has no process to observe")
+        processes.add(processes.observation(pid: 880, executable: "/opt/fixture/bin/node", group: 880, marker: runtimeID))
+        try await launch.commitSpawn(pid: 880, processGroupID: 880)
+
+        before = processes.inventoryCalls
+        let shimOnly = await registry.claudeProviderHomesRefreshingIfPending(conversationID: "conv-R")
+        XCTAssertEqual(shimOnly, [])
+        XCTAssertEqual(processes.inventoryCalls, before + 1, "one discovery pass")
+        processes.add(processes.observation(
+            pid: 881, start: 200, parent: 880, executable: versions, group: 880, marker: runtimeID, home: "/fixture/home-r"
+        ))
+        let found = await registry.claudeProviderHomesRefreshingIfPending(conversationID: "conv-R")
+        XCTAssertEqual(found, ["/fixture/home-r"], "the child appeared: the second lookup refreshes and returns its home")
+        XCTAssertEqual(processes.inventoryCalls, before + 2)
+        let recorded = await registry.claudeProviderHomesRefreshingIfPending(conversationID: "conv-R")
+        XCTAssertEqual(recorded, ["/fixture/home-r"], "a recorded home is returned without a refresh")
+        XCTAssertEqual(processes.inventoryCalls, before + 2)
+
+        // The writer seen with a readable environment and no home: another refresh can't help.
+        let settled = try newLaunch(registry, worktreePath: "/tmp/rpce-wt-s", conversationID: "conv-S")
+        let settledID = try await settled.prepareSpawn()
+        processes.add(processes.observation(pid: 882, executable: "/opt/fixture/bin/node", group: 882, marker: settledID))
+        processes.add(processes.observation(pid: 883, start: 200, parent: 882, executable: versions, group: 882, marker: settledID))
+        try await settled.commitSpawn(pid: 882, processGroupID: 882)
+        before = processes.inventoryCalls
+        _ = await registry.claudeProviderHomesRefreshingIfPending(conversationID: "conv-S")
+        _ = await registry.claudeProviderHomesRefreshingIfPending(conversationID: "conv-S")
+        XCTAssertEqual(processes.inventoryCalls, before + 1, "no refresh after the writer was seen without a home")
+
+        // The shim alone forever: at most the cap.
+        let capped = try newLaunch(registry, worktreePath: "/tmp/rpce-wt-c", conversationID: "conv-C")
+        let cappedID = try await capped.prepareSpawn()
+        processes.add(processes.observation(pid: 884, executable: "/opt/fixture/bin/node", group: 884, marker: cappedID))
+        try await capped.commitSpawn(pid: 884, processGroupID: 884)
+        before = processes.inventoryCalls
+        for _ in 0 ..< AgentProcessRegistry.maxHomeRefreshesPerRuntime + 2 {
+            _ = await registry.claudeProviderHomesRefreshingIfPending(conversationID: "conv-C")
+        }
+        XCTAssertEqual(processes.inventoryCalls, before + AgentProcessRegistry.maxHomeRefreshesPerRuntime)
+    }
+
+    /// O42 review A P1 (round 2): a nested homeless writer under an unreadable outer CLI never settles
+    /// the runtime, so the next lookup refreshes and returns the outer CLI's home once it is readable.
+    func testANestedHomelessWriterNeverEndsTheHomeLookupRetries() async throws {
+        let store = makeStore()
+        let registry = makeRegistry(store: store, qualification: AgentRecoveryActivation.claudeAndCodex.runtime)
+        await registry.start()
+        let launch = try newLaunch(registry, conversationID: "conv-nested-homeless")
+        let runtimeID = try await launch.prepareSpawn()
+        let versions = "/Users/fixture/.local/share/claude/versions/2.1.302"
+        processes.add(processes.observation(pid: 900, executable: "/opt/fixture/bin/node", group: 900, marker: runtimeID))
+        processes.add(processes.observation(pid: 901, start: 200, parent: 900, executable: versions, group: 900, environmentAvailable: false))
+        processes.add(processes.observation(pid: 902, start: 300, parent: 901, executable: "/bin/bash", group: 902, marker: runtimeID))
+        processes.add(processes.observation(pid: 903, start: 400, parent: 902, executable: versions, group: 902, marker: runtimeID))
+        try await launch.commitSpawn(pid: 900, processGroupID: 900)
+
+        var before = processes.inventoryCalls
+        let first = await registry.claudeProviderHomesRefreshingIfPending(conversationID: "conv-nested-homeless")
+        XCTAssertEqual(first, [])
+        XCTAssertEqual(processes.inventoryCalls, before + 1)
+        XCTAssertEqual(Fixtures.record(store, runtimeID)?.members.map(\.role), [.unknown, .unknown, .writer])
+
+        processes.add(processes.observation(
+            pid: 901, start: 200, parent: 900, executable: versions, group: 900, marker: runtimeID, home: "/fixture/home-a"
+        ))
+        before = processes.inventoryCalls
+        let second = await registry.claudeProviderHomesRefreshingIfPending(conversationID: "conv-nested-homeless")
+        XCTAssertEqual(processes.inventoryCalls, before + 1, "the nested homeless writer didn't settle the runtime")
+        XCTAssertEqual(second, ["/fixture/home-a"])
+    }
+
+    /// O42 review A P1 (round 1): an unknown member between a writer and the root (the real CLI while
+    /// its environment is unreadable) is a barrier, so a nested Claude never supplies the home; once
+    /// the real CLI is readable, its home is recorded.
+    func testAnUnknownAncestorBlocksANestedClaudesHome() async throws {
+        let store = makeStore()
+        let registry = makeRegistry(store: store, qualification: AgentRecoveryActivation.claudeAndCodex.runtime)
+        await registry.start()
+        let launch = try newLaunch(registry, conversationID: "conv-barrier")
+        let runtimeID = try await launch.prepareSpawn()
+        let versions = "/Users/fixture/.local/share/claude/versions/2.1.302"
+        processes.add(processes.observation(pid: 890, executable: "/opt/fixture/bin/node", group: 890, marker: runtimeID))
+        processes.add(processes.observation(pid: 891, start: 200, parent: 890, executable: versions, group: 890, environmentAvailable: false))
+        processes.add(processes.observation(pid: 892, start: 300, parent: 891, executable: "/bin/bash", group: 892, marker: runtimeID))
+        processes.add(processes.observation(
+            pid: 893, start: 400, parent: 892, executable: versions, group: 892, marker: runtimeID, home: "/fixture/home-b"
+        ))
+        try await launch.commitSpawn(pid: 890, processGroupID: 890)
+
+        await registry.refresh()
+        var record = try XCTUnwrap(Fixtures.record(store, runtimeID))
+        XCTAssertEqual(record.members.map(\.role), [.unknown, .unknown, .writer])
+        XCTAssertNil(record.providerHome, "the nested CLI's home is never attributed through an unknown ancestor")
+
+        processes.add(processes.observation(
+            pid: 891, start: 200, parent: 890, executable: versions, group: 890, marker: runtimeID, home: "/fixture/home-a"
+        ))
+        await registry.refresh()
+        record = try XCTUnwrap(Fixtures.record(store, runtimeID))
+        XCTAssertEqual(record.members.map(\.role), [.writer, .unknown, .writer])
+        XCTAssertEqual(record.providerHome, "/fixture/home-a")
+    }
+
+    /// O42: the native-installer path rule makes no writer outside a Claude family, nor a Claude
+    /// descendant that lacks the family's own marker.
+    func testNativeInstallerPathIsNoWriterOutsideClaudeOrWithoutTheMarker() async throws {
+        let store = makeStore()
+        let registry = makeRegistry(store: store, qualification: AgentRecoveryActivation.claudeAndCodex.runtime)
+        await registry.start()
+        let codex = try newLaunch(registry, family: .codexAppServer, worktreePath: "/tmp/rpce-wt-codex")
+        let codexID = try await codex.prepareSpawn()
+        processes.add(processes.observation(pid: 840, executable: "/opt/fixture/bin/codex", group: 840, marker: codexID))
+        processes.add(processes.observation(
+            pid: 841, start: 200, parent: 840, executable: "/opt/fixture/claude/versions/2.1.302", group: 840, marker: codexID
+        ))
+        try await codex.commitSpawn(pid: 840, processGroupID: 840)
+
+        let claude = try newLaunch(registry, worktreePath: "/tmp/rpce-wt-claude", conversationID: "conv-N")
+        let claudeID = try await claude.prepareSpawn()
+        processes.add(processes.observation(pid: 850, executable: "/opt/fixture/bin/node", group: 850, marker: claudeID))
+        processes.add(processes.observation(
+            pid: 851,
+            start: 200,
+            parent: 850,
+            executable: "/opt/fixture/claude/versions/2.1.302",
+            group: 850,
+            home: "/Users/fixture/.claude-other"
+        ))
+        try await claude.commitSpawn(pid: 850, processGroupID: 850)
+
+        await registry.refresh()
+        XCTAssertEqual(Fixtures.record(store, codexID)?.members.map(\.role), [.unknown], "a non-Claude family never gains a writer by path")
+        let claudeRecord = try XCTUnwrap(Fixtures.record(store, claudeID))
+        XCTAssertEqual(claudeRecord.members.map(\.role), [.unknown], "a parent-linked descendant without the marker stays unknown")
+        XCTAssertNil(claudeRecord.providerHome, "an unknown member's environment is never the home")
+
+        XCTAssertTrue(AgentProcessRegistry.isClaudeNativeInstallerExecutable("/Users/a/.local/share/claude/versions/2.1.302"))
+        XCTAssertFalse(AgentProcessRegistry.isClaudeNativeInstallerExecutable("/Users/a/.local/share/other/versions/2.1.302"))
+        XCTAssertFalse(AgentProcessRegistry.isClaudeNativeInstallerExecutable("/Users/a/claude/versions"))
+        XCTAssertFalse(AgentProcessRegistry.isClaudeNativeInstallerExecutable("/versions/2.1.302"))
+    }
+
     // MARK: Discovery
 
     func testPIDReuseAndDeniedInspection() async throws {

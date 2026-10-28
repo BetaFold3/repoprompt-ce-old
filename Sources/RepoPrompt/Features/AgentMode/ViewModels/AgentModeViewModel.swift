@@ -691,6 +691,12 @@ final class AgentModeViewModel: ObservableObject {
     #if DEBUG
         /// Tests: replaces the registry's Claude history-home lookup (fixture homes only).
         var test_recoveryClaudeHistoryHomes: (@MainActor (String) async -> [String])?
+        /// Tests: replaces the history locator's fallback candidate homes (fixture homes only; under
+        /// XCTest without it the fallback has no candidates).
+        var test_recoveryClaudeHistoryLocatorHomes: (@MainActor () async -> [String])?
+        /// Tests: stands in for the registry's one refresh when no home is recorded (only while
+        /// `test_recoveryClaudeHistoryHomes` is set; otherwise no refresh happens in a fixture).
+        var test_recoveryRefreshHistoryRegistry: (@MainActor () async -> Void)?
         /// Tests: replaces the runner's result of an explicit recovery choice (the request is built,
         /// gated and cached as usual; nothing is reserved or sent). Production never sets it.
         var test_recoveryActionResult: (@MainActor (AgentRecoveryActionRequest) async -> AgentRecoveryActionResult)?

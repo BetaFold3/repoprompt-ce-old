@@ -993,10 +993,18 @@ extension AgentModeViewModel {
         guard let conversationID = session.providerSessionID, !conversationID.isEmpty else {
             return await recordUnsupported("no Claude conversation identity before sending", conversationID: nil)
         }
-        let roots = await recoveryClaudeHistoryRoots(conversationID: conversationID)
+        let location = await recoveryClaudeHistoryRoots(conversationID: conversationID)
         guard stillCurrent(conversationID) else { return .refused(Self.recoveryActionStaleText) }
-        guard !roots.isEmpty else {
+        let roots: [URL]
+        switch location {
+        case let .roots(found):
+            roots = found
+        case .unknown:
             return await recordUnsupported("Claude history location unknown", conversationID: conversationID)
+        case .ambiguous:
+            return await recordUnsupported(Self.recoveryClaudeHistoryAmbiguousReason, conversationID: conversationID)
+        case .uninspectable:
+            return await recordUnsupported(Self.recoveryClaudeHistoryUninspectableReason, conversationID: conversationID)
         }
         // The previous latest receipt's proven target must still hold before this boundary may
         // replace it as the latest receipt (verified on the same captured bytes).
@@ -1344,25 +1352,103 @@ extension AgentModeViewModel {
         )
     }
 
-    /// The `projects` roots under the Claude homes the registry recorded for this conversation's
-    /// own runtimes (never the app environment or a guessed default). Empty = location unknown.
-    private func recoveryClaudeHistoryRoots(conversationID: String) async -> [URL] {
+    static let recoveryClaudeHistoryAmbiguousReason = "Claude history for this conversation exists in more than one location"
+    static let recoveryClaudeHistoryUninspectableReason = "Claude history location couldn't be checked"
+
+    enum RecoveryClaudeHistoryLocation: Equatable {
+        /// The `projects` roots to read (never empty).
+        case roots([URL])
+        case unknown
+        /// The fallback search found the conversation's file under more than one home: baseline is
+        /// recorded unsupported (the send proceeds); reconcile fails.
+        case ambiguous
+        /// A fallback candidate couldn't be inspected, so a single hit isn't proven unique: baseline
+        /// is recorded unsupported (the send proceeds); reconcile fails.
+        case uninspectable
+    }
+
+    /// Where this conversation's Claude history lives (O42). First the homes the registry recorded
+    /// for this conversation's own runtimes; when none is recorded yet (discovery may not have seen
+    /// the real CLI since spawn), at most one registry refresh per lookup (only while a runtime may still reveal its home, up to
+    /// a small per-runtime cap) and a re-read;
+    /// then the bounded `ClaudeHistoryLocator` search over every recorded Claude home, the app's
+    /// `CLAUDE_CONFIG_DIR` and `~/.claude`, which must find exactly one home holding
+    /// `<conversationID>.jsonl` with every candidate inspected. Baseline and reconcile share this
+    /// selection logic but resolve at different times, so they may pick different roots (for
+    /// example, a home recorded after a locator-found baseline); the cursor's file identity is what
+    /// guards a reconcile against reading a different file.
+    private func recoveryClaudeHistoryRoots(conversationID: String) async -> RecoveryClaudeHistoryLocation {
         #if DEBUG
             test_recoveryClaudeHistoryAccessCount += 1
         #endif
-        let homes: [String]
+        func projects(_ home: URL) -> URL {
+            home.appendingPathComponent("projects", isDirectory: true)
+        }
+        var homes = await recoveryClaudeRecordedHomes(conversationID: conversationID)
+        if homes.isEmpty {
+            homes = await recoveryClaudeRefreshedHomes(conversationID: conversationID)
+        }
+        if !homes.isEmpty {
+            return .roots(homes.map { projects(URL(fileURLWithPath: $0, isDirectory: true)) })
+        }
+        let candidates = await recoveryClaudeLocatorHomes()
+        switch await Self.locateClaudeHistory(sessionID: conversationID, homes: candidates) {
+        case let .unique(home):
+            return .roots([projects(home)])
+        case .ambiguous:
+            return .ambiguous
+        case .uninspectable:
+            return .uninspectable
+        case nil:
+            return .unknown
+        }
+    }
+
+    @concurrent
+    private nonisolated static func locateClaudeHistory(sessionID: String, homes: [URL]) async -> ClaudeHistoryLocator.Location? {
+        ClaudeHistoryLocator.locate(sessionID: sessionID, homes: homes)
+    }
+
+    /// The registry's recorded homes for this conversation's own runtimes.
+    private func recoveryClaudeRecordedHomes(conversationID: String) async -> [String] {
         #if DEBUG
             if let override = test_recoveryClaudeHistoryHomes {
-                homes = await override(conversationID)
-            } else {
-                homes = await recoveryHistoryRegistry?.claudeProviderHomes(conversationID: conversationID) ?? []
+                return await override(conversationID).filter { !$0.isEmpty }
             }
-        #else
-            homes = await recoveryHistoryRegistry?.claudeProviderHomes(conversationID: conversationID) ?? []
         #endif
-        return homes.filter { !$0.isEmpty }.map {
-            URL(fileURLWithPath: $0, isDirectory: true).appendingPathComponent("projects", isDirectory: true)
-        }
+        return await recoveryHistoryRegistry?.claudeProviderHomes(conversationID: conversationID) ?? []
+    }
+
+    /// The recorded homes after at most one discovery pass (only while a runtime may still reveal
+    /// its home, up to a small per-runtime cap), so a just-spawned
+    /// CLI's `CLAUDE_CONFIG_DIR` can be recorded.
+    private func recoveryClaudeRefreshedHomes(conversationID: String) async -> [String] {
+        #if DEBUG
+            // A fixture home lookup stands in for the registry: never refresh a real one.
+            if test_recoveryClaudeHistoryHomes != nil {
+                await test_recoveryRefreshHistoryRegistry?()
+                return await recoveryClaudeRecordedHomes(conversationID: conversationID)
+            }
+        #endif
+        return await recoveryHistoryRegistry?.claudeProviderHomesRefreshingIfPending(conversationID: conversationID) ?? []
+    }
+
+    /// The fallback search's candidate homes.
+    private func recoveryClaudeLocatorHomes() async -> [URL] {
+        #if DEBUG
+            if let override = test_recoveryClaudeHistoryLocatorHomes {
+                return await override().map { URL(fileURLWithPath: $0, isDirectory: true) }
+            }
+            // Under XCTest the fallback never reaches the developer's real `~/.claude` or the
+            // runner's own `CLAUDE_CONFIG_DIR`.
+            if !AgentRecoveryStore.isProductionCompositionActive { return [] }
+        #endif
+        let recorded = await recoveryHistoryRegistry?.allClaudeProviderHomes() ?? []
+        return ClaudeHistoryLocator.candidateHomes(
+            recorded: recorded,
+            environment: ProcessInfo.processInfo.environment,
+            userHome: FileManager.default.homeDirectoryForCurrentUser
+        )
     }
 
     private func recoveryHistoryObservation(
@@ -1410,9 +1496,16 @@ extension AgentModeViewModel {
             guard let cursor = claudeBoundary else {
                 return .failure(RecoveryHistoryFailure(message: Self.recoveryAssociationText(.baselineUnavailable)))
             }
-            let roots = await recoveryClaudeHistoryRoots(conversationID: conversationID)
-            guard !roots.isEmpty else {
+            let roots: [URL]
+            switch await recoveryClaudeHistoryRoots(conversationID: conversationID) {
+            case let .roots(found):
+                roots = found
+            case .unknown:
                 return .failure(RecoveryHistoryFailure(message: "Claude's history location for this conversation is unknown."))
+            case .ambiguous:
+                return .failure(RecoveryHistoryFailure(message: Self.recoveryClaudeHistoryAmbiguousReason + "."))
+            case .uninspectable:
+                return .failure(RecoveryHistoryFailure(message: Self.recoveryClaudeHistoryUninspectableReason + "."))
             }
             let input = RecoveryHistoryReadInput(
                 conversationID: conversationID,
