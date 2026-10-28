@@ -94,6 +94,19 @@ package enum CodexRecoveryAdapter {
         try await controller.observeRecovery(threadID: threadID, expectedTurnID: expectedTurnID, timeout: timeout)
     }
 
+    /// The observation did not find exactly the expected turn.
+    package static let noMatchingTurnText = "Codex has no matching record of the interrupted turn."
+    /// The expected turn was found, but its items are unavailable or outside the importable subset
+    /// (9-live R2). Reason-neutral: a found turn with no readable items gives the same observation.
+    package static let unsupportedTurnItemsText =
+        "Codex's record of the interrupted turn was found, but its items couldn't be imported; nothing was imported."
+
+    /// Why `historyObservation` found nothing usable in `observation`: no turn with the expected ID,
+    /// or that turn found with items that can't be imported. Both are unconfirmed observations.
+    package static func unusableObservationText(_ observation: CodexRecoveryObservation) -> String {
+        observation.turnID == nil ? noMatchingTurnText : unsupportedTurnItemsText
+    }
+
     /// Normalizes an observation for the import planner. `nil` when nothing is usable: the expected
     /// turn was not found (or was ambiguous), or its items are unavailable/unsupported and it is not
     /// verifiably completed. Completion is confirmed only by the expected turn's own `completed`

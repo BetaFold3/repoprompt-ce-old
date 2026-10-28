@@ -39,6 +39,41 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
         XCTAssertEqual(observation.transportGeneration, 3)
     }
 
+    /// 9-live R2: an interrupted turn found with tool items is unusable but named as found (its own
+    /// text), unlike a turn that isn't there at all.
+    func testCodexAdapterTellsAFoundTurnWithToolItemsFromAMissingTurn() {
+        let turns: [[String: Any]] = [[
+            "id": "turn-expected",
+            "status": "interrupted",
+            "items": [
+                ["id": "u1", "type": "userMessage"],
+                ["id": "f1", "type": "commandExecution", "command": "sleep 900"],
+                ["id": "a1", "type": "agentMessage", "text": "Running it."]
+            ]
+        ]]
+        func observe(_ expectedTurnID: String) -> CodexRecoveryObservation {
+            CodexNativeSessionController.recoveryObservation(
+                threadID: "thread-1",
+                expectedTurnID: expectedTurnID,
+                turns: turns,
+                source: .turnsList,
+                transportGeneration: 1
+            )
+        }
+        let found = observe("turn-expected")
+        XCTAssertEqual(found.turnID, "turn-expected")
+        XCTAssertEqual(found.terminal, .interrupted)
+        XCTAssertNil(CodexRecoveryAdapter.historyObservation(found), "tool items are never imported")
+        XCTAssertEqual(
+            CodexRecoveryAdapter.unusableObservationText(found),
+            "Codex's record of the interrupted turn was found, but its items couldn't be imported; nothing was imported."
+        )
+
+        let missing = observe("turn-other")
+        XCTAssertNil(CodexRecoveryAdapter.historyObservation(missing))
+        XCTAssertEqual(CodexRecoveryAdapter.unusableObservationText(missing), "Codex has no matching record of the interrupted turn.")
+    }
+
     func testCodexObservationNeverInfersCompletionFromLatestIdleOrAmbiguousTurns() {
         func observe(_ turns: [[String: Any]]) -> CodexRecoveryObservation {
             CodexNativeSessionController.recoveryObservation(
@@ -4447,9 +4482,11 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
                 expected: { _ in .nothingImported("Codex has no matching record of the interrupted turn.") }
             ),
             Row(
+                // 9-live R2: the turn was found; its items can't be imported. Still an
+                // unconfirmed observation (`nothingImported`, not `blocked`), so Continue proceeds.
                 name: "interrupted-unsupported-items",
                 observed: { _ in self.codexObservation(turnID: "turn-c", terminal: .interrupted, items: nil) },
-                expected: { _ in .nothingImported("Codex has no matching record of the interrupted turn.") }
+                expected: { _ in .nothingImported("Codex's record of the interrupted turn was found, but its items couldn't be imported; nothing was imported.") }
             )
         ]
         for (index, row) in rows.enumerated() {
@@ -4491,16 +4528,68 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
 
     /// Step 9-check through the real Reconcile (cold Codex, temporary controller): history confirms
     /// the interrupted attempt's turn finished and its rows are saved, so Check reports the card
-    /// resolved from the runner's typed result.
+    /// resolved from the runner's typed result. 9-live R2: the observed turn is the one recorded on
+    /// the run attempt, with no span naming it and with a span naming a different turn (record wins).
     func testCheckReportsAConfirmedAndSavedCodexCompletionAsResolved() async throws {
+        for (index, spanTurnID) in [nil, "turn-old"].enumerated() {
+            let name = "span \(spanTurnID ?? "none")"
+            let controller = LifecycleNoopCodexController(recorder: LifecycleRecorder())
+            controller.joinsRetirementBeforeSuccessor = true
+            controller.recoveryObservationOutcome = .success(codexObservation(
+                turnID: "turn-c",
+                terminal: .completed,
+                items: [.init(nativeItemID: "item-1", kind: .agentMessage, text: "Done.")]
+            ))
+            let (harness, _) = try await makeColdCodexHarness(windowID: 5070 + index, controllers: [controller])
+            let viewModel = harness.viewModel
+            let coordinator = try XCTUnwrap(viewModel.recoveryCoordinator)
+            let sessionID = try XCTUnwrap(harness.session.activeAgentSessionID)
+            let turnID = UUID()
+            harness.session.transcript = AgentTranscript(turns: [AgentTranscriptTurn(
+                id: turnID,
+                request: AgentTranscriptRequestAnchor(from: AgentChatItem.user("Do it")),
+                responseSpans: [AgentTranscriptProviderResponseSpan(providerTurnID: spanTurnID, startedAt: Date(), activities: [])],
+                startedAt: Date()
+            )])
+            let ownership = RecoveryTestSupport.ownership(sessionID: sessionID)
+            _ = try await harness.lane.ensureRunAttempt(
+                ownership: ownership, processRunID: nil, transcriptTurnID: turnID, providerKindRaw: harness.session.selectedAgent.rawValue
+            ).get()
+            _ = try await harness.lane.recordRunProviderTurn(ownership: ownership, providerTurnID: "turn-c").get()
+            await harness.lane.recordTerminalEvidence(
+                RecoveryTestSupport.terminalCommit(ownership: ownership, state: .failed, cause: .providerProcessLost),
+                transcriptTurnID: turnID
+            ).value
+            let itemID = "turn-\(sessionID.uuidString)-\(turnID.uuidString)"
+            let listed = await RecoveryTestSupport.eventually { coordinator.catalog.item(id: itemID)?.attention == .informational }
+            XCTAssertTrue(listed, name)
+            let itemCountBefore = harness.session.items.count
+            let rows = viewModel.recoveryNeedsAttentionRows(includeDismissed: false, activeSession: harness.session)
+
+            let task = try XCTUnwrap(viewModel.startRecoveryCheck(rows: rows))
+            let result = await task.value
+            let status = try XCTUnwrap(result)
+            let entry = try XCTUnwrap(status.entries.first { $0.itemID == itemID })
+            XCTAssertEqual(controller.observedExpectedTurnIDs, ["turn-c"], "\(name): the recorded turn is observed")
+            XCTAssertEqual(entry.outcome, .resolved("Provider history shows the turn finished."), name)
+            XCTAssertGreaterThan(harness.session.items.count, itemCountBefore, "\(name): the observed rows were imported")
+            XCTAssertTrue(controller.sentTexts.isEmpty, "\(name): nothing was sent")
+            XCTAssertTrue(controller.startReferences.isEmpty, "\(name): no thread start or resume")
+        }
+    }
+
+    /// 9-live R2 round 1: a run whose recorded turn was cleared (a non-user turn became
+    /// authoritative) never falls back to a span naming an older turn: Check doesn't ask Codex for
+    /// it, imports nothing and doesn't report the run resolved.
+    func testCheckNeverObservesTheSpanTurnAfterTheRecordedTurnWasCleared() async throws {
         let controller = LifecycleNoopCodexController(recorder: LifecycleRecorder())
         controller.joinsRetirementBeforeSuccessor = true
         controller.recoveryObservationOutcome = .success(codexObservation(
-            turnID: "turn-c",
+            turnID: "turn-old",
             terminal: .completed,
             items: [.init(nativeItemID: "item-1", kind: .agentMessage, text: "Done.")]
         ))
-        let (harness, _) = try await makeColdCodexHarness(windowID: 5070, controllers: [controller])
+        let (harness, _) = try await makeColdCodexHarness(windowID: 5072, controllers: [controller])
         let viewModel = harness.viewModel
         let coordinator = try XCTUnwrap(viewModel.recoveryCoordinator)
         let sessionID = try XCTUnwrap(harness.session.activeAgentSessionID)
@@ -4508,19 +4597,20 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
         harness.session.transcript = AgentTranscript(turns: [AgentTranscriptTurn(
             id: turnID,
             request: AgentTranscriptRequestAnchor(from: AgentChatItem.user("Do it")),
-            responseSpans: [AgentTranscriptProviderResponseSpan(providerTurnID: "turn-c", startedAt: Date(), activities: [])],
+            responseSpans: [AgentTranscriptProviderResponseSpan(providerTurnID: "turn-old", startedAt: Date(), activities: [])],
             startedAt: Date()
         )])
         let ownership = RecoveryTestSupport.ownership(sessionID: sessionID)
         _ = try await harness.lane.ensureRunAttempt(
             ownership: ownership, processRunID: nil, transcriptTurnID: turnID, providerKindRaw: harness.session.selectedAgent.rawValue
         ).get()
+        _ = try await harness.lane.recordRunProviderTurn(ownership: ownership, providerTurnID: nil).get()
         await harness.lane.recordTerminalEvidence(
             RecoveryTestSupport.terminalCommit(ownership: ownership, state: .failed, cause: .providerProcessLost),
             transcriptTurnID: turnID
         ).value
         let itemID = "turn-\(sessionID.uuidString)-\(turnID.uuidString)"
-        let listed = await RecoveryTestSupport.eventually { coordinator.catalog.item(id: itemID)?.attention == .informational }
+        let listed = await RecoveryTestSupport.eventually { coordinator.catalog.item(id: itemID) != nil }
         XCTAssertTrue(listed)
         let itemCountBefore = harness.session.items.count
         let rows = viewModel.recoveryNeedsAttentionRows(includeDismissed: false, activeSession: harness.session)
@@ -4529,10 +4619,10 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
         let result = await task.value
         let status = try XCTUnwrap(result)
         let entry = try XCTUnwrap(status.entries.first { $0.itemID == itemID })
-        XCTAssertEqual(entry.outcome, .resolved("Provider history shows the turn finished."))
-        XCTAssertGreaterThan(harness.session.items.count, itemCountBefore, "the observed rows were imported")
+        XCTAssertEqual(controller.observedExpectedTurnIDs, [], "the span's older turn is never observed")
+        XCTAssertNotEqual(entry.outcome, .resolved("Provider history shows the turn finished."))
+        XCTAssertEqual(harness.session.items.count, itemCountBefore, "nothing was imported")
         XCTAssertTrue(controller.sentTexts.isEmpty, "nothing was sent")
-        XCTAssertTrue(controller.startReferences.isEmpty, "no thread start or resume")
     }
 
     /// Review A P1-04 / B F1: live Codex output already in the conversation has no native mapping, so
@@ -4582,7 +4672,6 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
                 id: turnID,
                 request: AgentTranscriptRequestAnchor(from: userItem),
                 responseSpans: [AgentTranscriptProviderResponseSpan(
-                    providerTurnID: "turn-c",
                     startedAt: Date(),
                     activities: row.liveOutput ? [AgentTranscriptActivity(from: live)] : []
                 )],

@@ -8558,6 +8558,8 @@ final class LifecycleNoopCodexController: CodexSessionControlling {
     var recoveryObservationOutcome: Result<CodexRecoveryObservation, Error>?
     var observationGate: LifecycleAsyncGate?
     private(set) var observationOwners: [AgentRuntimeSessionScope] = []
+    /// The native turn each observation was asked for, in order.
+    private(set) var observedExpectedTurnIDs: [String] = []
 
     init(
         recorder: LifecycleRecorder,
@@ -8775,6 +8777,7 @@ final class LifecycleNoopCodexController: CodexSessionControlling {
         guard let outcome = recoveryObservationOutcome else { throw CodexRecoveryObservationError.unsupported }
         recorder.record("codex:observe" + (lifecycleLabel.map { ":\($0)" } ?? ""))
         observationOwners.append(AgentRuntimeOperationOwner.current)
+        observedExpectedTurnIDs.append(expectedTurnID)
         if let observationGate {
             await observationGate.arriveAndWait()
         }

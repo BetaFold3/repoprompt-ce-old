@@ -1267,6 +1267,38 @@ package actor AgentRecoveryStore {
         return runReceipt(runAttemptID, record: record, binding: binding, disposition: .committed)
     }
 
+    /// Records the provider's native turn ID on the existing run attempt `ownership.attemptID`
+    /// (extras member `providerTurnID`, 9-live R2). Last-wins: a different ID rewrites it and `nil`
+    /// clears it to an explicit JSON `null` marker (a non-user turn became authoritative; the key
+    /// stays present, so no span fallback applies), written even when no ID was recorded before.
+    /// An identical value (ID or marker) is unchanged. An attempt
+    /// from another transcript generation is a conflict; a missing attempt is not created here (the
+    /// dispatch commit creates it before the provider write).
+    package func recordRunProviderTurn(
+        binding: AgentRecoveryLifecycleBinding,
+        expectedRevision: AgentRecoveryRecordRevision?,
+        ownership: AgentRunOwnership,
+        providerTurnID: String?
+    ) throws -> AgentRecoveryRunReceipt {
+        let runAttemptID = ownership.attemptID
+        try requireOwnership(ownership, binding: binding)
+        let (current, index) = try requireRunAttemptIndex(runAttemptID, binding: binding)
+        var run = current.runAttempts[index]
+        guard run.transcriptResetGeneration == binding.transcriptResetGeneration else {
+            throw AgentRecoveryStoreError.runAttemptConflict(runAttemptID)
+        }
+        let value: AgentRecoveryJSONValue = providerTurnID.map { .string($0) } ?? .null
+        if run.extras[AgentRecoveryRunAttempt.providerTurnIDExtrasKey] == value {
+            return runReceipt(runAttemptID, record: current, binding: binding, disposition: .unchanged)
+        }
+        try requireRevision(expectedRevision, current: current)
+        run.extras[AgentRecoveryRunAttempt.providerTurnIDExtrasKey] = value
+        var runAttempts = current.runAttempts
+        runAttempts[index] = run
+        let record = try rewrite(current, binding: binding, runAttempts: runAttempts)
+        return runReceipt(runAttemptID, record: record, binding: binding, disposition: .committed)
+    }
+
     /// Records terminal evidence from the terminal commit barrier's revision (commit ID, terminal
     /// state, expected process run), with or without an MCP publication envelope. Identical repeats
     /// are unchanged; a different commit for the same run attempt fails.

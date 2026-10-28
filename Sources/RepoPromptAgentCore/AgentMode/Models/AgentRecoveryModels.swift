@@ -781,6 +781,27 @@ package struct AgentRecoveryRunAttempt: Equatable {
         return nil
     }
 
+    /// Extras member naming the provider's native turn ID (9-live R2, Codex): the turn that last
+    /// became authoritative for this run when it is a user turn, written after run start and
+    /// rewritten last-wins (a steer Codex accepted into a different turn names the turn running at a
+    /// kill). Set to an explicit JSON `null` when a compaction, review or unknown turn becomes
+    /// authoritative: the run's turn is then known to be unidentifiable. Reconcile matches the
+    /// provider history against it.
+    package static let providerTurnIDExtrasKey = "providerTurnID"
+
+    /// The recorded native provider turn ID, or `nil` when none was recorded or it was cleared.
+    package var recordedProviderTurnID: String? {
+        if case let .string(value)? = extras[Self.providerTurnIDExtrasKey] { return value }
+        return nil
+    }
+
+    /// Whether the run's provider turn was recorded (an ID, or the cleared `null` marker). When true,
+    /// `recordedProviderTurnID` is authoritative and no other source (a transcript span) may stand in
+    /// for it; when false (a legacy or unrecorded attempt) a fallback may.
+    package var hasProviderTurnRecord: Bool {
+        extras[Self.providerTurnIDExtrasKey] != nil
+    }
+
     package init(
         runAttemptID: UUID,
         transcriptResetGeneration: UInt64,

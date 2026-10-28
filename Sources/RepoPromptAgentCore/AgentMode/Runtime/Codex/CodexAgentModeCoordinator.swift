@@ -1910,6 +1910,45 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
         session.codexPendingTurnKind = .user
     }
 
+    #if DEBUG
+        /// Test seam: awaited by each provider-turn record write after its predecessor and before it
+        /// enters the recovery lane, with the turn ID it writes (`nil` for a clear).
+        var testProviderTurnWriteWillEnterLane: (@MainActor (String?) async -> Void)?
+    #endif
+
+    /// 9-live R2: keeps the run attempt's recorded native turn equal to the turn that last became
+    /// authoritative on it, so Reconcile matches the turn running at a kill. A user turn records its
+    /// ID (a steer Codex accepted into a different turn rewrites it); a compaction, review or unknown
+    /// turn clears it, so an older, finished user turn is never named. Writes are chained per session
+    /// (`codexProviderTurnWriteTask`, set synchronously here) so they commit in install order; event
+    /// handling never awaits them and a failure is only logged. Without a lane nothing is written.
+    private func recordCodexProviderTurn(
+        _ identity: AgentTabSession.CodexAuthoritativeTurnIdentity,
+        session: AgentTabSession
+    ) {
+        guard let lane = session.recoveryLane,
+              !lane.isRetired,
+              let ownership = session.activeRunOwnership,
+              ownership.attemptID == identity.runAttemptID
+        else { return }
+        let turnID: String? = identity.turnKind == .user ? identity.turnID : nil
+        let previous = session.codexProviderTurnWriteTask
+        #if DEBUG
+            let willEnterLane = testProviderTurnWriteWillEnterLane
+        #endif
+        session.codexProviderTurnWriteTask = Task { @MainActor in
+            await previous?.value
+            #if DEBUG
+                await willEnterLane?(turnID)
+            #endif
+            guard case let .failure(failure) = await lane.recordRunProviderTurn(ownership: ownership, providerTurnID: turnID),
+                  // Nothing to clear on a run attempt never recorded (a compaction-only run).
+                  !(turnID == nil && failure == .store(.runAttemptNotFound(ownership.attemptID)))
+            else { return }
+            logCodex("[AgentModeVM][Recovery] Codex turn ID not recorded run=\(ownership.attemptID) turn=\(turnID ?? "cleared"): \(failure)")
+        }
+    }
+
     private func installAuthoritativeCodexTurnForStart(
         turnID: String?,
         session: AgentTabSession,
@@ -1975,6 +2014,7 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
                     session.codexPendingSteerLifecycleReconciliation = nil
                     session.codexPendingTurnKind = nil
                     session.codexRoutingObservedTurnID = turnID
+                    recordCodexProviderTurn(reconciled, session: session)
                     return reconciled.turnKind
                 }
                 recordRejectedCodexTurnStart(
@@ -1989,6 +2029,7 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
             session.codexPendingTurnKind = nil
             session.codexRoutingObservedTurnID = turnID
             bindResumedThreadFallbacks(to: candidate, session: session)
+            recordCodexProviderTurn(candidate, session: session)
             return kind
         }
 

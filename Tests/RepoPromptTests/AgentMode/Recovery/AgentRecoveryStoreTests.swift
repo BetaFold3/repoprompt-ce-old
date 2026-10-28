@@ -717,6 +717,72 @@ final class AgentRecoveryStoreTests: XCTestCase {
         XCTAssertNotNil(final.intent(id: withdrawnCase.intentID)?.withdrawnAt, "withdrawal kept as history")
     }
 
+    /// 9-live R2: the provider's native turn ID is recorded on an existing run attempt only, last-wins;
+    /// an identical repeat is unchanged, and the run-start extras are kept.
+    func testRunProviderTurnIsRecordedLastWinsOnAnExistingRunAttempt() async throws {
+        let store = makeStore()
+        let session = binding(UUID(), UUID())
+        let ownership = Support.ownership(sessionID: session.sessionID)
+        await assertStoreError(.runAttemptNotFound(ownership.attemptID)) {
+            try await store.recordRunProviderTurn(binding: session, expectedRevision: nil, ownership: ownership, providerTurnID: "turn-1")
+        }
+        var revision = try await store.ensureRunAttempt(
+            binding: session, expectedRevision: nil, ownership: ownership, processRunID: nil, transcriptTurnID: nil,
+            providerKindRaw: AgentProviderKind.codexExec.rawValue
+        ).recordRevision
+        revision = try await store.recordRunProviderTurn(
+            binding: session, expectedRevision: revision, ownership: ownership, providerTurnID: "turn-1"
+        ).recordRevision
+        let repeated = try await store.recordRunProviderTurn(
+            binding: session, expectedRevision: revision, ownership: ownership, providerTurnID: "turn-1"
+        )
+        XCTAssertEqual(repeated.disposition, .unchanged)
+        let rewritten = try await store.recordRunProviderTurn(
+            binding: session, expectedRevision: revision, ownership: ownership, providerTurnID: "turn-2"
+        )
+        XCTAssertEqual(rewritten.disposition, .committed)
+
+        let record = try await loadRecord(makeStore(instance: instanceB), session.sessionID)
+        let run = try XCTUnwrap(record.runAttempt(id: ownership.attemptID))
+        XCTAssertEqual(run.recordedProviderTurnID, "turn-2", "last-wins")
+        XCTAssertEqual(run.recordedProviderKindRaw, AgentProviderKind.codexExec.rawValue, "run-start extras kept")
+
+        // A non-user authoritative turn clears it with an explicit null marker (round 1): the key stays
+        // present, so the span fallback stays off; clearing again is unchanged.
+        let cleared = try await store.recordRunProviderTurn(
+            binding: session, expectedRevision: rewritten.recordRevision, ownership: ownership, providerTurnID: nil
+        )
+        XCTAssertEqual(cleared.disposition, .committed)
+        let clearedAgain = try await store.recordRunProviderTurn(
+            binding: session, expectedRevision: cleared.recordRevision, ownership: ownership, providerTurnID: nil
+        )
+        XCTAssertEqual(clearedAgain.disposition, .unchanged)
+        let clearedRecord = try await loadRecord(makeStore(instance: instanceB), session.sessionID)
+        let clearedRun = try XCTUnwrap(clearedRecord.runAttempt(id: ownership.attemptID))
+        XCTAssertNil(clearedRun.recordedProviderTurnID)
+        XCTAssertTrue(clearedRun.hasProviderTurnRecord, "the cleared marker survives a reload")
+        XCTAssertEqual(clearedRun.extras[AgentRecoveryRunAttempt.providerTurnIDExtrasKey], .null)
+        XCTAssertEqual(clearedRun.recordedProviderKindRaw, AgentProviderKind.codexExec.rawValue)
+
+        // Clearing a run attempt that never recorded a turn still writes the marker.
+        let unrecorded = Support.ownership(sessionID: session.sessionID)
+        let created = try await store.ensureRunAttempt(
+            binding: session, expectedRevision: clearedAgain.recordRevision, ownership: unrecorded, processRunID: nil, transcriptTurnID: nil,
+            providerKindRaw: AgentProviderKind.codexExec.rawValue
+        )
+        let createdRecord = try await loadRecord(store, session.sessionID)
+        let unrecordedRun = try XCTUnwrap(createdRecord.runAttempt(id: unrecorded.attemptID))
+        XCTAssertFalse(unrecordedRun.hasProviderTurnRecord, "a new attempt has no provider-turn record")
+        let markerOnly = try await store.recordRunProviderTurn(
+            binding: session, expectedRevision: created.recordRevision, ownership: unrecorded, providerTurnID: nil
+        )
+        XCTAssertEqual(markerOnly.disposition, .committed)
+        let markedRecord = try await loadRecord(store, session.sessionID)
+        let markedRun = try XCTUnwrap(markedRecord.runAttempt(id: unrecorded.attemptID))
+        XCTAssertTrue(markedRun.hasProviderTurnRecord)
+        XCTAssertNil(markedRun.recordedProviderTurnID)
+    }
+
     func testRunAttemptEvidenceIsKeyedByExistingOwnershipAndSharedByDeliveries() async throws {
         let store = makeStore()
         let session = binding(UUID(), UUID())

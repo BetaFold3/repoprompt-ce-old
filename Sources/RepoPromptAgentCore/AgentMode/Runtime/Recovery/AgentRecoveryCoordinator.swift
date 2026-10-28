@@ -3070,6 +3070,23 @@ package final class AgentRecoverySessionLane {
         }
     }
 
+    /// Records (or, with `nil`, clears) the provider's native turn ID on the run attempt (9-live R2),
+    /// last-wins. The write is an unconditioned extras update, so it reads the current revision
+    /// inside the gate.
+    package func recordRunProviderTurn(
+        ownership: AgentRunOwnership,
+        providerTurnID: String?
+    ) async -> Result<AgentRecoveryRunReceipt, AgentRecoveryControllerFailure> {
+        await transaction { store, binding in
+            try await store.recordRunProviderTurn(
+                binding: binding,
+                expectedRevision: store.currentRevision(sessionID: binding.sessionID),
+                ownership: ownership,
+                providerTurnID: providerTurnID
+            )
+        }
+    }
+
     package func attachDeliveryAttempt(
         attemptID: UUID,
         ownership: AgentRunOwnership

@@ -2215,6 +2215,112 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         XCTAssertEqual(session.codexFallbackQueue.count, 1)
     }
 
+    /// 9-live R2: a user turn that becomes authoritative records its native turn ID on the session's
+    /// run attempt through the recovery lane (event handling never awaits the write); a steer Codex
+    /// accepted into a different turn rewrites it (last-wins); a compaction turn records nothing, and
+    /// clears a recorded user turn so an older, finished turn is never named.
+    func testAuthoritativeUserTurnRecordsItsNativeTurnIDOnTheRunAttempt() async throws {
+        let fixture = try await RecoveryLaneFixture.make("codex-provider-turn-record")
+        defer { fixture.tearDown() }
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller, recoveryLane: fixture.lane) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
+        let ownership = try XCTUnwrap(session.activeRunOwnership)
+        _ = try await fixture.lane.ensureRunAttempt(
+            ownership: ownership, processRunID: nil, transcriptTurnID: nil, providerKindRaw: session.selectedAgent.rawValue
+        ).get()
+        func recordedTurn() async -> String? {
+            // Drain the session's chained writes, then reload the record.
+            await session.codexProviderTurnWriteTask?.value
+            return await fixture.store.read(sessionID: fixture.sessionID).record?
+                .runAttempts.first { $0.runAttemptID == ownership.attemptID }?.recordedProviderTurnID
+        }
+        func startFreshTurn(_ turnID: String, kind: AgentTabSession.CodexTurnKind) async {
+            session.codexAuthoritativeActiveTurn = nil
+            session.codexRoutingObservedTurnID = nil
+            session.codexPendingTurnKind = kind
+            await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(.turnStarted(turnID: turnID), session: session)
+            XCTAssertEqual(session.codexAuthoritativeActiveTurn?.turnID, turnID, "\(turnID) became authoritative")
+        }
+
+        await startFreshTurn("compact-turn", kind: .compact)
+        let afterCompaction = await recordedTurn()
+        XCTAssertNil(afterCompaction, "a compaction turn is never recorded")
+
+        await startFreshTurn("user-turn-1", kind: .user)
+        let afterUserTurn = await recordedTurn()
+        XCTAssertEqual(afterUserTurn, "user-turn-1", "the authoritative user turn is recorded on the run attempt")
+
+        let prior = try XCTUnwrap(session.codexAuthoritativeActiveTurn)
+        session.codexPendingSteerLifecycleReconciliation = .init(priorIdentity: prior, acceptedDispatchTurnID: "user-turn-2")
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "user-turn-2"), session: session)
+        XCTAssertEqual(session.codexAuthoritativeActiveTurn?.turnID, "user-turn-2", "the accepted steer's turn is reinstalled")
+        let afterSteer = await recordedTurn()
+        XCTAssertEqual(afterSteer, "user-turn-2", "the steer-mismatch reinstall rewrites the recorded turn (last-wins)")
+
+        await startFreshTurn("compact-after-user", kind: .compact)
+        let afterLaterCompaction = await recordedTurn()
+        XCTAssertNil(afterLaterCompaction, "user turn, then compaction turn: the record is cleared")
+    }
+
+    /// 9-live R2 (review A P1, B F3): provider-turn writes commit in authoritative-install order. T1's
+    /// write is held before it enters the lane while T2 becomes authoritative; T2's write enters the
+    /// lane only after T1's committed, and T2 is the recorded turn once both drain.
+    func testProviderTurnWritesCommitInAuthoritativeInstallOrder() async throws {
+        let fixture = try await RecoveryLaneFixture.make("codex-provider-turn-order")
+        defer { fixture.tearDown() }
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller, recoveryLane: fixture.lane) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
+        let ownership = try XCTUnwrap(session.activeRunOwnership)
+        _ = try await fixture.lane.ensureRunAttempt(
+            ownership: ownership, processRunID: nil, transcriptTurnID: nil, providerKindRaw: session.selectedAgent.rawValue
+        ).get()
+        func storedTurn() async -> String? {
+            await fixture.store.read(sessionID: fixture.sessionID).record?
+                .runAttempts.first { $0.runAttemptID == ownership.attemptID }?.recordedProviderTurnID
+        }
+        let hold = ProviderTurnWriteHold()
+        var entered: [String] = []
+        var storedWhenEnteringLane: [String: String?] = [:]
+        viewModel.test_codexCoordinator.testProviderTurnWriteWillEnterLane = { turnID in
+            guard let turnID else { return }
+            entered.append(turnID)
+            storedWhenEnteringLane[turnID] = await storedTurn()
+            if turnID == "user-turn-1" { await hold.hold() }
+        }
+
+        session.codexAuthoritativeActiveTurn = nil
+        session.codexRoutingObservedTurnID = nil
+        session.codexPendingTurnKind = .user
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "user-turn-1"), session: session)
+        let firstWrite = try XCTUnwrap(session.codexProviderTurnWriteTask)
+        await hold.waitUntilArrived()
+
+        let prior = try XCTUnwrap(session.codexAuthoritativeActiveTurn)
+        session.codexPendingSteerLifecycleReconciliation = .init(priorIdentity: prior, acceptedDispatchTurnID: "user-turn-2")
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "user-turn-2"), session: session)
+        XCTAssertEqual(session.codexAuthoritativeActiveTurn?.turnID, "user-turn-2")
+        let secondWrite = try XCTUnwrap(session.codexProviderTurnWriteTask)
+        // Give an unchained T2 write every chance to run ahead of the held T1 (main-actor FIFO).
+        for _ in 0 ..< 5 {
+            await Task.yield()
+        }
+        XCTAssertEqual(entered, ["user-turn-1"], "T2 has not started toward the lane while T1 is held")
+        hold.release()
+        await firstWrite.value
+        await secondWrite.value
+
+        XCTAssertEqual(entered, ["user-turn-1", "user-turn-2"])
+        XCTAssertEqual(storedWhenEnteringLane["user-turn-2"], .some("user-turn-1"), "T2 entered the lane after T1 committed")
+        let recorded = await storedTurn()
+        XCTAssertEqual(recorded, "user-turn-2", "the later authoritative turn is the recorded one")
+    }
+
     func testTypedSteerRejectionReturnsFallbackWithoutReplacingAuthoritativeIdentity() async throws {
         let fixture = try await RecoveryLaneFixture.make("codex-liveness-typed-rejection")
         defer { fixture.tearDown() }
@@ -2976,5 +3082,30 @@ private final class CodexQuestionWriteControl: @unchecked Sendable {
             },
             removeItem: { url in try FileManager.default.removeItem(at: url) }
         )
+    }
+}
+
+/// Holds one provider-turn record write before it enters the recovery lane (9-live R2 ordering).
+@MainActor
+private final class ProviderTurnWriteHold {
+    private var arrived = false
+    private var arrivalWaiter: CheckedContinuation<Void, Never>?
+    private var releaseWaiter: CheckedContinuation<Void, Never>?
+
+    func hold() async {
+        arrived = true
+        arrivalWaiter?.resume()
+        arrivalWaiter = nil
+        await withCheckedContinuation { releaseWaiter = $0 }
+    }
+
+    func waitUntilArrived() async {
+        guard !arrived else { return }
+        await withCheckedContinuation { arrivalWaiter = $0 }
+    }
+
+    func release() {
+        releaseWaiter?.resume()
+        releaseWaiter = nil
     }
 }

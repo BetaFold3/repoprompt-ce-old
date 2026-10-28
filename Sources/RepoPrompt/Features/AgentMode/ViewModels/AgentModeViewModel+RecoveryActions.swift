@@ -139,11 +139,13 @@ extension AgentModeViewModel {
         var sourceInteractionID: UUID?
         var codexTurnID: String?
         var runTurnID: UUID?
+        var readsRecordedProviderTurn = false
         switch (action, item.payload) {
         case let (.continueTurn, payload), let (.reconcileHistory, payload), let (.continueInNewConversation, payload):
             guard let run = Self.recoveryRunReference(payload) else { return "This item can't be continued." }
             sourceRunAttemptID = run.runAttemptID
             runTurnID = run.turnID
+            readsRecordedProviderTurn = true
             codexTurnID = run.turnID.flatMap { turnID in
                 session.transcript.turns.first { $0.id == turnID }?.responseSpans.last { $0.providerTurnID != nil }?.providerTurnID
             }
@@ -181,6 +183,15 @@ extension AgentModeViewModel {
         case let .failure(failure):
             AgentRecoveryFailureDiagnostics.presentationFailure(site: "recovery_action_record_unreadable", failure: failure)
             return "This session's recovery data couldn't be read (\(Self.recoveryListDescription(of: failure)))."
+        }
+        // 9-live R2: the native turn recorded on the run attempt wins over a transcript span. A cleared
+        // record (`null`: a non-user turn became authoritative) is authoritative too, so the span
+        // fallback applies only when nothing was recorded (a legacy or unrecorded attempt).
+        if readsRecordedProviderTurn, let sourceRunAttemptID,
+           let runAttempt = runAttempts.first(where: { $0.runAttemptID == sourceRunAttemptID }),
+           runAttempt.hasProviderTurnRecord
+        {
+            codexTurnID = runAttempt.recordedProviderTurnID
         }
         // A choice that acts on the run attempt (Continue, Reconcile) is performed only by the
         // provider the run was started with (recorded at run start); nothing reserved or written.
@@ -1484,7 +1495,7 @@ extension AgentModeViewModel {
                 )
                 guard let observation = CodexRecoveryAdapter.historyObservation(observed) else {
                     return .failure(RecoveryHistoryFailure(
-                        message: "Codex has no matching record of the interrupted turn.",
+                        message: CodexRecoveryAdapter.unusableObservationText(observed),
                         isUnconfirmedObservation: true
                     ))
                 }

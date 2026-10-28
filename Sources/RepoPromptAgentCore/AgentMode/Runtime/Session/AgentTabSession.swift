@@ -733,6 +733,9 @@ package final class AgentTabSession: ObservableObject {
     package var codexAnonymousActiveTurn: CodexAnonymousTurnLiveness?
     package var codexRoutingObservedTurnID: String?
     var codexPendingSteerLifecycleReconciliation: CodexPendingSteerLifecycleReconciliation?
+    /// Tail of this session's provider-turn record writes (9-live R2): each write awaits the previous
+    /// one, so they commit in authoritative-install order. Never awaited by event handling.
+    package var codexProviderTurnWriteTask: Task<Void, Never>?
     package var codexFallbackQueue: [CodexFallbackQueueEntry] = []
     package var codexFallbackDispatchInFlight: CodexFallbackQueueEntry?
     var codexDeliveredMCPFallbackAttemptIDs: Set<UUID> = []
