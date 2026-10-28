@@ -1,5 +1,6 @@
 import Darwin
 @testable import RepoPromptAgentCore
+@testable import RepoPromptApp
 import XCTest
 
 /// Spec R6 integration of the runtime-ownership registry into recovery: startup adoption, send
@@ -36,7 +37,8 @@ final class AgentRecoveryRuntimeOwnershipTests: XCTestCase {
 
     private func startedCoordinator(
         qualification: AgentRuntimeQualification = AgentRecoveryActivation.off.runtime,
-        attachRegistry: Bool = true
+        attachRegistry: Bool = true,
+        reconciliation: AgentRecoveryStartupReconciliation = .empty
     ) async throws -> AgentRecoveryCoordinator {
         let store = AgentRecoveryStore(rootURL: recoveryRoot, appInstanceID: UUID())
         let service = AgentSessionDataService(
@@ -46,7 +48,7 @@ final class AgentRecoveryRuntimeOwnershipTests: XCTestCase {
         let coordinator = try AgentRecoveryCoordinator(
             store: store,
             dataService: service,
-            reconcile: { _ in .empty },
+            reconcile: { _ in reconciliation },
             makeComposerController: { store, gate in
                 AgentRecoveryComposerPersistenceController(
                     store: store,
@@ -275,6 +277,72 @@ final class AgentRecoveryRuntimeOwnershipTests: XCTestCase {
         XCTAssertTrue(coordinator.runtimeBlocksAutomaticWork(worktreePath: nil))
         let item = try XCTUnwrap(catalog(coordinator).item(id: AgentRecoveryCatalogProjection.runtimeOwnershipUnknownItemID))
         XCTAssertEqual(item.payload, .runtimeOwnershipUnknown(unidentifiedRecordCount: 1, failure: nil))
+    }
+
+    /// 9-live R7: app-scoped runtime items come before every session and workspace item (the sheet
+    /// lists the live process first); their IDs don't change.
+    func testRuntimeItemsPrecedeSessionItemsInTheCatalog() async throws {
+        let writer = try seedWriter(pid: 5800, conversationID: "conv-O7", worktreePath: "/tmp/wt-o7")
+        let coordinator = try await startedCoordinator()
+        let sessionID = UUID()
+        let workspaceID = UUID()
+        let summary = AgentScheduledSendConfirmationSummary(
+            sessionID: sessionID, tabID: nil, workspaceID: workspaceID, scheduleID: UUID(), attemptID: nil, reason: nil,
+            notBefore: Date(timeIntervalSince1970: 1000), previewText: "later"
+        )
+        let catalog = AgentRecoveryCatalogProjection.build(
+            coordinator: coordinator,
+            schedules: [summary],
+            unavailableScheduleIndexes: [AgentRecoveryWorkspaceDestination(id: UUID(), name: "Other", customStoragePath: nil)],
+            generation: 1
+        )
+        let runtimeItemID = AgentRecoveryCatalogProjection.runtimeItemID(runtimeID: writer.runtimeID)
+        XCTAssertEqual(catalog.items.count, 3, "\(catalog.items.map(\.id))")
+        XCTAssertEqual(catalog.items.first?.id, runtimeItemID, "\(catalog.items.map(\.id))")
+        XCTAssertEqual(catalog.items.first?.kind, .survivingProcess)
+        XCTAssertEqual(catalog.items.dropFirst().map(\.kind), [.scheduleNeedsConfirmation, .statusUnknown])
+        XCTAssertTrue(catalog.items.dropFirst().allSatisfy { $0.kind != .survivingProcess })
+    }
+
+    /// 9-live R7: the global ownership warning also comes first.
+    func testRuntimeOwnershipWarningPrecedesSessionItemsInTheCatalog() async throws {
+        let directory = recoveryRoot.appendingPathComponent("runtimes", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try Data("{}".utf8).write(to: directory.appendingPathComponent("not-a-runtime.json"))
+        let coordinator = try await startedCoordinator()
+        let summary = AgentScheduledSendConfirmationSummary(
+            sessionID: UUID(), tabID: nil, workspaceID: UUID(), scheduleID: UUID(), attemptID: nil, reason: nil,
+            notBefore: Date(timeIntervalSince1970: 1000), previewText: "later"
+        )
+        let catalog = AgentRecoveryCatalogProjection.build(coordinator: coordinator, schedules: [summary], generation: 1)
+        XCTAssertEqual(
+            catalog.items.map(\.id).first,
+            AgentRecoveryCatalogProjection.runtimeOwnershipUnknownItemID,
+            "\(catalog.items.map(\.id))"
+        )
+        XCTAssertEqual(catalog.items.last?.kind, .scheduleNeedsConfirmation)
+    }
+
+    /// 9-live R7, review B L4: the Needs Attention sheet's first "Needs action" row is the
+    /// survivor, ahead of a session-independent startup item that is built before it would have
+    /// been. (The catalog's only blocker is a session's crash hold; runtime items write none.)
+    func testSurvivorIsTheFirstNeedsActionRowOfTheSheet() async throws {
+        let writer = try seedWriter(pid: 5810, conversationID: "conv-S7", worktreePath: "/tmp/wt-s7")
+        let failure = AgentRecoveryWorkspaceInventory.Failure(workspaceID: UUID(), location: "/tmp/ws-s7", reason: "unreadable")
+        let coordinator = try await startedCoordinator(reconciliation: AgentRecoveryStartupReconciliation(workspaceFailures: [failure]))
+        let viewModel = AgentModeViewModel(
+            testWindowID: 5810,
+            testWorkspacePath: root.path,
+            testWorkspaceDirectory: root,
+            codexControllerFactory: { _, _, _, _, _, _ in LifecycleNoopCodexController(recorder: LifecycleRecorder()) }
+        )
+        viewModel.installRecoveryCoordinator(coordinator)
+        let needsAction = viewModel.recoveryNeedsAttentionRows(includeDismissed: false, activeSession: nil)
+            .filter { $0.attention == .needsAction }
+        XCTAssertEqual(
+            needsAction.map(\.id),
+            [AgentRecoveryCatalogProjection.runtimeItemID(runtimeID: writer.runtimeID), "workspace-\(failure.workspaceID.uuidString)"]
+        )
     }
 
     func testUnhostedSessionKeysFromTheCallerStillBlockAutomaticWork() async throws {

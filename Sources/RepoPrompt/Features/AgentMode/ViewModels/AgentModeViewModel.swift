@@ -691,6 +691,9 @@ final class AgentModeViewModel: ObservableObject {
     #if DEBUG
         /// Tests: replaces the registry's Claude history-home lookup (fixture homes only).
         var test_recoveryClaudeHistoryHomes: (@MainActor (String) async -> [String])?
+        /// Tests: replaces the runner's result of an explicit recovery choice (the request is built,
+        /// gated and cached as usual; nothing is reserved or sent). Production never sets it.
+        var test_recoveryActionResult: (@MainActor (AgentRecoveryActionRequest) async -> AgentRecoveryActionResult)?
         /// Tests: Claude history-home lookups and history reads this window performed.
         var test_recoveryClaudeHistoryAccessCount = 0
         /// Tests: replaces this host's Claude pre-byte baseline admission result (coordinator wiring

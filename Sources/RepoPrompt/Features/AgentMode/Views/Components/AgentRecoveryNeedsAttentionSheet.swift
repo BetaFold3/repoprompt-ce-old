@@ -42,6 +42,10 @@ struct AgentRecoveryNeedsAttentionSheet: View {
                     acknowledgedWarning: warning
                 )
             },
+            continuationDraft: { rowID in agentModeVM.recoveryContinuationDraft(rowID: rowID) },
+            updateContinuationDraft: { rowID, text in
+                agentModeVM.updateRecoveryContinuationDraft(rowID: rowID, text: text)
+            },
             retryStartup: { agentModeVM.retryRecoveryStartup() },
             inspect: { rowID in await agentModeVM.inspectRecoveryEditProposal(rowID: rowID) }
         )
@@ -242,7 +246,7 @@ extension AgentRecoveryNeedsAttentionSheet {
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
-            AgentRecoveryListRow(row: entry.row, actions: actions)
+            AgentRecoveryListRow(row: entry.row, actions: actions, detailLineLimit: 4)
         }
         .padding(8)
         .background(

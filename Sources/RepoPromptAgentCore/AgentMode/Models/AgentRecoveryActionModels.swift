@@ -327,17 +327,24 @@ package extension AgentRecoveryRecord {
     /// A later textless action that does not resolve (Reconcile recorded `notDispatched` or
     /// `importedUnconfirmed`) only checked history; it never discards the text.
     func hasUnsentContinuation(for itemKey: AgentRecoveryCardKey) -> Bool {
-        guard let index = actions.lastIndex(where: { $0.itemKey == itemKey && $0.text?.isEmpty == false }) else { return false }
+        unsentContinuationText(for: itemKey) != nil
+    }
+
+    /// 9-live R4b: the exact typed text of the action `hasUnsentContinuation(for:)` selects (the
+    /// same rule, so the two never disagree), or `nil` when the card has no unsent continuation.
+    func unsentContinuationText(for itemKey: AgentRecoveryCardKey) -> String? {
+        guard let index = actions.lastIndex(where: { $0.itemKey == itemKey && $0.text?.isEmpty == false }) else { return nil }
         let continuation = actions[index]
         if continuation.outcome != nil {
-            if Self.resolvesItem(continuation) { return false }
+            if Self.resolvesItem(continuation) { return nil }
         } else if !isSuperseded(continuation) {
-            return false
+            return nil
         }
         if let itemID = continuation.plannedUserItemID, intents.contains(where: { $0.userItemID == itemID }) {
-            return false
+            return nil
         }
-        return !actions[(index + 1)...].contains { $0.itemKey == itemKey && Self.resolvesItem($0) }
+        if actions[(index + 1)...].contains(where: { $0.itemKey == itemKey && Self.resolvesItem($0) }) { return nil }
+        return continuation.text
     }
 
     /// Relaunch join of one action to the record's intents and attempts (phase4-plan "Restart

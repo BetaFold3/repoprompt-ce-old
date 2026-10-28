@@ -2193,6 +2193,269 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
         )
     }
 
+    /// 9-live R4b/R5: the Continue editor's text is kept per row in the window, outside the row
+    /// view: the row reopens with it, and a refused continuation keeps it (here through the real
+    /// `performRecoveryListContinuation`, refused before the runner).
+    func testRefusedContinuationKeepsTheEditorDraftForTheRow() async throws {
+        let harness = try await makeProducerHarness(windowID: 5094)
+        let viewModel = harness.viewModel
+        let coordinator = try XCTUnwrap(viewModel.recoveryCoordinator)
+        let itemID = try await makeRunCard(harness, providerKindRaw: nil)
+        let item = try XCTUnwrap(coordinator.catalog.item(id: itemID))
+        func row() -> AgentRecoveryListRowProps {
+            viewModel.recoveryListRow(for: item, coordinator: coordinator, activeSession: harness.session)
+        }
+        XCTAssertTrue(row().actions.contains(.continueTurn), "\(row().actions)")
+        XCTAssertEqual(row().continuationText, AgentModeViewModel.recoveryContinueDefaultText, "no draft, no unsent text")
+        XCTAssertNil(viewModel.recoveryContinuationDraft(rowID: itemID))
+
+        let typed = "RPCE continue: reply OK"
+        viewModel.updateRecoveryContinuationDraft(rowID: itemID, text: typed)
+        XCTAssertEqual(viewModel.recoveryContinuationDraft(rowID: itemID), typed)
+        XCTAssertEqual(row().continuationText, typed, "the row reopens with the draft")
+
+        await viewModel.performRecoveryListContinuation(rowID: itemID, action: .continueTurn, text: typed, acknowledgedWarning: nil)
+        XCTAssertEqual(coordinator.catalogActionStates[itemID], .failed(AgentModeViewModel.recoveryRunProviderNotRecordedText))
+        XCTAssertEqual(viewModel.recoveryContinuationDraft(rowID: itemID), typed, "a refusal keeps the draft")
+        XCTAssertEqual(row().continuationText, typed)
+        XCTAssertEqual(row().error, AgentModeViewModel.recoveryRunProviderNotRecordedText, "no unsent text recorded, so no note")
+        // Review B L2: the draft is app-wide (the coordinator's), so another window reopens with it.
+        XCTAssertEqual(coordinator.continuationDraftsByRowID[itemID], typed)
+        let otherWindow = AgentModeViewModel(
+            testWindowID: 5194,
+            testWorkspacePath: harness.workspace.customStoragePath?.path,
+            testWorkspaceDirectory: harness.workspace.customStoragePath,
+            codexControllerFactory: { _, _, _, _, _, _ in LifecycleNoopCodexController(recorder: LifecycleRecorder()) }
+        )
+        otherWindow.installRecoveryCoordinator(coordinator)
+        XCTAssertEqual(otherWindow.recoveryContinuationDraft(rowID: itemID), typed)
+    }
+
+    /// Review A LIST-02, B L3: through the real `performRecoveryListContinuation` (runner result
+    /// controlled), a recorded outcome whose record holds the text clears the sent draft, and an
+    /// edit made during the await is newer and survives. Nothing goes to the message box.
+    func testRecordedContinuationClearsOnlyTheSentDraft() async throws {
+        let harness = try await makeProducerHarness(windowID: 5095)
+        let viewModel = harness.viewModel
+        let itemID = try await makeRunCard(harness, providerKindRaw: harness.session.selectedAgent.rawValue)
+        let typed = "RPCE continue: reply OK"
+        let results: [AgentRecoveryActionResult] = [
+            .completed(.dispatched, reason: nil),
+            .outcomeUnrecorded(.dispatched, reason: nil),
+            .completed(.notDispatched, reason: "No history position was saved.")
+        ]
+        for result in results {
+            viewModel.updateRecoveryContinuationDraft(rowID: itemID, text: typed)
+            viewModel.test_recoveryActionResult = { request in
+                XCTAssertEqual(request.text, typed, "the exact edited text is the request's")
+                return result
+            }
+            await viewModel.performRecoveryListContinuation(rowID: itemID, action: .continueTurn, text: typed, acknowledgedWarning: nil)
+            XCTAssertNil(viewModel.recoveryContinuationDraft(rowID: itemID), "\(result): the sent draft is cleared")
+
+            viewModel.updateRecoveryContinuationDraft(rowID: itemID, text: typed)
+            viewModel.test_recoveryActionResult = { _ in
+                viewModel.updateRecoveryContinuationDraft(rowID: itemID, text: "newer edit")
+                return result
+            }
+            await viewModel.performRecoveryListContinuation(rowID: itemID, action: .continueTurn, text: typed, acknowledgedWarning: nil)
+            XCTAssertEqual(viewModel.recoveryContinuationDraft(rowID: itemID), "newer edit", "\(result): a newer edit survives")
+            viewModel.recoveryCoordinator?.continuationDraftsByRowID[itemID] = nil
+        }
+        XCTAssertEqual(harness.session.draftText, "", "a text the record holds never goes to the message box")
+    }
+
+    /// Review B L1: a continuation that finds the turn already finished resolves the card without
+    /// sending, so its typed text moves to the session's message box (alone when it is empty, after
+    /// a blank line otherwise) and the row says so. The default text is not moved. An unsent choice
+    /// whose outcome couldn't be recorded moves its text the same way.
+    func testContinuationThatFindsTheTurnFinishedMovesTheTypedTextToTheMessageBox() async throws {
+        let harness = try await makeProducerHarness(windowID: 5096)
+        let viewModel = harness.viewModel
+        let coordinator = try XCTUnwrap(viewModel.recoveryCoordinator)
+        let itemID = try await makeRunCard(harness, providerKindRaw: harness.session.selectedAgent.rawValue)
+        let tabID = harness.session.tabID
+        XCTAssertEqual(viewModel.currentTabID, tabID)
+        XCTAssertEqual(harness.session.draftText, "")
+        let finished = AgentRecoveryActionResult.completed(.importedCompleted, reason: AgentRecoveryActionRunner.verifiedCompletionText)
+        viewModel.test_recoveryActionResult = { _ in finished }
+
+        let typed = "RPCE continue: reply OK"
+        viewModel.updateRecoveryContinuationDraft(rowID: itemID, text: typed)
+        await viewModel.performRecoveryListContinuation(rowID: itemID, action: .continueTurn, text: typed, acknowledgedWarning: nil)
+        XCTAssertEqual(harness.session.draftText, typed, "an empty message box gets the text alone")
+        XCTAssertNil(viewModel.recoveryContinuationDraft(rowID: itemID))
+        XCTAssertEqual(coordinator.catalogActionStates[itemID], .failed(AgentModeViewModel.recoveryContinuationFinishedMovedText))
+        XCTAssertEqual(viewModel.draftRestorationEvent?.tabID, tabID)
+        XCTAssertEqual(viewModel.draftRestorationEvent?.text, typed)
+        XCTAssertEqual(viewModel.draftRestorationEvent?.strategy, .appendAfterBlankLine(result: typed))
+
+        viewModel.storeDraftText(for: tabID, "my own text")
+        await viewModel.performRecoveryListContinuation(rowID: itemID, action: .continueTurn, text: "second", acknowledgedWarning: nil)
+        XCTAssertEqual(harness.session.draftText, "my own text\n\nsecond", "current text is kept; the message follows a blank line")
+
+        await viewModel.performRecoveryListContinuation(
+            rowID: itemID, action: .continueTurn, text: AgentModeViewModel.recoveryContinueDefaultText, acknowledgedWarning: nil
+        )
+        XCTAssertEqual(harness.session.draftText, "my own text\n\nsecond", "the default text is not moved")
+        XCTAssertEqual(coordinator.catalogActionStates[itemID], .failed(AgentRecoveryActionRunner.verifiedCompletionText))
+
+        viewModel.test_recoveryActionResult = { _ in .outcomeUnrecorded(.notDispatched, reason: nil) }
+        await viewModel.performRecoveryListContinuation(rowID: itemID, action: .continueTurn, text: "third", acknowledgedWarning: nil)
+        XCTAssertEqual(harness.session.draftText, "my own text\n\nsecond\n\nthird")
+        XCTAssertEqual(coordinator.catalogActionStates[itemID], .failed(AgentModeViewModel.recoveryContinuationUnrecordedMovedText))
+    }
+
+    /// Records `request` with `outcome` in the lane, as the runner would, so the card really
+    /// resolves (`resolvedByAction`) and stops offering Continue.
+    private func recordAction(
+        _ request: AgentRecoveryActionRequest,
+        outcome: AgentRecoveryActionOutcomeKind,
+        lane: AgentRecoverySessionLane
+    ) async {
+        guard case .success = await lane.reserveRecoveryAction(request) else { return XCTFail("reservation failed") }
+        guard case .success = await lane.completeRecoveryAction(actionID: request.actionID, outcome: outcome, reason: nil) else {
+            return XCTFail("outcome write failed")
+        }
+    }
+
+    /// Review B N1: a Continue draft typed and left in a closed editor moves to the message box
+    /// when Reconcile proves the turn finished (the card resolves and no longer offers Continue).
+    func testReconcileThatResolvesTheCardMovesTheLeftoverContinueDraftToTheMessageBox() async throws {
+        let harness = try await makeProducerHarness(windowID: 5097)
+        let viewModel = harness.viewModel
+        let coordinator = try XCTUnwrap(viewModel.recoveryCoordinator)
+        let itemID = try await makeRunCard(harness, providerKindRaw: harness.session.selectedAgent.rawValue)
+        let typed = "RPCE continue: typed, editor closed"
+        viewModel.updateRecoveryContinuationDraft(rowID: itemID, text: typed)
+        let lane = harness.lane
+        viewModel.test_recoveryActionResult = { [self] request in
+            XCTAssertEqual(request.kind, .reconcileOnly)
+            await recordAction(request, outcome: .importedCompleted, lane: lane)
+            return .completed(.importedCompleted, reason: AgentRecoveryActionRunner.verifiedCompletionText)
+        }
+
+        await viewModel.performRecoveryListAction(rowID: itemID, action: .reconcileHistory)
+        XCTAssertEqual(coordinator.catalog.item(id: itemID)?.actionFacts.resolvedByAction, true, "the card resolved")
+        XCTAssertEqual(harness.session.draftText, typed, "the typed text is in the message box")
+        XCTAssertNil(viewModel.recoveryContinuationDraft(rowID: itemID))
+        XCTAssertEqual(coordinator.catalogActionStates[itemID], .failed(AgentModeViewModel.recoveryContinuationLeftoverMovedText))
+    }
+
+    /// Review A R1-01: a newer edit made during a dispatched Continue lands in the message box once
+    /// the card resolves; the sent text (already dispatched) never does.
+    func testNewerEditDuringADispatchedContinueMovesToTheMessageBoxNotTheSentText() async throws {
+        let harness = try await makeProducerHarness(windowID: 5098)
+        let viewModel = harness.viewModel
+        let itemID = try await makeRunCard(harness, providerKindRaw: harness.session.selectedAgent.rawValue)
+        let sent = "RPCE continue: the sent text"
+        let newer = "RPCE continue: a newer edit"
+        viewModel.updateRecoveryContinuationDraft(rowID: itemID, text: sent)
+        let lane = harness.lane
+        viewModel.test_recoveryActionResult = { [self] request in
+            await recordAction(request, outcome: .dispatched, lane: lane)
+            viewModel.updateRecoveryContinuationDraft(rowID: itemID, text: newer)
+            return .completed(.dispatched, reason: nil)
+        }
+
+        await viewModel.performRecoveryListContinuation(rowID: itemID, action: .continueTurn, text: sent, acknowledgedWarning: nil)
+        XCTAssertEqual(harness.session.draftText, newer, "only the newer edit moves")
+        XCTAssertNil(viewModel.recoveryContinuationDraft(rowID: itemID))
+        XCTAssertEqual(
+            viewModel.recoveryCoordinator?.catalogActionStates[itemID],
+            .failed(AgentModeViewModel.recoveryContinuationLeftoverMovedText)
+        )
+    }
+
+    /// Review A R1-01: when a Continue finds the turn finished, neither the submitted text nor a
+    /// newer edit made during the await was sent: both move, the submitted text first.
+    func testNewerEditDuringAFinishedContinueMovesTheSubmittedTextThenTheNewerEdit() async throws {
+        let harness = try await makeProducerHarness(windowID: 5099)
+        let viewModel = harness.viewModel
+        let itemID = try await makeRunCard(harness, providerKindRaw: harness.session.selectedAgent.rawValue)
+        let lane = harness.lane
+        viewModel.updateRecoveryContinuationDraft(rowID: itemID, text: "older")
+        viewModel.test_recoveryActionResult = { [self] request in
+            await recordAction(request, outcome: .importedCompleted, lane: lane)
+            viewModel.updateRecoveryContinuationDraft(rowID: itemID, text: "newest")
+            return .completed(.importedCompleted, reason: AgentRecoveryActionRunner.verifiedCompletionText)
+        }
+        await viewModel.performRecoveryListContinuation(rowID: itemID, action: .continueTurn, text: "older", acknowledgedWarning: nil)
+        XCTAssertEqual(harness.session.draftText, "older\n\nnewest")
+        XCTAssertEqual(viewModel.draftRestorationEvent?.strategy, .appendAfterBlankLine(result: "older\n\nnewest"), "one placement")
+        XCTAssertNil(viewModel.recoveryContinuationDraft(rowID: itemID))
+        XCTAssertEqual(
+            viewModel.recoveryCoordinator?.catalogActionStates[itemID],
+            .failed(AgentModeViewModel.recoveryContinuationFinishedMovedText)
+        )
+    }
+
+    /// Review A R2-02 / B P1-A: an action on another row of the same session leaves alone the draft
+    /// of a Continue still in flight, even though its dispatched outcome already resolved its card;
+    /// the row stays working, and its own completion disposes of the (sent) draft.
+    func testActionOnAnotherRowLeavesAnInFlightContinueDraftAlone() async throws {
+        let harness = try await makeProducerHarness(windowID: 5100)
+        let viewModel = harness.viewModel
+        let coordinator = try XCTUnwrap(viewModel.recoveryCoordinator)
+        let provider = harness.session.selectedAgent.rawValue
+        let rowA = try await makeRunCard(harness, providerKindRaw: provider)
+        let rowB = try await makeRunCard(harness, providerKindRaw: provider)
+        let sent = "RPCE continue: sent from row B"
+        viewModel.updateRecoveryContinuationDraft(rowID: rowB, text: sent)
+        let lane = harness.lane
+        let latch = RecoveryGateLatch()
+        viewModel.test_recoveryActionResult = { [self] request in
+            await recordAction(request, outcome: .dispatched, lane: lane)
+            await latch.pause()
+            return .completed(.dispatched, reason: nil)
+        }
+        let continuation = Task {
+            await viewModel.performRecoveryListContinuation(rowID: rowB, action: .continueTurn, text: sent, acknowledgedWarning: nil)
+        }
+        await latch.waitUntilPaused()
+        let resolved = await RecoveryTestSupport.eventually { coordinator.catalog.item(id: rowB)?.actionFacts.resolvedByAction == true }
+        XCTAssertTrue(resolved, "row B's dispatched outcome is written")
+
+        // Any list action on row A runs the helper for the session (Copy on a run card does nothing else).
+        await viewModel.performRecoveryListAction(rowID: rowA, action: .copyProposal)
+        XCTAssertEqual(viewModel.recoveryContinuationDraft(rowID: rowB), sent, "row B's draft is not moved")
+        XCTAssertEqual(coordinator.catalogActionStates[rowB], .working, "row B is still working")
+        XCTAssertEqual(harness.session.draftText, "")
+
+        await latch.open()
+        await continuation.value
+        XCTAssertNil(viewModel.recoveryContinuationDraft(rowID: rowB), "row B's completion clears its sent draft")
+        XCTAssertEqual(harness.session.draftText, "", "the sent text never reaches the message box")
+    }
+
+    /// Review A R2-01 / B P1-B: two drafts moved in one pass (two placements in one main-actor
+    /// turn) both stay in the stored draft, and the last event alone shows both, so an input bar
+    /// that sees only the coalesced last event loses nothing.
+    func testTwoPlacementsInOneTurnKeepBothTexts() async throws {
+        let harness = try await makeProducerHarness(windowID: 5101)
+        let viewModel = harness.viewModel
+        let provider = harness.session.selectedAgent.rawValue
+        let rowA = try await makeRunCard(harness, providerKindRaw: provider)
+        let rowB = try await makeRunCard(harness, providerKindRaw: provider)
+        viewModel.updateRecoveryContinuationDraft(rowID: rowA, text: "text A")
+        viewModel.updateRecoveryContinuationDraft(rowID: rowB, text: "text B")
+        let lane = harness.lane
+        viewModel.test_recoveryActionResult = { [self] request in
+            await recordAction(request, outcome: .importedCompleted, lane: lane)
+            return .completed(.importedCompleted, reason: AgentRecoveryActionRunner.verifiedCompletionText)
+        }
+        // Row B resolves without the list's draft handling, so both drafts are left for one pass.
+        _ = await viewModel.performRecoveryResumeAction(rowID: rowB, action: .reconcileHistory)
+        await viewModel.performRecoveryListAction(rowID: rowA, action: .reconcileHistory)
+
+        let expected = [rowA, rowB].sorted().map { $0 == rowA ? "text A" : "text B" }.joined(separator: "\n\n")
+        XCTAssertEqual(harness.session.draftText, expected, "both texts are stored")
+        XCTAssertEqual(viewModel.draftRestorationEvent?.strategy, .appendAfterBlankLine(result: expected), "the last event shows both")
+        XCTAssertEqual(AgentModeViewModel.recoveryComposerAppendUpdate(live: "", result: expected), expected)
+        XCTAssertNil(viewModel.recoveryContinuationDraft(rowID: rowA))
+        XCTAssertNil(viewModel.recoveryContinuationDraft(rowID: rowB))
+    }
+
     /// Round-1 B F1: the guard fails closed. A card without a run attempt (a legacy interrupted turn's
     /// `runAttemptID` is nil) or whose attempt is not in the record is refused as not recorded; only
     /// the found attempt's recorded provider decides.

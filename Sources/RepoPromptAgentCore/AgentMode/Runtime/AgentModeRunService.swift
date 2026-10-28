@@ -172,6 +172,11 @@ package final class AgentModeRunService {
         case replaceIfEmpty
         /// Always prepend the restored text, even if the user has started typing.
         case prependAlways
+        /// A recovery continuation that wasn't sent, appended after the message box's text and a
+        /// blank line. `result` is the message box's full text the view model just stored; the
+        /// composer shows exactly it (unchanged when it already does). A later event in the same
+        /// turn carries a result that includes every earlier one, so coalesced events lose nothing.
+        case appendAfterBlankLine(result: String)
     }
 
     package struct Hooks {

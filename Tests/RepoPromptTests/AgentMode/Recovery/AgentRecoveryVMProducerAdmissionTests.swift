@@ -1538,6 +1538,25 @@ final class AgentRecoveryVMProducerAdmissionTests: XCTestCase {
                 .contains("Its recovery status is unknown.")
         )
         XCTAssertEqual(AgentModeViewModel.recoveryAdmissionRefusalMessage(.untrackedInput), saveFailure)
+
+        // 9-live V1: every admission-refusal sentence is shown as a persistent composer notice;
+        // other blocked-submit messages keep the transient one.
+        for refusal in refusals + [.shutdownInProgress, .recoveryActionInProgress, .untrackedInput] {
+            let message = AgentModeViewModel.recoveryAdmissionRefusalMessage(refusal)
+            XCTAssertTrue(AgentModeViewModel.isRecoveryAdmissionRefusalNotice(message), "\(refusal): \(message)")
+        }
+        XCTAssertTrue(AgentModeViewModel.isRecoveryAdmissionRefusalNotice(
+            AgentModeViewModel.recoveryAdmissionRefusalMessage(.restricted("An agent process may still be writing this conversation."))
+        ))
+        for other in [
+            AgentModeViewModel.recoveryAdmissionStaleMessage,
+            AgentModeViewModel.recoveryReservedPayloadUnadmittedMessage,
+            AgentModeViewModel.composeTabRemovalInProgressMessage,
+            "Failed to create a new agent session.",
+            ""
+        ] {
+            XCTAssertFalse(AgentModeViewModel.isRecoveryAdmissionRefusalNotice(other), other)
+        }
     }
 
     // MARK: - FIFO edge: a head re-queued during a live instruction wait

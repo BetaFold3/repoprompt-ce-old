@@ -232,26 +232,65 @@ extension AgentModeViewModel {
     static func recoveryAdmissionRefusalMessage(_ refusal: AgentRecoveryAdmissionRefusal) -> String {
         switch refusal {
         case .startupNotReady:
-            "RepoPrompt is still checking what was interrupted by the last restart, so this message was not sent yet. Your draft is kept."
+            recoveryRefusalStartupNotReadyMessage
         case .startupFailed:
-            "RepoPrompt couldn't check what was interrupted by the last restart, so this message was not sent. Retry from the recovery banner. Your draft is kept."
+            recoveryRefusalStartupFailedMessage
         case let .restricted(reason):
-            "This message was not sent: \(reason) Review it in the recovery banner. Your draft is kept."
+            "\(recoveryRefusalRestrictedPrefix)\(reason)\(recoveryRefusalRestrictedSuffix)"
         case .crashHeld:
-            "The previous run in this session may still have been working when RepoPrompt closed. Confirm it stopped from the recovery banner before sending. Your draft is kept."
+            recoveryRefusalCrashHeldMessage
         case .unsavedPredecessorInput:
-            "Earlier unsaved input in this session needs to be restored or discarded first (recovery banner). Your draft is kept."
+            recoveryRefusalUnsavedPredecessorMessage
         case .resetPreparationInProgress:
-            "The conversation is being cleared, so this message was not sent. Your draft is kept."
+            recoveryRefusalResetPreparationMessage
         case .shutdownInProgress:
-            "RepoPrompt is saving this session before closing, so this message was not sent. Your draft is kept."
+            recoveryRefusalShutdownMessage
         case .recoveryActionInProgress:
-            "A recovery choice in this workspace is in progress, so this message was not sent. Your draft is kept."
+            recoveryRefusalActionInProgressMessage
         case .laneRetired, .bindingMismatch:
-            "The session changed before this message could be saved, so it was not sent. Your draft is kept."
+            recoveryRefusalSessionChangedMessage
         case .composerUnavailable, .untrackedInput:
             recoveryAdmissionFailedMessage
         }
+    }
+
+    static let recoveryRefusalStartupNotReadyMessage =
+        "RepoPrompt is still checking what was interrupted by the last restart, so this message was not sent yet. Your draft is kept."
+    static let recoveryRefusalStartupFailedMessage =
+        "RepoPrompt couldn't check what was interrupted by the last restart, so this message was not sent. Retry from the recovery banner. Your draft is kept."
+    static let recoveryRefusalRestrictedPrefix = "This message was not sent: "
+    static let recoveryRefusalRestrictedSuffix = " Review it in the recovery banner. Your draft is kept."
+    static let recoveryRefusalCrashHeldMessage =
+        "The previous run in this session may still have been working when RepoPrompt closed. Confirm it stopped from the recovery banner before sending. Your draft is kept."
+    static let recoveryRefusalUnsavedPredecessorMessage =
+        "Earlier unsaved input in this session needs to be restored or discarded first (recovery banner). Your draft is kept."
+    static let recoveryRefusalResetPreparationMessage =
+        "The conversation is being cleared, so this message was not sent. Your draft is kept."
+    static let recoveryRefusalShutdownMessage =
+        "RepoPrompt is saving this session before closing, so this message was not sent. Your draft is kept."
+    static let recoveryRefusalActionInProgressMessage =
+        "A recovery choice in this workspace is in progress, so this message was not sent. Your draft is kept."
+    static let recoveryRefusalSessionChangedMessage =
+        "The session changed before this message could be saved, so it was not sent. Your draft is kept."
+
+    /// 9-live V1: whether `message` is a sentence of `recoveryAdmissionRefusalMessage`. The composer
+    /// shows those as a persistent notice (until the next submit attempt or text change) instead of
+    /// the 3-second one.
+    static func isRecoveryAdmissionRefusalNotice(_ message: String) -> Bool {
+        if message.hasPrefix(recoveryRefusalRestrictedPrefix), message.hasSuffix(recoveryRefusalRestrictedSuffix) {
+            return true
+        }
+        return [
+            recoveryRefusalStartupNotReadyMessage,
+            recoveryRefusalStartupFailedMessage,
+            recoveryRefusalCrashHeldMessage,
+            recoveryRefusalUnsavedPredecessorMessage,
+            recoveryRefusalResetPreparationMessage,
+            recoveryRefusalShutdownMessage,
+            recoveryRefusalActionInProgressMessage,
+            recoveryRefusalSessionChangedMessage,
+            recoveryAdmissionFailedMessage
+        ].contains(message)
     }
 
     /// Shown when the input was committed but its lane retired during the commit: it is kept as held

@@ -133,6 +133,30 @@ extension AgentModeViewModel {
         if case let .failed(message)? = state { message } else { nil }
     }
 
+    /// 9-live R4a: a row's inline error. When the card's typed continuation was not sent, the note
+    /// saying so comes first, so a truncated line drops the reason, never the note.
+    static func recoveryListRowError(_ state: AgentRecoveryCatalogActionState?, hasUnsentContinuation: Bool) -> String? {
+        guard let reason = recoveryListError(state) else { return nil }
+        return hasUnsentContinuation ? "\(recoveryListUnsentContinuationNote) \(reason)" : reason
+    }
+
+    /// 9-live R4b/R5: the text the Continue editor opens with: the app-wide in-memory draft of the
+    /// row, then the card's unsent typed text, then the default.
+    static func recoveryContinuationOpeningText(draft: String?, unsentText: String?) -> String {
+        draft ?? unsentText ?? recoveryContinueDefaultText
+    }
+
+    /// The Continue editor's in-memory draft of `rowID` (read when the editor opens). Kept on the
+    /// app-wide recovery coordinator (review B L2), so every window sees the same draft.
+    func recoveryContinuationDraft(rowID: String) -> String? {
+        recoveryCoordinator?.continuationDraftsByRowID[rowID]
+    }
+
+    /// Every edit in the Continue editor of `rowID` (no UI refresh; nothing is written to disk).
+    func updateRecoveryContinuationDraft(rowID: String, text: String) {
+        recoveryCoordinator?.continuationDraftsByRowID[rowID] = text
+    }
+
     /// Formats one catalog item for this window: full actions for the active session (or the tab
     /// owning a draft in this window), Open for another session with a tab, and Dismiss for an item
     /// with a durable acknowledgement. Never rediscovers or removes anything.
@@ -168,6 +192,15 @@ extension AgentModeViewModel {
         }()
         let rowID = pausedIndicator ? "\(Self.recoveryListPausedRowPrefix)\(sessionID?.uuidString ?? "")" : item.id
         let state = coordinator.catalogActionStates[rowID]
+        let isRunCard = switch item.payload {
+        case .turn, .outcomeTurn, .recoveryOnlyRun: true
+        default: false
+        }
+        // R4a: a run card's refusal keeps the unsent-text note visible (the error replaces the detail).
+        let error = Self.recoveryListRowError(
+            state,
+            hasUnsentContinuation: isRunCard && item.actionFacts.hasUnsentContinuation
+        )
         func row(
             _ title: String,
             _ detail: String,
@@ -187,9 +220,14 @@ extension AgentModeViewModel {
                 attachmentNames: attachmentNames,
                 actions: actions,
                 isWorking: state == .working,
-                error: Self.recoveryListError(state),
+                error: error,
                 confirmation: confirmation,
-                continuationText: continues ? Self.recoveryContinueDefaultText : nil,
+                continuationText: continues
+                    ? Self.recoveryContinuationOpeningText(
+                        draft: recoveryContinuationDraft(rowID: rowID),
+                        unsentText: item.actionFacts.unsentContinuationText
+                    )
+                    : nil,
                 continuationWarning: continues ? recoveryPriorActionWarning(for: item.acknowledgement?.key) : nil
             )
         }
@@ -755,7 +793,9 @@ extension AgentModeViewModel {
         guard let coordinator = recoveryCoordinator, coordinator.catalogActionStates[rowID] != .working else { return }
         coordinator.setCatalogActionState(.working, for: rowID)
         refreshRecoveryListUI()
-        let failure: String? = switch action {
+        // Captured before the await: the action may resolve (or remove) the item.
+        let sessionID = recoveryListCatalogItem(rowID)?.sessionID
+        var failure: String? = switch action {
         case .edit:
             await editRecoveredIntent(rowID: rowID)
         case .remove:
@@ -787,6 +827,11 @@ extension AgentModeViewModel {
         case .discardProposal:
             await discardRecoveryEditProposal(rowID: rowID)
         }
+        // Review B N1: a Continue draft of this session whose card stopped offering Continue (here
+        // a Reconcile that proved the turn finished, or a saved draft resolved after N3 kept one).
+        if let moved = rescueOrphanedRecoveryContinuationDrafts(sessionID: sessionID, rowID: rowID) {
+            failure = moved
+        }
         coordinator.setCatalogActionState(failure.map { .failed($0) }, for: rowID)
         refreshRecoveryListUI()
     }
@@ -804,14 +849,252 @@ extension AgentModeViewModel {
         else { return }
         coordinator.setCatalogActionState(.working, for: rowID)
         refreshRecoveryListUI()
-        let failure = await performRecoveryResumeAction(
+        // Captured before the await: a choice that proves the turn finished resolves the card.
+        let sessionID = recoveryListCatalogItem(rowID)?.sessionID
+        let report = RecoveryResumeActionReport()
+        var failure = await performRecoveryResumeAction(
             rowID: rowID,
             action: action,
             continuationText: text,
-            acknowledgedWarning: acknowledgedWarning
+            acknowledgedWarning: acknowledgedWarning,
+            report: report
         )
+        // R4b/R5, review B L1/L3: once the action was recorded the record holds the text (sent,
+        // carried by a saved intent, or the card's unsent text again), so the draft goes; a text
+        // the record neither sent nor shows moves to the message box. A refusal keeps the draft.
+        // Only the sent text is removed: an edit made during the await is newer and survives.
+        switch Self.recoveryContinuationDraftDisposition(report.result) {
+        case .keep:
+            break
+        case .clear:
+            removeRecoveryContinuationDraft(rowID: rowID, ifEqualTo: text)
+        case .moveToComposer:
+            // Review A R1-01: neither the submitted text nor an edit made during the await was
+            // sent, so both move (the submitted text first, in one placement).
+            let unsent = Self.recoveryUnsentContinuationText(
+                submitted: text,
+                newer: coordinator.continuationDraftsByRowID[rowID]
+            )
+            if let unsent, let host = sessionID.flatMap({ recoveryComposerHost(sessionID: $0) }) {
+                failure = host.viewModel.moveRecoveryContinuationTextToComposer(
+                    unsent,
+                    rowID: rowID,
+                    session: host.session,
+                    message: Self.recoveryContinuationMovedToComposerText(report.result)
+                )
+            } else {
+                // Review A R1-02: no window hosts the session now; the text is kept, never dropped,
+                // and Open (a list action) brings it to the message box.
+                coordinator.continuationDraftsByRowID[rowID] = unsent
+                if unsent != nil { failure = Self.recoveryContinuationOpenSessionText }
+            }
+        }
+        // Review B N1: a leftover newer edit whose card no longer offers Continue (for example
+        // after a dispatched send) moves too; the sent text itself never does.
+        if let moved = rescueOrphanedRecoveryContinuationDrafts(sessionID: sessionID, rowID: rowID) {
+            failure = moved
+        }
         coordinator.setCatalogActionState(failure.map { .failed($0) }, for: rowID)
         refreshRecoveryListUI()
+    }
+
+    /// Review B N1 / A R1-01: every Continue draft of `sessionID` (plus `rowID`'s, whose item may
+    /// have left the catalog) whose card no longer offers Continue moves to the session's message
+    /// box; a blank or default draft is dropped. A draft whose card still offers Continue, or whose
+    /// session no window hosts (R1-02), or whose message box isn't in a normal state (N3) is kept.
+    /// Returns the acted row's message when its draft moved or was held back.
+    func rescueOrphanedRecoveryContinuationDrafts(sessionID: UUID?, rowID: String) -> String? {
+        guard let coordinator = recoveryCoordinator, let sessionID else { return nil }
+        var rowIDs = coordinator.continuationDraftsByRowID.keys.filter { coordinator.catalog.item(id: $0)?.sessionID == sessionID }
+        if coordinator.continuationDraftsByRowID[rowID] != nil, !rowIDs.contains(rowID) { rowIDs.append(rowID) }
+        guard !rowIDs.isEmpty, let host = recoveryComposerHost(sessionID: sessionID) else { return nil }
+        var actedRowMessage: String?
+        for id in rowIDs.sorted() {
+            guard let draft = coordinator.continuationDraftsByRowID[id] else { continue }
+            // Review A R2-02 / B P1-A: another row's action still in flight disposes of its own draft
+            // (its text may have been sent already).
+            if id != rowID, coordinator.catalogActionStates[id] == .working { continue }
+            if let item = coordinator.catalog.item(id: id), host.viewModel.recoveryCardOffersContinue(item, session: host.session) {
+                continue
+            }
+            if Self.isRecoveryContinuationDraftDisposable(draft) {
+                coordinator.continuationDraftsByRowID[id] = nil
+                continue
+            }
+            let message = host.viewModel.moveRecoveryContinuationTextToComposer(
+                draft,
+                rowID: id,
+                session: host.session,
+                message: Self.recoveryContinuationLeftoverMovedText
+            )
+            if id == rowID {
+                actedRowMessage = message
+            } else {
+                coordinator.setCatalogActionState(.failed(message), for: id)
+            }
+        }
+        return actedRowMessage
+    }
+
+    /// Whether `item` is a run card that still offers Continue for `session` (the row builder's
+    /// own rule, `recoveryRunActions`).
+    func recoveryCardOffersContinue(_ item: AgentRecoveryCatalogItem, session: AgentTabSession) -> Bool {
+        let status: AgentRecoveryInterruptedTurn.Status
+        switch item.payload {
+        case let .turn(turn):
+            status = turn.status
+        case let .outcomeTurn(outcome):
+            status = outcome.status
+        case let .recoveryOnlyRun(attempt):
+            status = AgentRecoveryInterruptedTurn.Status.classify(terminal: attempt.terminal, shutdown: attempt.shutdown)
+        default:
+            return false
+        }
+        let actions = recoveryRunActions(session: session, status: status, facts: item.actionFacts)
+        return actions.contains(.continueTurn) || actions.contains(.continueInNewConversation)
+    }
+
+    /// A draft with nothing the user typed: blank, or the unchanged default text.
+    static func isRecoveryContinuationDraftDisposable(_ text: String) -> Bool {
+        text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || text == recoveryContinueDefaultText
+    }
+
+    /// Review A R1-01: what a continuation that was neither sent nor shown again by its card moves
+    /// to the message box: the submitted text, then a differing newer edit, after a blank line.
+    /// Blank and default texts are left out; `nil` when nothing is left.
+    static func recoveryUnsentContinuationText(submitted: String, newer: String?) -> String? {
+        var texts: [String] = []
+        for text in [submitted, newer].compactMap(\.self)
+            where !isRecoveryContinuationDraftDisposable(text) && !texts.contains(text)
+        {
+            texts.append(text)
+        }
+        guard let first = texts.first else { return nil }
+        return texts.dropFirst().reduce(first) { recoveryComposerAppending($1, to: $0) }
+    }
+
+    /// The window hosting `sessionID`'s message box: this one, else another window on the same
+    /// recovery coordinator (review A R1-02: the session moved). `nil` when no window hosts it.
+    func recoveryComposerHost(sessionID: UUID) -> (viewModel: AgentModeViewModel, session: AgentTabSession)? {
+        if let session = recoveryListTabSession(sessionID: sessionID) { return (self, session) }
+        for window in WindowStatesManager.shared.allWindows {
+            let other = window.agentModeViewModel
+            guard other !== self, other.recoveryCoordinator === recoveryCoordinator,
+                  let session = other.recoveryListTabSession(sessionID: sessionID)
+            else { continue }
+            return (other, session)
+        }
+        return nil
+    }
+
+    /// Moves `text` into `session`'s message box (hosted by this window) and removes `rowID`'s
+    /// draft; returns the row's message. Review B N3: only while the session's recovered composer
+    /// is in its normal state (restored, nothing held, no unsaved predecessor input); otherwise the
+    /// text stays the row's draft, and the next list action on the session moves it.
+    func moveRecoveryContinuationTextToComposer(
+        _ text: String,
+        rowID: String,
+        session: AgentTabSession,
+        message: String
+    ) -> String {
+        guard let lane = session.recoveryLane, !lane.isRetired, lane.composerState == .ready,
+              lane.unsavedPredecessorInputs.isEmpty
+        else {
+            recoveryCoordinator?.continuationDraftsByRowID[rowID] = text
+            return Self.recoveryContinuationComposerBusyText
+        }
+        placeUnsentRecoveryContinuationInComposer(text, session: session, message: message)
+        recoveryCoordinator?.continuationDraftsByRowID[rowID] = nil
+        return message
+    }
+
+    /// What a continuation's result means for its row's Continue draft.
+    enum RecoveryContinuationDraftDisposition: Equatable {
+        /// Nothing was recorded by this choice (it never reached the runner, or was disabled,
+        /// refused, joined, or held by a prior action): the draft is the only copy.
+        case keep
+        /// The action and its outcome were recorded, and the record now holds the text: it was
+        /// sent (`dispatched`), or it ended unsent (`notDispatched`, `importedUnconfirmed`), so the
+        /// card shows it again as its unsent text unless a saved intent carries it.
+        case clear
+        /// The action was recorded but its text was neither sent nor shown again by the card: the
+        /// turn had already finished (`importedCompleted` resolves the card), or the outcome of an
+        /// unsent choice couldn't be recorded (the action stays open, so the card has no unsent
+        /// text). The text moves to the session's message box.
+        case moveToComposer
+    }
+
+    static func recoveryContinuationDraftDisposition(_ result: AgentRecoveryActionResult?) -> RecoveryContinuationDraftDisposition {
+        switch result {
+        case nil, .disabled?, .refused?, .joined?, .priorAction?:
+            .keep
+        case .completed(.dispatched, _)?, .completed(.notDispatched, _)?, .completed(.importedUnconfirmed, _)?,
+             .outcomeUnrecorded(.dispatched, _)?:
+            .clear
+        case .completed(.importedCompleted, _)?, .outcomeUnrecorded(.importedCompleted, _)?,
+             .outcomeUnrecorded(.notDispatched, _)?, .outcomeUnrecorded(.importedUnconfirmed, _)?:
+            .moveToComposer
+        }
+    }
+
+    static let recoveryContinuationFinishedMovedText =
+        "The interrupted turn had already finished, so your message wasn't sent. It's now in the message box."
+    static let recoveryContinuationUnrecordedMovedText =
+        "Nothing was sent, but that couldn't be recorded. Your message is now in the message box."
+    static let recoveryContinuationLeftoverMovedText =
+        "This card no longer offers Continue, so the message you typed for it wasn't sent. It's now in the message box."
+    static let recoveryContinuationOpenSessionText =
+        "Your message wasn't sent. Open this session to get it back in the message box."
+    static let recoveryContinuationComposerBusyText =
+        "Your message wasn't sent. Resolve this session's saved draft first; your message is kept and then moves to the message box."
+
+    /// The row's message once its unsent continuation text moved to the message box.
+    static func recoveryContinuationMovedToComposerText(_ result: AgentRecoveryActionResult?) -> String {
+        switch result {
+        case .completed(.importedCompleted, _)?, .outcomeUnrecorded(.importedCompleted, _)?:
+            recoveryContinuationFinishedMovedText
+        default:
+            recoveryContinuationUnrecordedMovedText
+        }
+    }
+
+    /// Removes the row's draft only while it still is `text` (a newer edit survives).
+    private func removeRecoveryContinuationDraft(rowID: String, ifEqualTo text: String) {
+        guard let coordinator = recoveryCoordinator, coordinator.continuationDraftsByRowID[rowID] == text else { return }
+        coordinator.continuationDraftsByRowID[rowID] = nil
+    }
+
+    /// Review B L1: puts a continuation's unsent text into `session`'s message box: the text alone
+    /// when the box is empty, otherwise after its current text and a blank line. Its current text
+    /// is never replaced. The change is an ordinary composer edit (saved like typing).
+    func placeUnsentRecoveryContinuationInComposer(_ text: String, session: AgentTabSession, message: String) {
+        // The session's draft is current: the input bar stores every edit, and the recovered-draft
+        // paths (Restore, retry load) store theirs synchronously before this runs.
+        let result = Self.recoveryComposerAppending(text, to: session.draftText)
+        storeDraftText(for: session.tabID, result)
+        if session.tabID == currentTabID {
+            // Review A R2-01 / B P1-B: the event carries the whole stored result, so the input bar
+            // shows exactly it; events coalesced in one turn lose nothing, and a repeat is a no-op.
+            draftRestorationEvent = DraftRestorationEvent(
+                id: UUID(),
+                tabID: session.tabID,
+                text: text,
+                message: message,
+                strategy: .appendAfterBlankLine(result: result)
+            )
+        }
+        syncComposerUIState(tabID: session.tabID)
+    }
+
+    /// `text` alone when `base` is blank, otherwise `base`, a blank line, and `text`.
+    static func recoveryComposerAppending(_ text: String, to base: String) -> String {
+        base.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? text : base + "\n\n" + text
+    }
+
+    /// The input bar's new text for an `appendAfterBlankLine(result:)` event: the view model's
+    /// stored `result`, or `nil` when the composer already shows it (review B N2: a repeat is a no-op).
+    static func recoveryComposerAppendUpdate(live: String, result: String) -> String? {
+        live == result ? nil : result
     }
 
     /// Refresh: one fresh discovery of every unresolved runtime. It never signals anything.

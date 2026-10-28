@@ -524,6 +524,12 @@ package final class AgentRecoveryCoordinator {
     /// Shared, app-wide action state per catalog item (every surface shows the same progress or
     /// error). An item disappears only when its backing state changes, never by a local mark.
     package private(set) var catalogActionStates: [String: AgentRecoveryCatalogActionState] = [:]
+    /// 9-live R4b/R5 (review B L2): the Continue editor's text per catalog row ID, written on every
+    /// edit so it survives the editor, its row view, or its window closing. App-wide like
+    /// `catalogActionStates` (any window's banner or sheet reopens with it), in memory only, and
+    /// not observed: the editor reads it when it opens. The window removes an entry once the
+    /// record holds the text (or the text moved to the message box), never on a refusal.
+    package var continuationDraftsByRowID: [String: String] = [:]
     /// Step 8-attention-2: the app-wide bulk Dismiss (one at a time; transient, never persisted).
     /// The running one, or the last finished one's summary until the next starts
     /// (`AgentRecoveryCoordinator+BulkDismiss.swift`).

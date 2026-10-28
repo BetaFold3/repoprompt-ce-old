@@ -353,6 +353,10 @@ struct AgentInputBar: View {
                         acknowledgedWarning: warning
                     )
                 },
+                continuationDraft: { rowID in agentModeVM.recoveryContinuationDraft(rowID: rowID) },
+                updateContinuationDraft: { rowID, text in
+                    agentModeVM.updateRecoveryContinuationDraft(rowID: rowID, text: text)
+                },
                 retryStartup: { agentModeVM.retryRecoveryStartup() },
                 openNeedsAttention: { agentModeVM.presentRecoveryNeedsAttention() },
                 inspect: { rowID in await agentModeVM.inspectRecoveryEditProposal(rowID: rowID) }
@@ -473,7 +477,7 @@ struct AgentComposerView: View, Equatable {
     @State private var ohMyPiThinkingRevision: UInt = 0
     @State private var showPermissionPopover: Bool = false
     @State private var showClaudeToolsPopover: Bool = false
-    @State private var steeringUnsupportedMessage: String? = nil
+    @State private var steeringNotice = AgentComposerSubmitNotice()
     @State private var steeringUnsupportedDismissTask: Task<Void, Never>?
     @State private var modelMenuSnapshotByAgent: [AgentProviderKind: [AgentModelOption]]? = nil
     @State private var modelMenuSnapshotReleaseTask: Task<Void, Never>? = nil
@@ -630,6 +634,10 @@ struct AgentComposerView: View, Equatable {
         permissionBinding?.externallyManagedReason != nil
     }
 
+    private var steeringUnsupportedMessage: String? {
+        steeringNotice.message
+    }
+
     private var hasSteeringUnsupportedNotice: Bool {
         guard let message = steeringUnsupportedMessage else { return false }
         return !message.isEmpty
@@ -775,6 +783,9 @@ struct AgentComposerView: View, Equatable {
             if let newTabID {
                 loadDraftFromSession(for: newTabID)
             }
+            // Review A LIST-01: a persistent refusal belongs to the previous tab's send, also when
+            // the new tab's draft is identical (no text change fires).
+            clearPersistentSteeringNotice()
             dismissCursorModelParametersPopover()
         }
         .onChange(of: props.selectedAgent) { _, selectedAgent in
@@ -821,6 +832,7 @@ struct AgentComposerView: View, Equatable {
         }
         .onChange(of: localInputText) { _, newValue in
             isInputEmpty = newValue.isEmpty
+            clearPersistentSteeringNotice()
             guard let tabID = currentTabID, !isSyncingDraftFromSession else { return }
             actions.storeDraft(tabID, newValue)
         }
@@ -843,6 +855,15 @@ struct AgentComposerView: View, Equatable {
                 } else {
                     restoredText = event.text + "\n" + existing
                 }
+            case let .appendAfterBlankLine(result):
+                guard let update = AgentModeViewModel.recoveryComposerAppendUpdate(live: localInputText, result: result) else {
+                    isSyncingDraftFromSession = false
+                    if !event.message.isEmpty {
+                        showSteeringUnsupportedNotice(event.message)
+                    }
+                    return
+                }
+                restoredText = update
             }
             setLocalInputText(restoredText, forceRevision: true)
             actions.storeDraft(event.tabID, restoredText)
@@ -2344,6 +2365,7 @@ struct AgentComposerView: View, Equatable {
         notBefore: Date,
         runAlongsideOtherSessions: Bool
     ) {
+        clearPersistentSteeringNotice()
         guard !submissionLatch.isLatched(for: currentTabID) else {
             logViewSubmitRejection(reason: "local_attempt_latched", target: renderedSubmitTarget, persistent: true)
             return
@@ -2399,7 +2421,10 @@ struct AgentComposerView: View, Equatable {
                 if let blockedMessage = effects.blockedMessage {
                     // The reason only: the message can carry error descriptions.
                     logViewSubmitRejection(reason: "schedule_completion_blocked", target: attempt.target, persistent: true)
-                    showSteeringUnsupportedNotice(blockedMessage)
+                    showSteeringUnsupportedNotice(
+                        blockedMessage,
+                        persistent: AgentModeViewModel.isRecoveryAdmissionRefusalNotice(blockedMessage)
+                    )
                 }
             }
         case let .rejected(rejection):
@@ -2413,6 +2438,7 @@ struct AgentComposerView: View, Equatable {
     }
 
     private func sendMessage() {
+        clearPersistentSteeringNotice()
         guard !submissionLatch.isLatched(for: currentTabID) else {
             logViewSubmitRejection(reason: "local_attempt_latched", target: renderedSubmitTarget, persistent: true)
             return
@@ -2471,7 +2497,11 @@ struct AgentComposerView: View, Equatable {
                 if let blockedMessage = effects.blockedMessage {
                     // The reason only: the message can carry error descriptions.
                     logViewSubmitRejection(reason: "completion_blocked", target: attempt.target, persistent: true)
-                    showSteeringUnsupportedNotice(blockedMessage)
+                    // 9-live V1: a recovery admission refusal stays until the next attempt or edit.
+                    showSteeringUnsupportedNotice(
+                        blockedMessage,
+                        persistent: AgentModeViewModel.isRecoveryAdmissionRefusalNotice(blockedMessage)
+                    )
                 }
             }
         case let .rejected(rejection):
@@ -2484,26 +2514,38 @@ struct AgentComposerView: View, Equatable {
         }
     }
 
-    private func showSteeringUnsupportedNotice(_ message: String) {
+    /// Shows `message` under the composer: for 3 seconds, or until the next submit attempt or text
+    /// change when `persistent`.
+    private func showSteeringUnsupportedNotice(_ message: String, persistent: Bool = false) {
         guard !message.isEmpty else { return }
         submissionLatch.advanceNoticeRevision()
         let noticeRevision = submissionLatch.noticeRevision
         steeringUnsupportedDismissTask?.cancel()
+        steeringUnsupportedDismissTask = nil
+        var needsTimer = false
         withAnimation(.easeInOut(duration: 0.15)) {
-            steeringUnsupportedMessage = message
+            needsTimer = steeringNotice.show(message, persistent: persistent)
         }
+        guard needsTimer else { return }
         steeringUnsupportedDismissTask = Task {
-            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            try? await Task.sleep(nanoseconds: AgentComposerSubmitNotice.transientDurationNanoseconds)
             guard !Task.isCancelled else { return }
             await MainActor.run {
-                guard submissionLatch.noticeRevision == noticeRevision,
-                      steeringUnsupportedMessage == message
-                else { return }
+                guard submissionLatch.noticeRevision == noticeRevision else { return }
                 withAnimation(.easeInOut(duration: 0.2)) {
-                    steeringUnsupportedMessage = nil
+                    _ = steeringNotice.transientTimerFired(for: message)
                 }
                 steeringUnsupportedDismissTask = nil
             }
+        }
+    }
+
+    /// 9-live V1: the next submit attempt, composer text change, or tab change clears a persistent
+    /// notice.
+    private func clearPersistentSteeringNotice() {
+        guard steeringNotice.isPersistent else { return }
+        withAnimation(.easeInOut(duration: 0.2)) {
+            _ = steeringNotice.clearPersistent()
         }
     }
 

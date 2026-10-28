@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptUI
 import SwiftUI
 
 /// Lossless-restart recovery banner above the composer: the active session's needs-action items of
@@ -28,7 +29,7 @@ struct AgentRecoveryListBanner: View {
                 ScrollView(.vertical) {
                     VStack(alignment: .leading, spacing: 0) {
                         ForEach(props.rows) { row in
-                            AgentRecoveryListRow(row: row, actions: actions)
+                            AgentRecoveryListRow(row: row, actions: actions, detailLineLimit: 2)
                                 .frame(height: Self.rowHeight)
                         }
                     }
@@ -93,6 +94,8 @@ struct AgentRecoveryListBanner: View {
 struct AgentRecoveryListRow: View {
     let row: AgentRecoveryListRowProps
     let actions: AgentRecoveryListActions
+    /// Lines of the detail or error: 2 in the banner (its rows have a fixed height), more in the sheet.
+    var detailLineLimit = 2
 
     @State private var isViewing = false
     @State private var pendingConfirmation: AgentRecoveryListRowProps.Action?
@@ -114,7 +117,9 @@ struct AgentRecoveryListRow: View {
                 Text(row.error ?? row.detail)
                     .font(.system(size: 10, weight: row.error == nil ? .regular : .semibold))
                     .foregroundStyle(row.error == nil ? Color.secondary : Color.orange)
-                    .lineLimit(2)
+                    .lineLimit(detailLineLimit)
+                    // Review B L9: the full text when the line limit cuts it (the reason after the note).
+                    .hoverTooltip(row.error ?? row.detail)
                     .accessibilityIdentifier(row.error == nil ? "agent.recoveryList.detail" : "agent.recoveryList.error")
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -136,7 +141,9 @@ struct AgentRecoveryListRow: View {
                     if action == .discardDraft || action == .cancelSchedule || action == .discardProposal, row.confirmation != nil {
                         pendingConfirmation = action
                     } else if isContinuation(action), let text = row.continuationText {
-                        continuationDraft = text
+                        // R4b/R5: the window's draft first (props may predate the latest edit),
+                        // then the props' opening text (unsent typed text, then the default).
+                        continuationDraft = actions.continuationDraft(row.id) ?? text
                         editingContinuation = action
                     } else {
                         Task { await actions.perform(row.id, action) }
@@ -189,7 +196,7 @@ struct AgentRecoveryListRow: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .accessibilityIdentifier("agent.recoveryList.continuationWarning")
             }
-            TextEditor(text: $continuationDraft)
+            TextEditor(text: continuationDraftBinding)
                 .font(.system(size: 12))
                 .frame(minHeight: 80, maxHeight: 160)
                 .accessibilityIdentifier("agent.recoveryList.continuationText")
@@ -208,6 +215,17 @@ struct AgentRecoveryListRow: View {
         }
         .padding(12)
         .frame(width: 380)
+    }
+
+    /// R5: every edit is also kept outside this view, so any close path keeps it.
+    private var continuationDraftBinding: Binding<String> {
+        Binding(
+            get: { continuationDraft },
+            set: { text in
+                continuationDraft = text
+                actions.updateContinuationDraft(row.id, text)
+            }
+        )
     }
 
     private func isDestructive(_ action: AgentRecoveryListRowProps.Action) -> Bool {

@@ -205,6 +205,10 @@ package struct AgentRecoveryCatalogActionFacts: Equatable {
     /// Cleared only by a saved intent carrying that text or a later action that resolves the card;
     /// a later textless Reconcile that does not resolve it never clears it.
     package var hasUnsentContinuation = false
+    /// 9-live R4b: the unsent typed text itself, from the same action `hasUnsentContinuation`
+    /// selects (`AgentRecoveryRecord.unsentContinuationText(for:)`); `nil` exactly when
+    /// `hasUnsentContinuation` is false. The Continue editor reopens with it.
+    package var unsentContinuationText: String?
     /// Run cards only: the projection-time clearing rule that matched
     /// (`AgentRecoveryCatalogProjection.automaticClear`). Applied only while the card is
     /// informational (`AgentRecoveryCatalogItem.automaticClear`).
@@ -223,6 +227,7 @@ package struct AgentRecoveryCatalogActionFacts: Equatable {
         resolvedByAction: Bool = false,
         hasUnfinishedAction: Bool = false,
         hasUnsentContinuation: Bool = false,
+        unsentContinuationText: String? = nil,
         automaticClear: AgentRecoveryCatalogAutomaticClear? = nil,
         runNeverHandedOff: Bool = false,
         runTranscriptResetGeneration: UInt64? = nil,
@@ -231,6 +236,7 @@ package struct AgentRecoveryCatalogActionFacts: Equatable {
         self.resolvedByAction = resolvedByAction
         self.hasUnfinishedAction = hasUnfinishedAction
         self.hasUnsentContinuation = hasUnsentContinuation
+        self.unsentContinuationText = unsentContinuationText
         self.automaticClear = automaticClear
         self.runNeverHandedOff = runNeverHandedOff
         self.runTranscriptResetGeneration = runTranscriptResetGeneration
@@ -300,6 +306,9 @@ package enum AgentRecoveryCatalogProjection {
             return AgentRecoveryCatalog(generation: generation, items: [], blockers: [:])
         }
         var builder = Builder(coordinator: coordinator)
+        // 9-live R7: app-scoped runtime items (a live process, or unknown process ownership) come
+        // first, ahead of every per-session item. Their IDs don't depend on the order.
+        builder.addRuntimeRestrictions()
         builder.addComposerPreparations()
         builder.addStartupResults()
         builder.addHeldInputOfUnlistedSessions()
@@ -307,7 +316,6 @@ package enum AgentRecoveryCatalogProjection {
         builder.addOwnerlessInput()
         builder.addSchedules(schedules)
         builder.addUnavailableScheduleIndexes(unavailableScheduleIndexes)
-        builder.addRuntimeRestrictions()
         builder.removeDeletedSessions()
         return AgentRecoveryCatalog(generation: generation, items: builder.items, blockers: builder.blockers)
     }
@@ -459,7 +467,8 @@ package enum AgentRecoveryCatalogProjection {
             if let record, let key = card?.key {
                 facts.resolvedByAction = record.resolvingAction(for: key) != nil
                 facts.hasUnfinishedAction = facts.hasUnfinishedAction || record.unresolvedAction(for: key) != nil
-                facts.hasUnsentContinuation = record.hasUnsentContinuation(for: key)
+                facts.unsentContinuationText = record.unsentContinuationText(for: key)
+                facts.hasUnsentContinuation = facts.unsentContinuationText != nil
                 if key.kindRaw == AgentRecoveryCardKey.Kind.run.rawValue {
                     let runAttemptID = UUID(uuidString: key.entityID)
                     facts.runNeverHandedOff = record.isVerifiedNeverHandedOff(runAttemptID: runAttemptID)

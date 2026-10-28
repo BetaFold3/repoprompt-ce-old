@@ -1427,6 +1427,106 @@ final class AgentRecoveryStartupCompositionTests: XCTestCase {
                 .hasSuffix(" \(AgentModeViewModel.recoveryListUnsentContinuationNote)") == true
         }
         XCTAssertTrue(explained, "\(viewModel.recoveryListProps(forActiveSession: session)?.rows.map(\.detail) ?? [])")
+        XCTAssertEqual(coordinator.catalog.item(id: itemID)?.actionFacts.unsentContinuationText, "please continue")
+
+        // 9-live R4a: a refusal on that row shows the note first, then the reason.
+        let reason = "No history position was saved for this run, so it can't be continued safely."
+        coordinator.setCatalogActionState(.failed(reason), for: itemID)
+        let refusedRow = viewModel.recoveryListProps(forActiveSession: session)?.rows.first { $0.id == itemID }
+        XCTAssertEqual(refusedRow?.error, "\(AgentModeViewModel.recoveryListUnsentContinuationNote) \(reason)")
+        let sheetError = viewModel.recoveryNeedsAttentionRows(includeDismissed: false, activeSession: session)
+            .first { $0.id == itemID }?.row.error
+        XCTAssertEqual(sheetError, refusedRow?.error, "the sheet shows the same row error")
+        coordinator.setCatalogActionState(nil, for: itemID)
+        XCTAssertNil(viewModel.recoveryListProps(forActiveSession: session)?.rows.first { $0.id == itemID }?.error)
+    }
+
+    /// 9-live R4a: the note leads only a run card's refusal while its typed text is unsent; other
+    /// refusals keep their reason alone.
+    func testRecoveryRowErrorPutsTheUnsentNoteBeforeTheReason() {
+        let note = AgentModeViewModel.recoveryListUnsentContinuationNote
+        XCTAssertEqual(
+            AgentModeViewModel.recoveryListRowError(.failed("Reason."), hasUnsentContinuation: true),
+            "\(note) Reason."
+        )
+        XCTAssertEqual(AgentModeViewModel.recoveryListRowError(.failed("Reason."), hasUnsentContinuation: false), "Reason.")
+        XCTAssertNil(AgentModeViewModel.recoveryListRowError(.working, hasUnsentContinuation: true))
+        XCTAssertNil(AgentModeViewModel.recoveryListRowError(nil, hasUnsentContinuation: true))
+    }
+
+    /// 9-live R4b/R5: the Continue editor opens with the row's draft, then the card's unsent
+    /// typed text, then the default; a draft is kept as typed, even when empty.
+    func testContinuationEditorOpeningTextPrecedence() {
+        let defaultText = AgentModeViewModel.recoveryContinueDefaultText
+        XCTAssertEqual(AgentModeViewModel.recoveryContinuationOpeningText(draft: "draft", unsentText: "unsent"), "draft")
+        XCTAssertEqual(AgentModeViewModel.recoveryContinuationOpeningText(draft: "", unsentText: "unsent"), "")
+        XCTAssertEqual(AgentModeViewModel.recoveryContinuationOpeningText(draft: nil, unsentText: "unsent"), "unsent")
+        XCTAssertEqual(AgentModeViewModel.recoveryContinuationOpeningText(draft: nil, unsentText: nil), defaultText)
+    }
+
+    /// 9-live R4b/R5, review B L1/L3: a choice that recorded nothing keeps the draft; a recorded
+    /// outcome whose record holds the text (sent, or the card's unsent text again) clears it; a
+    /// recorded choice whose text the record neither sent nor shows moves it to the message box.
+    func testContinuationDraftDispositionFollowsWhatTheRecordHolds() {
+        let expectations: [(AgentRecoveryActionResult?, AgentModeViewModel.RecoveryContinuationDraftDisposition)] = [
+            (nil, .keep),
+            (.disabled("off"), .keep),
+            (.refused("stale"), .keep),
+            (.joined(.unknown), .keep),
+            (.priorAction(actionID: UUID(), join: .unknown), .keep),
+            (.completed(.dispatched, reason: nil), .clear),
+            (.outcomeUnrecorded(.dispatched, reason: nil), .clear),
+            (.completed(.notDispatched, reason: "No history position was saved."), .clear),
+            (.completed(.importedUnconfirmed, reason: nil), .clear),
+            (.completed(.importedCompleted, reason: nil), .moveToComposer),
+            (.outcomeUnrecorded(.importedCompleted, reason: nil), .moveToComposer),
+            (.outcomeUnrecorded(.notDispatched, reason: nil), .moveToComposer),
+            (.outcomeUnrecorded(.importedUnconfirmed, reason: nil), .moveToComposer)
+        ]
+        for (result, expected) in expectations {
+            XCTAssertEqual(
+                AgentModeViewModel.recoveryContinuationDraftDisposition(result), expected, "\(String(describing: result))"
+            )
+        }
+        XCTAssertEqual(
+            AgentModeViewModel.recoveryContinuationMovedToComposerText(.completed(.importedCompleted, reason: nil)),
+            AgentModeViewModel.recoveryContinuationFinishedMovedText
+        )
+        XCTAssertEqual(
+            AgentModeViewModel.recoveryContinuationMovedToComposerText(.outcomeUnrecorded(.notDispatched, reason: nil)),
+            AgentModeViewModel.recoveryContinuationUnrecordedMovedText
+        )
+    }
+
+    /// Review B N2, A R2-01 / B P1-B: the view model stores the appended result and the input bar
+    /// shows exactly that result: a repeat changes nothing, and when two events coalesce, the last
+    /// one alone still shows both texts.
+    func testComposerAppendIsAppliedOnce() {
+        XCTAssertEqual(AgentModeViewModel.recoveryComposerAppending("moved", to: ""), "moved", "an empty box gets the text alone")
+        XCTAssertEqual(AgentModeViewModel.recoveryComposerAppending("moved", to: "  \n"), "moved", "whitespace counts as empty")
+        XCTAssertEqual(AgentModeViewModel.recoveryComposerAppending("moved", to: "mine"), "mine\n\nmoved")
+
+        XCTAssertEqual(AgentModeViewModel.recoveryComposerAppendUpdate(live: "mine", result: "mine\n\nmoved"), "mine\n\nmoved")
+        XCTAssertNil(
+            AgentModeViewModel.recoveryComposerAppendUpdate(live: "mine\n\nmoved", result: "mine\n\nmoved"),
+            "already showing the stored result: unchanged"
+        )
+        // Restore of R then a held-back T in one turn: the bar sees only the second event.
+        let restored = "R"
+        let second = AgentModeViewModel.recoveryComposerAppending("T", to: restored)
+        XCTAssertEqual(AgentModeViewModel.recoveryComposerAppendUpdate(live: "", result: second), "R\n\nT", "nothing is lost")
+
+        /// Review A R1-01: an unsent submitted text and a differing newer edit move together.
+        func unsent(_ submitted: String, _ newer: String?) -> String? {
+            AgentModeViewModel.recoveryUnsentContinuationText(submitted: submitted, newer: newer)
+        }
+        let defaultText = AgentModeViewModel.recoveryContinueDefaultText
+        XCTAssertEqual(unsent("X", "Y"), "X\n\nY", "the submitted text first")
+        XCTAssertEqual(unsent("X", "X"), "X", "deduplicated")
+        XCTAssertEqual(unsent("X", nil), "X")
+        XCTAssertEqual(unsent(defaultText, "Y"), "Y", "the default text is left out")
+        XCTAssertEqual(unsent("X", " \n"), "X", "a blank edit is left out")
+        XCTAssertNil(unsent(defaultText, nil))
     }
 
     /// Review B ATT1-5: after a crash, an active session whose only other items are informational

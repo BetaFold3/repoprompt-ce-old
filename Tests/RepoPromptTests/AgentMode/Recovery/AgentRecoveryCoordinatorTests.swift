@@ -2070,6 +2070,7 @@ final class AgentRecoveryCoordinatorTests: XCTestCase {
         try await fixture.perform(continuation, outcome: .notDispatched)
         let item = try XCTUnwrap(fixture.item)
         XCTAssertTrue(item.actionFacts.hasUnsentContinuation)
+        XCTAssertEqual(item.actionFacts.unsentContinuationText, "please continue from the last step", "9-live R4b: the typed text itself")
         XCTAssertFalse(item.actionFacts.hasUnfinishedAction)
         XCTAssertFalse(item.actionFacts.resolvedByAction)
         XCTAssertEqual(item.attention, .needsAction)
@@ -2088,6 +2089,11 @@ final class AgentRecoveryCoordinatorTests: XCTestCase {
             try await fixture.perform(fixture.request(), outcome: outcome)
             let item = try XCTUnwrap(fixture.item)
             XCTAssertTrue(item.actionFacts.hasUnsentContinuation, "\(outcome)")
+            XCTAssertEqual(
+                item.actionFacts.unsentContinuationText,
+                "please continue from the last step",
+                "a later textless Reconcile never replaces the typed text: \(outcome)"
+            )
             XCTAssertFalse(item.actionFacts.hasUnfinishedAction, "\(outcome)")
             XCTAssertEqual(item.attention, .needsAction, "\(outcome)")
             XCTAssertEqual(fixture.coordinator.catalog.openNeedsActionCount, 1, "\(outcome)")
@@ -2125,6 +2131,18 @@ final class AgentRecoveryCoordinatorTests: XCTestCase {
             actions: [emptyText]
         )
         XCTAssertFalse(emptyTextRecord.hasUnsentContinuation(for: fixture.key))
+        XCTAssertNil(emptyTextRecord.unsentContinuationText(for: fixture.key))
+    }
+
+    /// 9-live R4b: a newer unsent typed continuation decides the text over an older unsent one.
+    func testUnsentContinuationTextIsTheNewestUnsentTypedText() async throws {
+        let fixture = try await makeRunCardFixture()
+        try await recordUnsentContinuation(fixture)
+
+        try await fixture.perform(fixture.request(text: "continue, second try"), outcome: .notDispatched)
+        let item = try XCTUnwrap(fixture.item)
+        XCTAssertTrue(item.actionFacts.hasUnsentContinuation)
+        XCTAssertEqual(item.actionFacts.unsentContinuationText, "continue, second try")
     }
 
     /// Review A/B ATT1-R2-2 (a): a previous launch's typed continuation that never got an outcome,
@@ -2149,6 +2167,7 @@ final class AgentRecoveryCoordinatorTests: XCTestCase {
             XCTAssertNil(record?.action(id: continuation.actionID)?.outcome, "the old continuation has no outcome")
             let item = try XCTUnwrap(fixture.item)
             XCTAssertTrue(item.actionFacts.hasUnsentContinuation, "\(outcome)")
+            XCTAssertEqual(item.actionFacts.unsentContinuationText, "please continue from the last step", "\(outcome)")
             XCTAssertFalse(item.actionFacts.hasUnfinishedAction, "\(outcome)")
             XCTAssertEqual(item.attention, .needsAction, "\(outcome)")
         }
@@ -2164,6 +2183,7 @@ final class AgentRecoveryCoordinatorTests: XCTestCase {
         XCTAssertTrue(adopted)
         let item = try XCTUnwrap(fixture.item)
         XCTAssertFalse(item.actionFacts.hasUnsentContinuation)
+        XCTAssertNil(item.actionFacts.unsentContinuationText)
         XCTAssertTrue(item.actionFacts.hasUnfinishedAction)
         XCTAssertEqual(item.attention, .needsAction)
     }
@@ -2177,6 +2197,7 @@ final class AgentRecoveryCoordinatorTests: XCTestCase {
         try await fixture.perform(fixture.request(text: "continue, second try"), outcome: .dispatched)
         let item = try XCTUnwrap(fixture.item)
         XCTAssertFalse(item.actionFacts.hasUnsentContinuation)
+        XCTAssertNil(item.actionFacts.unsentContinuationText)
         XCTAssertTrue(item.actionFacts.resolvedByAction)
         XCTAssertEqual(item.attention, .informational)
     }
@@ -2201,6 +2222,7 @@ final class AgentRecoveryCoordinatorTests: XCTestCase {
         XCTAssertTrue(adopted)
         let item = try XCTUnwrap(fixture.item)
         XCTAssertFalse(item.actionFacts.hasUnsentContinuation)
+        XCTAssertNil(item.actionFacts.unsentContinuationText)
         XCTAssertEqual(item.attention, .informational)
     }
 
@@ -2213,6 +2235,7 @@ final class AgentRecoveryCoordinatorTests: XCTestCase {
         let item = try XCTUnwrap(fixture.item)
         XCTAssertTrue(item.actionFacts.resolvedByAction)
         XCTAssertFalse(item.actionFacts.hasUnsentContinuation)
+        XCTAssertNil(item.actionFacts.unsentContinuationText)
         XCTAssertEqual(item.attention, .informational)
         XCTAssertEqual(fixture.coordinator.catalog.openNeedsActionCount, 0)
     }

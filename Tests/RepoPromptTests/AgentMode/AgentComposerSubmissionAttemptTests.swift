@@ -192,6 +192,94 @@ final class AgentComposerSubmissionAttemptTests: XCTestCase {
         XCTAssertNil(effects.blockedMessage)
     }
 
+    /// Review B L5: an admission refusal reaches the composer's completion as `effects.blockedMessage`
+    /// unchanged, so the input bar's classifier makes it persistent; an unrelated block stays timed.
+    func testAdmissionRefusalBlockedMessageIsClassifiedAsPersistent() throws {
+        let refusals: [AgentRecoveryAdmissionRefusal] = [
+            .startupNotReady,
+            .restricted("A process from before the restart may still be writing this conversation."),
+            .untrackedInput
+        ]
+        for refusal in refusals {
+            var latch = AgentComposerSubmissionLatch()
+            let session = AgentTabSession(tabID: UUID())
+            let attempt = try XCTUnwrap(latch.begin(target: makeTarget(session: session), rawDraftSnapshot: "draft"))
+            let effects = latch.complete(
+                attempt,
+                result: .blocked(message: AgentModeViewModel.recoveryAdmissionRefusalMessage(refusal)),
+                currentTabID: session.tabID,
+                currentRawDraft: "draft"
+            )
+            XCTAssertFalse(effects.shouldClearInput, "\(refusal)")
+            let message = try XCTUnwrap(effects.blockedMessage, "\(refusal)")
+            XCTAssertTrue(AgentModeViewModel.isRecoveryAdmissionRefusalNotice(message), "\(refusal): \(message)")
+        }
+        var latch = AgentComposerSubmissionLatch()
+        let session = AgentTabSession(tabID: UUID())
+        let attempt = try XCTUnwrap(latch.begin(target: makeTarget(session: session), rawDraftSnapshot: "draft"))
+        let effects = latch.complete(
+            attempt,
+            result: .blocked(message: AgentModeViewModel.staleComposerSubmitTargetMessage),
+            currentTabID: session.tabID,
+            currentRawDraft: "draft"
+        )
+        let message = try XCTUnwrap(effects.blockedMessage)
+        XCTAssertFalse(AgentModeViewModel.isRecoveryAdmissionRefusalNotice(message))
+
+        // Review B P3: a refusal completing after a switch to another tab publishes no notice, so
+        // it can't be pinned on the new tab.
+        var switched = AgentComposerSubmissionLatch()
+        let sourceSession = AgentTabSession(tabID: UUID())
+        let switchedAttempt = try XCTUnwrap(switched.begin(target: makeTarget(session: sourceSession), rawDraftSnapshot: "draft"))
+        let switchedEffects = switched.complete(
+            switchedAttempt,
+            result: .blocked(message: AgentModeViewModel.recoveryAdmissionRefusalMessage(.startupNotReady)),
+            currentTabID: UUID(),
+            currentRawDraft: "draft"
+        )
+        XCTAssertNil(switchedEffects.blockedMessage)
+    }
+
+    /// 9-live V1: a persistent notice (a recovery admission refusal) survives the transient
+    /// dismiss timer and clears on the next submit attempt or composer text change.
+    func testPersistentNoticeSurvivesTheTimerAndClearsOnTheNextEditOrAttempt() {
+        var notice = AgentComposerSubmitNotice()
+        let refusal = AgentModeViewModel.recoveryAdmissionRefusalMessage(.startupNotReady)
+        XCTAssertFalse(notice.show(refusal, persistent: true), "no dismiss timer for a persistent notice")
+        XCTAssertFalse(notice.transientTimerFired(for: refusal), "a timer never clears a persistent notice")
+        XCTAssertEqual(notice.message, refusal)
+        XCTAssertTrue(notice.isPersistent)
+
+        XCTAssertTrue(notice.clearPersistent(), "the next text change or submit attempt clears it")
+        XCTAssertNil(notice.message)
+        XCTAssertFalse(notice.isPersistent)
+        XCTAssertFalse(notice.clearPersistent(), "nothing left to clear")
+
+        // A transient notice that replaces a persistent one is timed again.
+        XCTAssertFalse(notice.show(refusal, persistent: true))
+        XCTAssertTrue(notice.show("Steering isn't supported here.", persistent: false))
+        XCTAssertFalse(notice.isPersistent)
+        XCTAssertTrue(notice.transientTimerFired(for: "Steering isn't supported here."))
+        XCTAssertNil(notice.message)
+    }
+
+    /// The 3-second behaviour stays for every other notice: an edit doesn't clear it, its own timer
+    /// does, and an older timer never clears a newer notice. An empty message shows nothing.
+    func testTransientNoticeClearsOnlyOnItsOwnTimer() {
+        var notice = AgentComposerSubmitNotice()
+        XCTAssertEqual(AgentComposerSubmitNotice.transientDurationNanoseconds, 3_000_000_000)
+        XCTAssertTrue(notice.show("first", persistent: false))
+        XCTAssertFalse(notice.clearPersistent(), "an edit leaves a transient notice to its timer")
+        XCTAssertEqual(notice.message, "first")
+        XCTAssertTrue(notice.show("second", persistent: false))
+        XCTAssertFalse(notice.transientTimerFired(for: "first"), "an older timer never clears a newer notice")
+        XCTAssertEqual(notice.message, "second")
+        XCTAssertTrue(notice.transientTimerFired(for: "second"))
+        XCTAssertNil(notice.message)
+        XCTAssertFalse(notice.show("", persistent: true))
+        XCTAssertNil(notice.message)
+    }
+
     private func makeTarget(session: AgentTabSession) -> AgentComposerSubmitTarget {
         AgentComposerSubmitTarget(
             tabID: session.tabID,

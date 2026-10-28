@@ -248,7 +248,16 @@ extension AgentModeViewModel {
                 return observed
             }
         }
-        let result = await recoveryActionRunner.perform(request, lane: lane, performers: performers)
+        let result: AgentRecoveryActionResult
+        #if DEBUG
+            if let override = test_recoveryActionResult {
+                result = await override(request)
+            } else {
+                result = await recoveryActionRunner.perform(request, lane: lane, performers: performers)
+            }
+        #else
+            result = await recoveryActionRunner.perform(request, lane: lane, performers: performers)
+        #endif
         report?.result = result
         // The session's action hold ended: automatic work it paused is re-evaluated.
         scheduledSendCoordinator?.recordDidChange()

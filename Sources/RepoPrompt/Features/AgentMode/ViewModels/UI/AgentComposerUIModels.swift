@@ -149,6 +149,42 @@ struct AgentComposerSubmissionLatch {
     }
 }
 
+/// The composer's submit-guidance notice. A transient notice clears after
+/// `transientDurationNanoseconds`; a persistent one (9-live V1: a durable-admission refusal) stays
+/// until the next submit attempt or composer text change.
+struct AgentComposerSubmitNotice: Equatable {
+    static let transientDurationNanoseconds: UInt64 = 3_000_000_000
+
+    private(set) var message: String?
+    private(set) var isPersistent = false
+
+    /// Shows `message` (an empty one shows nothing). Returns whether a dismiss timer is needed.
+    @discardableResult
+    mutating func show(_ message: String, persistent: Bool) -> Bool {
+        guard !message.isEmpty else { return false }
+        self.message = message
+        isPersistent = persistent
+        return !persistent
+    }
+
+    /// The dismiss timer of the transient `message` fired: clears it unless it was replaced or is
+    /// persistent. Returns whether it cleared.
+    mutating func transientTimerFired(for message: String) -> Bool {
+        guard !isPersistent, self.message == message else { return false }
+        self.message = nil
+        return true
+    }
+
+    /// A submit attempt or a composer text change: clears a persistent notice. Returns whether it
+    /// cleared.
+    mutating func clearPersistent() -> Bool {
+        guard isPersistent else { return false }
+        message = nil
+        isPersistent = false
+        return true
+    }
+}
+
 struct AgentScheduledSendProps: Equatable, Identifiable {
     enum Status: Equatable {
         case scheduled
@@ -589,6 +625,11 @@ struct AgentRecoveryListActions {
         _ text: String,
         _ acknowledgedWarning: String?
     ) async -> Void = { _, _, _, _ in }
+    /// 9-live R4b/R5: the app-wide in-memory Continue draft of a row, read when its editor opens.
+    /// Required (review B L7): a construction site that omits it would silently lose R5.
+    let continuationDraft: (_ rowID: String) -> String?
+    /// 9-live R5: every edit in a row's Continue editor (in memory; survives the editor closing).
+    let updateContinuationDraft: (_ rowID: String, _ text: String) -> Void
     let retryStartup: () -> Void
     /// Presents the app-wide Needs Attention sheet.
     var openNeedsAttention: () -> Void = {}
