@@ -484,6 +484,90 @@ final class AgentRecoveryActionTests: XCTestCase {
         XCTAssertEqual(unnamedResult, .disabled(AgentRecoveryActionRunner.unqualifiedProviderText("this provider")))
     }
 
+    /// 9-flip gate (launch-authority review B L1): every Agent Mode provider kind is pinned to the
+    /// launch pairs its managed launchers build, and under `.claudeAndCodex` only Claude Code
+    /// (standard) and Codex register; every other kind launches unregistered, carries no run-start
+    /// registration mark, and its recovery choices refuse with the named reason. The pair table
+    /// mirrors the launch sites (`ClaudeNativeProcessSessionController` runtimeFamily: native for
+    /// standard, compatible otherwise; `ClaudeCodeAgentProvider`, `ClaudeCodeProvider` and
+    /// `ClaudeCLIModelDiscoveryProbe`: headless; `CodexExecAgentProvider` and `CodexAppServerClient`;
+    /// `ACPAgentSessionController`); it must equal `supportedPairs` for the kind's actual provider, so
+    /// no launcher can spawn a covered provider through a family the run-start mark doesn't check.
+    func testEveryProviderKindLaunchPairIsPinnedAndOnlyClaudeStandardAndCodexRegister() async throws {
+        func key(_ family: AgentRuntimeFamily, _ provider: AgentRuntimeProvider) -> String {
+            family.rawValue + "|" + provider.rawValue
+        }
+        let launchPairs: [AgentProviderKind: [(AgentRuntimeFamily, AgentRuntimeProvider)]] = [
+            .claudeCode: [(.claudeNative, .claude(.standard)), (.claudeHeadless, .claude(.standard))],
+            .claudeCodeGLM: [(.claudeCompatible, .claude(.glm)), (.claudeHeadless, .claude(.glm))],
+            .kimiCode: [(.claudeCompatible, .claude(.kimi)), (.claudeHeadless, .claude(.kimi))],
+            .customClaudeCompatible: [
+                (.claudeCompatible, .claude(.customCompatible)), (.claudeHeadless, .claude(.customCompatible))
+            ],
+            .codexExec: [(.codexAppServer, .codex), (.codexExec, .codex)],
+            .openCode: [(.acp, .acp(.openCode))],
+            .cursor: [(.acp, .acp(.cursor))],
+            .ohMyPi: [(.acp, .acp(.ohMyPi))]
+        ]
+        XCTAssertEqual(Set(launchPairs.keys), Set(AgentProviderKind.allCases), "every provider kind is pinned")
+        let supported = Set(AgentRuntimeQualification.supportedPairs.map { key($0.family, $0.provider) })
+        XCTAssertEqual(
+            Set(launchPairs.values.flatMap(\.self).map { key($0.0, $0.1) }),
+            supported,
+            "the pinned launch pairs are exactly the supported pairs"
+        )
+
+        let activation = AgentRecoveryActivation.claudeAndCodex
+        let registry = AgentProcessRegistry(store: previousLaunchStore(), qualification: activation.runtime, system: .live)
+        XCTAssertTrue(registry.isAnyPairRegistered)
+        let authority = AgentRuntimeLaunchAuthority.registry(registry)
+        let registered: Set<AgentProviderKind> = [.claudeCode, .codexExec]
+        let runner = AgentRecoveryActionRunner(activation: activation, registrationActive: { true })
+        let calls = Calls()
+        for kind in AgentProviderKind.allCases {
+            let provider = try XCTUnwrap(AgentRuntimeProvider(agentKind: kind), "\(kind)")
+            let pairs = try XCTUnwrap(launchPairs[kind])
+            let servingSupported = Set(
+                AgentRuntimeQualification.supportedPairs.filter { $0.provider == provider }.map { key($0.family, $0.provider) }
+            )
+            XCTAssertEqual(Set(pairs.map { key($0.0, $0.1) }), servingSupported, "\(kind): launchers build only supported pairs")
+            let registers = registered.contains(kind)
+            for (family, pairProvider) in pairs {
+                XCTAssertEqual(pairProvider, provider, "\(kind): a launch's provider is the kind's actual provider")
+                XCTAssertEqual(authority.isRegistrationActive(family: family, provider: pairProvider), registers, "\(kind) \(family)")
+                let context = AgentRuntimeLaunchContext(
+                    family: family, provider: pairProvider, session: .sessionless, worktreePath: nil, permission: .unavailable
+                )
+                XCTAssertEqual(authority.makeLaunch(context) != nil, registers, "\(kind) \(family): launch owner iff registered")
+                XCTAssertNil(AgentRuntimeLaunchAuthority.activationOff.makeLaunch(context), "\(kind) \(family): off never registers")
+            }
+            XCTAssertEqual(activation.coversProvider(provider), registers, "\(kind)")
+            XCTAssertEqual(
+                authority.runStartRegistrationMark(providerKindRaw: kind.rawValue),
+                registers ? AgentRecoveryRunAttempt.registeredRuntimeRegistration : nil,
+                "\(kind): run-start mark only for a registered provider"
+            )
+            XCTAssertNil(AgentRuntimeLaunchAuthority.activationOff.runStartRegistrationMark(providerKindRaw: kind.rawValue))
+
+            let request = try await AgentRecoveryActionRequest(
+                actionID: UUID(), itemKey: runKey(), kind: .reconcileOnly, expectedRevision: revision(),
+                target: AgentRecoveryActionTarget(providerKindRaw: kind.rawValue, providerConversationID: "conv-\(kind.rawValue)")
+            )
+            let result = await runner.perform(request, lane: lane, performers: performers(calls, reconcile: .nothingImported("none")))
+            if registers {
+                XCTAssertEqual(result, .completed(.notDispatched, reason: "none"), "\(kind): a registered provider's choice runs")
+            } else {
+                XCTAssertEqual(
+                    result,
+                    .disabled(AgentRecoveryActionRunner.unqualifiedProviderText(kind.displayName)),
+                    "\(kind): refused with the named reason"
+                )
+            }
+        }
+        XCTAssertEqual(calls.reconcile, registered.count, "only the registered providers reconciled")
+        XCTAssertEqual(calls.dispatch, 0)
+    }
+
     /// A qualified provider whose choice reconciles still needs a history performer: without one it
     /// refuses before reserving with the history-unavailable reason (never a silent continuation or
     /// a "nothing imported" outcome). Send saved reads no history, so it needs none: a real saved

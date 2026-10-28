@@ -713,6 +713,7 @@ allowed_tracked_docs=(
   "docs/context/plans/evidence/2026-10-18-lossless-app-restart/fix-launch-authority-review-r0.md"
   "docs/context/plans/evidence/2026-10-18-lossless-app-restart/verifier-9live-brief.md"
   "docs/context/plans/evidence/2026-10-18-lossless-app-restart/verifier-9live-results.md"
+  "docs/context/plans/evidence/2026-10-18-lossless-app-restart/verifier-9live-r2-brief.md"
   "docs/context/plans/evidence/2026-10-18-lossless-app-restart/diag-9live-r1-worker.md"
   "docs/context/plans/evidence/2026-10-18-lossless-app-restart/diag-9live-r2-r5-worker.md"
   "docs/context/plans/evidence/2026-10-18-lossless-app-restart/diag-9live-r6-worker.md"
