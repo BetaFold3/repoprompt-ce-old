@@ -826,10 +826,23 @@ package final class AgentTabSession: ObservableObject {
     /// inactive admission still honors its shared action holds (review A P1-01).
     package weak var recoveryCoordinator: AgentRecoveryCoordinator?
 
-    /// The launch authority this session's managed provider launchers resolve (they default to the
-    /// same `.production` value; tests inject both). Read once per run, at run start, only to derive
-    /// the run-start registration mark (`AgentRuntimeLaunchAuthority.runStartRegistrationMark`).
-    package var runtimeLaunchAuthority: AgentRuntimeLaunchAuthority = .production
+    // The launch authority this session's managed provider launchers resolve. Read once per run, at
+    // run start, only to derive the run-start registration mark
+    // (`AgentRuntimeLaunchAuthority.runStartRegistrationMark`). Outside DEBUG it is always
+    // `.production`, the same value every managed launcher uses (no production site passes a
+    // launcher another authority), and `.production` is fixed for the process lifetime
+    // (`AgentRecoveryActivation.production` and `AgentProcessRegistry.production` are `static let`).
+    // If activation ever becomes switchable at runtime, the mark and the launchers need one shared
+    // resolved authority instead.
+    #if DEBUG
+        /// The launchers' launch authority; settable so tests can inject one.
+        package var runtimeLaunchAuthority: AgentRuntimeLaunchAuthority = .production
+    #else
+        /// The launchers' launch authority: always `.production`.
+        package var runtimeLaunchAuthority: AgentRuntimeLaunchAuthority {
+            .production
+        }
+    #endif
 
     /// The managed session context of this tab's provider work right now: the live lane's durable
     /// lifecycle binding plus the current run attempt and process run when they exist. `unavailable`

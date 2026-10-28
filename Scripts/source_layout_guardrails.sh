@@ -710,6 +710,7 @@ allowed_tracked_docs=(
   "docs/context/plans/evidence/2026-10-18-lossless-app-restart/fix-p5-esc-worker.md"
   "docs/context/plans/evidence/2026-10-18-lossless-app-restart/fix-p5-esc-review-oraclea-r0.md"
   "docs/context/plans/evidence/2026-10-18-lossless-app-restart/fix-p5-esc-review-oracleb-r0.md"
+  "docs/context/plans/evidence/2026-10-18-lossless-app-restart/fix-launch-authority-review-r0.md"
   "docs/context/review-policy.md"
   "docs/context/plans/completed/2026-10-04-swift-build-measurement-and-debug-dsym-plan.md"
   "docs/context/plans/completed/2026-10-08-swift-compile-follow-ups-plan.md"
