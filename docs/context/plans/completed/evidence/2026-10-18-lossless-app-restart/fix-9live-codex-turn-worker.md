@@ -65,7 +65,7 @@ The first, third and fourth items above are superseded by the review fixes below
 
 ## Review fixes (round 0)
 
-Applies five items from reviews [A](../../../../../prompt-exports/oracle-chat-2026-10-28-220108-9fix-5-codex-turn-re-3aab.md) and [B](../../../../../prompt-exports/oracle-chat-2026-10-28-220108-9fix-5-codex-turn-re-d0fb.md). Nothing else was changed.
+Applies five items from reviews [A](../../../../../../prompt-exports/oracle-chat-2026-10-28-220108-9fix-5-codex-turn-re-3aab.md) and [B](../../../../../../prompt-exports/oracle-chat-2026-10-28-220108-9fix-5-codex-turn-re-d0fb.md). Nothing else was changed.
 
 ### 1. Writes commit in install order (A P1 = B F3)
 
@@ -127,7 +127,7 @@ Not run: `AgentRecoveryActivationTests` (owned by the parallel worker), the full
 
 ## Review fixes (round 1)
 
-The round-1 reviews are [02ea](../../../../../prompt-exports/oracle-chat-2026-10-28-221148-9fix-5-codex-turn-re-02ea.md) (new P1) and [6543](../../../../../prompt-exports/oracle-chat-2026-10-28-221202-9fix-5-codex-turn-re-6543.md) (the same issue at P3).
+The round-1 reviews are [02ea](../../../../../../prompt-exports/oracle-chat-2026-10-28-221148-9fix-5-codex-turn-re-02ea.md) (new P1) and [6543](../../../../../../prompt-exports/oracle-chat-2026-10-28-221202-9fix-5-codex-turn-re-6543.md) (the same issue at P3).
 
 **Problem.** A clear removed the `providerTurnID` key. The lookup then fell back to a transcript span, so a span naming an older user turn could be observed again.
 

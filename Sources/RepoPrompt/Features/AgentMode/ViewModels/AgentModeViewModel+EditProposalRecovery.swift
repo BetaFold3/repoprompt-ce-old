@@ -4,7 +4,7 @@ import MCP
 import RepoPromptAgentCore
 import RepoPromptWorkspace
 
-// Lossless-restart Step 5a (docs/context/plans/2026-10-18-lossless-app-restart-spec.md, Phase 5):
+// Lossless-restart Step 5a (docs/context/plans/completed/2026-10-18-lossless-app-restart-spec.md, Phase 5):
 // ordinary pending `apply_edits` reviews of a recovery-tracked Agent Mode session.
 //
 // - The owner (the reviewing tab's session, its exact recovery lane, the lane's binding, and the

@@ -2,7 +2,7 @@ import Foundation
 import MCP
 import RepoPromptAgentCore
 
-// Lossless-restart Step 5b (docs/context/plans/2026-10-18-lossless-app-restart-spec.md, Phase 5):
+// Lossless-restart Step 5b (docs/context/plans/completed/2026-10-18-lossless-app-restart-spec.md, Phase 5):
 // durable parent → child linkage for a routed `agent_run.start`, committed before the child's
 // first dispatch.
 //

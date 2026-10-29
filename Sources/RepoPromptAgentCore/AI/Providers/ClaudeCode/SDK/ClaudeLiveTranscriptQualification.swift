@@ -5,7 +5,7 @@ import Foundation
 // assistant envelope and success result are attributed to that dispatch's own outbound user message
 // and agree). The app does not request user-message replay; a replay, when present, is only exact
 // corroboration. Scope and boundaries:
-// docs/context/plans/evidence/2026-10-18-lossless-app-restart/phase4d3.md.
+// docs/context/plans/completed/evidence/2026-10-18-lossless-app-restart/phase4d3.md.
 //
 // The native controller classifies EVERY raw stdout payload of a qualified producer, from the exact
 // bytes it fed the translator and before any translated result is suppressed. A positive
