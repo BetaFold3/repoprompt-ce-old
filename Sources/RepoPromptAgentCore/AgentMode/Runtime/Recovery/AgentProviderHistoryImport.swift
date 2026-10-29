@@ -228,6 +228,12 @@ package enum AgentProviderHistoryAssociationRefusal: Equatable {
     /// Canonical provider output after the dispatch is not explicitly associated to native rows
     /// (or cannot be enumerated because it was compacted).
     case canonicalOutputAssociationUnavailable
+    /// 9-live r3 T1 (option B): every check passed and the attempt's outbound claims matched Claude's
+    /// user entries exactly; only some enumerable canonical output after the dispatch (live output
+    /// saved under its own IDs, such as a Bash call) has no association to native rows. The import is
+    /// withheld in full (no row, ledger or cursor change); unlike the other cases a continuation may
+    /// follow, because the exact claims rule out an unknown or replayed user message.
+    case canonicalOutputImportWithheld
     /// The attempt's recorded outbound claims and the native user entries after its boundary do not
     /// match exactly (a claimed entry missing, an unclaimed or reordered entry, a text digest
     /// mismatch, duplicate claims, or constituents not in this transcript). A claim never proves a
@@ -325,6 +331,8 @@ package enum AgentProviderHistoryAssociationPreflight {
     /// boundary) first. When every one carries an outbound claim, those claims are the user
     /// association evidence and must match the native user entries after the boundary exactly;
     /// when any lacks one, there is no claim association (legacy) and the ledger alone decides.
+    /// Only with exact claims does unassociated canonical output become `.canonicalOutputImportWithheld`,
+    /// and only once every other check passed; without them it stays `.canonicalOutputAssociationUnavailable`.
     package static func check(
         observation: AgentProviderHistoryObservation,
         baseline: AgentSessionProviderHistoryRecovery.DispatchBaseline?,
@@ -392,15 +400,22 @@ package enum AgentProviderHistoryAssociationPreflight {
         }
         let associated = Set((ledger?.nativeItems ?? []).compactMap(\.localItemID))
             .union(observation.rows.compactMap { $0.item?.id })
-        if !ids.isSubset(of: associated) {
+        let outputUncovered = !ids.isSubset(of: associated)
+        // Without exact claims (ledger-only), uncovered output refuses at once, as before.
+        if outputUncovered, claimed == nil {
             return .canonicalOutputAssociationUnavailable
         }
-        return canonicalPayloadRefusal(
+        // With exact claims, the gap is classified only after the known associations were validated:
+        // any independent refusal wins over a withheld import.
+        if let refusal = canonicalPayloadRefusal(
             observation: observation,
             canonical: canonical,
             ledger: ledger,
             claimedUserConstituents: claimed?.userItemIDsByNativeEntryID ?? [:]
-        )
+        ) {
+            return refusal
+        }
+        return outputUncovered ? .canonicalOutputImportWithheld : nil
     }
 
     /// One canonical item as the payload check reads it.

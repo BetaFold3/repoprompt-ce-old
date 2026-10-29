@@ -1259,8 +1259,10 @@ extension AgentModeViewModel {
         let canonical = AgentProviderHistoryCanonicalView(transcript: session.transcript, suffixItems: session.items)
         // Claude: canonical import needs explicit native ↔ canonical associations (canonical turns,
         // compacted ones included, plus the mutable suffix): the attempt's exactly matched outbound
-        // claims (Step 4d2) or ledger associations. Live output persisted under its own IDs still has
-        // none, so it refuses with zero changes and no cursor movement.
+        // claims (Step 4d2) or ledger associations. Live output persisted under its own IDs has none:
+        // without exact claims it refuses (blocking a continuation); with exact claims and every other
+        // check passed (9-live r3 T1), the whole import is withheld as "nothing imported" so a
+        // continuation may follow. Both leave rows, ledger, receipt and cursor unchanged.
         if session.selectedAgent == .claudeCode,
            let refusal = AgentProviderHistoryAssociationPreflight.check(
                observation: observation,
@@ -1273,6 +1275,10 @@ extension AgentModeViewModel {
                dispatchWindow: claudeWindow
            )
         {
+            if refusal == .canonicalOutputImportWithheld, case .unconfirmed = completion {
+                let hasNativeOutput = observation.rows.contains { $0.item != nil }
+                return .nothingImported(hasNativeOutput ? Self.recoveryClaudeOutputWithheldText : Self.recoveryClaudeOutputUnmatchedText)
+            }
             return .associationUnavailable(refusal, Self.recoveryAssociationText(refusal, baseline: claudeBaseline))
         }
         // Codex: no native → canonical mapping exists for live Codex items, so rows that could
@@ -1340,6 +1346,15 @@ extension AgentModeViewModel {
         /// The observation itself succeeded but proved nothing (not a failure of the check).
         var isUnconfirmedObservation = false
     }
+
+    /// 9-live r3 T1: Claude's history has output after the interrupted send that couldn't be matched
+    /// to this conversation's own output, so none of it was imported.
+    static let recoveryClaudeOutputWithheldText =
+        "Claude's history has output RepoPrompt couldn't safely match to this conversation. Nothing was imported, so some of it may not show here; Claude still has it."
+    /// 9-live r3 T1: this conversation shows output Claude's history doesn't match, and Claude has no
+    /// other output to import.
+    static let recoveryClaudeOutputUnmatchedText =
+        "RepoPrompt couldn't safely match this conversation's output to Claude's history. Nothing was imported."
 
     static let recoveryCodexOverlapText =
         "Codex's record of the turn overlaps output already shown in this conversation, so nothing was imported."
@@ -1646,8 +1661,12 @@ extension AgentModeViewModel {
             "No history position was saved before the interrupted run, so its history can't be matched safely. Nothing was imported."
         case .baselineTargetMismatch:
             "The saved history position doesn't belong to this conversation and run. Nothing was imported."
-        case .nativeUserAssociationUnavailable, .canonicalOutputAssociationUnavailable:
-            "The pre-send history position was saved, but this build cannot safely match Claude's history to messages already in this conversation. Nothing was imported."
+        case .nativeUserAssociationUnavailable:
+            "A message of yours couldn't be safely matched between this conversation and Claude's history. Nothing was imported or sent."
+        case .canonicalOutputAssociationUnavailable:
+            "Output shown in this conversation couldn't be safely checked against Claude's history. Nothing was imported or sent."
+        case .canonicalOutputImportWithheld:
+            recoveryClaudeOutputUnmatchedText
         case .outboundClaimUnmatched:
             "Claude's history doesn't show exactly the messages recorded for this run, so it can't be matched safely. Nothing was imported or sent again."
         case .canonicalPayloadUnavailable:

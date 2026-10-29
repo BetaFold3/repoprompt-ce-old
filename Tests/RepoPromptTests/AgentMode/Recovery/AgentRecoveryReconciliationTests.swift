@@ -1526,8 +1526,18 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
         )
         XCTAssertEqual(
             check(claimed(exact), items: [first, steer, .assistant("Done.")]),
-            .canonicalOutputAssociationUnavailable,
-            "saved live output under its own ID still refuses"
+            .canonicalOutputImportWithheld,
+            "9-live r3 T1: with exact claims, live output saved under its own ID withholds the whole import"
+        )
+        XCTAssertEqual(
+            check(claimed([exact[1], exact[0]]), items: [first, steer, .assistant("Done.")]),
+            .outboundClaimUnmatched,
+            "a claim mismatch still wins over unassociated live output"
+        )
+        XCTAssertEqual(
+            check(claimed(exact), window: [firstBaseline, legacySteer], items: [first, steer, .assistant("Done.")]),
+            .nativeUserAssociationUnavailable,
+            "without exact claims, nothing is withheld: it refuses"
         )
         XCTAssertEqual(
             preflight(claimed(exact), baseline: firstBaseline, runAttemptID: runAttemptID, items: [first, steer]),
@@ -1614,8 +1624,8 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
         XCTAssertNil(check(canonical(secondTurn: [])), "first-turn output before the dispatch's user item is excluded")
         XCTAssertEqual(
             check(canonical(secondTurn: [live])),
-            .canonicalOutputAssociationUnavailable,
-            "unassociated live output in a later persisted turn refuses"
+            .canonicalOutputImportWithheld,
+            "unassociated live output in a later persisted turn is never skipped: with exact claims the import is withheld"
         )
         XCTAssertEqual(
             AgentProviderHistoryAssociationPreflight.outputItemIDs(after: [first.id], in: canonical(secondTurn: [live])),
@@ -1638,6 +1648,91 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
         }
         XCTAssertNil(codexOverlap(canonical(secondTurn: [])))
         XCTAssertEqual(codexOverlap(canonical(secondTurn: [live])), .canonicalOutputAssociationUnavailable)
+    }
+
+    /// 9-live r3 T1 (option B): unassociated live output withholds the import only with exact claims
+    /// and only once every other check passed; every independent refusal wins.
+    func testWithheldOutputImportNeedsExactClaimsAndLosesToEveryIndependentRefusal() {
+        typealias Claim = AgentSessionProviderHistoryRecovery.DispatchBaseline.OutboundUserMessage
+        let runAttemptID = UUID()
+        let user = AgentChatItem.user("Do it")
+        let dispatch = UUID()
+        let claimed = [baseline(
+            dispatchID: dispatch, runAttemptID: runAttemptID, userItemIDs: [user.id],
+            outboundUserMessage: Claim(uuid: dispatch, providerBoundText: "Do it")
+        )]
+        func native(_ id: String, _ text: String) -> AgentProviderHistoryNativeUserEntry {
+            .init(nativeEntryID: id, textSHA256: AgentSessionProviderHistoryRecovery.sha256Hex(Data(text.utf8)))
+        }
+        let entry = native(dispatch.uuidString.lowercased(), "Do it")
+        let live = AgentChatItem.assistant("Done.")
+        let rows = [nativeUserRow(entry.nativeEntryID), assistantRow("a1")]
+        func check(
+            _ rows: [AgentProviderHistoryRow],
+            entries: [AgentProviderHistoryNativeUserEntry]? = nil,
+            validation: [AgentProviderHistoryRow]? = nil,
+            window: [AgentSessionProviderHistoryRecovery.DispatchBaseline]? = nil,
+            items: [AgentChatItem]? = nil,
+            ledger: AgentSessionProviderHistoryRecovery? = nil
+        ) -> AgentProviderHistoryAssociationRefusal? {
+            let window = window ?? claimed
+            return AgentProviderHistoryAssociationPreflight.check(
+                observation: AgentProviderHistoryObservation(
+                    provider: .claude, conversationID: "conv-1", rows: rows, validationRows: validation, file: nil,
+                    completeLineOffset: 0, completionConfirmed: false, nativeUserEntries: entries ?? [entry]
+                ),
+                baseline: window.first,
+                hasUnreadableBaselines: false,
+                expectedRunAttemptID: runAttemptID,
+                transcriptResetGeneration: 0,
+                canonical: AgentProviderHistoryCanonicalView(transcript: .empty, suffixItems: items ?? [user, live]),
+                ledger: ledger,
+                dispatchWindow: window
+            )
+        }
+        XCTAssertEqual(check(rows), .canonicalOutputImportWithheld, "exact claims; only the live output is unassociated")
+        XCTAssertEqual(check([nativeUserRow(entry.nativeEntryID)]), .canonicalOutputImportWithheld, "no native output at all")
+        XCTAssertNil(check(rows, items: [user]), "nothing unassociated: an ordinary import")
+
+        // Claim refusals win: missing, extra, digest mismatch.
+        XCTAssertEqual(check(rows, entries: []), .outboundClaimUnmatched)
+        XCTAssertEqual(check(rows, entries: [entry, native(UUID().uuidString.lowercased(), "Extra")]), .outboundClaimUnmatched)
+        XCTAssertEqual(check(rows, entries: [native(entry.nativeEntryID, "Do it!")]), .outboundClaimUnmatched)
+        // An unclaimed dispatch leaves no claim association: the ledger-only contract refuses.
+        let legacy = [baseline(dispatchID: dispatch, runAttemptID: runAttemptID, userItemIDs: [user.id])]
+        XCTAssertEqual(check(rows, window: legacy), .nativeUserAssociationUnavailable)
+        XCTAssertEqual(
+            check([assistantRow("a1")], window: legacy, ledger: userLedger(user)),
+            .canonicalOutputAssociationUnavailable,
+            "user associated through the ledger, but no claims: uncovered output still refuses"
+        )
+        // A conflicting or unprovable known association wins over the withheld import.
+        let laterLive = AgentChatItem.assistant("More.")
+        let mapped = AgentSessionProviderHistoryRecovery(nativeItems: [mappedNative("a0", kind: "assistantText", localItemID: live.id)])
+        XCTAssertEqual(
+            check(
+                rows,
+                validation: [nativeUserRow(entry.nativeEntryID), projectedRow("a0", kind: "assistantText", item: live), assistantRow("a1")],
+                items: [user, live, laterLive],
+                ledger: mapped
+            ),
+            .canonicalOutputImportWithheld,
+            "an equal known association passes; only the later live row is unassociated"
+        )
+        XCTAssertEqual(
+            check(
+                rows,
+                validation: [
+                    nativeUserRow(entry.nativeEntryID),
+                    projectedRow("a0", kind: "assistantText", item: AgentChatItem.assistant("Changed.").replacingID(live.id)),
+                    assistantRow("a1")
+                ],
+                items: [user, live, laterLive],
+                ledger: mapped
+            ),
+            .canonicalPayloadMismatch
+        )
+        XCTAssertEqual(check(rows, items: [user, live, laterLive], ledger: mapped), .canonicalPayloadUnavailable)
     }
 
     // MARK: Baseline producer and reconcile refusal (view model, real persistence)
@@ -4289,9 +4384,11 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
 
     /// Review A R1, real composition: the initial dispatch and its claimed steer sit in two persisted
     /// turns, and both claims match Claude's history exactly. Live output saved under its own ID in
-    /// the SECOND turn is still unassociated canonical output, so the import refuses with no item,
-    /// ledger or cursor change (it was skipped before, letting native output be appended twice).
-    func testUnassociatedLiveOutputInALaterPersistedTurnRefusesWithoutChangingAnything() async throws {
+    /// the SECOND turn is still unassociated canonical output (it was skipped before, letting native
+    /// output be appended twice). 9-live r3 T1 (option B): with exact claims the whole import is
+    /// withheld as "nothing imported", saying output may be missing, with no item, ledger or cursor
+    /// change; "Done." is not imported either.
+    func testUnassociatedLiveOutputInALaterPersistedTurnWithholdsTheImportWithoutChangingAnything() async throws {
         let harness = try await makeProducerHarness(windowID: 4994)
         let runAttemptID = UUID()
         let (first, firstIdentity) = try await admitClaimedDispatch(harness, runAttemptID: runAttemptID, text: "Do it")
@@ -4333,14 +4430,9 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
             lane: harness.lane,
             codexTurnID: nil
         )
-        XCTAssertEqual(
-            result,
-            .associationUnavailable(
-                .canonicalOutputAssociationUnavailable,
-                AgentModeViewModel.recoveryAssociationText(.canonicalOutputAssociationUnavailable)
-            )
-        )
+        XCTAssertEqual(result, .nothingImported(AgentModeViewModel.recoveryClaudeOutputWithheldText))
         XCTAssertEqual(harness.session.items.map(\.id), itemsBefore)
+        XCTAssertFalse(harness.session.items.contains { $0.text == "Done." }, "nothing is imported, not even unshown output")
         XCTAssertEqual(harness.session.providerHistoryRecovery, ledgerBefore)
         let cursorAfter = await harness.cursor()
         XCTAssertEqual(cursorAfter, cursorBefore)
@@ -4408,6 +4500,328 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
         XCTAssertEqual(harness.session.items.count { $0.text == "Done." }, 1, "nothing earlier is appended again")
         let grownCursor = await harness.cursor()
         XCTAssertEqual(grownCursor?.importID, harness.session.providerHistoryRecovery?.lastImportCommit?.importID)
+    }
+
+    // MARK: 9-live r3 T1: verified claims, output import withheld
+
+    /// Native entries of one Claude turn as the CLI writes them (K1/K3/K4 lines 29-34): the claimed
+    /// prompt as one `{type, text}` block, a nonrendering attachment, then, with `call`, an assistant
+    /// Bash `tool_use` with no result yet.
+    private func killTurnHistory(caller: String, parent: String, prompt: String, toolUseID: String, tag: String, call: Bool = true) -> [[String: Any]] {
+        var entries: [[String: Any]] = [
+            claudeEntry("user", uuid: caller, parent: parent, content: [["type": "text", "text": prompt]]),
+            [
+                "type": "attachment", "uuid": "\(tag)-n", "parentUuid": caller, "sessionId": conversationID, "isSidechain": false,
+                "attachment": ["type": "total_tokens_reminder", "content": Self.historySentinel]
+            ]
+        ]
+        if call {
+            entries.append(claudeEntry(
+                "assistant", uuid: "\(tag)-c", parent: "\(tag)-n",
+                content: [["type": "tool_use", "id": toolUseID, "name": "Bash", "input": ["command": "sleep 10"]]]
+            ))
+        }
+        return entries
+    }
+
+    private func claudeEntry(_ type: String, uuid: String, parent: String, content: Any, extra: [String: Any] = [:]) -> [String: Any] {
+        var object: [String: Any] = [
+            "type": type, "uuid": uuid, "parentUuid": parent, "sessionId": conversationID,
+            "message": ["role": type, "content": content], "isSidechain": false
+        ]
+        for (key, value) in extra {
+            object[key] = value
+        }
+        return object
+    }
+
+    /// A tool result for `toolUseID` and a final reply, after the call `"\(tag)-c"`.
+    private func resultAndReply(tag: String, toolUseID: String) -> [[String: Any]] {
+        [
+            claudeEntry(
+                "user", uuid: "\(tag)-r", parent: "\(tag)-c",
+                content: [["type": "tool_result", "tool_use_id": toolUseID, "content": "finished"]],
+                extra: ["sourceToolAssistantUUID": "\(tag)-c"]
+            ),
+            claudeEntry("assistant", uuid: "\(tag)-a", parent: "\(tag)-r", content: [["type": "text", "text": "Loop finished."]])
+        ]
+    }
+
+    /// The K1 fixture: a first turn sent before Claude had a conversation identity (unsupported
+    /// baseline, unclaimed native prompt) that completed, then a claimed kill turn whose Bash call the
+    /// live run saved under its own random ID. `native` is what Claude wrote after the kill turn's
+    /// baseline (default: the prompt and the unanswered call).
+    private func makeKilledBashTurn(
+        windowID: Int,
+        native: ((_ caller: String) -> [[String: Any]])? = nil
+    ) async throws -> (harness: ProducerHarness, runAttemptID: UUID) {
+        let harness = try await makeProducerHarness(windowID: windowID)
+        harness.session.providerSessionID = nil
+        let warmUp = AgentChatItem.user("Warm up")
+        harness.session.appendItem(warmUp)
+        let warmUpIdentity = AgentDispatchBaselineIdentity(
+            dispatchID: UUID(), runAttemptID: UUID(), userItemIDs: [warmUp.id], hasCompleteUserItems: true
+        )
+        _ = await harness.viewModel.admitClaudeDispatchBaseline(
+            warmUpIdentity,
+            outboundUserMessage: .init(uuid: warmUpIdentity.dispatchID, providerBoundText: "Warm up"),
+            session: harness.session
+        )
+        harness.session.providerSessionID = conversationID
+        let warmUpBaseline = harness.session.providerHistoryRecovery?.dispatchBaseline(dispatchID: warmUpIdentity.dispatchID)
+        guard case .unsupported? = warmUpBaseline?.status else {
+            XCTFail("the warm-up baseline is unsupported (no identity before sending)")
+            return (harness, UUID())
+        }
+        XCTAssertNil(warmUpBaseline?.outboundUserMessage)
+        harness.session.appendItem(.assistant("Warmed up."))
+        try harness.appendHistory(o19History(caller: "w-prompt", parent: nil, assistant: "w-a", prompt: "Warm up", reply: "Warmed up.", tag: "w"))
+
+        let runAttemptID = UUID()
+        let (_, identity) = try await admitClaimedDispatch(harness, runAttemptID: runAttemptID, text: "Run the loop")
+        let caller = identity.dispatchID.uuidString.lowercased()
+        try harness.appendHistory(native?(caller) ?? killTurnHistory(
+            caller: caller, parent: "w-t", prompt: "Run the loop", toolUseID: "toolu_k1", tag: "k"
+        ))
+        // The live Bash row: a random invocation ID, never the native `toolu_` ID.
+        harness.session.appendItem(.toolResult(name: "bash", invocationID: UUID(), resultJSON: "{\"interrupted\":true}", isError: true))
+        _ = await harness.viewModel.flushSave(for: harness.session.tabID)
+        return (harness, runAttemptID)
+    }
+
+    private func reconcileClaude(_ harness: ProducerHarness, runAttemptID: UUID) async -> AgentRecoveryReconcileResult {
+        await harness.viewModel.reconcileRecoveryHistory(
+            reconcileAction(harness, runAttemptID: runAttemptID), session: harness.session, lane: harness.lane, codexTurnID: nil
+        )
+    }
+
+    @MainActor
+    private final class SentTexts {
+        var texts: [String?] = []
+    }
+
+    private static let capturedDispatchText = "Captured by the test; nothing reached a provider."
+
+    /// Continue through the real runner and the real Claude Reconcile. The dispatch performer only
+    /// records the text it was handed; nothing reaches a provider.
+    private func continueThroughRunner(
+        _ harness: ProducerHarness,
+        runAttemptID: UUID,
+        text: String,
+        sent: SentTexts,
+        repeating previous: AgentRecoveryActionRequest? = nil
+    ) async -> (result: AgentRecoveryActionResult, request: AgentRecoveryActionRequest) {
+        var revision: AgentRecoveryRecordRevision?
+        if case let .success(.supported(record)) = await harness.lane.readRecord() { revision = record.revision }
+        let request = previous ?? AgentRecoveryActionRequest(
+            actionID: UUID(),
+            itemKey: AgentRecoveryCardKey(
+                kind: .run,
+                incarnationID: harness.lane.binding.incarnationID,
+                transcriptResetGeneration: harness.lane.binding.transcriptResetGeneration,
+                entityID: "run-\(runAttemptID.uuidString)"
+            ),
+            kind: .continueWithText,
+            expectedRevision: revision,
+            sourceRunAttemptID: runAttemptID,
+            target: harness.viewModel.recoveryActionTarget(for: harness.session),
+            text: text,
+            plannedUserItemID: UUID()
+        )
+        let viewModel = harness.viewModel
+        let session = harness.session
+        let lane = harness.lane
+        let captured = Self.capturedDispatchText
+        let performers = AgentRecoveryActionPerformers(
+            reconcile: { action in
+                await viewModel.reconcileRecoveryHistory(action, session: session, lane: lane, codexTurnID: nil)
+            },
+            dispatch: { action, _ in
+                sent.texts.append(action.text)
+                return .notDispatched(captured)
+            }
+        )
+        let result = await viewModel.recoveryActionRunner.perform(request, lane: lane, performers: performers)
+        return (result, request)
+    }
+
+    /// 9-live r3 T1, the exact K1/K3/K4 shape: the warm-up's unclaimed prompt is before the kill
+    /// turn's baseline and never matters; the kill turn's claim matches; only the live Bash row is
+    /// unassociated. Reconcile withholds the whole import (no row, ledger, receipt or cursor change)
+    /// and repeats identically; Continue hands the edited text to dispatch exactly once, and the same
+    /// choice repeated joins instead of sending again.
+    func testKilledClaimedBashTurnWithholdsTheImportAndContinueSendsTheEditedTextOnce() async throws {
+        let (harness, runAttemptID) = try await makeKilledBashTurn(windowID: 5301)
+        let itemsBefore = harness.session.items.map(\.id)
+        let ledgerBefore = harness.session.providerHistoryRecovery
+        let cursorBefore = await harness.cursor()
+        let withheld = AgentRecoveryReconcileResult.nothingImported(AgentModeViewModel.recoveryClaudeOutputWithheldText)
+        for attempt in 1 ... 2 {
+            let result = await reconcileClaude(harness, runAttemptID: runAttemptID)
+            XCTAssertEqual(result, withheld, "reconcile \(attempt)")
+            XCTAssertEqual(harness.session.items.map(\.id), itemsBefore, "reconcile \(attempt): no row")
+            XCTAssertEqual(harness.session.providerHistoryRecovery, ledgerBefore, "reconcile \(attempt): no ledger or receipt")
+            XCTAssertNil(harness.session.pendingHistoryImportCommit)
+            let cursorAfter = await harness.cursor()
+            XCTAssertEqual(cursorAfter, cursorBefore, "reconcile \(attempt): no cursor movement")
+        }
+
+        let sent = SentTexts()
+        let (first, request) = await continueThroughRunner(harness, runAttemptID: runAttemptID, text: "Edited: keep going", sent: sent)
+        XCTAssertEqual(first, .completed(.notDispatched, reason: Self.capturedDispatchText))
+        XCTAssertEqual(sent.texts, ["Edited: keep going"], "the edited text is handed to dispatch exactly once")
+        let (repeated, _) = await continueThroughRunner(harness, runAttemptID: runAttemptID, text: "Edited: keep going", sent: sent, repeating: request)
+        guard case .joined = repeated else { return XCTFail("a repeated choice joins, got \(repeated)") }
+        XCTAssertEqual(sent.texts.count, 1, "never sent twice")
+        XCTAssertEqual(harness.session.items.map(\.id), itemsBefore)
+        XCTAssertEqual(harness.session.providerHistoryRecovery, ledgerBefore)
+    }
+
+    /// Option B: native output beyond what the conversation shows (a result and a reply) is withheld
+    /// too, with the text saying some output may be missing; with no native output at all the other
+    /// text applies. Continue proceeds either way.
+    func testWithheldImportNamesWhetherClaudeHasOutputAndContinueProceeds() async throws {
+        let cases: [(name: String, windowID: Int, native: (String) -> [[String: Any]], text: String)] = [
+            (
+                "result and reply not shown here", 5302,
+                { caller in
+                    self.killTurnHistory(caller: caller, parent: "w-t", prompt: "Run the loop", toolUseID: "toolu_k1", tag: "k")
+                        + self.resultAndReply(tag: "k", toolUseID: "toolu_k1")
+                },
+                AgentModeViewModel.recoveryClaudeOutputWithheldText
+            ),
+            (
+                "only the claimed prompt", 5303,
+                { caller in
+                    self.killTurnHistory(caller: caller, parent: "w-t", prompt: "Run the loop", toolUseID: "toolu_k1", tag: "k", call: false)
+                },
+                AgentModeViewModel.recoveryClaudeOutputUnmatchedText
+            )
+        ]
+        for testCase in cases {
+            let (harness, runAttemptID) = try await makeKilledBashTurn(windowID: testCase.windowID, native: testCase.native)
+            let itemsBefore = harness.session.items.map(\.id)
+            let ledgerBefore = harness.session.providerHistoryRecovery
+            let result = await reconcileClaude(harness, runAttemptID: runAttemptID)
+            XCTAssertEqual(result, .nothingImported(testCase.text), testCase.name)
+            XCTAssertEqual(harness.session.items.map(\.id), itemsBefore, testCase.name)
+            XCTAssertEqual(harness.session.providerHistoryRecovery, ledgerBefore, testCase.name)
+            let sent = SentTexts()
+            let (continued, _) = await continueThroughRunner(harness, runAttemptID: runAttemptID, text: "Go on", sent: sent)
+            XCTAssertEqual(continued, .completed(.notDispatched, reason: Self.capturedDispatchText), testCase.name)
+            XCTAssertEqual(sent.texts, ["Go on"], testCase.name)
+        }
+        XCTAssertNotEqual(AgentModeViewModel.recoveryClaudeOutputWithheldText, AgentModeViewModel.recoveryClaudeOutputUnmatchedText)
+        // Neutral about direction: the refusal also covers local user items with no association.
+        XCTAssertEqual(
+            AgentModeViewModel.recoveryAssociationText(.nativeUserAssociationUnavailable),
+            "A message of yours couldn't be safely matched between this conversation and Claude's history. Nothing was imported or sent."
+        )
+        XCTAssertNotEqual(
+            AgentModeViewModel.recoveryAssociationText(.nativeUserAssociationUnavailable),
+            AgentModeViewModel.recoveryAssociationText(.canonicalOutputAssociationUnavailable),
+            "the two blocking association refusals say different things"
+        )
+    }
+
+    /// Option B safety: with the same live Bash row, a claim mismatch (an extra unclaimed user entry,
+    /// a changed prompt), an unsupported record, or a rewritten prefix before the baseline still
+    /// refuses or blocks. Continue hands nothing to dispatch and nothing changes.
+    func testWithheldImportNeverCoversAClaimMismatchUnsupportedHistoryOrARewrittenPrefix() async throws {
+        let call: (String) -> [[String: Any]] = { caller in
+            self.killTurnHistory(caller: caller, parent: "w-t", prompt: "Run the loop", toolUseID: "toolu_k1", tag: "k")
+        }
+        let cases: [(name: String, windowID: Int, native: (String) -> [[String: Any]], rewritePrefix: Bool, claimRefusal: Bool)] = [
+            ("an extra unclaimed user entry", 5304, { caller in
+                call(caller) + [self.claudeEntry("user", uuid: "u-extra", parent: "k-c", content: [["type": "text", "text": "Extra"]])]
+            }, false, true),
+            ("a changed prompt", 5305, { caller in
+                self.killTurnHistory(caller: caller, parent: "w-t", prompt: "Run the loop!", toolUseID: "toolu_k1", tag: "k")
+            }, false, true),
+            ("an unsupported record", 5306, { caller in
+                call(caller) + [[
+                    "type": "attachment", "uuid": "k-h", "parentUuid": "k-c", "sessionId": self.conversationID, "isSidechain": false,
+                    "attachment": ["type": "hook_success", "content": Self.historySentinel]
+                ]]
+            }, false, false),
+            ("a rewritten prefix", 5307, call, true, false)
+        ]
+        for testCase in cases {
+            let (harness, runAttemptID) = try await makeKilledBashTurn(windowID: testCase.windowID, native: testCase.native)
+            if testCase.rewritePrefix {
+                let data = try Data(contentsOf: harness.historyFile)
+                let text = try XCTUnwrap(String(data: data, encoding: .utf8))
+                XCTAssertTrue(text.contains("Warmed up."))
+                try Data(text.replacingOccurrences(of: "Warmed up.", with: "Warmed UP.").utf8).write(to: harness.historyFile)
+            }
+            let itemsBefore = harness.session.items.map(\.id)
+            let ledgerBefore = harness.session.providerHistoryRecovery
+            let cursorBefore = await harness.cursor()
+            let result = await reconcileClaude(harness, runAttemptID: runAttemptID)
+            if testCase.claimRefusal {
+                XCTAssertEqual(
+                    result,
+                    .associationUnavailable(.outboundClaimUnmatched, AgentModeViewModel.recoveryAssociationText(.outboundClaimUnmatched)),
+                    testCase.name
+                )
+            } else if case .blocked = result {} else {
+                XCTFail("\(testCase.name): expected the read to block, got \(result)")
+            }
+            let sent = SentTexts()
+            let (continued, _) = await continueThroughRunner(harness, runAttemptID: runAttemptID, text: "Go on", sent: sent)
+            guard case .completed(.notDispatched, _) = continued else { return XCTFail("\(testCase.name): \(continued)") }
+            XCTAssertEqual(sent.texts, [], "\(testCase.name): nothing is handed to dispatch")
+            XCTAssertEqual(harness.session.items.map(\.id), itemsBefore, testCase.name)
+            XCTAssertEqual(harness.session.providerHistoryRecovery, ledgerBefore, testCase.name)
+            let cursorAfter = await harness.cursor()
+            XCTAssertEqual(cursorAfter, cursorBefore, testCase.name)
+        }
+    }
+
+    /// The second kill in one conversation: resuming after the first kill makes Claude write an
+    /// interrupted `tool_result` for the first call and a `<synthetic>` reply AFTER the continuation's
+    /// baseline (K1/K3 lines 37-38), then the continuation prompt and a new Bash call. Pinned: the
+    /// orphan result and synthetic reply are never imported (no duplicate row), and Continue sends
+    /// only its own text once.
+    func testSecondKillAfterAResumeWithholdsTheOrphanResultAndSendsOnce() async throws {
+        let (harness, firstRun) = try await makeKilledBashTurn(windowID: 5308)
+        let secondRun = UUID()
+        let (_, identity) = try await admitClaimedDispatch(harness, runAttemptID: secondRun, text: "Keep going")
+        let caller = identity.dispatchID.uuidString.lowercased()
+        try harness.appendHistory([
+            claudeEntry(
+                "user", uuid: "k-r", parent: "k-c",
+                content: [["type": "tool_result", "tool_use_id": "toolu_k1", "content": "[Tool call interrupted]", "is_error": true]],
+                extra: ["sourceToolAssistantUUID": "k-c", "toolUseResult": "interrupted"]
+            ),
+            claudeEntry(
+                "assistant", uuid: "k-s", parent: "k-r",
+                content: [["type": "text", "text": "No response requested."]],
+                extra: ["isApiErrorMessage": false]
+            )
+        ] + killTurnHistory(caller: caller, parent: "k-s", prompt: "Keep going", toolUseID: "toolu_k2", tag: "k2"))
+        harness.session.appendItem(.toolResult(name: "bash", invocationID: UUID(), resultJSON: "{\"interrupted\":true}", isError: true))
+        _ = await harness.viewModel.flushSave(for: harness.session.tabID)
+        let itemsBefore = harness.session.items.map(\.id)
+        let ledgerBefore = harness.session.providerHistoryRecovery
+
+        let result = await reconcileClaude(harness, runAttemptID: secondRun)
+        XCTAssertEqual(result, .nothingImported(AgentModeViewModel.recoveryClaudeOutputWithheldText))
+        XCTAssertEqual(harness.session.items.map(\.id), itemsBefore, "no orphan result, no synthetic reply")
+        XCTAssertFalse(harness.session.items.contains { $0.text == "No response requested." })
+        XCTAssertEqual(harness.session.providerHistoryRecovery, ledgerBefore)
+
+        // The first kill's attempt now sees an unclaimed user entry (the continuation): it never sends.
+        let earlier = await reconcileClaude(harness, runAttemptID: firstRun)
+        XCTAssertEqual(
+            earlier,
+            .associationUnavailable(.outboundClaimUnmatched, AgentModeViewModel.recoveryAssociationText(.outboundClaimUnmatched))
+        )
+
+        let sent = SentTexts()
+        let (continued, _) = await continueThroughRunner(harness, runAttemptID: secondRun, text: "Once more", sent: sent)
+        XCTAssertEqual(continued, .completed(.notDispatched, reason: Self.capturedDispatchText))
+        XCTAssertEqual(sent.texts, ["Once more"])
     }
 
     /// Step 4d2 prefix fences, real composition (no process): the import receipt durably binds its

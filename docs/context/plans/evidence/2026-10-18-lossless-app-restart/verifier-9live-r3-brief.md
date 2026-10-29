@@ -105,4 +105,4 @@ If the saved dispatch has no `outboundUserMessage`, or the IDs differ, record it
 
 ## Reporting
 
-Write results to a new file, `verifier-9live-r3-results.md`, in this directory (then link it here), with the same header style and contents as round 2. Include the identity check result, every refusal text, and the list of synthetic sessions (full IDs), each marked deleted or not. Send failures back to the main agent.
+Write results to a new file, [verifier-9live-r3-results.md](verifier-9live-r3-results.md), in this directory (then link it here), with the same header style and contents as round 2. Include the identity check result, every refusal text, and the list of synthetic sessions (full IDs), each marked deleted or not. Send failures back to the main agent.

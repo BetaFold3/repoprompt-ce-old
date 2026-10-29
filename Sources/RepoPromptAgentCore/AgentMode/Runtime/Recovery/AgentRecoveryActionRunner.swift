@@ -67,6 +67,8 @@ package enum AgentRecoveryReconcileResult: Equatable {
     case imported(completion: AgentRecoveryReconcileCompletion, rowCount: Int)
     /// A SUCCESSFUL observation that proved neither completion nor new rows (the provider has no
     /// record of the turn, nothing new, or overlapping rows withheld). A continuation may follow.
+    /// Claude's withheld import (9-live r3 T1) lands here only after its outbound claims matched
+    /// Claude's user entries exactly and every other check passed: only output association failed.
     case nothingImported(String)
     /// The provider history could not be merged without association evidence this build lacks
     /// (or without the attempt's own pre-send baseline). Nothing changed; never completion, never
