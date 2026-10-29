@@ -397,18 +397,41 @@ final class AgentRecoveryActionTests: XCTestCase {
     )
 
     func testProductionQualificationAndInactiveRegistrationReserveNothing() async throws {
-        // Step 9-activation-a: production stays `.off` until the live checks (9-flip).
-        XCTAssertEqual(AgentRecoveryActivation.production, .off)
-        XCTAssertEqual(AgentRecoveryActivation.production.actions, AgentRecoveryActionQualification())
-        for kind in AgentRecoveryActionKind.allCases {
-            XCTAssertFalse(AgentRecoveryActivation.production.actions.allows(kind), "\(kind) must stay OFF in production")
-        }
-        XCTAssertFalse(AgentRecoveryActivation.production.actions.safeRestart)
+        // 9-flip (2026-10-29, after 9-live round 4 passed): production is `.claudeAndCodex`, which
+        // allows exactly same-conversation resume and history reconciliation.
+        XCTAssertEqual(AgentRecoveryActivation.production, .claudeAndCodex)
+        XCTAssertEqual(
+            AgentRecoveryActivation.production.actions,
+            AgentRecoveryActionQualification(sameConversationResume: true, historyReconciliation: true)
+        )
+        let productionActions = AgentRecoveryActivation.production.actions
+        XCTAssertTrue(productionActions.allows(.continueWithText), "same-conversation resume")
+        XCTAssertTrue(productionActions.allows(.sendSaved), "same-conversation resume")
+        XCTAssertTrue(productionActions.allows(.questionAnswerAsInput), "same-conversation resume")
+        XCTAssertTrue(productionActions.allows(.reconcileOnly), "history reconciliation")
+        XCTAssertFalse(productionActions.allows(.continueInNewConversation), "fresh Claude conversation stays OFF")
+        XCTAssertEqual(
+            Set(AgentRecoveryActionKind.allCases.filter(productionActions.allows)),
+            [.continueWithText, .sendSaved, .questionAnswerAsInput, .reconcileOnly]
+        )
+        XCTAssertFalse(productionActions.freshClaudeConversation)
+        XCTAssertFalse(productionActions.safeRestart)
         let calls = Calls()
         let production = AgentRecoveryActionRunner(activation: .production, registrationActive: { true })
-        let request = try await continuation(key: runKey(), expectedRevision: revision())
-        let disabled = await production.perform(request, lane: lane, performers: performers(calls))
+        // A choice production doesn't qualify refuses before any reservation.
+        let fresh = try await AgentRecoveryActionRequest(
+            actionID: UUID(),
+            itemKey: runKey(),
+            kind: .continueInNewConversation,
+            expectedRevision: revision(),
+            sourceRunAttemptID: UUID(),
+            target: target,
+            text: "continue",
+            plannedUserItemID: UUID()
+        )
+        let disabled = await production.perform(fresh, lane: lane, performers: performers(calls))
         XCTAssertEqual(disabled, .disabled(AgentRecoveryActionRunner.disabledText))
+        let request = try await continuation(key: runKey(), expectedRevision: revision())
         let inactive = AgentRecoveryActionRunner(qualification: qualified, registrationActive: { false })
         XCTAssertFalse(inactive.isAvailable(.continueWithText))
         let refused = await inactive.perform(request, lane: lane, performers: performers(calls))
@@ -718,7 +741,10 @@ final class AgentRecoveryActionTests: XCTestCase {
     func testAssociationUnavailableIsNeitherCompletionNorImport() async throws {
         let runner = AgentRecoveryActionRunner(qualification: qualified, registrationActive: { true })
         XCTAssertTrue(runner.capturesDispatchBaselines(for: .claudeCode))
-        XCTAssertFalse(AgentRecoveryActionRunner(activation: .production, registrationActive: { true }).capturesDispatchBaselines(for: .claudeCode))
+        XCTAssertTrue(
+            AgentRecoveryActionRunner(activation: .production, registrationActive: { true }).capturesDispatchBaselines(for: .claudeCode),
+            "production (.claudeAndCodex since the 9-flip) captures Claude baselines"
+        )
         let claudeAndCodex = AgentRecoveryActionRunner(activation: .claudeAndCodex, registrationActive: { true })
         XCTAssertTrue(
             claudeAndCodex.capturesDispatchBaselines(for: .claudeCode),

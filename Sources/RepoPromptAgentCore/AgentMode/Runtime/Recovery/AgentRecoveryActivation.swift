@@ -22,8 +22,8 @@ package struct AgentRecoveryActivation: Equatable {
     /// history association, dispatch identity and settlement before its actions may execute.
     /// freshClaudeConversation and safeRestart stay off: each needs its own acceptance, and safe
     /// restart cannot prove unregistered families stopped (`verifyAllFamiliesStopped`).
-    /// Subset registration is owner choice A (O37, 2026-10-26); production flips to
-    /// .claudeAndCodex only in a separate reviewed commit after the live checks.
+    /// Subset registration is owner choice A (O37, 2026-10-26); production is .claudeAndCodex
+    /// since the 9-flip (2026-10-29).
     ///
     /// Writer basenames are what the managed launchers exec; an unlisted basename (for example an
     /// npm-installed Claude running as `node`) stays `unknown` and keeps the runtime a possible
@@ -38,9 +38,10 @@ package struct AgentRecoveryActivation: Equatable {
         actions: AgentRecoveryActionQualification(sameConversationResume: true, historyReconciliation: true)
     )
 
-    /// The app's activation. OFF until the live checks (9-live) pass on a candidate that changes only
-    /// this line; the flip to `.claudeAndCodex` is its own reviewed commit (9-flip).
-    package static let production: AgentRecoveryActivation = .off
+    /// The app's activation. Switched on to `.claudeAndCodex` (9-flip, 2026-10-29) after the 9-live
+    /// checks passed: Claude in round 4; Codex in rounds 1-3 (Check-confirmed holds, Continue,
+    /// Reconcile). Evidence: the lossless-restart spec's Step 9-flip status line.
+    package static let production: AgentRecoveryActivation = .claudeAndCodex
 
     /// Whether every supported family that serves this actual provider is covered (the runner's
     /// provider gate and dispatch-baseline capture): a provider whose runs can launch through an

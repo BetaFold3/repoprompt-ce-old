@@ -870,7 +870,7 @@ final class AgentRecoveryStartupCompositionTests: XCTestCase {
         let uninstalled = makeViewModel(windowID: 4815, fixture: fixture)
         XCTAssertEqual(uninstalled.recoveryActionRunner.activation, AgentRecoveryActivation.production)
         XCTAssertEqual(AgentRecoveryAppComposition.makeActionRunner().activation, AgentRecoveryActivation.production)
-        XCTAssertEqual(AgentRecoveryActivation.production, .off, "Production stays off until the reviewed flip")
+        XCTAssertEqual(AgentRecoveryActivation.production, .claudeAndCodex, "Production is the reviewed 9-flip activation")
 
         let scheduler = AgentScheduledSendCoordinator(startupAdmission: .awaitingRecovery)
         let composition = AgentRecoveryAppComposition(

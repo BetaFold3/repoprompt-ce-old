@@ -738,6 +738,8 @@ allowed_tracked_docs=(
   "docs/context/plans/evidence/2026-10-18-lossless-app-restart/fix-9live-r3-t1-review-oracleb-r0.md"
   "docs/context/plans/evidence/2026-10-18-lossless-app-restart/verifier-9live-r4-brief.md"
   "docs/context/plans/evidence/2026-10-18-lossless-app-restart/verifier-9live-r4-results.md"
+  "docs/context/plans/evidence/2026-10-18-lossless-app-restart/activation-switch-review-oraclea.md"
+  "docs/context/plans/evidence/2026-10-18-lossless-app-restart/activation-switch-review-oracleb.md"
   "docs/context/plans/evidence/2026-10-18-lossless-app-restart/diag-9live-r1-worker.md"
   "docs/context/plans/evidence/2026-10-18-lossless-app-restart/diag-9live-r2-r5-worker.md"
   "docs/context/plans/evidence/2026-10-18-lossless-app-restart/diag-9live-r6-worker.md"

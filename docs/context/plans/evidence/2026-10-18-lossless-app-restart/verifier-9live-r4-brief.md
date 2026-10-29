@@ -90,7 +90,7 @@ These are covered by unit tests, because this app can't produce their live state
 
 ## Reporting
 
-Write results to a new file, `verifier-9live-r4-results.md`, in this directory, in the same header style as earlier rounds, then link it here. Include:
+Write results to a new file, [verifier-9live-r4-results.md](verifier-9live-r4-results.md), in this directory, in the same header style as earlier rounds, then link it here. Include:
 
 - the build commit, PIDs and approvals;
 - the result table with exact texts;

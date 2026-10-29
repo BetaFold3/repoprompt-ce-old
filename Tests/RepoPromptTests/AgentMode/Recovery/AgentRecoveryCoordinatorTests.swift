@@ -2638,12 +2638,14 @@ final class AgentRecoveryCoordinatorTests: XCTestCase {
         var result: AgentRecoveryActionResult?
     }
 
-    /// Before activation (production qualification: Reconcile unavailable) Check refreshes and
+    /// Before activation (`.off` qualification: Reconcile unavailable) Check refreshes and
     /// reconciles nothing, writes nothing, and reports the items from the catalog only with the
     /// "not active" header; nothing is resolved.
     func testCheckBeforeActivationReportsNotActiveAndWritesNothing() async throws {
+        let inactive = AgentRecoveryActionRunner(activation: .off, registrationActive: { true })
+        XCTAssertFalse(inactive.isAvailable(.reconcileOnly), "the window's checksActive is off before activation")
         let production = AgentRecoveryActionRunner(activation: .production, registrationActive: { true })
-        XCTAssertFalse(production.isAvailable(.reconcileOnly), "the window's checksActive is off in production")
+        XCTAssertTrue(production.isAvailable(.reconcileOnly), "production (.claudeAndCodex since the 9-flip) offers Reconcile")
         let cards = try await makeRunCardFixtures(count: 2)
         let (store, coordinator) = (cards[0].store, cards[0].coordinator)
         let captured = try cards.map { try XCTUnwrap($0.item) }

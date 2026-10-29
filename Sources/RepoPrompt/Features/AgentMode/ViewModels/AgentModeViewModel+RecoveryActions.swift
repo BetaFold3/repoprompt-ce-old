@@ -11,8 +11,8 @@ import RepoPromptAgentCore
 // `submitUserTurn` under a store-issued queue receipt. History reconciliation commits rows, the
 // native-ID ledger and the import receipt in ONE owner session save before the recovery cursor's
 // compare-and-swap. Which actions are offered and may execute comes from the app's one activation
-// (`AgentRecoveryActivation.production`, OFF until the live checks); the runner refuses a choice for
-// a provider that activation doesn't qualify before anything is reserved (O32).
+// (`AgentRecoveryActivation.production`, on since 9-live round 4 passed, 2026-10-29); the runner
+// refuses a choice for a provider that activation doesn't qualify before anything is reserved (O32).
 
 extension AgentModeViewModel {
     /// One recovery item and one choice on it (the stable-request key).

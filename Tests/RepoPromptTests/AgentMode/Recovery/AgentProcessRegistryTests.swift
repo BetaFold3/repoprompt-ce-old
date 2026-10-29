@@ -98,8 +98,12 @@ final class AgentProcessRegistryTests: XCTestCase {
     // MARK: Activation gate
 
     func testProductionActivationStaysOffAndInactiveRegistryRefusesReservations() async {
-        // Step 9-activation-a: production stays `.off` until the live checks (9-flip).
-        XCTAssertEqual(AgentRecoveryActivation.production, .off)
+        // 9-flip (2026-10-29, after 9-live round 4 passed): production is `.claudeAndCodex`; its runtime
+        // activates registration but covers only a subset, and fresh --session-id stays off.
+        XCTAssertEqual(AgentRecoveryActivation.production, .claudeAndCodex)
+        XCTAssertTrue(AgentRecoveryActivation.production.runtime.activatesRegistration)
+        XCTAssertFalse(AgentRecoveryActivation.production.runtime.coversAllSupportedPairs)
+        XCTAssertFalse(AgentRecoveryActivation.production.runtime.allowsFreshSessionID(.claudeNative, provider: .claude(.standard)))
         XCTAssertFalse(AgentRecoveryActivation.off.runtime.activatesRegistration)
         // Subset activation: any covered supported pair activates registration; only all of them
         // speak for the whole app.
@@ -127,7 +131,7 @@ final class AgentProcessRegistryTests: XCTestCase {
 
         XCTAssertNil(AgentProcessRegistry.production, "XCTest composes no production registry")
         guard case .activationOff = AgentRuntimeLaunchAuthority.production else {
-            return XCTFail("Production launch authority must stay off")
+            return XCTFail("Without a production registry (XCTest), launch authority must stay off")
         }
         XCTAssertNil(AgentRuntimeLaunchAuthority.activationOff.makeLaunch(Fixtures.context(.claudeNative, worktreePath: "/tmp/x")))
         XCTAssertFalse(AgentRuntimeLaunchAuthority.activationOff.isRegistrationActive(family: .claudeNative, provider: .claude(.standard)))

@@ -84,8 +84,8 @@ package actor AgentProcessRegistry {
     }
 
     /// The production registry over the production store with the runtime qualification of
-    /// `AgentRecoveryActivation.production` (while that is `.off`, registration stays off and only
-    /// existing runtime records are enforced). `nil` in XCTest.
+    /// `AgentRecoveryActivation.production` (`.claudeAndCodex`: only those pairs register; existing
+    /// runtime records are always enforced). `nil` in XCTest.
     package static let production: AgentProcessRegistry? = AgentRecoveryStore.production.map {
         AgentProcessRegistry(store: $0, qualification: AgentRecoveryActivation.production.runtime, system: .live)
     }
