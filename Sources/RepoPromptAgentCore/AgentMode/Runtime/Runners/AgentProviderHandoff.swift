@@ -544,7 +544,7 @@ final class AgentProviderHandoff {
 
     /// Headless provider streams: model output proves the provider processed the input. Stream
     /// creation, lifecycle, usage, and error results do not.
-    static func streamResultProvesProviderAcceptance(_ result: AIStreamResult) -> Bool {
+    nonisolated static func streamResultProvesProviderAcceptance(_ result: AIStreamResult) -> Bool {
         switch result.type {
         case "content", "reasoning":
             let hasText = !(result.text ?? "").isEmpty
@@ -741,5 +741,20 @@ final class ACPPromptWriteObservation: @unchecked Sendable {
 
     var wasWritten: Bool {
         lock.withLock { written }
+    }
+
+    private var failedAfterReceipt = false
+
+    /// O49: passed as `prompt(onFailure:)`; records that prompt's own receipt evidence.
+    var onFailure: @Sendable (_ receivedByAgent: Bool) -> Void {
+        { [self] receivedByAgent in
+            lock.withLock { failedAfterReceipt = receivedByAgent }
+        }
+    }
+
+    /// O49: the observed prompt threw after the agent began it and RepoPrompt's own Stop or steer
+    /// cancelled it (the prompt's own evidence, never another prompt's).
+    var failedAfterAgentReceipt: Bool {
+        lock.withLock { failedAfterReceipt }
     }
 }

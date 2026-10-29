@@ -48,6 +48,10 @@ package protocol NativeAgentRuntimeControlling: Actor {
     /// R6: whether this runtime's launches are registered. A registered start joins the tab's
     /// retained runtime retirements (any provider) before it reserves. Others never join.
     nonisolated var joinsRetirementBeforeSuccessor: Bool { get }
+    /// O49: the written, not yet completed turn that provider output (model text, reasoning, or a
+    /// tool call) has been attributed to, or `nil`. A queued turn the provider has not begun is
+    /// never reported. Runtimes without per-turn output attribution report `nil`.
+    nonisolated var startedTurnID: UUID? { get }
     /// RepoPrompt MCP health of the current launch. Runtimes without health tracking report
     /// `.unknown` and are never recovered for MCP health.
     var currentRepoPromptMCPHealth: NativeAgentRuntimeRepoPromptMCPHealth { get async }
@@ -90,6 +94,10 @@ extension NativeAgentRuntimeControlling {
 
     nonisolated var joinsRetirementBeforeSuccessor: Bool {
         false
+    }
+
+    nonisolated var startedTurnID: UUID? {
+        nil
     }
 
     var currentRepoPromptMCPHealth: NativeAgentRuntimeRepoPromptMCPHealth {

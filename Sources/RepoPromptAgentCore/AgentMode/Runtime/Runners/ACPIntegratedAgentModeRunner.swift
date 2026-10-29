@@ -680,7 +680,12 @@ package final class ACPIntegratedAgentModeRunner {
         do {
             log("active steering session/prompt begin attempt=\(runAttemptID)", runID: runID)
             guard handoff.enterProviderBoundary(in: session) else { return false }
-            try await controller.prompt(agentMessage, request: runRequest, onSubmitted: promptWrite.onSubmitted)
+            try await controller.prompt(
+                agentMessage,
+                request: runRequest,
+                onSubmitted: promptWrite.onSubmitted,
+                onFailure: promptWrite.onFailure
+            )
             // The provider answered `session/prompt`: affirmative acceptance, recorded first.
             handoff.noteAccepted()
             log("active steering session/prompt completed attempt=\(runAttemptID)", runID: runID)
@@ -698,7 +703,7 @@ package final class ACPIntegratedAgentModeRunner {
             return true
         } catch {
             if promptWrite.wasWritten {
-                handoff.noteDeliveryUnknown()
+                Self.noteWrittenPromptFailure(handoff, promptWrite: promptWrite)
             } else {
                 // Documented boundary: building or writing the request failed; never written.
                 handoff.noteProvenNotWritten(message: String(describing: error))
@@ -709,6 +714,23 @@ package final class ACPIntegratedAgentModeRunner {
             let normalizedText = displayText(for: normalized)
             log("active steering session/prompt failed attempt=\(runAttemptID) raw=\(String(describing: error)) normalized=\(normalizedText)", runID: runID)
             return false
+        }
+    }
+
+    /// A written `session/prompt` threw. O49: when the agent had started that prompt's turn (it
+    /// streamed content or reasoning for it) and RepoPrompt's own Stop or steer sent
+    /// `session/cancel` (or its own Stop, window close or quit was requested before the run task
+    /// was cancelled), the prompt was received: accepted. The evidence is that prompt's own,
+    /// reported through its `onFailure`, and never when another prompt overlapped it. Any other
+    /// written failure stays delivery-unknown.
+    private static func noteWrittenPromptFailure(
+        _ handoff: AgentProviderHandoff,
+        promptWrite: ACPPromptWriteObservation
+    ) {
+        if promptWrite.failedAfterAgentReceipt {
+            handoff.noteAccepted()
+        } else {
+            handoff.noteDeliveryUnknown()
         }
     }
 
@@ -1819,7 +1841,8 @@ package final class ACPIntegratedAgentModeRunner {
             try await controller.prompt(
                 agentMessage,
                 request: runRequest,
-                onSubmitted: promptWrite.onSubmitted
+                onSubmitted: promptWrite.onSubmitted,
+                onFailure: promptWrite.onFailure
             )
             // The provider answered `session/prompt`: affirmative acceptance, recorded before any
             // reconciliation below.
@@ -1830,7 +1853,7 @@ package final class ACPIntegratedAgentModeRunner {
             log("controller.prompt returned; awaiting event consumer", runID: runID)
         } catch {
             if promptWrite.wasWritten {
-                handoff.noteDeliveryUnknown()
+                Self.noteWrittenPromptFailure(handoff, promptWrite: promptWrite)
             } else {
                 // Documented boundary: building or writing the request failed; never written.
                 handoff.noteProvenNotWritten(message: String(describing: error))

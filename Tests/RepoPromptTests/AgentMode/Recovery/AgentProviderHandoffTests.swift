@@ -692,6 +692,9 @@ extension AgentModeRunServiceLifecycleTests {
 
         let unknown = await fixture.waitForIntent(identity, state: .deliveryUnknown)
         XCTAssertEqual(unknown?.deliveryState, .deliveryUnknown, "A written turn without its own completion is never requeued")
+        // Control for the O49 tests: a cancel RepoPrompt did not request still needs a decision.
+        let needsAction = await waitForOpenNeedsActionCount(fixture, 1)
+        XCTAssertEqual(needsAction, 1)
     }
 
     /// The central Claude send seam never sends a handoff under a different run attempt than the
@@ -920,6 +923,428 @@ extension AgentModeRunServiceLifecycleTests {
         let accepted = await fixture.waitForIntent(identity, state: .providerAccepted)
         XCTAssertEqual(accepted?.deliveryState, .providerAccepted)
         XCTAssertEqual(accepted?.intentID, identity.intentID)
+    }
+
+    /// O49 (Stop): a written Claude turn that started (output attributed to it) and was then
+    /// stopped by RepoPrompt settles accepted at run end, before any result: the controller is shut
+    /// down without ever reporting one. The attempt never recorded `deliveryUnknown`, not even
+    /// transiently, and nothing needs action.
+    func testClaudeTurnInterruptedByStopSettlesAcceptedWithNoNeedsAction() async throws {
+        let fixture = try await RecoveryLaneFixture.make("o49-claude-stop")
+        defer { fixture.tearDown() }
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleFakeNativeController(
+            recorder: recorder,
+            emittedAssistantTextOnSend: "partial",
+            interruptOutcome: .acknowledged
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            claudeController: controller,
+            handleHeadlessStreamResult: { result in
+                if result.type == "assistant", let text = result.text {
+                    recorder.record("run-stream:\(text)")
+                }
+            },
+            autoSignalACPRouting: true
+        )
+        let session = fixture.boundTabSession()
+        session.selectedAgent = .claudeCode
+        harness.host.test_installLiveSession(session)
+        let identity = try await fixture.queuedIdentity("stop me")
+        session.recoveryAdmissionMode = .mandatory
+        let needsActionBefore = fixture.coordinator.catalog.openNeedsActionCount
+
+        let outcome = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "stop me",
+            initialMessageForRun: "stop me",
+            attachments: [],
+            inputConstituents: [identity]
+        )
+        XCTAssertNil(outcome)
+        let agentTask = session.agentTask
+        let turnID = await controller.waitForPendingTurnCompletion()
+        for _ in 0 ..< 300 where !recorder.contains("run-stream:partial") {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertTrue(recorder.contains("run-stream:partial"), "The turn's output was delivered before Stop")
+        await controller.setStartedTurnID(turnID)
+
+        await harness.service.cancelRun(tabID: session.tabID, session: session, cause: .userCancel)
+        await agentTask?.value
+        // Stop's controller cleanup (interrupt, then shutdown) runs after the detach; no result is
+        // ever emitted for the stopped turn.
+        for _ in 0 ..< 300 where !recorder.contains("claude:shutdown") {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertTrue(recorder.contains("claude:interrupt:interrupt"), "Stop interrupts the in-flight turn")
+        XCTAssertTrue(recorder.contains("claude:shutdown"), "The controller shut down before any result")
+
+        let accepted = await fixture.waitForIntent(identity, state: .providerAccepted)
+        XCTAssertEqual(accepted?.deliveryState, .providerAccepted)
+        let attempts = await fixture.attempts(for: identity)
+        XCTAssertEqual(attempts.count, 1)
+        XCTAssertEqual(attempts.first?.outcome?.outcome, .providerAccepted)
+        XCTAssertNil(attempts.first?.supersededOutcome, "Never recorded as delivery-unknown first")
+        // Barrier: wait until the coordinator applied the accepted commit (the record the catalog
+        // projects), then read the count once — never poll toward the baseline.
+        let intentID = try XCTUnwrap(identity.intentID)
+        func appliedAccepted() -> Bool {
+            guard case let .supported(record)? = fixture.coordinator.liveRecordState(for: fixture.sessionID)
+            else { return false }
+            return record.intent(id: intentID)?.deliveryState == .providerAccepted
+        }
+        for _ in 0 ..< 300 where !appliedAccepted() {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertTrue(appliedAccepted(), "The catalog's source record carries the accepted outcome")
+        XCTAssertEqual(
+            fixture.coordinator.catalog.openNeedsActionCount,
+            needsActionBefore,
+            "Stop adds no needs-action item"
+        )
+    }
+
+    /// O49 (Stop): only the started turn is the Stop's target. A second message written behind it
+    /// that the CLI never began, and an older retained turn of an ended attempt, are not marked: a
+    /// late unsolicited `.cancelled` for either leaves it uncertain.
+    func testClaudeStopMarksOnlyTheStartedTurnNeverAQueuedOrOlderOne() async throws {
+        let fixture = try await RecoveryLaneFixture.make("o49-claude-target")
+        defer { fixture.tearDown() }
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleFakeNativeController(recorder: recorder)
+        let harness = makeHarness(recorder: recorder, claudeController: controller)
+        let session = makeRunningClaudeSession(controller: controller)
+        session.installPersistentSessionBinding(AgentPersistentSessionBindingIdentity(tabID: session.tabID, sessionID: fixture.sessionID))
+        session.recoveryLane = fixture.lane
+        harness.host.test_installLiveSession(session)
+        let coordinator = harness.host.claudeCoordinator
+
+        func write(_ text: String, ownership: AgentRunOwnership) async throws -> (AgentQueuedInputIdentity, AgentProviderHandoff) {
+            let identity = try await fixture.queuedIdentity(text)
+            let handoff = try await AgentProviderHandoff.begin(
+                session: session,
+                constituents: [identity],
+                ownership: ownership,
+                processRunID: session.runID
+            ).get()
+            let sent = await coordinator.sendClaudeNativeMessage(
+                session: session,
+                text: text,
+                attachments: [],
+                handoff: handoff
+            )
+            XCTAssertTrue(sent)
+            return (identity, handoff)
+        }
+
+        // An older attempt's message, retained after its attempt ended uncertain.
+        let olderOwnership = session.beginRunAttempt(source: "test.older")
+        let (older, olderHandoff) = try await write("older", ownership: olderOwnership)
+        coordinator.settleWrittenDispatchHandoffs(tabID: session.tabID, runAttemptID: olderOwnership.attemptID)
+        _ = await fixture.waitForIntent(older, state: .deliveryUnknown)
+
+        // The current attempt: a started turn, then a queued message the CLI has not begun.
+        let ownership = session.beginRunAttempt(source: "test.current")
+        let (started, startedHandoff) = try await write("started", ownership: ownership)
+        let (queued, queuedHandoff) = try await write("queued", ownership: ownership)
+        let turnIDs = await controller.recordedSentTurnIDs()
+        XCTAssertEqual(turnIDs.count, 3)
+        await controller.setStartedTurnID(turnIDs[1])
+
+        coordinator.noteRepoPromptTeardownRequested(session)
+        // A late, unsolicited cancel of the older turn proves nothing about it.
+        coordinator.noteClaudeTurnCompleted(turnID: turnIDs[0], status: .cancelled, isEmittedBy: { $0 === controller })
+        coordinator.settleWrittenDispatchHandoffs(tabID: session.tabID, runAttemptID: ownership.attemptID)
+        // The queued message's late cancel proves nothing either.
+        coordinator.noteClaudeTurnCompleted(turnID: turnIDs[2], status: .cancelled, isEmittedBy: { $0 === controller })
+
+        _ = await olderHandoff.evidence.settled()
+        _ = await startedHandoff.evidence.settled()
+        _ = await queuedHandoff.evidence.settled()
+        XCTAssertEqual(olderHandoff.observation, .deliveryUnknown)
+        XCTAssertEqual(startedHandoff.observation, .accepted)
+        XCTAssertEqual(queuedHandoff.observation, .deliveryUnknown)
+        let olderIntent = await fixture.intent(older)
+        let startedIntent = await fixture.intent(started)
+        let queuedIntent = await fixture.intent(queued)
+        XCTAssertEqual(olderIntent?.deliveryState, .deliveryUnknown, "The older retained turn still needs a decision")
+        XCTAssertEqual(startedIntent?.deliveryState, .providerAccepted)
+        XCTAssertEqual(queuedIntent?.deliveryState, .deliveryUnknown, "A queued message that never started is not accepted")
+    }
+
+    /// O49 (steer): an interrupt that was not sent leaves nothing marked: the started message's
+    /// later `.cancelled` keeps it uncertain.
+    func testClaudeInterruptNotSentLeavesTheMessageUncertain() async throws {
+        let fixture = try await RecoveryLaneFixture.make("o49-claude-not-sent")
+        defer { fixture.tearDown() }
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleFakeNativeController(
+            recorder: recorder,
+            emittedAssistantTextOnSend: "partial",
+            interruptOutcome: .failed
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            claudeController: controller,
+            handleHeadlessStreamResult: { result in
+                if result.type == "assistant", let text = result.text {
+                    recorder.record("run-stream:\(text)")
+                }
+            },
+            autoSignalACPRouting: true
+        )
+        let session = fixture.boundTabSession()
+        session.selectedAgent = .claudeCode
+        harness.host.test_installLiveSession(session)
+        let first = try await fixture.queuedIdentity("first")
+        session.recoveryAdmissionMode = .mandatory
+
+        let outcome = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "first",
+            initialMessageForRun: "first",
+            attachments: [],
+            inputConstituents: [first]
+        )
+        XCTAssertNil(outcome)
+        let agentTask = session.agentTask
+        let firstTurnID = await controller.waitForPendingTurnCompletion()
+        for _ in 0 ..< 300 where !recorder.contains("run-stream:partial") {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        await controller.setStartedTurnID(firstTurnID)
+
+        await controller.setTurnInFlight(true)
+        let steer = try await fixture.queuedIdentity("steer")
+        session.pendingClaudeSteeringInstructions.append(AgentTabSession.ClaudeSteeringInstruction(
+            id: UUID(),
+            targetRunID: session.runID,
+            targetRunAttemptID: session.activeRunAttemptID,
+            providerText: "steer",
+            attachments: [],
+            taggedFileAttachments: [],
+            draftText: "steer",
+            identity: steer,
+            createdAt: Date()
+        ))
+        _ = await harness.service.submitQueuedClaudeSteeringIfSupported(session: session)
+        await session.claudeSteeringFlushTask?.value
+        XCTAssertEqual(recorder.events.count(where: { $0 == "claude:interrupt:interrupt" }), 1)
+        let sent = await controller.recordedSentMessages()
+        XCTAssertEqual(sent, ["first"], "The steer is not written behind an unsent interrupt")
+
+        // A cancelled result RepoPrompt's interrupt did not cause.
+        await controller.emitCancelledTurnCompletion(turnID: firstTurnID)
+        let unknown = await fixture.waitForIntent(first, state: .deliveryUnknown)
+        XCTAssertEqual(unknown?.deliveryState, .deliveryUnknown)
+
+        await harness.service.cancelRun(
+            tabID: session.tabID, session: session, cause: .userCancel, completion: .terminalTeardownCompleted
+        )
+        await agentTask?.value
+    }
+
+    /// G2: a steer's mark is provisional. A `.failed` completion that arrives while the interrupt
+    /// is still awaited is held; an interrupt that then fails leaves the message uncertain, and
+    /// only an acknowledged one accepts it.
+    func testClaudeCompletionDuringAPendingSteerInterruptWaitsForItsOutcome() async throws {
+        let notAcknowledged = try await steerInterruptOutcomeAfterFailedCompletion(
+            .failed,
+            name: "g2-claude-interrupt-fails"
+        )
+        XCTAssertEqual(notAcknowledged, .deliveryUnknown, "A failed interrupt never accepts on its provisional mark")
+        let acknowledged = try await steerInterruptOutcomeAfterFailedCompletion(
+            .acknowledged,
+            name: "g2-claude-interrupt-acknowledged"
+        )
+        XCTAssertEqual(acknowledged, .providerAccepted)
+    }
+
+    /// Steers a started Claude turn whose interrupt is held open; delivers the turn's `.failed`
+    /// completion meanwhile, then lets the interrupt return `outcome`. Returns the first message's
+    /// delivery state.
+    private func steerInterruptOutcomeAfterFailedCompletion(
+        _ outcome: NativeAgentRuntimeInterruptOutcome,
+        name: String
+    ) async throws -> AgentRecoveryDeliveryState? {
+        let fixture = try await RecoveryLaneFixture.make(name)
+        defer { fixture.tearDown() }
+        let recorder = LifecycleRecorder()
+        let interruptGate = LifecycleAsyncGate()
+        let controller = LifecycleFakeNativeController(
+            recorder: recorder,
+            emittedAssistantTextOnSend: "partial",
+            interruptOutcome: outcome,
+            interruptGate: interruptGate
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            claudeController: controller,
+            handleHeadlessStreamResult: { result in
+                if result.type == "assistant", let text = result.text {
+                    recorder.record("run-stream:\(text)")
+                }
+            },
+            autoSignalACPRouting: true
+        )
+        let session = fixture.boundTabSession()
+        session.selectedAgent = .claudeCode
+        harness.host.test_installLiveSession(session)
+        let first = try await fixture.queuedIdentity("first")
+        session.recoveryAdmissionMode = .mandatory
+
+        let startOutcome = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "first",
+            initialMessageForRun: "first",
+            attachments: [],
+            inputConstituents: [first]
+        )
+        XCTAssertNil(startOutcome)
+        let agentTask = session.agentTask
+        let firstTurnID = await controller.waitForPendingTurnCompletion()
+        for _ in 0 ..< 300 where !recorder.contains("run-stream:partial") {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        await controller.setStartedTurnID(firstTurnID)
+
+        await controller.setTurnInFlight(true)
+        let steer = try await fixture.queuedIdentity("steer")
+        session.pendingClaudeSteeringInstructions.append(AgentTabSession.ClaudeSteeringInstruction(
+            id: UUID(),
+            targetRunID: session.runID,
+            targetRunAttemptID: session.activeRunAttemptID,
+            providerText: "steer",
+            attachments: [],
+            taggedFileAttachments: [],
+            draftText: "steer",
+            identity: steer,
+            createdAt: Date()
+        ))
+        _ = await harness.service.submitQueuedClaudeSteeringIfSupported(session: session)
+        await interruptGate.waitUntilArrived()
+
+        // The process is lost while the interrupt is still awaited.
+        await controller.emitFailedTurnCompletion(turnID: firstTurnID)
+        let coordinator = harness.host.claudeCoordinator
+        for _ in 0 ..< 300 where !coordinator.test_holdsCompletionDuringInterrupt(turnID: firstTurnID) {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertTrue(coordinator.test_holdsCompletionDuringInterrupt(turnID: firstTurnID), "The completion waits for the interrupt")
+        let duringInterrupt = await fixture.intent(first)
+        XCTAssertNotEqual(duringInterrupt?.deliveryState, .providerAccepted, "Not accepted on a provisional mark")
+
+        await interruptGate.release()
+        await session.claudeSteeringFlushTask?.value
+        let expected: AgentRecoveryDeliveryState = outcome == .acknowledged ? .providerAccepted : .deliveryUnknown
+        let settled = await fixture.waitForIntent(first, state: expected)
+
+        await harness.service.cancelRun(
+            tabID: session.tabID, session: session, cause: .userCancel, completion: .terminalTeardownCompleted
+        )
+        await agentTask?.value
+        let final = await fixture.intent(first)
+        XCTAssertEqual(final?.deliveryState, settled?.deliveryState, "Stop after the turn ended changes nothing")
+        return settled?.deliveryState
+    }
+
+    /// O49 (steer): steering a running Claude turn interrupts it; the interrupted message settles
+    /// accepted, the steer itself is accepted by its own completion, and nothing needs action.
+    func testClaudeTurnInterruptedBySteerSettlesAcceptedWithNoNeedsAction() async throws {
+        let fixture = try await RecoveryLaneFixture.make("o49-claude-steer")
+        defer { fixture.tearDown() }
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleFakeNativeController(
+            recorder: recorder,
+            emittedAssistantTextOnSend: "partial",
+            interruptOutcome: .acknowledged
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            claudeController: controller,
+            handleHeadlessStreamResult: { result in
+                if result.type == "assistant", let text = result.text {
+                    recorder.record("run-stream:\(text)")
+                }
+            },
+            autoSignalACPRouting: true
+        )
+        let session = fixture.boundTabSession()
+        session.selectedAgent = .claudeCode
+        harness.host.test_installLiveSession(session)
+        let first = try await fixture.queuedIdentity("first")
+        session.recoveryAdmissionMode = .mandatory
+        let needsActionBefore = fixture.coordinator.catalog.openNeedsActionCount
+
+        let outcome = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "first",
+            initialMessageForRun: "first",
+            attachments: [],
+            inputConstituents: [first]
+        )
+        XCTAssertNil(outcome)
+        let agentTask = session.agentTask
+        let firstTurnID = await controller.waitForPendingTurnCompletion()
+        for _ in 0 ..< 300 where !recorder.contains("run-stream:partial") {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertTrue(recorder.contains("run-stream:partial"), "The first turn started before the steer")
+        await controller.setStartedTurnID(firstTurnID)
+
+        await controller.setTurnInFlight(true)
+        let steer = try await fixture.queuedIdentity("steer")
+        session.pendingClaudeSteeringInstructions.append(AgentTabSession.ClaudeSteeringInstruction(
+            id: UUID(),
+            targetRunID: session.runID,
+            targetRunAttemptID: session.activeRunAttemptID,
+            providerText: "steer",
+            attachments: [],
+            taggedFileAttachments: [],
+            draftText: "steer",
+            identity: steer,
+            createdAt: Date()
+        ))
+        let steered = await harness.service.submitQueuedClaudeSteeringIfSupported(session: session)
+        XCTAssertTrue(steered)
+        await session.claudeSteeringFlushTask?.value
+        XCTAssertEqual(recorder.events.count(where: { $0 == "claude:interrupt:interrupt" }), 1)
+        let sent = await controller.recordedSentMessages()
+        XCTAssertEqual(sent, ["first", "steer"])
+
+        // The CLI's result for the interrupted first turn.
+        await controller.emitCancelledTurnCompletion(turnID: firstTurnID)
+        let firstAccepted = await fixture.waitForIntent(first, state: .providerAccepted)
+        XCTAssertEqual(firstAccepted?.deliveryState, .providerAccepted, "The steered-over message was received")
+
+        let steerTurnID = await controller.waitForPendingTurnCompletion()
+        XCTAssertNotEqual(steerTurnID, firstTurnID)
+        await controller.emitCompletedTurnCompletion(turnID: steerTurnID)
+        let steerAccepted = await fixture.waitForIntent(steer, state: .providerAccepted)
+        XCTAssertEqual(steerAccepted?.deliveryState, .providerAccepted)
+
+        await harness.service.cancelRun(
+            tabID: session.tabID, session: session, cause: .userCancel, completion: .terminalTeardownCompleted
+        )
+        await agentTask?.value
+        let firstAfterRun = await fixture.intent(first)
+        XCTAssertEqual(firstAfterRun?.deliveryState, .providerAccepted)
+        let needsAction = await waitForOpenNeedsActionCount(fixture, needsActionBefore)
+        XCTAssertEqual(needsAction, needsActionBefore, "Steering adds no needs-action item")
+    }
+
+    /// Polls the catalog's open needs-action count until it equals `expected` or the bound expires.
+    private func waitForOpenNeedsActionCount(_ fixture: RecoveryLaneFixture, _ expected: Int) async -> Int {
+        for _ in 0 ..< 300 where fixture.coordinator.catalog.openNeedsActionCount != expected {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return fixture.coordinator.catalog.openNeedsActionCount
     }
 
     /// Uncertain durable delivery neither replays (didSend false) nor consumes (didSend true) the

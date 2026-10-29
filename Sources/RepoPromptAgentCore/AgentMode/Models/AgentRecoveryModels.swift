@@ -1113,6 +1113,37 @@ package struct AgentRecoveryRecord: Equatable {
         }
     }
 
+    /// O50: the intent has at least one delivery attempt and every one ran in a run attempt whose
+    /// end this app recorded (terminal or shutdown evidence). Its delivery uncertainty then does not
+    /// come from an unclean exit, so it is never worded as "RepoPrompt stopped".
+    package func intentRunsEndedWithRecordedEvidence(intentID: UUID) -> Bool {
+        let attempts = attempts(forIntent: intentID)
+        return !attempts.isEmpty && attempts.allSatisfy { attempt in
+            guard let runAttemptID = attempt.runAttemptID, let run = runAttempt(id: runAttemptID) else { return false }
+            return run.terminal != nil || run.shutdown != nil
+        }
+    }
+
+    /// O51: a `deliveryUnknown` intent left by a run RepoPrompt itself ended normally: it has at
+    /// least one attempt, and every attempt closed `deliveryUnknown` in a run attempt with terminal
+    /// cause `ordinary` and state `completed` or `cancelled`, without shutdown evidence. Anything
+    /// else (an open attempt, a run without terminal evidence, a crash, quit, user-cancel,
+    /// provider-loss, legacy or failed run) does not qualify.
+    package func ordinaryExitSettlementQualifies(intentID: UUID) -> Bool {
+        guard intent(id: intentID)?.deliveryState == .deliveryUnknown else { return false }
+        let attempts = attempts(forIntent: intentID)
+        return !attempts.isEmpty && attempts.allSatisfy { attempt in
+            guard attempt.outcome?.outcome == .deliveryUnknown,
+                  let runAttemptID = attempt.runAttemptID,
+                  let run = runAttempt(id: runAttemptID),
+                  run.shutdown == nil,
+                  let terminal = run.terminal,
+                  terminal.cause == .ordinary
+            else { return false }
+            return terminal.terminalState == .completed || terminal.terminalState == .cancelled
+        }
+    }
+
     /// O43 qualification: a crash-hold confirmation whose run attempts `exitedRunAttemptIDs` exited
     /// may settle this intent: it is delivery-uncertain (`dispatching` or `deliveryUnknown`), it and
     /// every attempt of it were started by an earlier launch than `currentInstanceID`, and its

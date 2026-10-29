@@ -1,4 +1,5 @@
 import Foundation
+import os
 @testable import RepoPromptAgentCore
 @testable import RepoPromptPlatform
 @testable import RepoPromptUI
@@ -2709,6 +2710,8 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
     private let shutdownGate: LifecycleAsyncGate?
     private let emittedAssistantTextOnSend: String?
     private let interruptOutcome: NativeAgentRuntimeInterruptOutcome
+    /// Opt-in: `interruptTurn` waits here before returning its outcome.
+    private let interruptGate: LifecycleAsyncGate?
     private let rejectsEffortApplicationWhileTurnInFlight: Bool
     private let applyGate: LifecycleAsyncGate?
     private var sentMessages: [String] = []
@@ -2726,6 +2729,9 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
     private var maxConcurrentStartInvocationCount = 0
     private var pendingTurnCompletionID: UUID?
     private var pendingTurnCompletionWaiters: [CheckedContinuation<UUID, Never>] = []
+    private var sentTurnIDs: [UUID] = []
+    /// O49: the turn tests declare the provider has begun (`startedTurnID`); never set implicitly.
+    private nonisolated let startedTurnIDSnapshot = OSAllocatedUnfairLock<UUID?>(initialState: nil)
     /// R6: a registered fake joins the tab's retained runtime retirements before it starts.
     nonisolated let joinsRetirementBeforeSuccessor: Bool
     /// Opt-in: behaves like a managed transport at the write (the real controller's
@@ -2765,6 +2771,7 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         shutdownGate: LifecycleAsyncGate? = nil,
         emittedAssistantTextOnSend: String? = nil,
         interruptOutcome: NativeAgentRuntimeInterruptOutcome = .noTurnInFlight,
+        interruptGate: LifecycleAsyncGate? = nil,
         rejectsEffortApplicationWhileTurnInFlight: Bool = false,
         applyGate: LifecycleAsyncGate? = nil,
         sessionID: String = "lifecycle-claude-session",
@@ -2793,6 +2800,7 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         self.shutdownGate = shutdownGate
         self.emittedAssistantTextOnSend = emittedAssistantTextOnSend
         self.interruptOutcome = interruptOutcome
+        self.interruptGate = interruptGate
         self.rejectsEffortApplicationWhileTurnInFlight = rejectsEffortApplicationWhileTurnInFlight
         self.applyGate = applyGate
         self.sessionID = sessionID
@@ -3022,6 +3030,7 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         }
         let turnID = UUID()
         sentMessages.append(text)
+        sentTurnIDs.append(turnID)
         if invokesWriteAdmission {
             try writtenUserFrames.append(ClaudeSDKProtocolCodec.encodeUserMessage(
                 text: text,
@@ -3067,6 +3076,26 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         sentMessages
     }
 
+    /// Turn IDs returned by successful writes, in write order.
+    func recordedSentTurnIDs() -> [UUID] {
+        sentTurnIDs
+    }
+
+    nonisolated var startedTurnID: UUID? {
+        startedTurnIDSnapshot.withLock { $0 }
+    }
+
+    /// Declares that the provider began `turnID` (output attributed to it), or clears it.
+    func setStartedTurnID(_ turnID: UUID?) {
+        startedTurnIDSnapshot.withLock { $0 = turnID }
+    }
+
+    private func clearStartedTurnID(ifEqualTo turnID: UUID) {
+        startedTurnIDSnapshot.withLock { started in
+            if started == turnID { started = nil }
+        }
+    }
+
     /// The owner scope bound for each write admission this fake evaluated.
     func recordedAdmissionOwners() -> [AgentRuntimeSessionScope] {
         admissionOwners
@@ -3083,6 +3112,7 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         if pendingTurnCompletionID == turnID {
             pendingTurnCompletionID = nil
         }
+        clearStartedTurnID(ifEqualTo: turnID)
         streamContinuation.yield(.turnCompleted(turnID: turnID, status: .completed))
     }
 
@@ -3091,12 +3121,26 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         if pendingTurnCompletionID == turnID {
             pendingTurnCompletionID = nil
         }
+        clearStartedTurnID(ifEqualTo: turnID)
         streamContinuation.yield(.turnCompleted(turnID: turnID, status: .cancelled))
+    }
+
+    /// A failed completion, like the real controller's on process loss.
+    func emitFailedTurnCompletion(turnID: UUID) {
+        turnInFlight = false
+        if pendingTurnCompletionID == turnID {
+            pendingTurnCompletionID = nil
+        }
+        clearStartedTurnID(ifEqualTo: turnID)
+        streamContinuation.yield(.turnCompleted(turnID: turnID, status: .failed))
     }
 
     func interruptTurn(reason: String) async -> NativeAgentRuntimeInterruptOutcome {
         recorder.record("\(label):interrupt:\(reason)")
         interruptCount += 1
+        if let interruptGate {
+            await interruptGate.arriveAndWait()
+        }
         return interruptOutcome
     }
 

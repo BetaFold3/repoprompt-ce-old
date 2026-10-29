@@ -374,6 +374,59 @@ final class AgentRecoveryResetBoundaryTests: XCTestCase {
         XCTAssertEqual(run?.terminal?.terminalState, .cancelled)
     }
 
+    /// O49 (app quit, Stage B): a written Claude message whose turn the CLI had begun settles
+    /// accepted through the window teardown, before any result arrives and although the controller
+    /// is shut down; the attempt never recorded delivery-unknown first.
+    func testAppQuitTeardownSettlesAStartedClaudeTurnAcceptedWithoutAResult() async throws {
+        let harness = try await makeHarness(windowID: 4620)
+        let lane = try await persistAndClaimLane(harness)
+        let viewModel = harness.viewModel
+        let session = harness.session
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleFakeNativeController(recorder: recorder)
+        session.selectedAgent = .claudeCode
+        session.runState = .running
+        session.runID = UUID()
+        let ownership = session.beginRunAttempt(source: "test.quit")
+        session.claudeController = controller
+        let admitted = try await lane.admitQueued(AgentRecoveryAdmission(
+            binding: lane.binding,
+            userItemID: UUID(),
+            origin: .mcp,
+            target: .session,
+            original: RecoveryTestSupport.content("quit me")
+        )).get()
+        let intentID = admitted.receipt.intent.intentID
+        let handoff = try await AgentProviderHandoff.begin(
+            session: session,
+            constituents: [AgentQueuedInputIdentity(receipt: admitted.receipt)],
+            ownership: ownership,
+            processRunID: session.runID
+        ).get()
+        // The provider write itself (this harness cannot prepare a Claude session to send).
+        XCTAssertTrue(handoff.enterProviderBoundary(in: session))
+        let turnID = UUID()
+        viewModel.claudeCoordinator.test_recordWrittenDispatchHandoff(
+            turnID: turnID,
+            session: session,
+            handoff: handoff,
+            controller: controller
+        )
+        await controller.setStartedTurnID(turnID)
+
+        await viewModel.prepareForWindowClose(reason: .appQuit)
+        _ = await handoff.evidence.settled()
+        XCTAssertEqual(handoff.observation, .accepted)
+        XCTAssertTrue(recorder.contains("claude:shutdown"), "The controller was shut down without a result")
+        let accepted = await RecoveryTestSupport.eventually {
+            await lane.store.read(sessionID: lane.sessionID).record?.intent(id: intentID)?.deliveryState == .providerAccepted
+        }
+        XCTAssertTrue(accepted)
+        let attempts = await lane.store.read(sessionID: lane.sessionID).record?.attempts(forIntent: intentID) ?? []
+        XCTAssertEqual(attempts.count, 1)
+        XCTAssertNil(attempts.first?.supersededOutcome, "Never recorded as delivery-unknown first")
+    }
+
     /// R4-B07: after the real teardown, the final flush writes content that arrived during it (the
     /// terminal commit's transcript) with an empty report; a queued intent stays queued; and a
     /// later preparation of the torn-down window is a no-op that keeps its preserved question.

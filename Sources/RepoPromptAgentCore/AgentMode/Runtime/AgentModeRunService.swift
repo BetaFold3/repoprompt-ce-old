@@ -2002,6 +2002,10 @@ package final class AgentModeRunService {
                 expectedRunID: expectedRunID
             )
             : nil
+        // O49: before the run detaches, so run end settles a started Claude turn as accepted and a
+        // started ACP prompt failing from this teardown reports receipt.
+        dependencies.claudeCoordinator.noteRepoPromptTeardownRequested(session)
+        acpController?.noteRepoPromptTeardownRequested()
         session.agentTask?.cancel()
 
         if session.selectedAgent == .codexExec {

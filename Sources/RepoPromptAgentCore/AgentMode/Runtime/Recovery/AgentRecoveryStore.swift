@@ -368,6 +368,11 @@ package actor AgentRecoveryStore {
     /// shares them; both are immutable.
     nonisolated let fileOperations: FileOperations
     nonisolated let now: @Sendable () -> Date
+    /// O51 (G4): when the first launch that ran the ordinary-exit settlement began. Read from the
+    /// previous launch mark and written into every launch mark this launch writes, so the
+    /// settlement's cohort stays "dispatched before that launch" even if its own marker was never
+    /// written. `nil` until a mark is read or written.
+    private(set) var ordinaryExitSettlementLaunchCutoff: AgentRecoveryTimestamp?
 
     package init(
         rootURL: URL,
@@ -1523,6 +1528,11 @@ package actor AgentRecoveryStore {
         else {
             return .unreadable("malformed or future launch mark")
         }
+        if ordinaryExitSettlementLaunchCutoff == nil,
+           let carried = (object[Self.ordinaryExitSettlementCutoffLaunchKey] as? NSNumber)?.int64Value
+        {
+            ordinaryExitSettlementLaunchCutoff = AgentRecoveryTimestamp(millisecondsSince1970: carried)
+        }
         return .mark(AgentRecoveryLaunchMark(
             appInstanceID: instanceID,
             state: state,
@@ -1567,11 +1577,13 @@ package actor AgentRecoveryStore {
             state: state,
             recordedAt: AgentRecoveryTimestamp(now())
         )
+        let settlementCutoff = ordinaryExitSettlementLaunchCutoff ?? mark.recordedAt
         let object: [String: Any] = [
             "schemaVersion": 1,
             "appInstanceID": mark.appInstanceID.uuidString,
             "state": mark.state.rawValue,
-            "recordedAtMs": NSNumber(value: mark.recordedAt.millisecondsSince1970)
+            "recordedAtMs": NSNumber(value: mark.recordedAt.millisecondsSince1970),
+            Self.ordinaryExitSettlementCutoffLaunchKey: NSNumber(value: settlementCutoff.millisecondsSince1970)
         ]
         do {
             let data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
@@ -1580,8 +1592,13 @@ package actor AgentRecoveryStore {
         } catch {
             throw AgentRecoveryStoreError.classifiedStorageFailure(error)
         }
+        ordinaryExitSettlementLaunchCutoff = settlementCutoff
         return mark
     }
+
+    /// Launch-mark member carrying `ordinaryExitSettlementLaunchCutoff` (optional; readers that
+    /// do not know it ignore it).
+    static let ordinaryExitSettlementCutoffLaunchKey = "ordinaryExitSettlementCutoffMs"
 
     // MARK: Deleted-session cleanup
 

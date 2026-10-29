@@ -3532,7 +3532,8 @@ package actor AgentSessionDataService {
                 transcriptResetGeneration: intent.transcriptResetGeneration,
                 delivery: AgentColdRestoreInterruptionContext.unacceptedDelivery(
                     state: intent.deliveryState,
-                    attempts: record.attempts(forIntent: intent.intentID)
+                    attempts: record.attempts(forIntent: intent.intentID),
+                    runsEndedWithRecordedEvidence: record.intentRunsEndedWithRecordedEvidence(intentID: intent.intentID)
                 )
             )
         }

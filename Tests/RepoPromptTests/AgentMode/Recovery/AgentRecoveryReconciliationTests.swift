@@ -2706,7 +2706,8 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
                 sessionName: nil,
                 composeTabID: harness.session.tabID,
                 payload: .intent(intent, AgentRecoveryCatalogIntentContext(
-                    isEarlierLaunch: true, heldReason: nil, sameGeneration: true, isRemote: false
+                    isEarlierLaunch: true, heldReason: nil, sameGeneration: true, isRemote: false,
+                    runsEndedWithRecordedEvidence: false
                 )),
                 acknowledgement: AgentRecoveryCatalogAcknowledgement(
                     key: AgentRecoveryCardKey(

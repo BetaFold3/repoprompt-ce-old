@@ -408,15 +408,19 @@ struct AgentMessageBubble: View {
         switch delivery {
         case .notSent: "Not sent"
         case .unconfirmed: "Delivery unconfirmed"
+        case .notConfirmedByAgent: "Not confirmed"
         }
     }
 
     static func recoveryDeliveryHelp(_ delivery: AgentUserItemRecoveryDelivery) -> String {
         switch delivery {
         case .notSent:
-            "RepoPrompt stopped before this message reached the agent."
+            // Verified non-delivery says nothing about how RepoPrompt exited (O50).
+            "This message was not delivered to the agent."
         case .unconfirmed:
             "RepoPrompt stopped before the agent confirmed this message. Sending it again might duplicate it."
+        case .notConfirmedByAgent:
+            "The agent didn't confirm it received this message. Sending it again might duplicate it."
         }
     }
 

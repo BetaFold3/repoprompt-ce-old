@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import os
 import OSLog
 import RepoPromptPlatform
 import RepoPromptShared
@@ -546,6 +547,17 @@ package final actor ClaudeNativeProcessSessionController {
     private var pendingTurnIDBuffer: ContiguousArray<UUID> = []
     private var pendingTurnIDHead: Int = 0
     private var turnWasInterrupted = false
+    /// O49: snapshot of `startedTurnID`, readable without an actor hop (Stop and quit mark the
+    /// started turn synchronously, before the run detaches). Written only on this actor.
+    private nonisolated let startedTurnIDSnapshot = OSAllocatedUnfairLock<UUID?>(initialState: nil)
+
+    /// O49: the written turn that model output, reasoning, or a tool call was last attributed to,
+    /// while it is still queued here. Attribution is this controller's own FIFO: output belongs to
+    /// the first turn whose `result` has not arrived. Cleared when that turn is dequeued and
+    /// whenever the queue is cleared, so a queued turn the CLI has not begun is never reported.
+    package nonisolated var startedTurnID: UUID? {
+        startedTurnIDSnapshot.withLock { $0 }
+    }
 
     // MARK: - Authoritative lifecycle (session_state_changed)
 
@@ -2615,6 +2627,10 @@ package final actor ClaudeNativeProcessSessionController {
         // arrive per turn.
         let payloadType = (payload["type"] as? String) ?? ""
         let isResultPayload = payloadType == "result"
+        // O49: only the model's own live output starts a turn. A `result` payload closes a turn,
+        // so text it carries is never credited (it may be processed after the finishing turn left
+        // the FIFO head, which would credit the queued turn behind it).
+        let creditsStartedTurn = payloadType == "assistant" || payloadType == "stream_event"
         if payloadType == "assistant" {
             emitMainRequestUsageIfOwned(payload: payload, streamResults: streamResults)
         }
@@ -2661,6 +2677,9 @@ package final actor ClaudeNativeProcessSessionController {
                 continue
             }
             writeRawEventLogRecord(kind: "translator.streamResult", payload: logPayload)
+            if creditsStartedTurn, AgentProviderHandoff.streamResultProvesProviderAcceptance(result) {
+                noteOutputAttributedToProducingTurn()
+            }
             emit(.stream(result))
             if isResultPayload, result.type == "message_stop" {
                 // Accounting ownership is decided against launch-local dispatch ordinals, not the
@@ -4952,7 +4971,20 @@ package final actor ClaudeNativeProcessSessionController {
         let id = pendingTurnIDBuffer[pendingTurnIDHead]
         pendingTurnIDHead += 1
         compactTurnIDBufferIfNeeded()
+        startedTurnIDSnapshot.withLock { started in
+            if started == id { started = nil }
+        }
         return id
+    }
+
+    /// O49: the producing turn is the first queued turn whose `result` has not arrived (in deferred
+    /// mode, turns with a result awaiting `idle` are still queued ahead of it). No queued turn: the
+    /// output is attributed to nothing.
+    private func noteOutputAttributedToProducingTurn() {
+        let index = pendingTurnIDHead + pendingAuthoritativeTurnStatuses.count
+        guard index < pendingTurnIDBuffer.count else { return }
+        let id = pendingTurnIDBuffer[index]
+        startedTurnIDSnapshot.withLock { $0 = id }
     }
 
     /// Drain all remaining IDs and reset.
@@ -4967,6 +4999,7 @@ package final actor ClaudeNativeProcessSessionController {
     private func clearTurnIDQueue() {
         pendingTurnIDBuffer.removeAll(keepingCapacity: false)
         pendingTurnIDHead = 0
+        startedTurnIDSnapshot.withLock { $0 = nil }
     }
 
     private func compactTurnIDBufferIfNeeded() {

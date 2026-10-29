@@ -289,8 +289,11 @@ package struct AgentColdRestoreInterruptionContext: Equatable {
         for bubble in unacceptedBubbles where bubble.incarnationID == lifecycle.incarnationID
             && bubble.transcriptResetGeneration == lifecycle.transcriptResetGeneration
         {
-            // Several intents can never share an item; if they did, uncertainty wins.
-            if deliveries[bubble.userItemID] != .unconfirmed {
+            // Several intents can never share an item; if they did, uncertainty (crash first) wins.
+            switch (deliveries[bubble.userItemID], bubble.delivery) {
+            case (.unconfirmed?, _), (.notConfirmedByAgent?, .notSent):
+                continue
+            default:
                 deliveries[bubble.userItemID] = bubble.delivery
             }
         }
@@ -299,16 +302,20 @@ package struct AgentColdRestoreInterruptionContext: Equatable {
 
     /// The presentation an earlier launch's unaccepted intent implies: unconfirmed while a handoff
     /// may have happened (`dispatching`, `deliveryUnknown`, or any attempt without conclusive
-    /// non-delivery, superseded outcomes included); otherwise verified not sent.
+    /// non-delivery, superseded outcomes included); otherwise verified not sent. O50: uncertainty
+    /// whose runs all ended with recorded evidence (`runsEndedWithRecordedEvidence`) did not come
+    /// from an unclean exit and is presented as not confirmed by the agent instead.
     package static func unacceptedDelivery(
         state: AgentRecoveryDeliveryState,
-        attempts: [AgentRecoveryAttempt]
+        attempts: [AgentRecoveryAttempt],
+        runsEndedWithRecordedEvidence: Bool
     ) -> AgentUserItemRecoveryDelivery {
+        let uncertain: AgentUserItemRecoveryDelivery = runsEndedWithRecordedEvidence ? .notConfirmedByAgent : .unconfirmed
         switch state {
         case .dispatching, .deliveryUnknown, .providerAccepted:
-            .unconfirmed
+            return uncertain
         case .queued, .failed, .withdrawn:
-            AgentRecoveryStore.hasOnlyAffirmativeNonDelivery(attempts) ? .notSent : .unconfirmed
+            return AgentRecoveryStore.hasOnlyAffirmativeNonDelivery(attempts) ? .notSent : uncertain
         }
     }
 

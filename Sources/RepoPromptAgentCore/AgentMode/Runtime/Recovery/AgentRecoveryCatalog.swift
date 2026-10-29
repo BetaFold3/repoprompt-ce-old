@@ -76,6 +76,9 @@ package struct AgentRecoveryCatalogIntentContext: Equatable {
     package let sameGeneration: Bool
     /// The session executes on an authoritative remote host (F-3).
     package let isRemote: Bool
+    /// O50: every run of the intent ended with recorded evidence, so its uncertainty did not come
+    /// from an unclean exit (`AgentRecoveryRecord.intentRunsEndedWithRecordedEvidence`).
+    package let runsEndedWithRecordedEvidence: Bool
 }
 
 /// The typed display payload a presentation adapter formats.
@@ -827,7 +830,8 @@ package enum AgentRecoveryCatalogProjection {
                         isEarlierLaunch: isEarlierLaunch,
                         heldReason: heldReason,
                         sameGeneration: intent.transcriptResetGeneration == currentGeneration,
-                        isRemote: isRemote
+                        isRemote: isRemote,
+                        runsEndedWithRecordedEvidence: record.intentRunsEndedWithRecordedEvidence(intentID: intent.intentID)
                     )),
                     card: (
                         AgentRecoveryCardKey(kind: .savedInput, incarnationID: record.incarnationID, transcriptResetGeneration: intent.transcriptResetGeneration, entityID: intent.intentID.uuidString),

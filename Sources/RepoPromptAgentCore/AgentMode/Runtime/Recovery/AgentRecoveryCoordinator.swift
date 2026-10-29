@@ -971,6 +971,9 @@ package final class AgentRecoveryCoordinator {
             // R5: cold loads stamp from the captured previous launch, not this launch's mark.
             await dataService.adoptColdRestoreLaunchEvidence(previous)
             let current = try await store.recordCurrentLaunchRunning()
+            // O51: one-time settlement of earlier builds' ordinary-exit uncertainty, before
+            // discovery so those intents hold nothing and list nothing.
+            await store.settleOrdinaryExitDeliveryUnknownIntentsOnce()
             let entries = try await store.discoverRecords()
             // Schema-8 hints: from now on a session without a discovered record is known clear.
             await dataService.adoptRecoveryHintInventory(entries)

@@ -144,7 +144,7 @@ GLOBAL_SETTINGS_KEYS = {
 GLOBAL_SETTINGS_MAX_SCHEMA = 5
 GLOBAL_SETTINGS_LINEAGE = "repoprompt-ce.global-settings"
 GLOBAL_SETTINGS_MAPS = ("copySettingsByWorkspaceID", "chatSettingsByWorkspaceID", "agentModelsSettingsByWorkspaceID")
-RECOVERY_V1_ENTRIES = {"launch-state.json", "sessions", "tombstones", "attachments"}
+RECOVERY_V1_ENTRIES = {"launch-state.json", "ordinary-exit-settlement.json", "sessions", "tombstones", "attachments"}
 IGNORABLE_NAMES = {".DS_Store"}
 
 # Class C name groups: every fixture workspace name group the Step 10b classification found in the

@@ -29,6 +29,10 @@ actor ClaudeCompatibleNativeSessionAdapter: NativeAgentRuntimeControlling {
         get async { await controller.hasTurnInFlight }
     }
 
+    nonisolated var startedTurnID: UUID? {
+        controller.startedTurnID
+    }
+
     var events: AsyncStream<NativeAgentRuntimeEvent> {
         get async { await controller.events }
     }

@@ -1831,7 +1831,7 @@ final class AgentRecoveryCoordinatorTests: XCTestCase {
             ("turn", .turn(turn), .informational),
             ("outcomeTurn", .outcomeTurn(AgentRecoveryOutcomeTurn(turnID: id, runAttempt: run)), .informational),
             ("recoveryOnlyRun", .recoveryOnlyRun(run), .informational),
-            ("intent", .intent(intent, AgentRecoveryCatalogIntentContext(isEarlierLaunch: true, heldReason: nil, sameGeneration: true, isRemote: false)), .needsAction),
+            ("intent", .intent(intent, AgentRecoveryCatalogIntentContext(isEarlierLaunch: true, heldReason: nil, sameGeneration: true, isRemote: false, runsEndedWithRecordedEvidence: false)), .needsAction),
             ("question", .question(question, isCurrentLaunch: false), .needsAction),
             ("editProposal", .editProposal(proposal, isCurrentLaunch: false), .needsAction),
             ("heldDraft", .heldDraft(Support.snapshot("held")), .needsAction),
@@ -2966,7 +2966,7 @@ final class AgentRecoveryCoordinatorTests: XCTestCase {
         )
         let run = AgentRecoveryRunAttempt(runAttemptID: id, transcriptResetGeneration: 0, processRunID: nil, transcriptTurnID: nil, startedAt: stamp)
         let note = AgentRecoveryCheckOutcome.couldNotCheck("note")
-        let context = AgentRecoveryCatalogIntentContext(isEarlierLaunch: true, heldReason: nil, sameGeneration: true, isRemote: false)
+        let context = AgentRecoveryCatalogIntentContext(isEarlierLaunch: true, heldReason: nil, sameGeneration: true, isRemote: false, runsEndedWithRecordedEvidence: false)
         let table: [(AgentRecoveryCatalogPayload, AgentRecoveryCatalogActionFacts, AgentRecoveryCheckOutcome)] = [
             (.intent(intent, context), .init(), .needsYou("Send or discard the saved message")),
             (.question(question, isCurrentLaunch: false), .init(), .needsYou("Answer the question")),

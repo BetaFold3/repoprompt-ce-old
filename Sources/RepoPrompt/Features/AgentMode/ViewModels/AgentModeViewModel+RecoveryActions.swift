@@ -781,7 +781,9 @@ extension AgentModeViewModel {
         guard intent.deliveryState == .queued,
               AgentColdRestoreInterruptionContext.unacceptedDelivery(
                   state: intent.deliveryState,
-                  attempts: record.attempts(forIntent: intentID)
+                  attempts: record.attempts(forIntent: intentID),
+                  // Only `.notSent` matters here; the flag changes the uncertain wording alone.
+                  runsEndedWithRecordedEvidence: record.intentRunsEndedWithRecordedEvidence(intentID: intentID)
               ) == .notSent
         else {
             return .notDispatched("This message may already have been delivered. Check the conversation, then edit it to send it again.")

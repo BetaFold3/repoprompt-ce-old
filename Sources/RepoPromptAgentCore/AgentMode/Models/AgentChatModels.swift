@@ -365,8 +365,12 @@ public enum AgentUserItemRecoveryDelivery: String, Codable, Sendable, Equatable 
     /// Verified not delivered: no handoff began, or every attempt conclusively failed before or at
     /// the provider boundary.
     case notSent
-    /// A handoff began and its outcome is unknown; sending again might duplicate it.
+    /// A handoff began and its outcome is unknown because RepoPrompt stopped uncleanly (a run of
+    /// the message has neither terminal nor shutdown evidence); sending again might duplicate it.
     case unconfirmed
+    /// O50: a handoff began and the agent never confirmed it, but every run of the message ended
+    /// with recorded terminal or shutdown evidence: RepoPrompt did not stop uncleanly.
+    case notConfirmedByAgent
 }
 
 // MARK: - Persistence Model

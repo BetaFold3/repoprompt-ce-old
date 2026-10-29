@@ -3983,6 +3983,11 @@ final class AgentModeViewModel: ObservableObject {
         // still finalizes run state and disposes the provider.
         // The conversation is retained, so buffered assistant text is applied, not discarded.
         session.drainPendingAssistantDelta()
+        // O49: before the run task is cancelled, so run end settles a started Claude turn as
+        // accepted and a started ACP prompt failing from this teardown reports receipt (window
+        // close and app quit Stage B).
+        claudeCoordinator.noteRepoPromptTeardownRequested(session)
+        session.acpController?.noteRepoPromptTeardownRequested()
         session.cancelEphemeralRuntimeState()
         cancelPendingQuestion(for: session)
         cancelPendingApproval(for: session)

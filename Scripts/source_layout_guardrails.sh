@@ -686,6 +686,7 @@ allowed_tracked_docs=(
   "docs/context/plans/evidence/2026-10-18-lossless-app-restart/fix-10c-worker.md"
   "docs/context/plans/evidence/2026-10-18-lossless-app-restart/fix-10c-review-oraclea.md"
   "docs/context/plans/evidence/2026-10-18-lossless-app-restart/fix-10c-review-oracleb.md"
+  "docs/context/plans/evidence/2026-10-18-lossless-app-restart/fix-11-quiet-by-default.md"
   "docs/context/plans/evidence/2026-10-18-lossless-app-restart/fix-verifier-worker.md"
   "docs/context/plans/evidence/2026-10-18-lossless-app-restart/fix-verifier-review-oraclea-r0.md"
   "docs/context/plans/evidence/2026-10-18-lossless-app-restart/fix-verifier-review-oracleb-r0.md"

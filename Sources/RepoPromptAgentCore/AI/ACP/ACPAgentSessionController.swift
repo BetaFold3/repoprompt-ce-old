@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import os
 import RepoPromptPlatform
 
 package enum ACPDynamicModelPublicationPolicy {
@@ -340,6 +341,32 @@ package actor ACPAgentSessionController {
     #endif
     private var activePromptNormalizedContentCount = 0
     private var activePromptNormalizedReasoningCount = 0
+    /// O49: receipt evidence of one `session/prompt`, keyed by that prompt's own turn token and
+    /// recorded only while it is the active prompt. A newer prompt's trace can neither lend nor
+    /// reset an older prompt's evidence. Each prompt removes its entry when it returns or throws.
+    private struct PromptReceiptEvidence {
+        /// The agent streamed content or reasoning while this prompt was active.
+        var agentStreamed = false
+        /// RepoPrompt sent `session/cancel` (Stop or steering) while this prompt was active.
+        var cancelledByClient = false
+        /// Another prompt was outstanding while this one was: output is credited to whichever
+        /// prompt is active, so neither prompt's evidence is attributable and neither ever reports
+        /// receipt.
+        var overlappedAnotherPrompt = false
+        /// `repoPromptTeardownGeneration` when this prompt started.
+        let teardownGenerationAtStart: UInt64
+
+        func provesReceipt(teardownGeneration: UInt64) -> Bool {
+            agentStreamed && !overlappedAnotherPrompt
+                && (cancelledByClient || teardownGeneration != teardownGenerationAtStart)
+        }
+    }
+
+    private var promptReceiptEvidenceByTurnID: [UUID: PromptReceiptEvidence] = [:]
+    /// O49: bumped synchronously by RepoPrompt's own Stop, window close or quit before the run task
+    /// is cancelled, so a prompt outstanding at that moment knows RepoPrompt tore it down even when
+    /// it fails before `session/cancel` is written.
+    private nonisolated let repoPromptTeardownGeneration = OSAllocatedUnfairLock<UInt64>(initialState: 0)
     private var promptSettlementWaitersByTurnID: [UUID: [PromptSettlementWaiter]] = [:]
     private var sessionID: String?
     private var providerSessionIdentity: ACPProviderSessionIdentity
@@ -707,10 +734,16 @@ package actor ACPAgentSessionController {
     /// `onSubmitted` runs once, synchronously on this actor, immediately after the request was
     /// written to the provider transport — the actual dispatch boundary — and never when building
     /// or writing the request failed.
+    ///
+    /// `onFailure` (O49) runs once, synchronously on this actor, before this prompt rethrows. Its
+    /// argument is this prompt's own evidence that the agent received it: the agent streamed
+    /// content or reasoning for it, RepoPrompt's own Stop or steer sent `session/cancel` or its own
+    /// teardown was requested while it was outstanding, and no other prompt overlapped it.
     func prompt(
         _ message: AgentMessage,
         request overrideRunRequest: ACPRunRequest? = nil,
-        onSubmitted: (@Sendable () -> Void)? = nil
+        onSubmitted: (@Sendable () -> Void)? = nil,
+        onFailure: (@Sendable (_ receivedByAgent: Bool) -> Void)? = nil
     ) async throws {
         guard state == .sessionOpen || state == .promptRunning, let sessionID else {
             throw ControllerError.invalidState(expected: "sessionOpen or promptRunning", actual: state)
@@ -736,6 +769,15 @@ package actor ACPAgentSessionController {
         let promptTurnID = UUID()
         activePromptTurnID = promptTurnID
         resetActivePromptTrace()
+        // Fence: a prompt starting while another is outstanding makes both unattributable.
+        let overlapsAnotherPrompt = !promptReceiptEvidenceByTurnID.isEmpty
+        for outstandingTurnID in promptReceiptEvidenceByTurnID.keys {
+            promptReceiptEvidenceByTurnID[outstandingTurnID]?.overlappedAnotherPrompt = true
+        }
+        promptReceiptEvidenceByTurnID[promptTurnID] = PromptReceiptEvidence(
+            overlappedAnotherPrompt: overlapsAnotherPrompt,
+            teardownGenerationAtStart: repoPromptTeardownGeneration.withLock { $0 }
+        )
         state = .promptRunning
         log("Submitting ACP prompt")
         diagnose(.phaseStarted("prompt"))
@@ -794,6 +836,9 @@ package actor ACPAgentSessionController {
                     )
                 }
             #endif
+            let evidence = promptReceiptEvidenceByTurnID.removeValue(forKey: promptTurnID)
+            let teardownGeneration = repoPromptTeardownGeneration.withLock { $0 }
+            onFailure?(evidence?.provesReceipt(teardownGeneration: teardownGeneration) ?? false)
             settlePromptTurn(promptTurnID, result: .failure(error))
             if error is CancellationError {
                 throw error
@@ -813,6 +858,7 @@ package actor ACPAgentSessionController {
             throw error
         }
         diagnose(.phaseCompleted("prompt"))
+        promptReceiptEvidenceByTurnID.removeValue(forKey: promptTurnID)
         let stopReason = response["stopReason"] as? String
         // The stderr consumer task may not have processed pending stderr lines
         // before the JSON-RPC response unblocks sendRequest. Yield to let the
@@ -1503,6 +1549,13 @@ package actor ACPAgentSessionController {
         }
     }
 
+    /// O49: RepoPrompt's own Stop, window close or quit is about to cancel the run. Synchronous, so
+    /// callers record it before the run task is cancelled; the prompt outstanding now (if the agent
+    /// streamed for it and no other prompt overlapped it) then reports receipt when it fails.
+    package nonisolated func noteRepoPromptTeardownRequested() {
+        repoPromptTeardownGeneration.withLock { $0 &+= 1 }
+    }
+
     package func cancelPrompt() async {
         guard sessionID != nil else { return }
         do {
@@ -1541,6 +1594,31 @@ package actor ACPAgentSessionController {
         /// The production inbound `session/request_permission` handler.
         func debugHandlePermissionRequest(id: Int, params: [String: Any]) {
             handlePermissionRequest(id: .int(id), params: params)
+        }
+
+        /// The production inbound `session/update` notification handler.
+        func debugHandleSessionUpdate(params: [String: Any]) {
+            handleNotification(method: "session/update", params: params, inboundSequence: 0)
+        }
+
+        /// Whether a `session/prompt` is currently awaiting its response.
+        func debugHasActivePromptTurn() -> Bool {
+            activePromptTurnID != nil
+        }
+
+        /// Ends the active prompt's activity without answering its request, so a second prompt
+        /// can start while the first is still pending (an interleaving per-prompt receipt evidence
+        /// must withstand).
+        func debugAbandonActivePromptTurn() {
+            activePromptTurnID = nil
+            state = .sessionOpen
+        }
+
+        /// Fails every pending request as `shutdown()` does after its `cancelPrompt()`, without
+        /// reaping the (fixture) transport's process.
+        func debugFailPendingRequestsAsTransportClosed() {
+            failAllPromptSettlementWaiters(with: ControllerError.transportClosed)
+            failPendingRequests(with: ControllerError.transportClosed)
         }
 
         /// An owner request through the production request writer and its `.associate` fence (the
@@ -1614,6 +1692,10 @@ package actor ACPAgentSessionController {
                 "sessionId": sessionID
             ]
         ])
+        // Recorded only after the notification was written.
+        if let activePromptTurnID {
+            promptReceiptEvidenceByTurnID[activePromptTurnID]?.cancelledByClient = true
+        }
     }
 
     private func cancelPendingPermissionRequestsLocally() {
@@ -4283,7 +4365,7 @@ package actor ACPAgentSessionController {
         sourceUpdate: [String: Any],
         normalizedEvents: [NormalizedAgentRuntimeEvent]
     ) {
-        guard activePromptTurnID != nil else { return }
+        guard let activePromptTurnID else { return }
         #if DEBUG
             let sourceSessionUpdate = (sourceUpdate["sessionUpdate"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
             let key = sourceSessionUpdate?.isEmpty == false ? sourceSessionUpdate! : "<missing>"
@@ -4297,8 +4379,10 @@ package actor ACPAgentSessionController {
             switch result.type {
             case "content":
                 activePromptNormalizedContentCount += 1
+                promptReceiptEvidenceByTurnID[activePromptTurnID]?.agentStreamed = true
             case "reasoning":
                 activePromptNormalizedReasoningCount += 1
+                promptReceiptEvidenceByTurnID[activePromptTurnID]?.agentStreamed = true
             default:
                 break
             }

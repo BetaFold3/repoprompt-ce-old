@@ -310,7 +310,11 @@ extension AgentModeViewModel {
             } else if context.isRemote && intent.deliveryState == .deliveryUnknown {
                 Self.recoveryListRemoteUncertainty
             } else {
-                Self.recoveryListCertainty(of: intent.deliveryState, earlierLaunch: context.isEarlierLaunch)
+                Self.recoveryListCertainty(
+                    of: intent.deliveryState,
+                    earlierLaunch: context.isEarlierLaunch,
+                    runsEndedWithRecordedEvidence: context.runsEndedWithRecordedEvidence
+                )
             }
             if let heldReason = context.heldReason {
                 detail += " \(heldReason)"
@@ -692,7 +696,13 @@ extension AgentModeViewModel {
     static let recoveryListRemoteUncertainty =
         "The host received the command; provider delivery is unconfirmed. Retrying may duplicate it."
 
-    private static func recoveryListCertainty(of state: AgentRecoveryDeliveryState, earlierLaunch: Bool) -> String {
+    /// O50: "RepoPrompt closed" wording only when the exit was unclean; uncertainty whose runs all
+    /// ended with recorded evidence says plainly that the agent did not confirm it.
+    static func recoveryListCertainty(
+        of state: AgentRecoveryDeliveryState,
+        earlierLaunch: Bool,
+        runsEndedWithRecordedEvidence: Bool
+    ) -> String {
         switch state {
         case .queued:
             earlierLaunch
@@ -701,9 +711,13 @@ extension AgentModeViewModel {
         case .failed:
             "Sending it failed; it was not delivered."
         case .dispatching, .deliveryUnknown:
-            earlierLaunch
-                ? "RepoPrompt closed while sending it. Sending it again could deliver it twice."
-                : "Sending it started but wasn't confirmed. Sending it again could deliver it twice."
+            if runsEndedWithRecordedEvidence {
+                "The agent didn't confirm it received it. Sending it again could deliver it twice."
+            } else if earlierLaunch {
+                "RepoPrompt closed while sending it. Sending it again could deliver it twice."
+            } else {
+                "Sending it started but wasn't confirmed. Sending it again could deliver it twice."
+            }
         case .providerAccepted:
             "The agent received it."
         case .withdrawn:
