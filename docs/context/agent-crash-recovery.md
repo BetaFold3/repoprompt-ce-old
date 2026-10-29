@@ -79,10 +79,12 @@ This feature is implemented and in production. Its completed plan, the per-step 
 - **Continue and Check provider history** appear only while the session is open (U1, by design).
 
 ## Known gaps
-- **Interrupt before first output, unproven live.** Gated acceptance needs the CLI to name the interrupted message's UUID on its interrupted result, and nobody has observed that yet.
-  - If the CLI doesn't, a steer or Stop before first output still ends `deliveryUnknown`. That shows as a "Message may have been delivered" row with a "Not confirmed" bubble. The same applies to launches that send no outbound UUID.
-  - Each such steer then also pays the full 1.5 s hold.
-  - A live capture should record whether that result arrives, its shape, whether it is attributed, and how its timing compares with the 1.5 s steer hold and the 200 ms Stop window.
+- **Interrupt before first output: proven live for UUID-carrying sends (2026-10-29, Claude Code 2.1.302, build `76383c82`).**
+  - For a Stop and for a steer that each landed after the outbound frame but before any assistant payload, the CLI acknowledged the interrupt within 2–6 ms. It then wrote a `result` 2 ms later: `error_during_execution`, `is_error` true, `terminal_reason` `aborted_streaming`, `stop_reason` null.
+  - That result named the interrupted message in `user_message_uuid` and `user_message_uuids`. Both messages ended `providerAccepted` with no "Message may have been delivered" row. The steer's hold took about 106 ms, not 1.5 s.
+  - Still `deliveryUnknown`, by design: the first send of a launch, which carries no outbound UUID.
+  - A Stop pressed before the message is written to the CLI (about 0.6 s on a warm session in the capture) sends nothing. The intent stays `queued`, with no row.
+  - Raw capture: `.agent-artifacts/lossless-restart-ordinary-acceptance/cycle18/live/` (local).
   - Only if rows still appear in practice, evaluate `--include-partial-messages`, with its own tests.
 - **Quit or kill before first output.** If the process is gone before the CLI writes its result, the message stays uncertain.
 - **FIFO attribution.** Claude output is credited to turns by queue position, not by user-message UUID. If the CLI silently skips a message (for example a duplicate UUID replayed through the shim), that message never gets a result, and every later turn's output is credited one turn early. No in-app path reuses a UUID, so this needs external replay.

@@ -335,3 +335,15 @@ There were two OracleA/OracleB rounds under the O52 process cap: one review, the
   - the Q2 guard has no mutation check of its own.
 - **Interrupt routes without a test of their own:** settings recycle, MCP-health restart, provider switch, and reset.
 - **Test helper:** `test_holdsCompletionDuringInterrupt` still reports two different kinds of hold.
+
+## Live verification (2026-10-29)
+
+An external verifier rebuilt and relaunched build `76383c82` with Claude Code 2.1.302.
+- **Stop before first output:** the CLI acknowledged the interrupt in 6 ms. Its result came 2 ms later as `error_during_execution`, `terminal_reason` `aborted_streaming`, and named the message in `user_message_uuid(s)`. The message settled `providerAccepted` with no row and appears once in Claude's history.
+- **Steer before first output:** acknowledged in 2 ms, with the result 2 ms later naming the message, and the message was accepted. The steer was written about 106 ms after the acknowledgement. Claude answered the steer, and each message appears once.
+- **Unchanged edge cases:**
+  - The first send of a launch carries no UUID, so it stays `deliveryUnknown`.
+  - A Stop before the message is written to the CLI sends nothing. The intent stays `queued`, with no row.
+- **Not exercised:** a Stop after output (the control case), because a turn with no tools finishes as soon as its text appears.
+- **Records:** after the relaunch, the O51 marker reads `completed: true`. The read-only recount shows 3 `deliveryUnknown` intents, 0 left to settle: 1 old user Stop and 2 runs with no recorded end.
+- **Raw capture:** kept locally under `.agent-artifacts/lossless-restart-ordinary-acceptance/cycle18/live/`.
