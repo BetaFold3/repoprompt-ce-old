@@ -690,6 +690,53 @@ final class AgentRecoveryStartupCompositionTests: XCTestCase {
         XCTAssertTrue(unsavedFailed.detail.hasPrefix("The run failed"), unsavedFailed.detail)
     }
 
+    /// 9-live S4: a crash-interrupted turn's row outlives later normal quits, so its text names the
+    /// earlier launch; a normal quit keeps its own wording.
+    func testInterruptedTurnTextNamesTheEarlierLaunchOnlyForAnUnexpectedQuit() {
+        func text(_ reason: AgentTranscriptTurnInterruption.Reason) -> (title: String, detail: String) {
+            let id = UUID()
+            return AgentModeViewModel.recoveryListTurnText(AgentRecoveryInterruptedTurn(
+                turnID: id,
+                interruption: AgentTranscriptTurnInterruption(reason: reason, observedAt: Date(timeIntervalSince1970: 1), runAttemptID: id),
+                status: .interrupted,
+                isLastTurn: true
+            ))
+        }
+        let crashed = text(.appCrash)
+        XCTAssertEqual(crashed.title, "Turn interrupted")
+        XCTAssertEqual(
+            crashed.detail,
+            "In an earlier launch, RepoPrompt quit unexpectedly during this turn. The saved conversation stops where it was interrupted."
+        )
+        let quit = text(.appQuit)
+        XCTAssertEqual(quit.detail, "RepoPrompt was quit during this turn. The saved conversation stops where it was interrupted.")
+        XCTAssertFalse(quit.detail.contains("earlier launch"))
+    }
+
+    /// 9-live S5 / review P3-8: a survivor started through a launcher shim names the launcher's and
+    /// the agent's PIDs without contradicting the process count; without a distinct writer only the
+    /// root is named. Let finish is stated in the text.
+    func testSurvivingRuntimeTextNamesTheAgentPIDAndLetFinish() {
+        func restriction(rootPID: Int32?, writerPID: Int32?, letFinish: Bool) -> AgentRuntimeRestriction {
+            AgentRuntimeRestriction(
+                runtimeID: UUID(), kind: .possibleWriter, family: .claudeNative, provider: nil, state: .live,
+                isPreviousInstance: true, isUnreadable: false, providerHome: nil,
+                conversationIDs: ["conv-S5"], worktreePaths: ["/tmp/wt-s5"], sessionIDs: [], associations: [],
+                rootPID: rootPID, writerPID: writerPID, memberCount: 1, letFinish: letFinish, revision: .make(), createdAt: nil
+            )
+        }
+        let shim = AgentModeViewModel.recoveryListRuntimeText(restriction(rootPID: 56334, writerPID: 56474, letFinish: false)).1
+        XCTAssertTrue(
+            shim.hasPrefix("Claude from an earlier launch of RepoPrompt (1 process found; launcher PID 56334, agent PID 56474)."),
+            shim
+        )
+        XCTAssertFalse(shim.contains("You chose to let it finish"))
+        let direct = AgentModeViewModel.recoveryListRuntimeText(restriction(rootPID: 7048, writerPID: 7048, letFinish: true)).1
+        XCTAssertTrue(direct.hasPrefix("Claude from an earlier launch of RepoPrompt (1 process found, started as PID 7048)."), direct)
+        XCTAssertFalse(direct.contains("agent PID"))
+        XCTAssertTrue(direct.contains("You chose to let it finish; RepoPrompt keeps watching it."), direct)
+    }
+
     /// R04: Edit keeps a carrier's exact pending-handoff association. An absent session payload is
     /// restored and saved before the withdrawal, the join then releases it for the next explicit send
     /// (never pasted into the composer text); a conflicting snapshot refuses with nothing changed.

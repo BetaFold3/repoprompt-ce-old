@@ -96,6 +96,6 @@ Per scenario: pass or fail, the exact UI text, screenshots or accessibility dump
 
 ## Reporting
 
-- Write results to a new file, `verifier-9live-r2-results.md`, in this directory, with the same header style as this file (title, Scope, Authority: Reference, Last-verified, Covers).
+- Write results to a new file, [verifier-9live-r2-results.md](verifier-9live-r2-results.md), in this directory, with the same header style as this file (title, Scope, Authority: Reference, Last-verified, Covers).
 - Include: build commit, PIDs, approvals obtained (time and what), the result table, findings for the main agent, what is still to run, and the list of synthetic sessions created (full IDs), marked deleted or not.
 - Send failures back to the main agent. Don't change code, the plan, the spec or [verifier-scenarios.md](verifier-scenarios.md).

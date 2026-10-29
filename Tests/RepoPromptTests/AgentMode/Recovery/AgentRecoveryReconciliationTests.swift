@@ -165,6 +165,141 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
         await client.stop()
     }
 
+    /// 9-live S3: `thread/turns/list` defaults to a `summary` item view (only the user message for an
+    /// aborted turn), which must never pass for the turn's items. The fake answers like the server:
+    /// a summary unless the request asks for `itemsView: "full"`.
+    func testCodexObservationRequestsTheFullItemViewAndNamesAFoundToolTurn() async throws {
+        let requests = ReconciliationParamsLog()
+        let (controller, client) = await makeObservationController { method, params in
+            requests.append(method, params)
+            let user: [String: Any] = ["id": "u1", "type": "userMessage"]
+            let full = params?["itemsView"] as? String == "full"
+            let items: [[String: Any]] = full
+                ? [
+                    user,
+                    ["id": "a1", "type": "agentMessage", "text": "Running it."],
+                    ["id": "r1", "type": "reasoning"],
+                    ["id": "c1", "type": "commandExecution", "command": "sleep 1200"]
+                ]
+                : [user]
+            return ["data": [[
+                "id": "turn-expected",
+                "status": "interrupted",
+                "itemsView": full ? "full" : "summary",
+                "items": items
+            ]]]
+        }
+
+        let observation = try await controller.observeRecovery(threadID: "thread-1", expectedTurnID: "turn-expected", timeout: 5)
+
+        XCTAssertEqual(requests.entries.map(\.method), ["thread/turns/list"])
+        XCTAssertEqual(requests.entries.first?.params?["itemsView"] as? String, "full")
+        XCTAssertEqual(observation.turnID, "turn-expected")
+        XCTAssertEqual(observation.terminal, .interrupted)
+        XCTAssertNil(observation.items)
+        XCTAssertNil(CodexRecoveryAdapter.historyObservation(observation), "a found tool turn is never imported")
+        XCTAssertEqual(
+            CodexRecoveryAdapter.unusableObservationText(observation),
+            "Codex's record of the interrupted turn was found, but its items couldn't be imported; nothing was imported."
+        )
+        await client.stop()
+
+        // A server that rejects the field predates item views (full turns): one retry without it,
+        // remembered for the next observation on the same transport.
+        let legacyRequests = ReconciliationParamsLog()
+        let (legacy, legacyClient) = await makeObservationController { method, params in
+            legacyRequests.append(method, params)
+            if params?["itemsView"] != nil {
+                throw CodexAppServerClient.ClientError.requestFailed(.init(
+                    method: "thread/turns/list",
+                    code: -32602,
+                    message: "unknown field `itemsView`, expected one of `threadId`, `cursor`, `limit`, `sortDirection`",
+                    data: nil
+                ))
+            }
+            return ["data": [[
+                "id": "turn-expected",
+                "status": "completed",
+                "items": [["id": "u1", "type": "userMessage"], ["id": "a1", "type": "agentMessage", "text": "Done."]]
+            ]]]
+        }
+        let listed = try await legacy.observeRecovery(threadID: "thread-1", expectedTurnID: "turn-expected", timeout: 5)
+        XCTAssertEqual(listed.items?.map(\.nativeItemID), ["u1", "a1"])
+        XCTAssertEqual(listed.source, .turnsList)
+        _ = try await legacy.observeRecovery(threadID: "thread-1", expectedTurnID: "turn-expected", timeout: 5)
+        XCTAssertEqual(
+            legacyRequests.entries.map { $0.params?["itemsView"] as? String },
+            ["full", nil, nil],
+            "one retry without the field, then the rejection is remembered"
+        )
+        await legacyClient.stop()
+    }
+
+    /// 9-live S3: a turn listed with a partial item view has no usable items, whatever they look like.
+    func testCodexObservationTreatsAPartialItemViewAsUnavailableItems() {
+        func observe(status: String, itemsView: String) -> CodexRecoveryObservation {
+            CodexNativeSessionController.recoveryObservation(
+                threadID: "thread-1",
+                expectedTurnID: "turn-expected",
+                turns: [[
+                    "id": "turn-expected",
+                    "status": status,
+                    "itemsView": itemsView,
+                    "items": [
+                        ["id": "u1", "type": "userMessage"],
+                        ["id": "a1", "type": "agentMessage", "text": "Done."]
+                    ]
+                ]],
+                source: .turnsList,
+                transportGeneration: 1
+            )
+        }
+        let summary = observe(status: "interrupted", itemsView: "summary")
+        XCTAssertEqual(summary.turnID, "turn-expected")
+        XCTAssertEqual(summary.terminal, .interrupted)
+        XCTAssertNil(summary.items, "a summary is not the turn's items")
+        XCTAssertNil(CodexRecoveryAdapter.historyObservation(summary))
+        XCTAssertEqual(
+            CodexRecoveryAdapter.unusableObservationText(summary),
+            "Codex's record of the interrupted turn was found, but its items couldn't be imported; nothing was imported."
+        )
+        XCTAssertNil(observe(status: "interrupted", itemsView: "notLoaded").items)
+
+        let completedSummary = CodexRecoveryAdapter.historyObservation(observe(status: "completed", itemsView: "summary"))
+        XCTAssertEqual(completedSummary?.completionConfirmed, true, "completion still counts")
+        XCTAssertEqual(completedSummary?.rows.count, 0, "with zero rows")
+
+        let full = observe(status: "interrupted", itemsView: "full")
+        XCTAssertEqual(full.items?.map(\.nativeItemID), ["u1", "a1"])
+        XCTAssertEqual(CodexRecoveryAdapter.historyObservation(full)?.rows.count, 2)
+    }
+
+    private func makeObservationController(
+        respond: @escaping @Sendable (String, [String: Any]?) async throws -> [String: Any]
+    ) async -> (CodexNativeSessionController, CodexAppServerClient) {
+        let client = CodexAppServerClient(mcpHost: ServerNetworkManager.shared, livenessProbe: { _ in true })
+        await client.debugInstallTestTransport()
+        let controller = CodexNativeSessionController(
+            client: client,
+            runID: UUID(),
+            tabID: UUID(),
+            windowID: 1,
+            workspacePath: "/tmp/workspace",
+            options: CodexNativeSessionController.Options(
+                requestTimeout: 5,
+                configOverridesProvider: { [:] },
+                launchEnvironmentProvider: { [:] },
+                approvalPolicyProvider: { .never },
+                sandboxModeProvider: { .readOnly },
+                approvalReviewerProvider: { .user },
+                authTokensRefreshHandler: nil
+            ),
+            requestExecutor: { method, params, _ in try await respond(method, params) }
+        )
+        controller.recoveryObservationTreatsTransportAsRegisteredForTesting = true
+        return (controller, client)
+    }
+
     // MARK: Claude dangling --resume
 
     func testClaudeResumeFailureRequiresAnExplicitChoiceOnlyForTheSuppressedConversation() {
@@ -1717,6 +1852,105 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
         XCTAssertEqual(cursorAfter, firstBaseline.cursor, "the cursor is not the attempt-boundary authority")
     }
 
+    /// S1 (9-live round 2): a default-configuration first turn (sanitized K1 structure, invented
+    /// text): MCP instructions, skills, `CLAUDE.md` instructions, remote session, title records and an
+    /// assistant thinking block around a one-text reply.
+    private func defaultConfigurationFirstTurn() -> [[String: Any]] {
+        func record(_ type: String, _ extra: [String: Any] = [:]) -> [String: Any] {
+            extra.merging(["type": type, "sessionId": conversationID]) { _, new in new }
+        }
+        func node(_ uuid: String, parent: String, attachment type: String) -> [String: Any] {
+            [
+                "type": "attachment", "uuid": uuid, "parentUuid": parent, "sessionId": conversationID, "isSidechain": false,
+                "attachment": ["type": type, "content": "fixture context"]
+            ]
+        }
+        let thinking: [String: Any] = [
+            "type": "assistant", "uuid": "a1t", "parentUuid": "n9", "sessionId": conversationID, "isSidechain": false,
+            "message": ["role": "assistant", "id": "msg-a1", "content": [["type": "thinking", "thinking": "fixture", "signature": "sig"]]]
+        ]
+        var objects: [[String: Any]] = [
+            record("queue-operation", ["operation": "enqueue"]),
+            record("queue-operation", ["operation": "dequeue"]),
+            [
+                "type": "user", "uuid": "c1", "parentUuid": NSNull(), "sessionId": conversationID, "isSidechain": false,
+                "message": ["role": "user", "content": [["type": "text", "text": "Warm up: reply OK"]]]
+            ]
+        ]
+        var previous = "c1"
+        let types = [
+            "environment", "model", "mcp_instructions_delta", "skill_listing", "total_tokens_reminder", "instructions",
+            "session_context", "date", "remote_session_change", "prompt_snapshot"
+        ]
+        for (index, type) in types.enumerated() {
+            if index == 5 { objects.append(record("atis-latch")) }
+            objects.append(node("n\(index)", parent: previous, attachment: type))
+            previous = "n\(index)"
+        }
+        objects += [
+            record("api-request-shape"), record("api-request-blob"), record("api-request"),
+            record("last-prompt", ["leafUuid": previous]), record("atis-latch"), record("ai-title", ["aiTitle": "Warm-up"]),
+            thinking,
+            historyEntry("assistant", uuid: "a1", parent: "a1t", text: "OK"),
+            node("t1", parent: "a1", attachment: "prompt_snapshot"),
+            record("last-prompt", ["leafUuid": "t1"]), record("ai-title", ["aiTitle": "Warm-up"]), record("atis-latch")
+        ]
+        return objects
+    }
+
+    /// S1: before the owner-profile qualification this refused at the `mcp_instructions_delta` line.
+    func testBaselineAfterADefaultConfigurationFirstTurnIsCaptured() async throws {
+        let harness = try await makeProducerHarness(windowID: 5291)
+        try harness.appendHistory(defaultConfigurationFirstTurn())
+        let size = try UInt64(Data(contentsOf: harness.historyFile).count)
+        let identity = AgentDispatchBaselineIdentity(dispatchID: UUID(), runAttemptID: UUID(), userItemIDs: [UUID()])
+        let admission = await harness.viewModel.captureClaudeDispatchBaseline(identity, session: harness.session)
+        XCTAssertEqual(admission, .committed)
+        let baseline = try XCTUnwrap(harness.session.providerHistoryRecovery?.dispatchBaseline(dispatchID: identity.dispatchID))
+        XCTAssertEqual(baseline.status, .captured)
+        XCTAssertEqual(baseline.completeLineOffset, size)
+        XCTAssertNotNil(baseline.file)
+        XCTAssertEqual(harness.session.committedHistoryImportID, baseline.baselineCommitID)
+    }
+
+    /// S1 diagnostics: an unsupported history keeps its specific case (schema name and line only,
+    /// including the refused attachment's structural type name, never its payload), and Reconcile of
+    /// that attempt names the saved reason instead of "No history position was saved".
+    func testUnsupportedHistoryBaselineKeepsItsCaseAndReconcileNamesIt() async throws {
+        let harness = try await makeProducerHarness(windowID: 5292)
+        let hook: [String: Any] = [
+            "type": "attachment", "uuid": "n1", "parentUuid": "u1", "sessionId": conversationID, "isSidechain": false,
+            "attachment": ["type": "hook_additional_context", "content": "PRIVATE-HOOK"]
+        ]
+        try harness.appendHistory([historyEntry("user", uuid: "u1", parent: nil, text: "hi"), hook])
+        let identity = AgentDispatchBaselineIdentity(dispatchID: UUID(), runAttemptID: UUID(), userItemIDs: [UUID()])
+        let admission = await harness.viewModel.captureClaudeDispatchBaseline(identity, session: harness.session)
+        let reason = "Claude history contains records the version that sent it doesn't support (attachment hook_additional_context, line 2)"
+        XCTAssertEqual(admission, .unsupported(reason))
+        XCTAssertTrue(admission.admitsWrite, "the ordinary send proceeds")
+        XCTAssertEqual(harness.session.providerHistoryRecovery?.dispatchBaseline(dispatchID: identity.dispatchID)?.status, .unsupported(reason))
+        XCTAssertFalse(reason.contains("PRIVATE-HOOK"), "no payload")
+
+        let refused = await harness.viewModel.reconcileRecoveryHistory(
+            reconcileAction(harness, runAttemptID: identity.runAttemptID),
+            session: harness.session,
+            lane: harness.lane,
+            codexTurnID: nil
+        )
+        XCTAssertEqual(
+            refused,
+            .associationUnavailable(
+                .baselineUnavailable,
+                "No history position could be saved when the interrupted run was sent: \(reason). Its history can't be matched safely. Nothing was imported."
+            )
+        )
+        XCTAssertEqual(
+            AgentModeViewModel.recoveryAssociationText(.baselineUnavailable, baseline: nil),
+            AgentModeViewModel.recoveryAssociationText(.baselineUnavailable),
+            "no recorded baseline keeps the existing text"
+        )
+    }
+
     func testMissingIdentityOrLocationIsRecordedUnsupportedAndNeverBackfilled() async throws {
         let harness = try await makeProducerHarness(windowID: 4972)
         harness.session.providerSessionID = nil
@@ -2970,6 +3204,132 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
         XCTAssertNotEqual(harness.session.items.last?.id, later.localItemID)
         XCTAssertNil(harness.session.providerHistoryRecovery?.nativeItem(forKey: later.ledgerKey), "never healed")
         harness.viewModel.clearPendingAssistantDelta(harness.session)
+    }
+
+    /// S1 round-0 P1, end to end: a captured baseline after a default-configuration first turn, then a
+    /// live turn whose answer is a thinking-only envelope followed by the text envelope of the same API
+    /// message. The real producer skips the thinking (as the history reader does), so the text becomes
+    /// the qualified, persisted live row. Reconcile over Claude's matching native turn records the live
+    /// row with zero new rows, never a second copy, both for the CLI's real outbound user entry (one
+    /// `{type, text}` block, whose text carries the claim digest) and for string content. A repeat is
+    /// idempotent, and nothing is sent.
+    func testLiveThinkingThenTextTurnReconcilesWithoutADuplicateRow() async throws {
+        let prompt = "Reply with exactly: ALPHA-7"
+        let reply = "ALPHA-7"
+        for (index, arrayContent) in [true, false].enumerated() {
+            let label = arrayContent ? "array user content (the CLI's outbound form)" : "string user content"
+            let harness = try await makeProducerHarness(windowID: 5293 + index)
+            try harness.appendHistory(defaultConfigurationFirstTurn())
+            let runID = UUID()
+            harness.session.runID = runID
+            harness.session.runState = .running
+            let attemptID = harness.session.beginRunAttempt(source: "test.liveThinking").attemptID
+            let (userItem, identity) = try await admitClaimedDispatch(harness, runAttemptID: attemptID, text: prompt)
+            let baseline = harness.session.providerHistoryRecovery?.dispatchBaseline(dispatchID: identity.dispatchID)
+            XCTAssertEqual(baseline?.status, .captured, label)
+            let caller = identity.dispatchID.uuidString.lowercased()
+
+            // The live turn, through the real producer classifier and the real owner.
+            var state = ClaudeLiveTranscriptProducerState(launchToken: UUID())
+            state.markEligible()
+            state.noteOutbound(uuid: identity.dispatchID, text: prompt)
+            func envelope(_ entry: String, _ block: [String: Any]) throws -> Data {
+                let message: [String: Any] = [
+                    "id": "msg_a2",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "claude-sonnet-5",
+                    "content": [block],
+                    "stop_reason": NSNull(),
+                    "stop_sequence": NSNull(),
+                    "usage": ["input_tokens": 4, "output_tokens": 3]
+                ]
+                let payload: [String: Any] = [
+                    "type": "assistant",
+                    "message": message,
+                    "parent_tool_use_id": NSNull(),
+                    "session_id": conversationID,
+                    "request_id": "req_a2",
+                    "uuid": entry,
+                    "user_message_uuid": caller,
+                    "user_message_uuids": [caller]
+                ]
+                return try JSONSerialization.data(withJSONObject: payload)
+            }
+            let thinking = try state.classify(
+                envelope: envelope("a2t", ["type": "thinking", "thinking": "fixture", "signature": "sig"]),
+                translated: [],
+                turnInFlight: true
+            )
+            XCTAssertEqual(thinking, .benign, label)
+            var content = AIStreamResult(type: "content", text: reply)
+            let outcome = try state.classify(envelope: envelope("a2", ["type": "text", "text": reply]), translated: [content], turnInFlight: true)
+            guard case let .attach(0, evidence) = outcome, case let .completeText(complete) = evidence.kind else {
+                return XCTFail("\(label): expected the text to qualify, got \(outcome)")
+            }
+            XCTAssertNil(state.disqualification, label)
+            content.claudeLiveTranscriptEvidence = evidence
+            await harness.viewModel.test_handleStreamResult(content, session: harness.session, runID: runID, runAttemptID: attemptID)
+            XCTAssertEqual(harness.session.items.last?.id, complete.localItemID, label)
+            let saved = await harness.viewModel.flushSave(for: harness.session.tabID)
+            XCTAssertTrue(saved, label)
+            let persistedLive = try await harness.persisted()
+            XCTAssertEqual(persistedLive?.providerHistoryRecovery?.nativeItem(forKey: complete.ledgerKey), complete.ledgerItem, label)
+            harness.session.runState = .completed
+
+            /// Claude's native history holds the same turn (default configuration: thinking, then text).
+            func attachment(_ uuid: String, parent: String, type: String) -> [String: Any] {
+                [
+                    "type": "attachment", "uuid": uuid, "parentUuid": parent, "sessionId": conversationID, "isSidechain": false,
+                    "attachment": ["type": type, "content": "fixture context"]
+                ]
+            }
+            let userContent: Any = arrayContent ? [["type": "text", "text": prompt]] : prompt
+            let nativeUser: [String: Any] = [
+                "type": "user", "uuid": caller, "parentUuid": "t1", "sessionId": conversationID, "isSidechain": false,
+                "message": ["role": "user", "content": userContent]
+            ]
+            let nativeThinking: [String: Any] = [
+                "type": "assistant", "uuid": "a2t", "parentUuid": "m2", "sessionId": conversationID, "isSidechain": false,
+                "message": ["role": "assistant", "id": "msg_a2", "content": [["type": "thinking", "thinking": "fixture", "signature": "sig"]]]
+            ]
+            try harness.appendHistory([
+                ["type": "queue-operation", "operation": "enqueue", "sessionId": conversationID],
+                ["type": "queue-operation", "operation": "dequeue", "sessionId": conversationID],
+                nativeUser,
+                attachment("m1", parent: caller, type: "date"),
+                attachment("m2", parent: "m1", type: "prompt_snapshot"),
+                nativeThinking,
+                historyEntry("assistant", uuid: "a2", parent: "a2t", text: reply),
+                attachment("t2", parent: "a2", type: "prompt_snapshot"),
+                ["type": "last-prompt", "leafUuid": "t2", "sessionId": conversationID]
+            ])
+
+            let action = reconcileAction(harness, runAttemptID: attemptID)
+            func reconcile() async -> AgentRecoveryReconcileResult {
+                await harness.viewModel.reconcileRecoveryHistory(action, session: harness.session, lane: harness.lane, codexTurnID: nil)
+            }
+            let baselineCount = harness.session.providerHistoryRecovery?.dispatchBaselines.count
+            let first = await reconcile()
+            let settledItems = harness.session.items.map(\.id)
+            let settledLedger = harness.session.providerHistoryRecovery
+            let settledCursor = await harness.cursor()
+            XCTAssertEqual(first, .imported(completion: .unconfirmed, rowCount: 0), "\(label): recorded, never appended again")
+            XCTAssertEqual(settledLedger?.nativeItem(forKey: complete.ledgerKey), complete.ledgerItem, label)
+            XCTAssertEqual(Set(settledLedger?.nativeItems.map(\.nativeEntryID) ?? []), [caller, "a2"], "\(label): the claimed user entry is recorded")
+            XCTAssertEqual(harness.session.items.count { $0.kind == .assistant && $0.text == reply }, 1, "\(label): no duplicate row")
+            XCTAssertEqual(harness.session.items.count { $0.kind == .user && $0.text == prompt }, 1, "\(label): nothing re-sent")
+            XCTAssertEqual(harness.session.items.count { $0.id == userItem.id }, 1, label)
+
+            let repeated = await reconcile()
+            XCTAssertEqual(repeated, .nothingImported("The provider has no new history for this conversation."), label)
+            XCTAssertEqual(harness.session.items.map(\.id), settledItems, "\(label): a repeat changes no rows")
+            XCTAssertEqual(harness.session.providerHistoryRecovery, settledLedger, "\(label): a repeat changes no ledger")
+            let repeatedCursor = await harness.cursor()
+            XCTAssertEqual(repeatedCursor, settledCursor, "\(label): a repeat moves no cursor")
+            XCTAssertEqual(harness.session.providerHistoryRecovery?.dispatchBaselines.count, baselineCount, "\(label): no new dispatch")
+            XCTAssertEqual(harness.session.runState, .completed, "\(label): no run started")
+        }
     }
 
     /// Step 4d7, actual save and relaunch: a live row whose turn agreed exactly is no longer owned,
@@ -4883,6 +5243,28 @@ private final class CodexObservationFactoryLog {
     ) -> any CodexSessionControlling {
         calls.append(Call(runID: runID, workspacePath: workspacePath, permissionProfile: permissionProfile, sessionProfile: sessionProfile, taskLabelKind: taskLabelKind))
         return controllers[min(calls.count - 1, controllers.count - 1)]
+    }
+}
+
+private final class ReconciliationParamsLog: @unchecked Sendable {
+    struct Entry {
+        let method: String
+        let params: [String: Any]?
+    }
+
+    private let lock = NSLock()
+    private var recorded: [Entry] = []
+
+    var entries: [Entry] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recorded
+    }
+
+    func append(_ method: String, _ params: [String: Any]?) {
+        lock.lock()
+        recorded.append(Entry(method: method, params: params))
+        lock.unlock()
     }
 }
 

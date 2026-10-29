@@ -226,9 +226,30 @@ final class ClaudeLiveTranscriptQualificationTests: XCTestCase {
                     turnInFlight: true
                 )
             }),
-            ("thinking block", .unsupportedAssistant, { state in
+            ("redacted thinking block", .unsupportedAssistant, { state in
+                state.classify(
+                    envelope: self.data(self.assistant(content: [["type": "redacted_thinking", "data": "x"]])),
+                    translated: [],
+                    turnInFlight: true
+                )
+            }),
+            ("thinking block with an extra key", .unsupportedAssistant, { state in
+                state.classify(
+                    envelope: self.data(self.assistant(content: [["type": "thinking", "thinking": "x", "citations": []]])),
+                    translated: [],
+                    turnInFlight: true
+                )
+            }),
+            ("thinking with a translated row", .translationMismatch, { state in
                 state.classify(
                     envelope: self.data(self.assistant(content: [["type": "thinking", "thinking": "x", "signature": "s"]])),
+                    translated: [AIStreamResult(type: "reasoning", text: nil)],
+                    turnInFlight: true
+                )
+            }),
+            ("thinking attributed to another message", .attributionMismatch, { state in
+                state.classify(
+                    envelope: self.data(self.assistant(content: [["type": "thinking", "thinking": "x", "signature": "s"]], attributedTo: UUID())),
                     translated: [],
                     turnInFlight: true
                 )
@@ -286,6 +307,124 @@ final class ClaudeLiveTranscriptQualificationTests: XCTestCase {
         var pending = State(launchToken: UUID())
         pending.noteOutbound(uuid: UUID(), text: prompt)
         XCTAssertEqual(disqualification(pending.classify(envelope: data(assistant()), translated: [content(reply)], turnInFlight: true)), .unownedAssistant)
+    }
+
+    /// S1 (9-live round 2): a thinking-only envelope before the answer is benign and changes nothing
+    /// (the history reader skips it the same way); the answer that follows, in the same API message,
+    /// still attaches with the reader's identity and the success result agrees. A thinking envelope
+    /// after the answer is still an unowned second assistant.
+    func testAThinkingOnlyEnvelopeBeforeTheAnswerIsBenignAndTheAnswerStillQualifies() {
+        let token = UUID()
+        var state = eligibleState(token: token)
+        let outbound = UUID()
+        state.noteOutbound(uuid: outbound, text: prompt)
+        let thinking = assistant(entry: "a1t", content: [["type": "thinking", "thinking": "x", "signature": "s"]], attributedTo: outbound)
+        let usage = AIStreamResult(type: "usage", text: nil)
+        XCTAssertEqual(state.classify(envelope: data(thinking), translated: [usage], turnInFlight: true), .benign)
+        let unattributed = assistant(entry: "a1t", content: [["type": "thinking", "thinking": "y"]])
+        XCTAssertEqual(state.classify(envelope: data(unattributed), translated: [], turnInFlight: true), .benign, "attribution and signature are optional")
+        XCTAssertNil(state.disqualification)
+        let outcome = state.classify(envelope: data(assistant(attributedTo: outbound)), translated: [content(reply)], turnInFlight: true)
+        guard case let .attach(_, evidence) = outcome, case let .completeText(complete) = evidence.kind else {
+            return XCTFail("expected an attachment, got \(outcome)")
+        }
+        XCTAssertEqual(complete.nativeEntryID, "a1")
+        XCTAssertEqual(complete.text, reply)
+        XCTAssertTrue(complete.matchesProjection, "the reader's identity for the text entry, unaffected by the thinking entry")
+        XCTAssertEqual(
+            state.classify(envelope: data(result(attributedTo: outbound)), translated: [], turnInFlight: true),
+            .standalone(.init(producerLaunchToken: token, kind: .resultAgreement(localItemID: complete.localItemID, text: reply)))
+        )
+
+        var answered = eligibleState()
+        let next = UUID()
+        answered.noteOutbound(uuid: next, text: prompt)
+        _ = answered.classify(envelope: data(assistant(attributedTo: next)), translated: [content(reply)], turnInFlight: true)
+        XCTAssertEqual(
+            disqualification(answered.classify(envelope: data(thinking), translated: [], turnInFlight: true)),
+            .unownedAssistant,
+            "thinking after the answer is a second assistant"
+        )
+    }
+
+    /// S1 round 1: the real CLI's thinking envelope (key names as recorded on K1/E7 stdout; values
+    /// invented): every message key, null `container`/`context_management`/`diagnostics`/`stop_*`,
+    /// empty `input_transformations`, plus top-level `thinking_display`/`thinking_duration_ms` and
+    /// no consumed-user attribution.
+    private func realThinkingEnvelope(entry: String = "a1t") -> [String: Any] {
+        let message: [String: Any] = [
+            "id": "msg_a1",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-5",
+            "content": [["type": "thinking", "thinking": "fixture", "signature": "fixture-signature"]],
+            "container": NSNull(),
+            "context_management": NSNull(),
+            "diagnostics": NSNull(),
+            "input_transformations": [Any](),
+            "stop_details": NSNull(),
+            "stop_reason": NSNull(),
+            "stop_sequence": NSNull(),
+            "usage": ["input_tokens": 4, "output_tokens": 3]
+        ]
+        return [
+            "type": "assistant",
+            "message": message,
+            "parent_tool_use_id": NSNull(),
+            "session_id": session,
+            "request_id": "req_a1",
+            "timestamp": "2026-10-29T00:00:00.000Z",
+            "thinking_display": "updates",
+            "thinking_duration_ms": 1234,
+            "uuid": entry
+        ]
+    }
+
+    /// S1 round 1: the real thinking envelope's two extra keys are accepted, type-checked, on a
+    /// thinking envelope only; the answer that follows still attaches.
+    func testTheRealCLIThinkingEnvelopeIsBenignAndItsExtraKeysAreTypeCheckedOnThinkingOnly() {
+        var state = eligibleState()
+        let outbound = UUID()
+        state.noteOutbound(uuid: outbound, text: prompt)
+        XCTAssertEqual(
+            state.classify(envelope: data(realThinkingEnvelope()), translated: [AIStreamResult(type: "usage", text: nil)], turnInFlight: true),
+            .benign
+        )
+        let outcome = state.classify(envelope: data(assistant(attributedTo: outbound)), translated: [content(reply)], turnInFlight: true)
+        guard case let .attach(_, evidence) = outcome, case .completeText = evidence.kind else {
+            return XCTFail("expected an attachment, got \(outcome)")
+        }
+
+        let wrongTypes: [(String, String, Any)] = [
+            ("numeric display", "thinking_display", 1),
+            ("null display", "thinking_display", NSNull()),
+            ("string duration", "thinking_duration_ms", "1234"),
+            ("boolean duration", "thinking_duration_ms", true),
+            ("negative duration", "thinking_duration_ms", -1)
+        ]
+        for (name, key, value) in wrongTypes {
+            var envelope = realThinkingEnvelope()
+            envelope[key] = value
+            var refusing = eligibleState()
+            refusing.noteOutbound(uuid: UUID(), text: prompt)
+            XCTAssertEqual(
+                disqualification(refusing.classify(envelope: data(envelope), translated: [], turnInFlight: true)),
+                .unsupportedAssistant,
+                name
+            )
+        }
+
+        let textOwner = UUID()
+        var text = assistant(attributedTo: textOwner)
+        text["thinking_display"] = "updates"
+        text["thinking_duration_ms"] = 1234
+        var textOnly = eligibleState()
+        textOnly.noteOutbound(uuid: textOwner, text: prompt)
+        XCTAssertEqual(
+            disqualification(textOnly.classify(envelope: data(text), translated: [content(reply)], turnInFlight: true)),
+            .unsupportedAssistant,
+            "the thinking keys are accepted on thinking envelopes only"
+        )
     }
 
     /// The current app requests no user-message replay: an unreplayed dispatch qualifies only through
@@ -498,7 +637,7 @@ final class ClaudeLiveTranscriptQualificationTests: XCTestCase {
             await runTurn(controller)
             let results = await reader.drain()
             let state = await controller.test_liveTranscriptQualification()
-            if enabled, provenance == .automaticResolved {
+            if enabled, provenance != .programmaticOverride {
                 XCTAssertEqual(state?.eligibility, .eligible)
             } else {
                 XCTAssertNil(state, "no state for a disabled or ineligible producer")
@@ -508,11 +647,18 @@ final class ClaudeLiveTranscriptQualificationTests: XCTestCase {
         let off = try await run(enabled: false, provenance: .automaticResolved)
         XCTAssertFalse(off.isEmpty)
         XCTAssertTrue(off.allSatisfy { $0.claudeLiveTranscriptEvidence == nil })
-        let ineligible = try await run(enabled: true, provenance: .configuredOverride)
+        let ineligible = try await run(enabled: true, provenance: .programmaticOverride)
         XCTAssertEqual(transcriptSignature(ineligible), transcriptSignature(off))
         XCTAssertTrue(ineligible.allSatisfy { $0.claudeLiveTranscriptEvidence == nil })
 
         let eligible = try await run(enabled: true, provenance: .automaticResolved)
+        // Owner decision (2026-10-29): a configured exact path qualifies exactly like automatic.
+        let configured = try await run(enabled: true, provenance: .configuredOverride)
+        XCTAssertEqual(transcriptSignature(configured), transcriptSignature(eligible))
+        XCTAssertEqual(
+            configured.compactMap(\.claudeLiveTranscriptEvidence).map(\.kind),
+            eligible.compactMap(\.claudeLiveTranscriptEvidence).map(\.kind)
+        )
         let carriers = evidenceCarriers(eligible)
         let withoutCarriers = eligible.filter { !($0.type == AIStreamResult.lifecycleType && $0.text == nil && $0.claudeLiveTranscriptEvidence != nil) }
         XCTAssertEqual(transcriptSignature(withoutCarriers), transcriptSignature(off), "the same results, order and finalization")
@@ -577,7 +723,7 @@ final class ClaudeLiveTranscriptQualificationTests: XCTestCase {
         }
 
         // Disabled and ineligible producers emit nothing for the same direct disqualification.
-        for (enabled, provenance) in [(false, ClaudeNativeProcessSessionController.CommandProvenance.automaticResolved), (true, .configuredOverride)] {
+        for (enabled, provenance) in [(false, ClaudeNativeProcessSessionController.CommandProvenance.automaticResolved), (true, .programmaticOverride)] {
             let controller = try makeController(enabled: enabled)
             let reader = await EventsReader(controller)
             await controller.test_beginSyntheticUsageLaunch(commandProvenance: provenance)
@@ -1040,7 +1186,7 @@ final class ClaudeLiveTranscriptQualificationTests: XCTestCase {
             await runReadTurn(controller)
             let results = await reader.drain()
             let state = await controller.test_liveTranscriptQualification()
-            if enabled, provenance == .automaticResolved {
+            if enabled, provenance != .programmaticOverride {
                 XCTAssertEqual(state?.eligibility, .eligible)
                 XCTAssertNil(state?.disqualification, "the chain qualified")
             } else {
@@ -1054,7 +1200,7 @@ final class ClaudeLiveTranscriptQualificationTests: XCTestCase {
         let offResult = try XCTUnwrap(off.first { $0.type == "tool_result" })
         XCTAssertEqual(offCall.toolInvocationID, offResult.toolInvocationID, "the translator pairs its own call and result")
         XCTAssertNil(offResult.toolIsError)
-        let ineligible = try await run(enabled: true, provenance: .configuredOverride)
+        let ineligible = try await run(enabled: true, provenance: .programmaticOverride)
         XCTAssertEqual(toolSignature(ineligible), toolSignature(off))
         XCTAssertTrue(ineligible.allSatisfy { $0.claudeLiveTranscriptEvidence == nil })
 

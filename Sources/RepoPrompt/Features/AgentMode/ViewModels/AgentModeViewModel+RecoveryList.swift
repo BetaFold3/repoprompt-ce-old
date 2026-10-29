@@ -772,7 +772,8 @@ extension AgentModeViewModel {
     private static func recoveryListDescription(of reason: AgentTranscriptTurnInterruption.Reason) -> String {
         switch reason {
         case .appCrash:
-            "RepoPrompt quit unexpectedly during this turn."
+            // 9-live S4: a row outlives later normal quits; name the launch that crashed.
+            "In an earlier launch, RepoPrompt quit unexpectedly during this turn."
         case .appQuit:
             "RepoPrompt was quit during this turn."
         case .windowClose:
@@ -1147,7 +1148,15 @@ extension AgentModeViewModel {
             parts.append("Its saved record couldn't be read, so its processes can't be checked.")
         } else {
             let processes = restriction.memberCount == 1 ? "1 process" : "\(restriction.memberCount) processes"
-            parts.append("\(provider) \(origin) (\(processes) found\(restriction.rootPID.map { ", started as PID \($0)" } ?? "")).")
+            // 9-live S5: the root is often a launcher shim; name the agent's own PID when known
+            // (review P3-8: two PIDs never read as contradicting the count).
+            let pids = switch (restriction.rootPID, restriction.writerPID) {
+            case let (root?, writer?): "; launcher PID \(root), agent PID \(writer)"
+            case let (nil, writer?): "; agent PID \(writer)"
+            case let (root?, nil): ", started as PID \(root)"
+            case (nil, nil): ""
+            }
+            parts.append("\(provider) \(origin) (\(processes) found\(pids)).")
         }
         if let worktree = restriction.worktreePaths.first {
             parts.append("Worktree: \(worktree).")

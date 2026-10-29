@@ -1038,12 +1038,15 @@ package final actor ClaudeNativeProcessSessionController {
     }
 
     /// Whether the current launch may carry an outbound user-message `uuid`: an automatically
-    /// resolved command on the first-party backend with no backend-routing environment keys.
-    /// Explicit command overrides (possibly stream wrappers) and compatible backends never qualify.
-    /// Automatic resolution is not proof of an authenticated binary; capture stays gated OFF.
+    /// resolved command, or a configured exact path (owner decision 2026-10-29, e.g. a
+    /// pass-through wrapper the owner controls, such as the rotator shim), on the first-party
+    /// backend with no backend-routing environment keys. A wrapper that drops or rewrites the
+    /// frame's `uuid` leaves the native entry under another ID, so the claim never matches and
+    /// Reconcile refuses safely. Programmatic overrides and compatible backends never qualify.
+    /// Neither provenance proves an authenticated binary; capture stays gated OFF.
     private var outboundUserMessageIdentityEligible: Bool {
         guard let identity = usageLaunchState?.identity else { return false }
-        return identity.commandProvenance == .automaticResolved
+        return [.automaticResolved, .configuredOverride].contains(identity.commandProvenance)
             && identity.backend == .defaultClaude
             && identity.environmentOverrideKeys.isEmpty
     }
@@ -4061,7 +4064,7 @@ package final actor ClaudeNativeProcessSessionController {
     }
 
     /// Once the launch identity is recorded, only a launch eligible for an outbound user-message
-    /// identity (automatic command, default backend, no routing overrides) keeps its state; an
+    /// identity (automatic or configured command, default backend, no routing overrides) keeps its state; an
     /// ineligible producer drops it and never emits evidence. Eligibility is not installed-profile
     /// qualification.
     private func resolveLiveTranscriptEligibility(launchToken: UUID) {

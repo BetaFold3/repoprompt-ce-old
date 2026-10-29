@@ -1042,8 +1042,8 @@ extension AgentModeViewModel {
         case .unsupported(.prefixProofUnavailable):
             // Distinct from a changed history (review B P3-02): the last target was lost or unproven.
             return await recordUnsupported(Self.recoveryBaselineUnprovenReason, conversationID: conversationID)
-        case .unsupported:
-            return await recordUnsupported("Claude history contains records this version doesn't support", conversationID: conversationID)
+        case let .unsupported(other):
+            return await recordUnsupported(Self.recoveryBaselineUnsupportedReason(other), conversationID: conversationID)
         }
         // A pending receipt (a reset or an earlier import still saving) is flushed first; one
         // that cannot commit leaves no room for this boundary: zero bytes.
@@ -1203,7 +1203,7 @@ extension AgentModeViewModel {
                 conversationID: conversationID,
                 transcriptResetGeneration: lane.binding.transcriptResetGeneration
             ) {
-                return .associationUnavailable(refusal, Self.recoveryAssociationText(refusal))
+                return .associationUnavailable(refusal, Self.recoveryAssociationText(refusal, baseline: claudeBaseline))
             }
         }
         // Claude: the attempt's whole dispatch window (its boundary first). The persisted record
@@ -1273,7 +1273,7 @@ extension AgentModeViewModel {
                dispatchWindow: claudeWindow
            )
         {
-            return .associationUnavailable(refusal, Self.recoveryAssociationText(refusal))
+            return .associationUnavailable(refusal, Self.recoveryAssociationText(refusal, baseline: claudeBaseline))
         }
         // Codex: no native → canonical mapping exists for live Codex items, so rows that could
         // overlap output already in the conversation are withheld entirely (zero rows, zero writes,
@@ -1583,6 +1583,37 @@ extension AgentModeViewModel {
     static let recoveryBaselineReceiptMovedReason =
         "Another history position was saved for this session while this one was read"
 
+    /// S1: the specific unsupported case, by schema name and line only (never a payload or ID).
+    static func recoveryBaselineUnsupportedReason(_ unsupported: ClaudeSessionHistoryReader.Unsupported) -> String {
+        func name(_ raw: String) -> String {
+            let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.")
+            return raw.count <= 48 && raw.unicodeScalars.allSatisfy(allowed.contains) ? raw : "unrecognized"
+        }
+        let detail = switch unsupported {
+        case let .malformedLine(line): "malformed record, line \(line)"
+        case let .entryType(type, line): "record type \(name(type)), line \(line)"
+        case let .fileHistorySnapshot(line): "file-history-snapshot, line \(line)"
+        case let .metadata(key, line): "metadata \(name(key)), line \(line)"
+        case let .contentBlock(type, line): "content block \(name(type)), line \(line)"
+        case let .sessionMismatch(line): "another session's record, line \(line)"
+        case .conflictingDuplicate: "conflicting duplicate entry"
+        case .missingParent: "missing parent entry"
+        case .multipleRoots: "more than one root entry"
+        case .cycle: "entry cycle"
+        case .ambiguousBranch: "ambiguous branch"
+        case .toolAssociation: "unmatched tool call or result"
+        case let .attachment(type?, line): "attachment \(name(type)), line \(line)"
+        case let .attachment(nil, line): "attachment, line \(line)"
+        case let .operationalRecord(type, line): "\(name(type)) record with entry identity, line \(line)"
+        case let .semanticMarker(key, line): "marker \(name(key)), line \(line)"
+        case .ledgerConflict: "an already recovered entry changed"
+        case .rewrittenHistory: "history changed before its last recovered position"
+        case .prefixProofUnavailable: "unproven recovered position"
+        }
+        // Saved with the baseline and shown later, possibly by a newer version (P3-9).
+        return "Claude history contains records the version that sent it doesn't support (\(detail))"
+    }
+
     static func recoveryCodexObservationText(_ error: Error) -> String {
         switch error as? CodexRecoveryObservationError {
         case .registeredTransportRequired:
@@ -1596,6 +1627,17 @@ extension AgentModeViewModel {
         case .unsupported, nil:
             "Codex history couldn't be read. Nothing was imported."
         }
+    }
+
+    /// S1: a missing baseline whose dispatch was recorded unsupported names that saved reason.
+    static func recoveryAssociationText(
+        _ refusal: AgentProviderHistoryAssociationRefusal,
+        baseline: AgentSessionProviderHistoryRecovery.DispatchBaseline?
+    ) -> String {
+        guard refusal == .baselineUnavailable, case let .unsupported(reason)? = baseline?.status, !reason.isEmpty else {
+            return recoveryAssociationText(refusal)
+        }
+        return "No history position could be saved when the interrupted run was sent: \(reason). Its history can't be matched safely. Nothing was imported."
     }
 
     static func recoveryAssociationText(_ refusal: AgentProviderHistoryAssociationRefusal) -> String {

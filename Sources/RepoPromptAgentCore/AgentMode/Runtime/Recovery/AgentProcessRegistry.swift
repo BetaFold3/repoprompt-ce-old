@@ -231,6 +231,7 @@ package actor AgentProcessRegistry {
             sessionIDs: sessionIDs(of: record),
             associations: record.associations,
             rootPID: record.root?.pid,
+            writerPID: record.members.first { $0.role == .writer && $0.identity != record.root }?.identity.pid,
             memberCount: record.members.count,
             letFinish: record.letFinish,
             revision: record.revision,

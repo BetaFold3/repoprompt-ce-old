@@ -712,6 +712,9 @@ final class AgentProcessRegistryTests: XCTestCase {
         XCTAssertEqual(record.members.map(\.identity.pid), [951, 952])
         XCTAssertEqual(record.members.map(\.role), [.writer, .writer], "exec into a writer upgrades; writers are never demoted")
         XCTAssertTrue(snapshot.blocksSend(AgentRuntimeOwnershipKeys(conversationID: "conv-M", worktreePath: nil)))
+        // 9-live S5: the restriction names the root and its first writer member (the agent's own PID).
+        XCTAssertEqual(snapshot.restrictions.first?.rootPID, 950)
+        XCTAssertEqual(snapshot.restrictions.first?.writerPID, 951)
     }
 
     func testMarkersAndParentLinksFindDescendantsButNotEarlierBornOrAppProcesses() async throws {

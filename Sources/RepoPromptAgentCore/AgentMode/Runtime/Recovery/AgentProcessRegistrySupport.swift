@@ -220,6 +220,9 @@ package struct AgentRuntimeRestriction: Equatable, Identifiable {
     /// empty for unreadable records.
     package let associations: [AgentRuntimeAssociation]
     package let rootPID: Int32?
+    /// 9-live S5: the first recorded writer member that isn't the root (the CLI under a launcher
+    /// shim), so the item can name the agent's own PID; `nil` when unknown or equal to the root.
+    package let writerPID: Int32?
     package let memberCount: Int
     package let letFinish: Bool
     package let revision: AgentRecoveryRecordRevision?
@@ -243,6 +246,7 @@ package struct AgentRuntimeRestriction: Equatable, Identifiable {
         sessionIDs: [UUID],
         associations: [AgentRuntimeAssociation],
         rootPID: Int32?,
+        writerPID: Int32? = nil,
         memberCount: Int,
         letFinish: Bool,
         revision: AgentRecoveryRecordRevision?,
@@ -261,6 +265,7 @@ package struct AgentRuntimeRestriction: Equatable, Identifiable {
         self.sessionIDs = sessionIDs
         self.associations = associations
         self.rootPID = rootPID
+        self.writerPID = writerPID == rootPID ? nil : writerPID
         self.memberCount = memberCount
         self.letFinish = letFinish
         self.revision = revision

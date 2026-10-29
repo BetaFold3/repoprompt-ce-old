@@ -367,6 +367,9 @@ package struct ClaudeLiveTranscriptProducerState {
     private static let assistantMessageNullKeys = [
         "container", "context_management", "diagnostics", "stop_details", "stop_reason", "stop_sequence"
     ]
+    /// S1 round 1 (observed on the real CLI's thinking envelopes only): the display mode and the
+    /// thinking duration. Neither is part of any row; both are type-checked in `classifyThinking`.
+    private static let thinkingKeys = assistantKeys.union(["thinking_display", "thinking_duration_ms"])
     /// Step 4d5 (O20): the Read call envelope adds only `wire_tool_inputs` to the assistant keys.
     private static let readCallKeys = assistantKeys.union(["wire_tool_inputs"])
     private static let readCallBlockKeys: Set<String> = ["type", "caller", "id", "name", "input"]
@@ -380,7 +383,7 @@ package struct ClaudeLiveTranscriptProducerState {
         self.launchToken = launchToken
     }
 
-    /// The launch identity was resolved eligible (automatic command, default backend, no routing
+    /// The launch identity was resolved eligible (automatic or configured command, default backend, no routing
     /// overrides) with the injected qualification enabled.
     package mutating func markEligible() {
         eligibility = .eligible
@@ -514,6 +517,15 @@ package struct ClaudeLiveTranscriptProducerState {
         guard eligibility == .eligible, turnInFlight, let nativeSessionID else {
             return disqualified(.unownedAssistant)
         }
+        // S1: a thinking-only envelope before the dispatch's answer (or a Read chain's final answer).
+        let thinkingOwner: UUID? = switch turn {
+        case let .dispatched(outbound, _, _): outbound
+        case let .readReturned(_, _, outbound): outbound
+        default: nil
+        }
+        if let thinkingOwner, Self.isSingleBlockEnvelope(object, type: "thinking") {
+            return classifyThinking(object, translated: translated, outbound: thinkingOwner)
+        }
         switch turn {
         case let .dispatched(outbound, _, replayed):
             if Self.isSingleToolUseEnvelope(object) {
@@ -616,10 +628,42 @@ package struct ClaudeLiveTranscriptProducerState {
     /// Whether an assistant envelope's message holds exactly one `tool_use` block (routing only;
     /// its shape is validated by `classifyReadCall`).
     private static func isSingleToolUseEnvelope(_ object: NSDictionary) -> Bool {
+        isSingleBlockEnvelope(object, type: "tool_use")
+    }
+
+    /// Whether an assistant envelope's message holds exactly one block of `type` (routing only).
+    private static func isSingleBlockEnvelope(_ object: NSDictionary, type: String) -> Bool {
         guard let content = (object["message"] as? NSDictionary)?["content"] as? [Any], content.count == 1,
               let block = content[0] as? NSDictionary
         else { return false }
-        return (block["type"] as? String) == "tool_use"
+        return (block["type"] as? String) == type
+    }
+
+    /// S1 (9-live round 2): one assistant `thinking` block in the observed envelope shape is benign
+    /// and changes no state, exactly as the history reader skips it (no row, no ordinal, outside the
+    /// envelope digest). It must translate to no visible result (reasoning extraction is off), and
+    /// any attribution it carries must name the open dispatch. `redacted_thinking`, extra block keys
+    /// or a translated row still refuse.
+    private mutating func classifyThinking(
+        _ object: NSDictionary,
+        translated: [AIStreamResult],
+        outbound: UUID
+    ) -> ClaudeLiveTranscriptOutcome {
+        guard case let (_, block)? = Self.assistantBlock(object, topLevelKeys: Self.thinkingKeys),
+              object["thinking_display"] == nil || object["thinking_display"] is String,
+              object["thinking_duration_ms"] == nil
+              || (Self.isNumber(object["thinking_duration_ms"]) && ((object["thinking_duration_ms"] as? NSNumber)?.doubleValue ?? -1) >= 0),
+              Self.keys(block).isSubset(of: ["type", "thinking", "signature"]),
+              block["thinking"] is String,
+              block["signature"] == nil || block["signature"] is String
+        else { return disqualified(.unsupportedAssistant) }
+        if Self.attribution(object, outbound: outbound) == false {
+            return disqualified(.attributionMismatch)
+        }
+        guard translated.allSatisfy({ $0.type == "usage" }) else {
+            return disqualified(.translationMismatch)
+        }
+        return .benign
     }
 
     /// Step 4d5: the dispatch's one Read call. Exact observed shape first (anything else is an

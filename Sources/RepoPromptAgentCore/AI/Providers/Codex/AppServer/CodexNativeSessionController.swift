@@ -651,6 +651,9 @@ package final class CodexNativeSessionController {
         var excludeTurns: ExcludeTurnsSupport = .unknown
         var turnsList: TurnsListSupport = .unknown
         var turnsListRejectsItemsView = false
+        /// The recovery observation's `itemsView: "full"` was rejected (separate from the newest-turn
+        /// listing's `notLoaded`: a server may reject that value yet accept `full`).
+        var turnsListRejectsFullItemsView = false
     }
 
     private struct ListedTurn {
@@ -1845,26 +1848,40 @@ package final class CodexNativeSessionController {
         let memo = capabilityMemo(forTransportGeneration: transportGeneration)
         var turns: [[String: Any]] = []
         var source = CodexRecoveryObservation.Source.turnsList
+        /// 9-live S3: `itemsView` defaults to `summary`, which is not the turn's items. Ask for `full`;
+        /// a server that rejects the field predates item views and lists full turns.
+        func listTurns(fullItemsView: Bool) async throws -> [[String: Any]] {
+            var params: [String: Any] = [
+                "threadId": threadID,
+                "limit": Self.recoveryObservationTurnLimit,
+                "sortDirection": "desc"
+            ]
+            if fullItemsView {
+                params["itemsView"] = "full"
+            }
+            let result = try await performRequest(method: "thread/turns/list", params: params, timeout: timeout)
+            try await requireObservedGeneration()
+            updateCapabilityMemo(forTransportGeneration: transportGeneration) { $0.turnsList = .supported }
+            return result["data"] as? [[String: Any]] ?? []
+        }
         if memo.turnsList != .unsupported {
+            let requestsFullItemsView = !memo.turnsListRejectsFullItemsView
             do {
-                let result = try await performRequest(
-                    method: "thread/turns/list",
-                    params: [
-                        "threadId": threadID,
-                        "limit": Self.recoveryObservationTurnLimit,
-                        "sortDirection": "desc"
-                    ],
-                    timeout: timeout
-                )
-                try await requireObservedGeneration()
-                updateCapabilityMemo(forTransportGeneration: transportGeneration) { $0.turnsList = .supported }
-                turns = result["data"] as? [[String: Any]] ?? []
+                turns = try await listTurns(fullItemsView: requestsFullItemsView)
             } catch {
                 // A changed transport is stale before any capability conclusion or fallback.
                 try await requireObservedGeneration()
-                guard Self.isTurnsListUnsupportedError(error) else { throw error }
-                updateCapabilityMemo(forTransportGeneration: transportGeneration) { $0.turnsList = .unsupported }
-                source = .threadRead
+                if requestsFullItemsView, Self.isTurnsListItemsViewRejection(error) {
+                    updateCapabilityMemo(forTransportGeneration: transportGeneration) { $0.turnsListRejectsFullItemsView = true }
+                    Self.logger.notice(
+                        "thread/turns/list rejected itemsView full; retrying once without it transportGeneration=\(transportGeneration, privacy: .public)"
+                    )
+                    turns = try await listTurns(fullItemsView: false)
+                } else {
+                    guard Self.isTurnsListUnsupportedError(error) else { throw error }
+                    updateCapabilityMemo(forTransportGeneration: transportGeneration) { $0.turnsList = .unsupported }
+                    source = .threadRead
+                }
             }
         } else {
             source = .threadRead
@@ -1925,12 +1942,16 @@ package final class CodexNativeSessionController {
         {
             abortDetail = String(message.prefix(500))
         }
+        // A turn listed with a partial item view (`summary`, `notLoaded`, anything but `full`) has no
+        // usable items (9-live S3); an absent view is a full turn (`Turn.itemsView` defaults to full).
+        let itemsView = turn["itemsView"]
+        let hasFullItems = itemsView == nil || (itemsView as? String)?.lowercased() == "full"
         return CodexRecoveryObservation(
             threadID: threadID,
             turnID: expectedTurnID,
             terminal: terminal,
             abortDetail: abortDetail,
-            items: recoveryItems(turn["items"]),
+            items: hasFullItems ? recoveryItems(turn["items"]) : nil,
             source: source,
             transportGeneration: transportGeneration
         )

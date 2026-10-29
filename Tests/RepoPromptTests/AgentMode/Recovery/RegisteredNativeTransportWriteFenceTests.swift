@@ -467,8 +467,8 @@ final class RegisteredNativeTransportWriteFenceTests: XCTestCase {
     }
 
     /// Step 4d1: the user frame carries a lowercase top-level `uuid` only when the write's own single
-    /// admission returned one for an eligible launch (automatic command, first-party backend, no
-    /// backend-routing keys); an ordinary admission (a retry after `alreadyRecorded`) omits it and
+    /// admission returned one for an eligible launch (automatic command or configured exact path,
+    /// first-party backend, no backend-routing keys); an ordinary admission (a retry after `alreadyRecorded`) omits it and
     /// keeps the legacy frame exactly; an ineligible launch never encodes one.
     func testClaudeUserFrameCarriesTheAdmittedOutboundUUIDOnlyForAnEligibleLaunch() async throws {
         await startRegistry()
@@ -494,11 +494,31 @@ final class RegisteredNativeTransportWriteFenceTests: XCTestCase {
         XCTAssertEqual(eligibility.messages, ["false"])
         XCTAssertNil(transport.frames.last?["uuid"], "an unqualified launch never carries an outbound identity")
 
-        // An explicit command override is ineligible too.
-        await controller.test_beginSyntheticUsageLaunch(commandProvenance: .configuredOverride)
+        // A programmatic command override is ineligible.
+        await controller.test_beginSyntheticUsageLaunch(commandProvenance: .programmaticOverride)
         try await send(.admitted(outboundUserMessageUUID: UUID()))
         XCTAssertEqual(eligibility.messages.last, "false")
         XCTAssertNil(transport.frames.last?["uuid"])
+
+        // A compatible backend is ineligible, even with a configured exact path.
+        await controller.test_beginSyntheticUsageLaunch(commandProvenance: .configuredOverride, backend: .compatible(.glmZAI))
+        try await send(.admitted(outboundUserMessageUUID: UUID()))
+        XCTAssertEqual(eligibility.messages.last, "false")
+        XCTAssertNil(transport.frames.last?["uuid"])
+
+        // A routing key on a configured exact path is ineligible.
+        await controller.test_beginSyntheticUsageLaunch(commandProvenance: .configuredOverride, environmentOverrideKeys: ["CLAUDE_CONFIG_DIR"])
+        try await send(.admitted(outboundUserMessageUUID: UUID()))
+        XCTAssertEqual(eligibility.messages.last, "false")
+        XCTAssertNil(transport.frames.last?["uuid"])
+
+        // Owner decision (2026-10-29): a configured exact path (e.g. the owner's pass-through
+        // wrapper) on the first-party backend with no routing keys is eligible.
+        await controller.test_beginSyntheticUsageLaunch(commandProvenance: .configuredOverride)
+        let configuredClaim = UUID()
+        try await send(.admitted(outboundUserMessageUUID: configuredClaim))
+        XCTAssertEqual(eligibility.messages.last, "true")
+        XCTAssertEqual(transport.frames.last?["uuid"] as? String, configuredClaim.uuidString.lowercased())
 
         // A routing key on an otherwise automatic first-party launch is ineligible.
         await controller.test_beginSyntheticUsageLaunch(environmentOverrideKeys: ["ANTHROPIC_BASE_URL"])
@@ -520,8 +540,8 @@ final class RegisteredNativeTransportWriteFenceTests: XCTestCase {
         let retried = try XCTUnwrap(transport.frames.last)
         XCTAssertNil(retried["uuid"], "a retry never reuses or mints an identity")
         XCTAssertEqual(Set(retried.keys), ["type", "message", "parent_tool_use_id"])
-        XCTAssertEqual(transport.frames.count, 5, "one write per send, one admission each")
-        XCTAssertEqual(eligibility.messages.count, 5)
+        XCTAssertEqual(transport.frames.count, 8, "one write per send, one admission each")
+        XCTAssertEqual(eligibility.messages.count, 8)
 
         // Denied: zero bytes even for an eligible launch.
         do {
@@ -530,7 +550,7 @@ final class RegisteredNativeTransportWriteFenceTests: XCTestCase {
         } catch {
             assertProcessNotRunning(error)
         }
-        XCTAssertEqual(transport.frames.count, 5)
+        XCTAssertEqual(transport.frames.count, 8)
     }
 
     // MARK: Claude native: inbound binding, automatic replies, cancellation (re-review A05/A06/A12)

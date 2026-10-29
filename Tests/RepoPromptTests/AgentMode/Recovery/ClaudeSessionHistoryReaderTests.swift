@@ -636,10 +636,13 @@ final class ClaudeSessionHistoryReaderTests: XCTestCase {
 
     func testCaptureQualifiedSingleTextTurnProjectsOnlyTheClaimedUserAndAssistantText() throws {
         let fixture = o19Turn()
-        // The fixture covers every whitelisted attachment type and every operational type.
-        let attachmentTypes = Set(fixture.compactMap { ($0["attachment"] as? [String: Any])?["type"] as? String })
+        // This fixture and the S1 owner-profile one together cover every whitelisted attachment type
+        // and every operational type.
+        let s1 = s1Session()
+        let covered = fixture + s1.firstTurn + s1.secondTurn
+        let attachmentTypes = Set(covered.compactMap { ($0["attachment"] as? [String: Any])?["type"] as? String })
         XCTAssertEqual(attachmentTypes, Reader.attachmentTypes)
-        XCTAssertEqual(Set(fixture.compactMap { $0["type"] as? String }).subtracting(["user", "assistant", "attachment"]), Reader.operationalTypes)
+        XCTAssertEqual(Set(covered.compactMap { $0["type"] as? String }).subtracting(["user", "assistant", "attachment"]), Reader.operationalTypes)
 
         let data = jsonl(fixture)
         let value = try XCTUnwrap(candidate(read(data, mode: fromStart)))
@@ -664,6 +667,30 @@ final class ClaudeSessionHistoryReaderTests: XCTestCase {
         XCTAssertTrue(baseline.rows.isEmpty)
         XCTAssertTrue(baseline.validationRows.isEmpty)
         XCTAssertTrue(baseline.userMessageEntries.isEmpty)
+    }
+
+    /// S1 round 0: the CLI writes RepoPrompt's outbound user message as exactly one `{type, text}`
+    /// block (K1's real prompt entries, with their prompt metadata keys); its text carries the same
+    /// claim digest as string content. Any other array shape carries none, so it never matches a claim.
+    func testASingleExactTextBlockUserEntryCarriesTheClaimDigestAndOtherArraysDoNot() throws {
+        let text = "Reply with exactly: ALPHA-7"
+        let promptMetadata: [String: Any] = [
+            "promptId": "fixture-prompt", "promptSource": "sdk", "turnOrigin": "fixture", "turnPosition": 1,
+            "permissionMode": "default", "entrypoint": "sdk-cli", "userType": "external", "gitBranch": "main"
+        ]
+        func digest(_ content: Any) throws -> String? {
+            let value = try XCTUnwrap(candidate(read(
+                jsonl([entry("user", uuid: "c1", parent: nil, content: content, extra: promptMetadata)]),
+                mode: fromStart
+            )))
+            XCTAssertEqual(value.userMessageEntries.map(\.nativeEntryID), ["c1"])
+            return value.userMessageEntries.first?.textSHA256
+        }
+        XCTAssertEqual(try digest([["type": "text", "text": text]]), sha256(text), "the CLI's outbound form")
+        XCTAssertEqual(try digest(text), sha256(text))
+        XCTAssertNil(try digest([["type": "text", "text": text, "cache_control": ["type": "ephemeral"]]]), "an extra block key")
+        XCTAssertNil(try digest([["type": "text", "text": text], ["type": "text", "text": ""]]), "more than one block")
+        XCTAssertNil(try digest([[String: Any]]()), "no block")
     }
 
     /// Step 4d3b parity: the live classifier's identity and proof for one O19 assistant text equal
@@ -823,13 +850,17 @@ final class ClaudeSessionHistoryReaderTests: XCTestCase {
         let described = String(describing: plain)
         XCTAssertFalse(described.contains(Self.contextSentinel))
         XCTAssertFalse(described.contains(Self.requestSentinel))
-        // A refusal names no payload.
+        // A refusal names no payload, only the structural attachment type (P2-3).
         var unknown = o19Turn()
         unknown[4] = attachment("n2", parent: "n1", type: "hook_additional_context")
         let refusal = read(jsonl(unknown), mode: fromStart)
-        XCTAssertEqual(refusal, .unsupported(.attachment(line: 5)))
+        XCTAssertEqual(refusal, .unsupported(.attachment(type: "hook_additional_context", line: 5)))
         XCTAssertFalse(String(describing: refusal).contains(Self.contextSentinel))
-        XCTAssertFalse(String(describing: refusal).contains("hook_additional_context"))
+        // A type that isn't a short structural identifier is never carried.
+        for freeText in ["has space", "PRIVATE/value", String(repeating: "a", count: 49), ""] {
+            unknown[4] = attachment("n2", parent: "n1", type: freeText)
+            XCTAssertEqual(read(jsonl(unknown), mode: fromStart), .unsupported(.attachment(type: nil, line: 5)), freeText)
+        }
     }
 
     func testUnknownMalformedOrIdentityBearingNonrenderingRecordsRefuseTheWholeCandidate() {
@@ -837,18 +868,21 @@ final class ClaudeSessionHistoryReaderTests: XCTestCase {
         func refusal(_ entries: [[String: Any]]) -> Reader.Result {
             read(jsonl(entries), mode: fromStart)
         }
-        XCTAssertEqual(refusal([root, attachment("n1", parent: "u1", type: "structured_output")]), .unsupported(.attachment(line: 2)))
-        XCTAssertEqual(refusal([root, attachment("n1", parent: "u1", type: "hook_success")]), .unsupported(.attachment(line: 2)))
+        XCTAssertEqual(
+            refusal([root, attachment("n1", parent: "u1", type: "structured_output")]),
+            .unsupported(.attachment(type: "structured_output", line: 2))
+        )
+        XCTAssertEqual(refusal([root, attachment("n1", parent: "u1", type: "hook_success")]), .unsupported(.attachment(type: "hook_success", line: 2)))
         XCTAssertEqual(refusal([root, entry("structured_output", uuid: "s1", parent: "u1", content: "x")]), .unsupported(.entryType("structured_output", line: 2)))
         var noAttachment = attachment("n1", parent: "u1", type: "date")
         noAttachment["attachment"] = nil
-        XCTAssertEqual(refusal([root, noAttachment]), .unsupported(.attachment(line: 2)))
+        XCTAssertEqual(refusal([root, noAttachment]), .unsupported(.attachment(type: nil, line: 2)))
         var numericType = attachment("n1", parent: "u1", type: "date")
         numericType["attachment"] = ["type": 7]
-        XCTAssertEqual(refusal([root, numericType]), .unsupported(.attachment(line: 2)))
+        XCTAssertEqual(refusal([root, numericType]), .unsupported(.attachment(type: nil, line: 2)))
         XCTAssertEqual(
             refusal([root, attachment("n1", parent: "u1", type: "date", extra: ["message": ["role": "user", "content": "x"]])]),
-            .unsupported(.attachment(line: 2)),
+            .unsupported(.attachment(type: "date", line: 2)),
             "an attachment carrying a message is not the observed shape"
         )
         XCTAssertEqual(
@@ -933,7 +967,7 @@ final class ClaudeSessionHistoryReaderTests: XCTestCase {
         )
     }
 
-    func testDocumentedRetractionThinkingAndCompactionMarkersRefuse() {
+    func testDocumentedRetractionAndCompactionMarkersRefuseButAssistantThinkingIsSkipped() {
         let root = user("u1", parent: nil, "hi")
         func refusal(_ entries: [[String: Any]]) -> Reader.Result {
             read(jsonl(entries), mode: fromStart)
@@ -947,12 +981,141 @@ final class ClaudeSessionHistoryReaderTests: XCTestCase {
         XCTAssertEqual(refusal([root, retraction]), .unsupported(.semanticMarker("retracted_message_uuids", line: 2)))
         let notAborted = entry("assistant", uuid: "a1", parent: "u1", content: [["type": "text", "text": "x"]], extra: ["aborted": false])
         XCTAssertNotNil(candidate(refusal([root, notAborted])), "an explicit false is not a marker")
-        let thinking = entry("assistant", uuid: "a1", parent: "u1", content: [["type": "thinking", "thinking": "hmm"]])
-        XCTAssertEqual(refusal([root, thinking]), .unsupported(.contentBlock("thinking", line: 2)))
+        // S1: assistant thinking is validated and skipped (no row, no ordinal, not in the digest); a
+        // thinking-only entry stays a graph node that projects nothing.
+        let thinking = entry("assistant", uuid: "a1", parent: "u1", content: [["type": "thinking", "thinking": "hmm", "signature": "s"]], messageID: "m")
+        let reply = assistantText("a2", parent: "a1", "x", messageID: "m")
+        XCTAssertEqual(rowSummary(candidate(refusal([root, thinking, reply]))?.rows ?? []), ["u1|userText|0", "a2|assistantText|0"])
+        XCTAssertEqual(rowSummary(candidate(refusal([root, thinking]))?.rows ?? []), ["u1|userText|0"], "a thinking-only tip projects nothing")
+        let mixed = entry("assistant", uuid: "a1", parent: "u1", content: [["type": "thinking", "thinking": "hmm"], ["type": "text", "text": "x"]])
+        let mixedRows = candidate(refusal([root, mixed]))?.rows ?? []
+        XCTAssertEqual(rowSummary(mixedRows), ["u1|userText|0", "a1|assistantText|0"], "the skipped block takes no ordinal")
+        XCTAssertEqual(
+            mixedRows.last?.envelopeDigest,
+            Reader.singleTextAssistantRow(nativeSessionID: sessionID, nativeEntryID: "a1", text: "x")?.envelopeDigest,
+            "thinking is outside the envelope digest"
+        )
+        XCTAssertFalse(String(describing: mixedRows).contains("hmm"), "thinking text is never kept")
         let summary = entry("user", uuid: "u2", parent: "u1", content: "s", extra: ["isCompactSummary": true])
         XCTAssertEqual(refusal([root, summary]), .unsupported(.metadata("isCompactSummary", line: 2)))
         let boundary = entry("system", uuid: "s1", parent: "u1", content: "x", extra: ["subtype": "compact_boundary"])
         XCTAssertEqual(refusal([root, boundary]), .unsupported(.entryType("system", line: 2)))
+    }
+
+    /// S1 keeps refusing every thinking shape except a plain assistant `thinking` block.
+    func testRedactedThinkingUserThinkingAndMalformedThinkingStillRefuse() {
+        let root = user("u1", parent: nil, "hi")
+        func refusal(_ entries: [[String: Any]]) -> Reader.Result {
+            read(jsonl(entries), mode: fromStart)
+        }
+        let redacted = entry("assistant", uuid: "a1", parent: "u1", content: [["type": "redacted_thinking", "data": "opaque"]])
+        XCTAssertEqual(refusal([root, redacted]), .unsupported(.contentBlock("redacted_thinking", line: 2)))
+        XCTAssertEqual(read(jsonl([root, redacted]), mode: .baseline), .unsupported(.contentBlock("redacted_thinking", line: 2)))
+        let userThinking = entry("user", uuid: "u2", parent: "u1", content: [["type": "thinking", "thinking": "hmm"]])
+        XCTAssertEqual(refusal([root, userThinking]), .unsupported(.contentBlock("thinking", line: 2)), "only an assistant thinks")
+        let malformed = entry("assistant", uuid: "a1", parent: "u1", content: [["type": "thinking", "thinking": 7]])
+        XCTAssertEqual(refusal([root, malformed]), .unsupported(.malformedLine(line: 2)))
+        let missing = entry("assistant", uuid: "a1", parent: "u1", content: [["type": "thinking"]])
+        XCTAssertEqual(refusal([root, missing]), .unsupported(.malformedLine(line: 2)))
+    }
+
+    // MARK: S1 owner-profile default-configuration shape (sanitized K1 structure, invented text)
+
+    private func thinkingAssistant(_ uuid: String, parent: String, messageID: String) -> [String: Any] {
+        entry(
+            "assistant",
+            uuid: uuid,
+            parent: parent,
+            content: [["type": "thinking", "thinking": Self.contextSentinel, "signature": "sig"]],
+            messageID: messageID
+        )
+    }
+
+    /// K1 lines 1–26 (the first turn: 10 attachments in one chain, request records, titles, a
+    /// thinking-only entry and its one-text reply sharing an API message ID, a trailing snapshot) and
+    /// a second turn: thinking → tool call (same message ID) → associated result → reply, plus the
+    /// remaining owner-profile attachment and title records.
+    private func s1Session() -> (firstTurn: [[String: Any]], secondTurn: [[String: Any]]) {
+        var first: [[String: Any]] = [
+            operational("queue-operation", extra: ["operation": "enqueue"]),
+            operational("queue-operation", extra: ["operation": "dequeue"]),
+            entry("user", uuid: "c1", parent: nil, content: [["type": "text", "text": "Warm up: reply OK"]], extra: ["promptId": "p1"])
+        ]
+        var previous = "c1"
+        let types = [
+            "environment", "model", "mcp_instructions_delta", "skill_listing", "total_tokens_reminder", "instructions",
+            "session_context", "date", "remote_session_change", "prompt_snapshot"
+        ]
+        for (index, type) in types.enumerated() {
+            if index == 5 { first.append(operational("atis-latch")) }
+            first.append(attachment("s\(index)", parent: previous, type: type))
+            previous = "s\(index)"
+        }
+        first += [
+            operational("api-request-shape"),
+            operational("api-request-blob"),
+            operational("api-request"),
+            operational("last-prompt", extra: ["leafUuid": previous]),
+            operational("atis-latch"),
+            operational("ai-title", extra: ["aiTitle": "Warm-up"]),
+            thinkingAssistant("a1t", parent: previous, messageID: "msg-a1"),
+            assistantText("a1", parent: "a1t", "OK", messageID: "msg-a1"),
+            attachment("t1", parent: "a1", type: "prompt_snapshot"),
+            operational("last-prompt", extra: ["leafUuid": "t1"]),
+            operational("ai-title", extra: ["aiTitle": "Warm-up"]),
+            operational("atis-latch")
+        ]
+        let second: [[String: Any]] = [
+            operational("queue-operation", extra: ["operation": "enqueue"]),
+            operational("queue-operation", extra: ["operation": "dequeue"]),
+            entry("user", uuid: "c2", parent: "t1", content: [["type": "text", "text": "List the files"]], extra: ["promptId": "p2"]),
+            attachment("s10", parent: "c2", type: "total_tokens_reminder"),
+            attachment("s11", parent: "s10", type: "date"),
+            attachment("s12", parent: "s11", type: "deferred_tools_delta"),
+            attachment("s13", parent: "s12", type: "agent_listing_delta"),
+            attachment("s14", parent: "s13", type: "thinking_drop"),
+            operational("api-request-blob"),
+            operational("api-request"),
+            operational("custom-title", extra: ["customTitle": "Fixture"]),
+            operational("agent-name", extra: ["agentName": "Fixture"]),
+            thinkingAssistant("a2t", parent: "s14", messageID: "msg-a2"),
+            toolUse("a2", parent: "a2t", id: "toolu_1", name: "Bash", messageID: "msg-a2"),
+            toolResult("r2", parent: "a2", toolUseID: "toolu_1", text: "README.md", source: "a2"),
+            assistantText("a3", parent: "r2", "One file.", messageID: "msg-a3")
+        ]
+        return (first, second)
+    }
+
+    func testOwnerProfileDefaultConfigurationSessionBaselinesAndImportsWithoutThinkingRows() throws {
+        let session = s1Session()
+        let firstData = jsonl(session.firstTurn)
+        // Before S1 this refused at line 6 (`mcp_instructions_delta`), so no baseline was ever taken.
+        let baseline = try XCTUnwrap(candidate(read(firstData, mode: .baseline)))
+        XCTAssertEqual(baseline.completeLineOffset, UInt64(firstData.count))
+        XCTAssertEqual(baseline.prefixSHA256, digest(firstData))
+
+        let full = firstData + jsonl(session.secondTurn)
+        let after = try XCTUnwrap(candidate(read(full, mode: .importAfter(cursor(file: identityA, over: firstData)))))
+        XCTAssertEqual(
+            rowSummary(after.rows),
+            ["c2|userText|0", "a2|toolCall|0", "r2|toolResult|0", "a3|assistantText|0"],
+            "thinking, attachments and records never render"
+        )
+        XCTAssertEqual(after.userMessageEntries.map(\.nativeEntryID), ["c2"])
+        XCTAssertEqual(after.rows.first { $0.kind == .toolResult }?.toolName, "Bash")
+
+        let whole = try XCTUnwrap(candidate(read(full, mode: fromStart)))
+        XCTAssertEqual(
+            rowSummary(whole.rows),
+            ["c1|userText|0", "a1|assistantText|0", "c2|userText|0", "a2|toolCall|0", "r2|toolResult|0", "a3|assistantText|0"]
+        )
+        XCTAssertFalse(String(describing: whole).contains(Self.contextSentinel), "thinking and attachment payloads are never kept")
+        XCTAssertNotNil(candidate(read(full, mode: .baseline)))
+
+        // Title records still never carry graph identity.
+        var identified = session.firstTurn
+        identified[19] = operational("ai-title", extra: ["uuid": "x1"])
+        XCTAssertEqual(read(jsonl(identified), mode: .baseline), .unsupported(.operationalRecord("ai-title", line: 20)))
     }
 
     func testRefusalsBeforeTheCursorStillRejectWithAKnownLedger() throws {
@@ -973,7 +1136,7 @@ final class ClaudeSessionHistoryReaderTests: XCTestCase {
         let prefix = jsonl(poisoned)
         XCTAssertEqual(
             read(jsonl(poisoned + later), mode: .importAfter(cursor(file: identityA, over: prefix)), ledger: plan.ledger),
-            .unsupported(.attachment(line: 4))
+            .unsupported(.attachment(type: "hook_success", line: 4))
         )
     }
 

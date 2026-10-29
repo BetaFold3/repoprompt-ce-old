@@ -26,7 +26,7 @@ import Foundation
 //   candidate is validated before any row, cursor or ledger suppression is produced: an unsupported
 //   entry type (including `file-history-snapshot`, `progress`, `system`), an attachment outside the
 //   exact whitelist, an operational record carrying graph identity, unsupported content block
-//   (thinking included), meaningful metadata (sidechain, meta, compaction, team/agent), a documented
+//   (`redacted_thinking` included), meaningful metadata (sidechain, meta, compaction, team/agent), a documented
 //   retraction marker (`supersedes`, `aborted`, `retracted_message_uuids`), malformed line, session
 //   mismatch, conflicting duplicate, missing parent, cycle, ambiguous branch, or ambiguous tool
 //   association rejects the whole candidate.
@@ -41,6 +41,14 @@ import Foundation
 //   any other key (graph ID keys included, even null), mode value, or session refuses. `mode` is
 //   deliberately not an operational type. Successful single-Read tool exchanges across a
 //   same-session resume project through the existing tool association unchanged.
+// - Owner-profile qualification (9-live round 2, S1; CLI 2.1.302, 200-file structural tally):
+//   default-configuration sessions add context-listing attachments (MCP instructions, skills,
+//   `CLAUDE.md` instructions, deferred tools, agent listing, remote session, thinking drop) and
+//   title/name records (`ai-title`, `custom-title`, `agent-name`); they are accepted exactly like
+//   the O19 shapes. Plain `thinking` blocks in ASSISTANT entries are validated (string `thinking`)
+//   and skipped: never a row, an ordinal, or part of the envelope digest. A thinking-only entry is a
+//   message graph node that projects nothing. `redacted_thinking`, compaction, hooks, file or
+//   queued-command attachments, and every unobserved shape still refuse.
 // - Attachment-only side branches carry no message and never count as a continuation; a branch
 //   whose subtree holds any message still does. A direct chain projects in ancestor order (block
 //   ordinals unchanged); a demonstrated tool fork keeps file order.
@@ -160,8 +168,10 @@ package enum ClaudeSessionHistoryReader {
         case cycle
         case ambiguousBranch(String)
         case toolAssociation(String)
-        /// An attachment outside the exact whitelist, or a malformed one (its payload is never named).
-        case attachment(line: Int)
+        /// An attachment outside the exact whitelist, or a malformed one. `type` is its `attachment.type`
+        /// only when that is a short structural identifier (`[A-Za-z0-9_.-]`, at most 48 characters);
+        /// the payload is never named.
+        case attachment(type: String?, line: Int)
         /// An operational or exact-metadata record carrying `uuid`/`parentUuid` graph identity.
         case operationalRecord(String, line: Int)
         /// A documented retraction/supersession marker (`supersedes`, `aborted`, `retracted_message_uuids`).
@@ -332,7 +342,8 @@ package enum ClaudeSessionHistoryReader {
         let messageID: String?
         let sourceToolAssistantUUID: String?
         let blocks: [Block]
-        /// SHA-256 of a user entry's plain string content (outbound-claim matching only).
+        /// SHA-256 of a user entry's plain string content, or of the text of content that is exactly
+        /// one `{type, text}` block (outbound-claim matching only).
         let userStringContentSHA256: String?
         /// The decoded line, kept in memory only for the duplicate comparison (never persisted,
         /// logged or hashed).
@@ -355,15 +366,30 @@ package enum ClaudeSessionHistoryReader {
 
     private static let rejectedWhenTrue = ["isSidechain", "isMeta", "isCompactSummary", "isApiErrorMessage", "isVisibleInTranscriptOnly"]
     private static let rejectedWhenPresent = ["logicalParentUuid", "teamName", "agentId", "compactMetadata", "subtype"]
-    /// Exact `attachment.type` values observed in the O19 capture (nonrendering graph nodes).
+    /// A refused record's type name when it is a short structural identifier, else `nil`, so a
+    /// diagnostic never carries free text.
+    static func structuralTypeName(_ name: String) -> String? {
+        guard !name.isEmpty, name.count <= 48,
+              name.unicodeScalars.allSatisfy({ $0.isASCII && (CharacterSet.alphanumerics.contains($0) || "_.-".unicodeScalars.contains($0)) })
+        else { return nil }
+        return name
+    }
+
+    /// Exact `attachment.type` values observed in the O19 capture, plus the context-listing metadata
+    /// observed in the owner's default-configuration sessions (S1). Nonrendering graph nodes.
     static let attachmentTypes: Set<String> = [
         "budget_usd", "credential_org", "date", "environment", "model", "prompt_snapshot", "session_context",
-        "total_tokens_reminder"
+        "total_tokens_reminder",
+        // S1: what the session can use (MCP instructions, skills, tools, agents), which `CLAUDE.md`
+        // files were loaded, the repo/PR metadata, and the thinking-retention report.
+        "mcp_instructions_delta", "skill_listing", "instructions", "deferred_tools_delta", "agent_listing_delta",
+        "remote_session_change", "thinking_drop"
     ]
-    /// Exact operational record types observed in the O19 capture (no graph identity, never read).
+    /// Exact operational record types observed in the O19 capture, plus the session title/name
+    /// records observed in the owner's sessions (S1). No graph identity, never read.
     static let operationalTypes: Set<String> = [
         "queue-operation", "atis-latch", "api-request-shape", "api-request-blob", "api-request", "last-prompt",
-        "cost-state"
+        "cost-state", "ai-title", "custom-title", "agent-name"
     ]
     /// Documented retraction/supersession markers (SDK assistant `supersedes`/`aborted`, refusal
     /// fallback `retracted_message_uuids`), checked only at the entry and `message` levels.
@@ -680,7 +706,8 @@ package enum ClaudeSessionHistoryReader {
                   let attachmentType = attachment["type"] as? String,
                   attachmentTypes.contains(attachmentType)
             else {
-                return .failure(.attachment(line: line))
+                let type = (object["attachment"] as? NSDictionary)?["type"] as? String
+                return .failure(.attachment(type: type.flatMap(Self.structuralTypeName), line: line))
             }
             return .success(Entry(
                 line: line,
@@ -719,6 +746,9 @@ package enum ClaudeSessionHistoryReader {
                 case ("text", _):
                     guard let text = block["text"] as? String else { return .failure(.malformedLine(line: line)) }
                     blocks.append(.text(text))
+                case ("thinking", true):
+                    // S1: assistant reasoning is validated and skipped (no row, ordinal or digest).
+                    guard block["thinking"] is String else { return .failure(.malformedLine(line: line)) }
                 case ("tool_use", true):
                     guard let id = block["id"] as? String, !id.isEmpty, let name = block["name"] as? String,
                           let input = block["input"] as? NSDictionary,
@@ -762,6 +792,14 @@ package enum ClaudeSessionHistoryReader {
             }
         default:
             return .failure(.malformedLine(line: line))
+        }
+        // S1 round 0: the CLI writes RepoPrompt's outbound message as exactly one `{type, text}` block,
+        // so that form carries the claim digest too (any other array never matches a claim).
+        if !isAssistant, let array = message["content"] as? [Any], array.count == 1,
+           let block = array.first as? NSDictionary, Set(block.allKeys.compactMap { $0 as? String }) == ["type", "text"],
+           block.count == 2, (block["type"] as? String) == "text", let text = block["text"] as? String
+        {
+            stringContentSHA256 = AgentSessionProviderHistoryRecovery.sha256Hex(Data(text.utf8))
         }
         if !isAssistant, source != nil, !blocks.contains(where: { if case .toolResult = $0 { true } else { false } }) {
             return .failure(.toolAssociation("source without tool result at line \(line)"))
@@ -955,7 +993,8 @@ package enum ClaudeSessionHistoryReader {
 
     /// Complete-envelope digest of one entry: SHA-256 over the length-prefixed ordered supported
     /// semantic payload (entry type, block count, then per block its kind, ordinal and text / tool
-    /// name, use ID and canonical input / tool use ID, result text and error flag). No metadata.
+    /// name, use ID and canonical input / tool use ID, result text and error flag). No metadata and
+    /// no skipped `thinking` block.
     private static func envelopeDigest(_ entry: Entry) -> String {
         var components = ["rpce-claude-history-envelope-v1", entry.kind.rawValue, String(entry.blocks.count)]
         for (ordinal, block) in entry.blocks.enumerated() {
