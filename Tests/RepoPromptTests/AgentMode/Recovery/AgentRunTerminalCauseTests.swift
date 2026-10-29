@@ -386,7 +386,7 @@ final class AgentRunTerminalCauseTests: XCTestCase {
         XCTAssertNil(launchAfterEOF, "the EOF reached the current launch")
         var failedTurns: [UUID] = []
         for await event in subscription.events {
-            if case let .turnCompleted(turnID, status) = event, status == .failed { failedTurns.append(turnID) }
+            if case let .turnCompleted(turnID, status, _) = event, status == .failed { failedTurns.append(turnID) }
         }
         XCTAssertEqual(failedTurns, [lostTurn], "the EOF failed the tracked turn")
         // Review R1: the runner asks through the protocol existential; the real witness must answer

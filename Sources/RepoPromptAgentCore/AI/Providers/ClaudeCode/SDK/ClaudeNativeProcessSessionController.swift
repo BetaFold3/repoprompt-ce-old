@@ -36,6 +36,71 @@ package final actor ClaudeNativeProcessSessionController {
         case failed
     }
 
+    /// Step 12: where a turn completion came from. Only a completion emitted on the CLI's own
+    /// boundary for this FIFO position is provider evidence for the turn.
+    package enum TurnCompletionOrigin: Equatable {
+        /// Emitted on the CLI's own `result` for this turn: immediately, or (deferred mode) at the
+        /// CLI's own `idle` that follows it. The status is `determineTurnStatus`'s classification
+        /// of that result; the evidence is what the result itself and the FIFO showed when it was
+        /// processed.
+        case providerResult(ProviderResultEvidence)
+        /// Emitted by the controller rather than on a CLI boundary: stdout EOF (process exit), a
+        /// protocol failure, the deferred-completion idle-fallback timer, or the shutdown/EOF flush
+        /// of deferred completions. The last two carry a status classified from a CLI result, but
+        /// the controller timed the completion, so it is never provider-result evidence.
+        case controllerSynthesized
+
+        /// What a CLI `result` showed about the turn it was FIFO-credited to.
+        package struct ProviderResultEvidence: Equatable {
+            /// When the result was processed, this turn was the controller's only written turn
+            /// without a result, and no earlier result was still waiting for `idle`. Attribution is
+            /// FIFO, so a message the CLI skipped (no result) shifts later results one turn early;
+            /// with no other turn outstanding, no skipped message can sit ahead of this one.
+            package var soleOutstandingTurn: Bool
+            /// The result payload itself reports an aborted or interrupted turn (its `subtype` is
+            /// `error_during_execution`, or its `subtype`, `stop_reason`, `terminal_reason` or
+            /// `errors` name a cancellation), independent of the controller's interrupt marker. A
+            /// `success` result never does.
+            package var reportsInterruption: Bool
+            /// The result's own consumed-user attribution (`user_message_uuid(s)`) against the
+            /// outbound UUID this controller wrote for the credited turn.
+            package var messageIdentity: MessageIdentity
+
+            package init(
+                soleOutstandingTurn: Bool,
+                reportsInterruption: Bool,
+                messageIdentity: MessageIdentity
+            ) {
+                self.soleOutstandingTurn = soleOutstandingTurn
+                self.reportsInterruption = reportsInterruption
+                self.messageIdentity = messageIdentity
+            }
+        }
+
+        package enum MessageIdentity: Equatable {
+            /// The result carries no (non-null) `user_message_uuid` / `user_message_uuids`.
+            case notReported
+            /// Every attribution the result carries names exactly the credited turn's outbound UUID
+            /// (`user_message_uuids` exactly that singleton).
+            case namesTurn
+            /// The result names another message, more than one, or a turn written without an
+            /// outbound UUID: it is not this turn's result.
+            case contradictsTurn
+        }
+
+        /// The CLI's own interrupted-turn result, attributed while no other written turn was
+        /// outstanding, and affirmatively attributed by the CLI to exactly this turn's outbound
+        /// message. Unattributed results never qualify: an unrelated interrupted or failed result
+        /// (for example an aborted background continuation) carries no consumed user message, and
+        /// a turn written without an outbound UUID can never be named, so it stays uncertain.
+        package var isExclusiveInterruptedResult: Bool {
+            guard case let .providerResult(evidence) = self else { return false }
+            return evidence.soleOutstandingTurn
+                && evidence.reportsInterruption
+                && evidence.messageIdentity == .namesTurn
+        }
+    }
+
     /// RepoPrompt MCP health of the current launch. Transient and launch-scoped: every spawn starts
     /// `unknown`; fresh evidence (a `system/init` or `mcp_status` report of `connected`) makes it
     /// `connected`; an app-initiated loss of this launch's connection makes it `unhealthy` for the
@@ -116,7 +181,7 @@ package final actor ClaudeNativeProcessSessionController {
         case runtimeInit(RuntimeInitStatus)
         case approvalRequest(AgentApprovalRequest)
         case approvalCancelled(requestID: String)
-        case turnCompleted(turnID: UUID, status: TurnStatus)
+        case turnCompleted(turnID: UUID, status: TurnStatus, origin: TurnCompletionOrigin = .controllerSynthesized)
         case error(String)
         /// In-band position marker requested by the consumer (`emitEventMarker`); carries no
         /// provider output.
@@ -566,10 +631,22 @@ package final actor ClaudeNativeProcessSessionController {
     /// timeout) rather than completing immediately on `result/message_stop`.
     private var observedSessionStateChangedEvents = false
 
-    /// FIFO queue of result-derived turn statuses waiting for an `idle` signal.
+    /// A result-derived completion waiting for `idle`, with the origin fixed when its result was
+    /// processed (Step 12).
+    private struct DeferredTurnCompletion {
+        let status: TurnStatus
+        let origin: TurnCompletionOrigin
+    }
+
+    /// Step 12: the outbound user-message UUID each still-queued turn was written with, when its
+    /// frame carried one (identity-eligible launches only). Compared with a result's own
+    /// `user_message_uuid(s)`; cleared with the FIFO entry.
+    private var outboundUserMessageUUIDByTurnID: [UUID: UUID] = [:]
+
+    /// FIFO queue of result-derived turn completions waiting for an `idle` signal.
     /// Turn IDs remain in `pendingTurnIDBuffer` until the deferred completion fires
     /// so that `turnInFlight` stays true during the result→idle window.
-    private var pendingAuthoritativeTurnStatuses: [TurnStatus] = []
+    private var pendingAuthoritativeTurnCompletions: [DeferredTurnCompletion] = []
 
     /// Fallback task that fires when `idle` does not arrive within the expected window.
     private var authoritativeIdleFallbackTask: Task<Void, Never>?
@@ -1113,7 +1190,7 @@ package final actor ClaudeNativeProcessSessionController {
         try sendLine(payload, writeOwner: writeOwner)
         // The write succeeded: register the turn and its launch-local dispatch ordinal in this
         // same non-suspending actor step so no result can interleave between write and ordinal.
-        let turnID = beginTurnTracking()
+        let turnID = beginTurnTracking(outboundUserMessageUUID: outboundUserMessageUUID)
         registerUsageDispatch(turnID: turnID)
         noteLiveTranscriptOutbound(uuid: outboundUserMessageUUID, text: text)
         return turnID
@@ -2700,17 +2777,32 @@ package final actor ClaudeNativeProcessSessionController {
                     continue
                 }
                 let status = determineTurnStatus(from: payload, stopReasonHint: result.stopReason)
+                // Step 12: fixed now, against the FIFO as this result finds it (a later write must
+                // not make an earlier result look exclusive, nor the reverse). The credited turn is
+                // the first queued one whose result has not arrived.
+                // (Surplus results can outnumber queued turns in deferred mode: no credited turn.)
+                let creditedIndex = pendingTurnIDHead + pendingAuthoritativeTurnCompletions.count
+                let creditedTurnID = creditedIndex < pendingTurnIDBuffer.count ? pendingTurnIDBuffer[creditedIndex] : nil
+                let origin = TurnCompletionOrigin.providerResult(.init(
+                    soleOutstandingTurn: pendingTurnIDBuffer.count - pendingTurnIDHead == 1
+                        && pendingAuthoritativeTurnCompletions.isEmpty,
+                    reportsInterruption: Self.resultPayloadReportsInterruption(payload),
+                    messageIdentity: Self.resultMessageIdentity(
+                        payload,
+                        outbound: creditedTurnID.flatMap { outboundUserMessageUUIDByTurnID[$0] }
+                    )
+                ))
                 if observedSessionStateChangedEvents {
                     // Defer completion until `idle` arrives or fallback timer fires.
                     // Do NOT dequeue the turn ID yet — keep turnInFlight == true so
                     // callers (e.g. coordinator steering) don't send a new user message
                     // before the authoritative idle boundary.
-                    pendingAuthoritativeTurnStatuses.append(status)
+                    pendingAuthoritativeTurnCompletions.append(DeferredTurnCompletion(status: status, origin: origin))
                     scheduleAuthoritativeIdleFallbackIfNeeded()
                 } else {
                     // Legacy mode: complete immediately on result/message_stop.
                     let completedTurnID = dequeueTurnID()
-                    emitTurnCompleted(turnID: completedTurnID, status: status)
+                    emitTurnCompleted(turnID: completedTurnID, status: status, origin: origin)
                 }
             }
         }
@@ -2720,8 +2812,8 @@ package final actor ClaudeNativeProcessSessionController {
     /// the fallback timer as needed. Dequeues the turn ID from `pendingTurnIDBuffer` at
     /// this point so `turnInFlight` transitions to false.
     private func completeNextDeferredTurnIfPending() {
-        guard !pendingAuthoritativeTurnStatuses.isEmpty else { return }
-        let status = pendingAuthoritativeTurnStatuses.removeFirst()
+        guard !pendingAuthoritativeTurnCompletions.isEmpty else { return }
+        let completion = pendingAuthoritativeTurnCompletions.removeFirst()
         authoritativeIdleFallbackTask?.cancel()
         authoritativeIdleFallbackTask = nil
         guard hasPendingTurnIDs else {
@@ -2729,7 +2821,8 @@ package final actor ClaudeNativeProcessSessionController {
             return
         }
         let turnID = dequeueTurnID()
-        emitTurnCompleted(turnID: turnID, status: status)
+        // The CLI's own `idle` boundary: the result's origin stands.
+        emitTurnCompleted(turnID: turnID, status: completion.status, origin: completion.origin)
         // If more deferred completions remain, schedule a new fallback.
         scheduleAuthoritativeIdleFallbackIfNeeded()
     }
@@ -2739,7 +2832,7 @@ package final actor ClaudeNativeProcessSessionController {
     /// the turn completes anyway. Each task carries a generation token so stale
     /// tasks that wake after cancellation are safely ignored.
     private func scheduleAuthoritativeIdleFallbackIfNeeded() {
-        guard !pendingAuthoritativeTurnStatuses.isEmpty else {
+        guard !pendingAuthoritativeTurnCompletions.isEmpty else {
             authoritativeIdleFallbackTask?.cancel()
             authoritativeIdleFallbackTask = nil
             return
@@ -2760,8 +2853,8 @@ package final actor ClaudeNativeProcessSessionController {
         // Ignore stale firings from superseded tasks.
         guard generation == authoritativeIdleFallbackGeneration else { return }
         authoritativeIdleFallbackTask = nil
-        guard !pendingAuthoritativeTurnStatuses.isEmpty else { return }
-        let status = pendingAuthoritativeTurnStatuses.removeFirst()
+        guard !pendingAuthoritativeTurnCompletions.isEmpty else { return }
+        let status = pendingAuthoritativeTurnCompletions.removeFirst().status
         guard hasPendingTurnIDs else {
             noteMissingPendingTurnID(context: "idle fallback")
             return
@@ -2771,7 +2864,8 @@ package final actor ClaudeNativeProcessSessionController {
             "turnID": turnID.uuidString,
             "status": String(describing: status)
         ] as [String: Any])
-        emitTurnCompleted(turnID: turnID, status: status)
+        // Step 12: timed by the controller's fallback, not by the CLI.
+        emitTurnCompleted(turnID: turnID, status: status, origin: .controllerSynthesized)
         scheduleAuthoritativeIdleFallbackIfNeeded()
     }
 
@@ -2783,12 +2877,13 @@ package final actor ClaudeNativeProcessSessionController {
         authoritativeIdleFallbackTask = nil
         // Emit deferred completions with their original status — the result/message_stop
         // already established the correct turn outcome; only idle was missing.
-        for status in pendingAuthoritativeTurnStatuses {
+        for completion in pendingAuthoritativeTurnCompletions {
             guard hasPendingTurnIDs else { break }
             let turnID = dequeueTurnID()
-            emitTurnCompleted(turnID: turnID, status: status)
+            // Step 12: a shutdown/EOF flush, timed by the controller.
+            emitTurnCompleted(turnID: turnID, status: completion.status, origin: .controllerSynthesized)
         }
-        pendingAuthoritativeTurnStatuses.removeAll()
+        pendingAuthoritativeTurnCompletions.removeAll()
     }
 
     /// Records a turn-completion signal that arrived with no pending turn ID.
@@ -2813,7 +2908,7 @@ package final actor ClaudeNativeProcessSessionController {
             "context": context,
             "isShuttingDown": isShuttingDown,
             "turnWasInterrupted": turnWasInterrupted,
-            "pendingAuthoritativeStatusCount": pendingAuthoritativeTurnStatuses.count
+            "pendingAuthoritativeStatusCount": pendingAuthoritativeTurnCompletions.count
         ] as [String: Any])
         if config.enableDebugLogging {
             print("[ClaudeNativeSession] \(context) with no pending turn IDs — recovered (shutting_down=\(isShuttingDown))")
@@ -3435,8 +3530,8 @@ package final actor ClaudeNativeProcessSessionController {
         }
 
         @discardableResult
-        func test_beginTurnTracking() -> UUID {
-            beginTurnTracking()
+        func test_beginTurnTracking(outboundUserMessageUUID: UUID? = nil) -> UUID {
+            beginTurnTracking(outboundUserMessageUUID: outboundUserMessageUUID)
         }
 
         /// The production stdout-EOF path (process loss) for the given launch's reader.
@@ -3656,6 +3751,45 @@ package final actor ClaudeNativeProcessSessionController {
                 return nil
             }
         }
+    }
+
+    /// Step 12 (P1-A): whether a result payload itself reports an aborted or interrupted turn,
+    /// independent of the sticky `turnWasInterrupted` marker (which classifies whatever result comes
+    /// next). The CLI's subtype for an aborted turn is `error_during_execution` (SDK: "API failure OR
+    /// cancelled request"; observed on interrupts with `aborted_streaming`). A `success` result, the
+    /// shape of an ordinary or background-continuation turn, never qualifies.
+    private static func resultPayloadReportsInterruption(_ payload: [String: Any]) -> Bool {
+        guard (payload["type"] as? String) == "result" else { return false }
+        let subtype = ((payload["subtype"] as? String) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard subtype != "success" else { return false }
+        if subtype == "error_during_execution" { return true }
+        return isCancelledTurnSignal(subtype)
+            || isCancelledTurnSignal(payload["stop_reason"] as? String)
+            || isCancelledTurnSignal(payload["terminal_reason"] as? String)
+            || extractResultErrors(from: payload).contains(where: { isCancelledTurnSignal($0) })
+    }
+
+    /// Step 12 (P1-A): a result's consumed-user attribution against `outbound`, the UUID the credited
+    /// turn's frame was written with (nil when written without one). JSON `null` counts as absent.
+    private static func resultMessageIdentity(
+        _ payload: [String: Any],
+        outbound: UUID?
+    ) -> TurnCompletionOrigin.MessageIdentity {
+        let single = payload["user_message_uuid"].flatMap { $0 is NSNull ? nil : $0 }
+        let list = payload["user_message_uuids"].flatMap { $0 is NSNull ? nil : $0 }
+        guard single != nil || list != nil else { return .notReported }
+        guard let outbound else { return .contradictsTurn }
+        if let single {
+            guard let value = single as? String, UUID(uuidString: value) == outbound else { return .contradictsTurn }
+        }
+        if let list {
+            guard let values = list as? [Any], values.count == 1, let value = values[0] as? String,
+                  UUID(uuidString: value) == outbound
+            else { return .contradictsTurn }
+        }
+        return .namesTurn
     }
 
     private static func isCancelledTurnSignal(_ value: String?) -> Bool {
@@ -3885,7 +4019,7 @@ package final actor ClaudeNativeProcessSessionController {
             }
             emit(.error("Claude process exited unexpectedly."))
             for id in staleIDs {
-                emitTurnCompleted(turnID: id, status: .failed)
+                emitTurnCompleted(turnID: id, status: .failed, origin: .controllerSynthesized)
             }
         }
         endUsageLaunch()
@@ -3894,8 +4028,8 @@ package final actor ClaudeNativeProcessSessionController {
 
     /// Every completion-lifecycle exit emits the transcript event and, when a launch is active,
     /// the ordered accounting closure on the usage stream (after any attribution for the turn).
-    private func emitTurnCompleted(turnID: UUID, status: TurnStatus) {
-        emit(.turnCompleted(turnID: turnID, status: status))
+    private func emitTurnCompleted(turnID: UUID, status: TurnStatus, origin: TurnCompletionOrigin) {
+        emit(.turnCompleted(turnID: turnID, status: status, origin: origin))
         if let state = usageLaunchState {
             emitUsage(.turnClosed(launchToken: state.identity.token, turnID: turnID, status: status))
         }
@@ -4687,7 +4821,7 @@ package final actor ClaudeNativeProcessSessionController {
         let staleIDs = drainAllTurnIDs()
         if !staleIDs.isEmpty {
             for id in staleIDs {
-                emitTurnCompleted(turnID: id, status: .failed)
+                emitTurnCompleted(turnID: id, status: .failed, origin: .controllerSynthesized)
             }
         }
         await shutdown()
@@ -4953,9 +5087,12 @@ package final actor ClaudeNativeProcessSessionController {
     }
 
     @discardableResult
-    private func beginTurnTracking() -> UUID {
+    private func beginTurnTracking(outboundUserMessageUUID: UUID? = nil) -> UUID {
         let id = UUID()
         pendingTurnIDBuffer.append(id)
+        if let outboundUserMessageUUID {
+            outboundUserMessageUUIDByTurnID[id] = outboundUserMessageUUID
+        }
         return id
     }
 
@@ -4970,6 +5107,7 @@ package final actor ClaudeNativeProcessSessionController {
     private func dequeueTurnID() -> UUID {
         let id = pendingTurnIDBuffer[pendingTurnIDHead]
         pendingTurnIDHead += 1
+        outboundUserMessageUUIDByTurnID.removeValue(forKey: id)
         compactTurnIDBufferIfNeeded()
         startedTurnIDSnapshot.withLock { started in
             if started == id { started = nil }
@@ -4981,7 +5119,7 @@ package final actor ClaudeNativeProcessSessionController {
     /// mode, turns with a result awaiting `idle` are still queued ahead of it). No queued turn: the
     /// output is attributed to nothing.
     private func noteOutputAttributedToProducingTurn() {
-        let index = pendingTurnIDHead + pendingAuthoritativeTurnStatuses.count
+        let index = pendingTurnIDHead + pendingAuthoritativeTurnCompletions.count
         guard index < pendingTurnIDBuffer.count else { return }
         let id = pendingTurnIDBuffer[index]
         startedTurnIDSnapshot.withLock { $0 = id }
@@ -4999,6 +5137,7 @@ package final actor ClaudeNativeProcessSessionController {
     private func clearTurnIDQueue() {
         pendingTurnIDBuffer.removeAll(keepingCapacity: false)
         pendingTurnIDHead = 0
+        outboundUserMessageUUIDByTurnID.removeAll()
         startedTurnIDSnapshot.withLock { $0 = nil }
     }
 

@@ -1339,6 +1339,569 @@ extension AgentModeRunServiceLifecycleTests {
         XCTAssertEqual(needsAction, needsActionBefore, "Steering adds no needs-action item")
     }
 
+    // MARK: - Step 12: gated acceptance for interrupts before first output
+
+    /// Step 12 (steer): a written turn with no visible output (never credited as started) is
+    /// steered. The interrupt is acknowledged, and the steer holds its own write (production wait)
+    /// so the CLI's interrupted-turn `.cancelled` result for exactly that turn is processed while it
+    /// is still the controller's only outstanding turn (the real controller then reports it
+    /// exclusive; see ClaudeNativeTurnTeardownTests). Both together prove receipt: the message
+    /// settles accepted and adds no needs-action item. The acknowledgement alone does not accept it.
+    func testClaudeUnstartedTurnSteeredWithAcknowledgedInterruptAndProviderCancelledResultSettlesAccepted() async throws {
+        let run = try await startUnstartedClaudeRun("step12-claude-steer-accepted", unstartedResultWaitSeconds: nil)
+        defer { run.fixture.tearDown() }
+
+        try await steerClaude(
+            session: run.session,
+            controller: run.controller,
+            harness: run.harness,
+            fixture: run.fixture,
+            text: "steer",
+            awaitFlush: false
+        )
+        // The steer is waiting on the interrupted turn: it polled it in flight after the interrupt.
+        await run.controller.waitForInFlightObservationsAfterInterrupt(1)
+        XCTAssertEqual(run.recorder.events.count(where: { $0 == "claude:interrupt:interrupt" }), 1)
+        XCTAssertTrue(run.coordinator.test_hasUnstartedInterruptMark(turnID: run.firstTurnID))
+        let sentWhileHeld = await run.controller.recordedSentMessages()
+        XCTAssertEqual(sentWhileHeld, ["first"], "The steer holds its write until the interrupted turn's result")
+        let afterAcknowledgement = await run.fixture.intent(run.first)
+        XCTAssertNotEqual(afterAcknowledgement?.deliveryState, .providerAccepted, "The acknowledgement alone accepts nothing")
+
+        // The CLI's own result for the interrupted turn, naming its outbound UUID, processed before
+        // the steer's write.
+        await run.controller.emitProviderCancelledTurnCompletion(turnID: run.firstTurnID, messageIdentity: .namesTurn)
+        await run.session.claudeSteeringFlushTask?.value
+        let sent = await run.controller.recordedSentMessages()
+        XCTAssertEqual(sent, ["first", "steer"], "The steer is written once the result was processed")
+        let firstAccepted = await run.fixture.waitForIntent(run.first, state: .providerAccepted)
+        XCTAssertEqual(firstAccepted?.deliveryState, .providerAccepted, "The steered-over message was received")
+
+        let steerTurnID = try await waitForSentTurnID(run.controller, index: 1)
+        await run.controller.emitCompletedTurnCompletion(turnID: steerTurnID)
+        await endRun(run)
+        let firstAfterRun = await run.fixture.intent(run.first)
+        XCTAssertEqual(firstAfterRun?.deliveryState, .providerAccepted)
+        try await assertNeedsActionCountAfterAppliedState(
+            run.fixture,
+            run.first,
+            .providerAccepted,
+            equals: run.needsActionBefore,
+            "Steering before first output adds no needs-action item"
+        )
+    }
+
+    /// A Claude run whose first written turn (`first`) shows no visible output. The fake's interrupt
+    /// returns `interruptOutcome`, after `interruptGate` when given.
+    private struct UnstartedClaudeRun {
+        let fixture: RecoveryLaneFixture
+        let recorder: LifecycleRecorder
+        let controller: LifecycleFakeNativeController
+        let harness: LifecycleHarness
+        let session: AgentTabSession
+        let first: AgentQueuedInputIdentity
+        let firstTurnID: UUID
+        let agentTask: Task<Void, Never>?
+        let needsActionBefore: Int
+
+        @MainActor
+        var coordinator: ClaudeAgentModeCoordinator {
+            harness.host.claudeCoordinator
+        }
+    }
+
+    private func startUnstartedClaudeRun(
+        _ name: String,
+        interruptOutcome: NativeAgentRuntimeInterruptOutcome = .acknowledged,
+        interruptGate: LifecycleAsyncGate? = nil,
+        shutdownGate: LifecycleAsyncGate? = nil,
+        firstText: String = "first",
+        unstartedResultWaitSeconds: TimeInterval? = 0.05
+    ) async throws -> UnstartedClaudeRun {
+        let fixture = try await RecoveryLaneFixture.make(name)
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleFakeNativeController(
+            recorder: recorder,
+            shutdownGate: shutdownGate,
+            interruptOutcome: interruptOutcome,
+            interruptGate: interruptGate
+        )
+        let harness = makeHarness(recorder: recorder, claudeController: controller, autoSignalACPRouting: true)
+        if let unstartedResultWaitSeconds {
+            // Short by default so a steer that gets no result is not held for the production 1.5 s.
+            harness.host.claudeCoordinator.test_setUnstartedInterruptResultWaitSeconds(unstartedResultWaitSeconds)
+        }
+        let session = fixture.boundTabSession()
+        session.selectedAgent = .claudeCode
+        harness.host.test_installLiveSession(session)
+        let first = try await fixture.queuedIdentity(firstText)
+        session.recoveryAdmissionMode = .mandatory
+        let needsActionBefore = fixture.coordinator.catalog.openNeedsActionCount
+        let outcome = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: firstText,
+            initialMessageForRun: firstText,
+            attachments: [],
+            inputConstituents: [first]
+        )
+        XCTAssertNil(outcome)
+        let agentTask = session.agentTask
+        let firstTurnID = try await waitForSentTurnID(controller, index: 0)
+        XCTAssertNil(controller.startedTurnID, "Precondition: no visible output, so the turn is not credited as started")
+        return UnstartedClaudeRun(
+            fixture: fixture,
+            recorder: recorder,
+            controller: controller,
+            harness: harness,
+            session: session,
+            first: first,
+            firstTurnID: firstTurnID,
+            agentTask: agentTask,
+            needsActionBefore: needsActionBefore
+        )
+    }
+
+    /// Waits until `turnID`'s written message has its final evidence decided (no longer tracked),
+    /// so no later event can change it.
+    private func waitUntilDecided(_ run: UnstartedClaudeRun, _ turnID: UUID) async throws {
+        for _ in 0 ..< 300 where run.coordinator.test_tracksWrittenDispatchHandoff(turnID: turnID) {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertFalse(run.coordinator.test_tracksWrittenDispatchHandoff(turnID: turnID), "The message's evidence is decided")
+    }
+
+    private func endRun(_ run: UnstartedClaudeRun) async {
+        await run.harness.service.cancelRun(
+            tabID: run.session.tabID, session: run.session, cause: .userCancel, completion: .terminalTeardownCompleted
+        )
+        await run.agentTask?.value
+    }
+
+    /// Step 12 (steer, either order): the CLI's exclusive cancelled result can arrive while the
+    /// interrupt is still awaited. It is held, accepts nothing on its own, and the acknowledgement
+    /// then accepts the message.
+    func testClaudeUnstartedSteerProviderResultBeforeAcknowledgementWaitsThenAccepts() async throws {
+        let interruptGate = LifecycleAsyncGate()
+        let run = try await startUnstartedClaudeRun("step12-claude-result-first", interruptGate: interruptGate)
+        defer { run.fixture.tearDown() }
+        await run.controller.setTurnInFlight(true)
+        let steer = try await run.fixture.queuedIdentity("steer")
+        run.session.pendingClaudeSteeringInstructions.append(AgentTabSession.ClaudeSteeringInstruction(
+            id: UUID(),
+            targetRunID: run.session.runID,
+            targetRunAttemptID: run.session.activeRunAttemptID,
+            providerText: "steer",
+            attachments: [],
+            taggedFileAttachments: [],
+            draftText: "steer",
+            identity: steer,
+            createdAt: Date()
+        ))
+        _ = await run.harness.service.submitQueuedClaudeSteeringIfSupported(session: run.session)
+        await interruptGate.waitUntilArrived()
+        XCTAssertTrue(run.coordinator.test_hasUnstartedInterruptMark(turnID: run.firstTurnID), "The sole unresolved turn is marked")
+
+        await run.controller.emitProviderCancelledTurnCompletion(turnID: run.firstTurnID, messageIdentity: .namesTurn)
+        for _ in 0 ..< 300 where !run.coordinator.test_holdsCompletionDuringInterrupt(turnID: run.firstTurnID) {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertTrue(run.coordinator.test_holdsCompletionDuringInterrupt(turnID: run.firstTurnID), "The result waits for the interrupt")
+        let duringInterrupt = await run.fixture.intent(run.first)
+        XCTAssertNotEqual(duringInterrupt?.deliveryState, .providerAccepted, "The result alone accepts nothing")
+
+        await interruptGate.release()
+        await run.session.claudeSteeringFlushTask?.value
+        let accepted = await run.fixture.waitForIntent(run.first, state: .providerAccepted)
+        XCTAssertEqual(accepted?.deliveryState, .providerAccepted)
+        await endRun(run)
+    }
+
+    /// Step 12 negative: after an acknowledged interrupt, a completion the controller synthesized
+    /// (a flush carrying the result's `.cancelled`, or the process exit's `.failed`) is not the CLI's
+    /// own result for the turn. The message stays uncertain.
+    func testClaudeUnstartedSteerThenControllerSynthesizedCompletionStaysUncertain() async throws {
+        for status in [NativeAgentRuntimeTurnStatus.cancelled, .failed] {
+            let run = try await startUnstartedClaudeRun("step12-claude-synthesized-\(status)")
+            defer { run.fixture.tearDown() }
+            try await steerClaude(
+                session: run.session, controller: run.controller, harness: run.harness, fixture: run.fixture, text: "steer"
+            )
+            XCTAssertTrue(run.coordinator.test_hasUnstartedInterruptMark(turnID: run.firstTurnID), "\(status)")
+
+            await run.controller.emitControllerSynthesizedTurnCompletion(turnID: run.firstTurnID, status: status)
+            try await waitUntilDecided(run, run.firstTurnID)
+            let unknown = await run.fixture.waitForIntent(run.first, state: .deliveryUnknown)
+            XCTAssertEqual(unknown?.deliveryState, .deliveryUnknown, "\(status): a synthesized completion proves nothing")
+            await endRun(run)
+            let final = await run.fixture.intent(run.first)
+            XCTAssertEqual(final?.deliveryState, .deliveryUnknown, "\(status)")
+        }
+    }
+
+    /// Step 12 negative: an acknowledged interrupt with no CLI result before the run ends leaves the
+    /// message uncertain (the acknowledgement alone is never acceptance).
+    func testClaudeUnstartedSteerAcknowledgedWithoutResultStaysUncertainAtRunEnd() async throws {
+        let run = try await startUnstartedClaudeRun("step12-claude-ack-no-result")
+        defer { run.fixture.tearDown() }
+        try await steerClaude(
+            session: run.session, controller: run.controller, harness: run.harness, fixture: run.fixture, text: "steer"
+        )
+        XCTAssertTrue(run.coordinator.test_hasUnstartedInterruptMark(turnID: run.firstTurnID))
+        let sent = await run.controller.recordedSentMessages()
+        XCTAssertEqual(sent, ["first", "steer"], "The held steer is written when its bounded wait times out")
+        let steerTurnID = try await waitForSentTurnID(run.controller, index: 1)
+        // The steer's own turn ends the run; the interrupted turn never got its result.
+        await run.controller.emitCompletedTurnCompletion(turnID: steerTurnID)
+        await endRun(run)
+        let unknown = await run.fixture.waitForIntent(run.first, state: .deliveryUnknown)
+        XCTAssertEqual(unknown?.deliveryState, .deliveryUnknown, "Acknowledged, but no result: not confirmed")
+        let attempts = await run.fixture.attempts(for: run.first)
+        XCTAssertEqual(attempts.first?.outcome?.outcome, .deliveryUnknown)
+    }
+
+    /// Step 12 negative: a timed-out or failed interrupt is withdrawn, so even the CLI's exclusive
+    /// cancelled result (whether it arrived during the interrupt or after) proves nothing.
+    func testClaudeUnstartedSteerWithUnacknowledgedInterruptStaysUncertain() async throws {
+        for outcome in [NativeAgentRuntimeInterruptOutcome.timedOut, .failed] {
+            for resultDuringInterrupt in [false, true] {
+                let label = "\(outcome) resultDuringInterrupt=\(resultDuringInterrupt)"
+                let interruptGate = LifecycleAsyncGate()
+                let run = try await startUnstartedClaudeRun(
+                    "step12-claude-unacknowledged-\(outcome)-\(resultDuringInterrupt)",
+                    interruptOutcome: outcome,
+                    interruptGate: interruptGate
+                )
+                defer { run.fixture.tearDown() }
+                await run.controller.setTurnInFlight(true)
+                let steer = try await run.fixture.queuedIdentity("steer")
+                run.session.pendingClaudeSteeringInstructions.append(AgentTabSession.ClaudeSteeringInstruction(
+                    id: UUID(),
+                    targetRunID: run.session.runID,
+                    targetRunAttemptID: run.session.activeRunAttemptID,
+                    providerText: "steer",
+                    attachments: [],
+                    taggedFileAttachments: [],
+                    draftText: "steer",
+                    identity: steer,
+                    createdAt: Date()
+                ))
+                _ = await run.harness.service.submitQueuedClaudeSteeringIfSupported(session: run.session)
+                await interruptGate.waitUntilArrived()
+                if resultDuringInterrupt {
+                    await run.controller.emitProviderCancelledTurnCompletion(turnID: run.firstTurnID)
+                    for _ in 0 ..< 300 where !run.coordinator.test_holdsCompletionDuringInterrupt(turnID: run.firstTurnID) {
+                        try await Task.sleep(nanoseconds: 10_000_000)
+                    }
+                    XCTAssertTrue(run.coordinator.test_holdsCompletionDuringInterrupt(turnID: run.firstTurnID), label)
+                }
+                await interruptGate.release()
+                await run.session.claudeSteeringFlushTask?.value
+                // The steer's race tolerance writes it only when the turn already ended meanwhile.
+                let sent = await run.controller.recordedSentMessages()
+                XCTAssertEqual(sent, resultDuringInterrupt ? ["first", "steer"] : ["first"], label)
+                if !resultDuringInterrupt {
+                    XCTAssertFalse(run.coordinator.test_hasUnstartedInterruptMark(turnID: run.firstTurnID), "\(label): withdrawn")
+                    await run.controller.emitProviderCancelledTurnCompletion(turnID: run.firstTurnID)
+                }
+                try await waitUntilDecided(run, run.firstTurnID)
+                let unknown = await run.fixture.waitForIntent(run.first, state: .deliveryUnknown)
+                XCTAssertEqual(unknown?.deliveryState, .deliveryUnknown, label)
+                await endRun(run)
+            }
+        }
+    }
+
+    /// Step 12 attribution: a message the CLI skipped (duplicate UUID; it never gets a result) sits
+    /// at the FIFO head, a fresh message behind it, then a steer interrupts. With two unresolved
+    /// turns nothing is marked, and the CLI's cancelled result (really the fresh turn's, FIFO-credited
+    /// to the phantom) is not exclusive. Neither the phantom nor the fresh message is accepted.
+    func testClaudeSkippedMessageAheadOfAFreshOneNeverAcceptsEitherOnAnInterruptedResult() async throws {
+        let run = try await startUnstartedClaudeRun("step12-claude-phantom-head", firstText: "phantom")
+        defer { run.fixture.tearDown() }
+        let phantomTurnID = run.firstTurnID
+        // The fresh message is written while the fake reports no turn in flight: no interrupt.
+        let fresh = try await steerClaude(
+            session: run.session,
+            controller: run.controller,
+            harness: run.harness,
+            fixture: run.fixture,
+            text: "fresh",
+            turnInFlight: false
+        )
+        XCTAssertEqual(run.recorder.events.count(where: { $0 == "claude:interrupt:interrupt" }), 0)
+        let freshTurnID = try await waitForSentTurnID(run.controller, index: 1)
+
+        try await steerClaude(
+            session: run.session, controller: run.controller, harness: run.harness, fixture: run.fixture, text: "steer"
+        )
+        XCTAssertEqual(run.recorder.events.count(where: { $0 == "claude:interrupt:interrupt" }), 1)
+        XCTAssertFalse(run.coordinator.test_hasUnstartedInterruptMark(turnID: phantomTurnID), "Two unresolved turns: no mark")
+        XCTAssertFalse(run.coordinator.test_hasUnstartedInterruptMark(turnID: freshTurnID), "Two unresolved turns: no mark")
+
+        // The real controller credits the head and reports a shared FIFO (see
+        // ClaudeNativeTurnTeardownTests); even an exclusive claim would find no mark.
+        await run.controller.emitProviderCancelledTurnCompletion(turnID: phantomTurnID, soleOutstandingTurn: false)
+        try await waitUntilDecided(run, phantomTurnID)
+        await endRun(run)
+        let phantomState = await run.fixture.waitForIntent(run.first, state: .deliveryUnknown)
+        let freshState = await run.fixture.waitForIntent(fresh, state: .deliveryUnknown)
+        XCTAssertEqual(phantomState?.deliveryState, .deliveryUnknown, "The skipped message is never accepted")
+        XCTAssertEqual(freshState?.deliveryState, .deliveryUnknown, "The fresh message is never accepted on a result it was not credited")
+    }
+
+    /// Step 12 attribution: a skipped message alone is marked by a steer (it is the sole unresolved
+    /// turn) and the interrupt is acknowledged, but no result of its own ever comes. The next result
+    /// is the steer message's, processed with both turns outstanding, so it is not exclusive and the
+    /// skipped message is not accepted on it.
+    func testClaudeSkippedMessageAloneIsNotAcceptedOnTheSteerMessagesResult() async throws {
+        let run = try await startUnstartedClaudeRun("step12-claude-phantom-alone", firstText: "phantom")
+        defer { run.fixture.tearDown() }
+        try await steerClaude(
+            session: run.session, controller: run.controller, harness: run.harness, fixture: run.fixture, text: "steer"
+        )
+        XCTAssertTrue(run.coordinator.test_hasUnstartedInterruptMark(turnID: run.firstTurnID), "Sole at the interrupt: marked")
+        let sent = await run.controller.recordedSentMessages()
+        XCTAssertEqual(sent, ["phantom", "steer"])
+
+        // FIFO [phantom, steer]: the steer's result is credited to the phantom, not exclusively.
+        await run.controller.emitProviderCancelledTurnCompletion(turnID: run.firstTurnID, soleOutstandingTurn: false)
+        try await waitUntilDecided(run, run.firstTurnID)
+        let unknown = await run.fixture.waitForIntent(run.first, state: .deliveryUnknown)
+        XCTAssertEqual(unknown?.deliveryState, .deliveryUnknown, "A shared-FIFO result never accepts a turn without output")
+        await endRun(run)
+        let final = await run.fixture.intent(run.first)
+        XCTAssertEqual(final?.deliveryState, .deliveryUnknown)
+    }
+
+    /// Step 12 (Stop): Stop interrupts a written turn with no visible output, the interrupt is
+    /// acknowledged, and the CLI's own cancelled result arrives before the controller shuts down.
+    /// Run end records the message uncertain first (Stop detaches before it interrupts); the result
+    /// then refines it to accepted, and the needs-action count returns to its baseline.
+    func testClaudeUnstartedTurnStoppedWithAcknowledgedInterruptAndProviderCancelledResultSettlesAccepted() async throws {
+        let shutdownGate = LifecycleAsyncGate()
+        let run = try await startUnstartedClaudeRun("step12-claude-stop-accepted", shutdownGate: shutdownGate)
+        defer { run.fixture.tearDown() }
+        await run.controller.setTurnInFlight(true)
+
+        await run.harness.service.cancelRun(tabID: run.session.tabID, session: run.session, cause: .userCancel)
+        await run.agentTask?.value
+        await shutdownGate.waitUntilArrived()
+        XCTAssertTrue(run.recorder.contains("claude:interrupt:interrupt"), "Stop interrupts the in-flight turn")
+        XCTAssertTrue(run.coordinator.test_hasUnstartedInterruptMark(turnID: run.firstTurnID), "Acknowledged, awaiting the result")
+
+        // The CLI's own result for the interrupted turn, naming its outbound UUID.
+        await run.controller.emitProviderCancelledTurnCompletion(turnID: run.firstTurnID, messageIdentity: .namesTurn)
+        let accepted = await run.fixture.waitForIntent(run.first, state: .providerAccepted)
+        XCTAssertEqual(accepted?.deliveryState, .providerAccepted)
+        await shutdownGate.release()
+        try await assertNeedsActionCountAfterAppliedState(
+            run.fixture,
+            run.first,
+            .providerAccepted,
+            equals: run.needsActionBefore,
+            "Stop before first output leaves no needs-action item once the CLI's result arrives"
+        )
+    }
+
+    /// Step 12 (OracleA P1): a message the CLI skipped is the sole pending turn. Stop interrupts it
+    /// and the interrupt is acknowledged, but the next result is not that message's: a background
+    /// continuation or replay (`success`; the sticky marker still classifies it `.cancelled`), an
+    /// interrupted result whose own attribution names another message, or an unattributed
+    /// `error_during_execution` (an aborted background turn or an API failure names no message).
+    /// The real controller reports these as not exclusive (see ClaudeNativeTurnTeardownTests), so
+    /// the message stays uncertain.
+    func testClaudeSkippedMessageAloneStoppedIsNotAcceptedOnAnUnrelatedResult() async throws {
+        let unrelated: [(label: String, reportsInterruption: Bool, identity: NativeAgentRuntimeTurnCompletionOrigin.MessageIdentity)] = [
+            ("success result", false, .notReported),
+            ("result naming another message", true, .contradictsTurn),
+            ("unattributed error_during_execution", true, .notReported)
+        ]
+        for (index, testCase) in unrelated.enumerated() {
+            let shutdownGate = LifecycleAsyncGate()
+            let run = try await startUnstartedClaudeRun(
+                "step12-claude-stop-unrelated-\(index)",
+                shutdownGate: shutdownGate,
+                firstText: "phantom"
+            )
+            defer { run.fixture.tearDown() }
+            await run.controller.setTurnInFlight(true)
+            await run.harness.service.cancelRun(tabID: run.session.tabID, session: run.session, cause: .userCancel)
+            await run.agentTask?.value
+            await shutdownGate.waitUntilArrived()
+            XCTAssertTrue(run.coordinator.test_hasUnstartedInterruptMark(turnID: run.firstTurnID), testCase.label)
+
+            await run.controller.emitProviderCancelledTurnCompletion(
+                turnID: run.firstTurnID,
+                soleOutstandingTurn: true,
+                reportsInterruption: testCase.reportsInterruption,
+                messageIdentity: testCase.identity
+            )
+            try await waitUntilDecided(run, run.firstTurnID)
+            await shutdownGate.release()
+            let final = await run.fixture.waitForIntent(run.first, state: .deliveryUnknown)
+            XCTAssertEqual(final?.deliveryState, .deliveryUnknown, "\(testCase.label): never accepted")
+        }
+    }
+
+    /// Step 12 (OracleB P1-N1): a turn keeps an acknowledged unstarted mark from an earlier steer
+    /// that got no result, and is later credited as started. With no result of its own after an
+    /// acknowledged interrupt, that credit is almost certainly the next message's output (FIFO head),
+    /// so neither a second steer nor Stop promotes it through O49: no started mark, nothing parked
+    /// in `completionDuringInterrupt`, and the message stays uncertain under the Step 12 gate.
+    func testClaudeAcknowledgedUnstartedTurnLaterCreditedAsStartedIsNotPromotedByO49() async throws {
+        for route in ["steer", "stop"] {
+            let run = try await startUnstartedClaudeRun("step12-claude-suspect-started-\(route)")
+            defer { run.fixture.tearDown() }
+            try await steerClaude(
+                session: run.session, controller: run.controller, harness: run.harness, fixture: run.fixture, text: "steer1"
+            )
+            XCTAssertTrue(run.coordinator.test_hasUnstartedInterruptMark(turnID: run.firstTurnID), "\(route): acknowledged, no result")
+
+            // steer1's output is credited to the first turn, still the FIFO head.
+            await run.controller.setStartedTurnID(run.firstTurnID)
+            if route == "steer" {
+                try await steerClaude(
+                    session: run.session, controller: run.controller, harness: run.harness, fixture: run.fixture, text: "steer2"
+                )
+                XCTAssertEqual(run.recorder.events.count(where: { $0 == "claude:interrupt:interrupt" }), 2)
+                XCTAssertTrue(run.coordinator.test_hasUnstartedInterruptMark(turnID: run.firstTurnID), "Still under the Step 12 gate")
+                let notAccepted = await run.fixture.intent(run.first)
+                XCTAssertNotEqual(notAccepted?.deliveryState, .providerAccepted, "The second steer's acknowledgement accepts nothing")
+                let sent = await run.controller.recordedSentMessages()
+                XCTAssertEqual(sent, ["first", "steer1", "steer2"])
+
+                // The next result is FIFO-credited to the first turn with later turns outstanding.
+                await run.controller.emitProviderCancelledTurnCompletion(turnID: run.firstTurnID, soleOutstandingTurn: false)
+                try await waitUntilDecided(run, run.firstTurnID)
+                XCTAssertFalse(
+                    run.coordinator.test_holdsCompletionDuringInterrupt(turnID: run.firstTurnID),
+                    "Nothing parked for an O49 interrupt outcome"
+                )
+                let unknown = await run.fixture.waitForIntent(run.first, state: .deliveryUnknown)
+                XCTAssertEqual(unknown?.deliveryState, .deliveryUnknown, route)
+                await endRun(run)
+            } else {
+                await run.controller.setTurnInFlight(true)
+                await run.harness.service.cancelRun(tabID: run.session.tabID, session: run.session, cause: .userCancel)
+                await run.agentTask?.value
+                for _ in 0 ..< 300 where !run.recorder.contains("claude:shutdown") {
+                    try await Task.sleep(nanoseconds: 10_000_000)
+                }
+                XCTAssertTrue(run.recorder.contains("claude:shutdown"))
+                XCTAssertTrue(run.coordinator.test_hasUnstartedInterruptMark(turnID: run.firstTurnID), "Stop places no teardown mark")
+                XCTAssertFalse(run.coordinator.test_holdsCompletionDuringInterrupt(turnID: run.firstTurnID))
+                let unknown = await run.fixture.waitForIntent(run.first, state: .deliveryUnknown)
+                XCTAssertEqual(unknown?.deliveryState, .deliveryUnknown, route)
+            }
+            let final = await run.fixture.intent(run.first)
+            XCTAssertEqual(final?.deliveryState, .deliveryUnknown, "\(route): never promoted to accepted")
+        }
+    }
+
+    /// Step 12 (P2): a steer of a started turn is never held for the interrupted turn's result, even
+    /// with the production wait: it is written before any completion is emitted, without polling the
+    /// interrupted turn after the interrupt, and O49 accepts the started turn on the acknowledgement.
+    func testClaudeSteerOfAStartedTurnIsNotHeld() async throws {
+        let run = try await startUnstartedClaudeRun("step12-claude-started-not-held", unstartedResultWaitSeconds: nil)
+        defer { run.fixture.tearDown() }
+        await run.controller.setStartedTurnID(run.firstTurnID)
+        try await steerClaude(
+            session: run.session, controller: run.controller, harness: run.harness, fixture: run.fixture, text: "steer"
+        )
+        let sent = await run.controller.recordedSentMessages()
+        XCTAssertEqual(sent, ["first", "steer"], "Written with no completion emitted for the interrupted turn")
+        let observations = await run.controller.inFlightObservationCountAfterInterrupt()
+        XCTAssertEqual(observations, 0, "The steer never waited on the interrupted turn after its interrupt")
+        XCTAssertFalse(run.coordinator.test_hasUnstartedInterruptMark(turnID: run.firstTurnID))
+        let accepted = await run.fixture.waitForIntent(run.first, state: .providerAccepted)
+        XCTAssertEqual(accepted?.deliveryState, .providerAccepted)
+        await endRun(run)
+    }
+
+    /// Step 12 (Stop, known gap): when the controller is gone before the CLI's result arrives (Stop
+    /// with no result, quit, kill), the acknowledged interrupt alone keeps the message uncertain.
+    func testClaudeUnstartedTurnStoppedWithoutResultStaysUncertain() async throws {
+        let run = try await startUnstartedClaudeRun("step12-claude-stop-no-result")
+        defer { run.fixture.tearDown() }
+        await run.controller.setTurnInFlight(true)
+        await run.harness.service.cancelRun(tabID: run.session.tabID, session: run.session, cause: .userCancel)
+        await run.agentTask?.value
+        for _ in 0 ..< 300 where !run.recorder.contains("claude:shutdown") {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertTrue(run.recorder.contains("claude:shutdown"), "The controller shut down before any result")
+        let unknown = await run.fixture.waitForIntent(run.first, state: .deliveryUnknown)
+        XCTAssertEqual(unknown?.deliveryState, .deliveryUnknown)
+    }
+
+    /// The `index`th turn ID this fake controller returned from a successful write.
+    private func waitForSentTurnID(_ controller: LifecycleFakeNativeController, index: Int) async throws -> UUID {
+        for _ in 0 ..< 300 {
+            let turnIDs = await controller.recordedSentTurnIDs()
+            if turnIDs.count > index { return turnIDs[index] }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let turnIDs = await controller.recordedSentTurnIDs()
+        return try XCTUnwrap(turnIDs.count > index ? turnIDs[index] : nil, "write \(index) never happened")
+    }
+
+    /// Queues `text` as a steer of the session's running Claude turn and flushes it. The fake reports
+    /// a turn in flight, so the steer interrupts before it writes. Returns the steer's identity.
+    @discardableResult
+    private func steerClaude(
+        session: AgentTabSession,
+        controller: LifecycleFakeNativeController,
+        harness: LifecycleHarness,
+        fixture: RecoveryLaneFixture,
+        text: String,
+        turnInFlight: Bool = true,
+        awaitFlush: Bool = true
+    ) async throws -> AgentQueuedInputIdentity {
+        await controller.setTurnInFlight(turnInFlight)
+        let steer = try await fixture.queuedIdentity(text)
+        session.pendingClaudeSteeringInstructions.append(AgentTabSession.ClaudeSteeringInstruction(
+            id: UUID(),
+            targetRunID: session.runID,
+            targetRunAttemptID: session.activeRunAttemptID,
+            providerText: text,
+            attachments: [],
+            taggedFileAttachments: [],
+            draftText: text,
+            identity: steer,
+            createdAt: Date()
+        ))
+        _ = await harness.service.submitQueuedClaudeSteeringIfSupported(session: session)
+        if awaitFlush {
+            await session.claudeSteeringFlushTask?.value
+        }
+        return steer
+    }
+
+    /// Barrier: waits until the coordinator applied `state` for `identity` to the record the catalog
+    /// projects, then reads the open needs-action count once (never polled toward the expectation).
+    private func assertNeedsActionCountAfterAppliedState(
+        _ fixture: RecoveryLaneFixture,
+        _ identity: AgentQueuedInputIdentity,
+        _ state: AgentRecoveryDeliveryState,
+        equals expected: Int,
+        _ message: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws {
+        let intentID = try XCTUnwrap(identity.intentID, file: file, line: line)
+        func applied() -> Bool {
+            guard case let .supported(record)? = fixture.coordinator.liveRecordState(for: fixture.sessionID)
+            else { return false }
+            return record.intent(id: intentID)?.deliveryState == state
+        }
+        for _ in 0 ..< 300 where !applied() {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertTrue(applied(), "The catalog's source record carries \(state)", file: file, line: line)
+        XCTAssertEqual(fixture.coordinator.catalog.openNeedsActionCount, expected, message, file: file, line: line)
+    }
+
     /// Polls the catalog's open needs-action count until it equals `expected` or the bound expires.
     private func waitForOpenNeedsActionCount(_ fixture: RecoveryLaneFixture, _ expected: Int) async -> Int {
         for _ in 0 ..< 300 where fixture.coordinator.catalog.openNeedsActionCount != expected {

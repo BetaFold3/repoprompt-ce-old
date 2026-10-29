@@ -30,9 +30,22 @@ This feature is implemented and in production. Its completed plan, the per-step 
   - "Queued" needs a store receipt, and "accepted" needs affirmative provider evidence.
 - **RepoPrompt's own interrupts count as acceptance (O49).**
   - A written message whose turn started, and which RepoPrompt itself then interrupted by steer, Stop, window close or quit, settles `providerAccepted`. It creates no row and no Needs Attention item.
-  - **Claude:** a start is credited only from `assistant` or `stream_event` output of that exact turn (`startedTurnID`), never from the final `result` message or a queued turn.
+  - **Claude:** a start (`startedTurnID`) is credited only by the first non-empty text block or tool call in a complete `assistant` envelope of that turn. It is never credited by the final `result` message or by a queued turn.
+    - The CLI is launched without `--include-partial-messages`, so no `stream_event` payloads arrive.
+    - Reasoning extraction is off (`ClaudeReasoningExtractionFeature.isEnabled == false`), so thinking-only output credits nothing.
+    - The uncredited window is therefore everything before Claude's first visible output. On a reasoning-heavy turn that can be tens of seconds.
     - A steer's mark stays provisional until the interrupt is acknowledged. The interrupt is bounded by a 1.5-second control timeout.
     - Stop, window close and quit set a final teardown mark before the run detaches.
+    - **Before first output (Step 12, gated acceptance).** A turn interrupted by RepoPrompt before it was credited as started settles `providerAccepted` only when all of these hold:
+      - the interrupt was acknowledged;
+      - a CLI-authored result, not one the controller synthesized, arrives for that turn;
+      - the result reports the interruption itself;
+      - it names that turn's outbound UUID (`user_message_uuid(s)`);
+      - that turn was the only unresolved written turn, both when the interrupt was issued and when the result arrived.
+
+      Anything else stays `deliveryUnknown`.
+    - After such an acknowledged interrupt, the steer holds its own write for up to 1.5 s so that result can arrive first.
+    - A turn with an acknowledged pre-output interrupt never gets an O49 mark later.
   - **ACP:** receipt evidence is kept per prompt. A prompt that overlaps another can never prove receipt.
   - **Codex** has no equivalent path.
 - **Crash wording only after an unclean exit (O50).** "RepoPrompt quit unexpectedly" and "closed while sending" wording appears only when no run end was recorded. Otherwise the message reads "Not confirmed", and the not-sent text is neutral.
@@ -66,6 +79,13 @@ This feature is implemented and in production. Its completed plan, the per-step 
 - **Continue and Check provider history** appear only while the session is open (U1, by design).
 
 ## Known gaps
+- **Interrupt before first output, unproven live.** Gated acceptance needs the CLI to name the interrupted message's UUID on its interrupted result, and nobody has observed that yet.
+  - If the CLI doesn't, a steer or Stop before first output still ends `deliveryUnknown`. That shows as a "Message may have been delivered" row with a "Not confirmed" bubble. The same applies to launches that send no outbound UUID.
+  - Each such steer then also pays the full 1.5 s hold.
+  - A live capture should record whether that result arrives, its shape, whether it is attributed, and how its timing compares with the 1.5 s steer hold and the 200 ms Stop window.
+  - Only if rows still appear in practice, evaluate `--include-partial-messages`, with its own tests.
+- **Quit or kill before first output.** If the process is gone before the CLI writes its result, the message stays uncertain.
+- **FIFO attribution.** Claude output is credited to turns by queue position, not by user-message UUID. If the CLI silently skips a message (for example a duplicate UUID replayed through the shim), that message never gets a result, and every later turn's output is credited one turn early. No in-app path reuses a UUID, so this needs external replay.
 - No route-level ACP Stop or quit test; ACP is covered at controller level.
 - Claude teardown routes other than Stop, quit and window close (agent or model switch, MCP-health restart, session reset) record `deliveryUnknown` first, then refine it to accepted on an interrupt acknowledgement.
 - After a second kill, an orphan tool result can show as a duplicate row.

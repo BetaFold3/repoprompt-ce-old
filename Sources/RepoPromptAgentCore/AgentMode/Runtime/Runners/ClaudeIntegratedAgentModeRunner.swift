@@ -441,9 +441,14 @@ final class ClaudeIntegratedAgentModeRunner {
                 }
                 hooks.updateBindings(session)
             }
-        case let .turnCompleted(turnID, turnStatus):
+        case let .turnCompleted(turnID, turnStatus, origin):
             // Provider evidence first, before any reconciliation below.
-            claudeCoordinator.noteClaudeTurnCompleted(turnID: turnID, status: turnStatus, isEmittedBy: isEmittedBy)
+            claudeCoordinator.noteClaudeTurnCompleted(
+                turnID: turnID,
+                status: turnStatus,
+                origin: origin,
+                isEmittedBy: isEmittedBy
+            )
             guard session.claudeExpectedTurnIDs.contains(turnID) else {
                 // Stale completion from a previous cancelled run attempt; ignore.
                 return nil
@@ -726,13 +731,14 @@ final class ClaudeIntegratedAgentModeRunner {
         controller: AnyObject,
         sourceID: UUID
     ) async {
-        if case let .turnCompleted(turnID, turnStatus) = event {
+        if case let .turnCompleted(turnID, turnStatus, origin) = event {
             // Provider evidence for a written message is honored even after its run attempt
             // ended or the tab moved to another controller: it applies only to the turn this
             // same controller wrote (never a successor's).
             claudeCoordinator.noteClaudeTurnCompleted(
                 turnID: turnID,
                 status: turnStatus,
+                origin: origin,
                 isEmittedBy: { $0 === controller }
             )
         }

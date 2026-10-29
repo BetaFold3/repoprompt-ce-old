@@ -137,6 +137,10 @@ package final class ClaudeAgentModeCoordinator {
     private let steeringInterruptSafePointTimeoutSeconds: TimeInterval
     private let globalCodeMapsDisabled: @MainActor () -> Bool
     private var interruptedTurnSettlementTimeoutSeconds: TimeInterval = 5.0
+    /// Step 12: how long a steer holds its own write after an acknowledged interrupt of a turn with
+    /// no visible output, so the CLI's result for that turn arrives while it is still the
+    /// controller's only outstanding turn. Capped at the interrupt's 1.5 s control timeout.
+    private var unstartedInterruptResultWaitSeconds: TimeInterval = 1.5
 
     /// Per-tab tool tracking handler for Claude sessions.
     /// Each tab gets its own handler instance to isolate correlation state across concurrent sessions.
@@ -174,6 +178,28 @@ package final class ClaudeAgentModeCoordinator {
         /// A cancelled/failed completion that arrived while `interruptPending`; decided once the
         /// interrupt outcome is known.
         var completionDuringInterrupt: NativeAgentRuntimeTurnStatus?
+        /// Step 12: RepoPrompt's own interrupt (steer or cleanup) of this turn before the CLI was
+        /// credited with starting it, placed only while it was the writing controller's sole
+        /// unresolved written turn. Accepts only with both an acknowledged interrupt and the CLI's
+        /// own exclusive `.cancelled` result for this turn, in either order.
+        var unstartedInterrupt: UnstartedInterrupt?
+    }
+
+    /// Which mark `noteRepoPromptInterruptRequested` placed, so the interrupt's outcome resolves
+    /// exactly that mark.
+    private enum RepoPromptInterruptMark {
+        /// O49 `interruptPending` on the started turn.
+        case started(UUID)
+        /// Step 12 `unstartedInterrupt` on the sole unresolved written turn.
+        case unstarted(UUID)
+    }
+
+    /// Step 12: the two halves of gated acceptance for an interrupt before first visible output.
+    private struct UnstartedInterrupt {
+        /// `interruptTurn` returned `.acknowledged`.
+        var acknowledged = false
+        /// The CLI's exclusive `.cancelled` result arrived before the acknowledgement.
+        var providerCancelledResultHeld = false
     }
 
     private var controllerRetirementGenerationByTabID: [UUID: UUID] = [:]
@@ -1338,6 +1364,10 @@ package final class ClaudeAgentModeCoordinator {
             toolHandlerByTabID[session.tabID]?.currentTrackedRunID
         }
 
+        func test_setUnstartedInterruptResultWaitSeconds(_ seconds: TimeInterval) {
+            unstartedInterruptResultWaitSeconds = seconds
+        }
+
         func test_setInterruptedTurnSettlementTimeoutSeconds(_ seconds: TimeInterval) {
             interruptedTurnSettlementTimeoutSeconds = seconds
         }
@@ -1928,6 +1958,11 @@ package final class ClaudeAgentModeCoordinator {
     /// steer interrupt of the turn is pending, the decision waits for its outcome. Called before
     /// any other handling of the completion.
     ///
+    /// Step 12: a turn RepoPrompt interrupted before the CLI was credited with starting it
+    /// (`unstartedInterrupt`) is accepted only on the CLI's exclusive interrupted-turn `.cancelled`
+    /// result (`origin.isExclusiveInterruptedResult`) together with an acknowledged interrupt, in
+    /// either order.
+    ///
     /// The completion must come from the controller that wrote the turn (`isEmittedBy` is asked
     /// about that controller), so it applies only to that same captured turn and delivery
     /// attempt, never to a successor. It is honored even after the turn's run attempt finalized
@@ -1935,6 +1970,7 @@ package final class ClaudeAgentModeCoordinator {
     func noteClaudeTurnCompleted(
         turnID: UUID,
         status: NativeAgentRuntimeTurnStatus,
+        origin: NativeAgentRuntimeTurnCompletionOrigin = .controllerSynthesized,
         isEmittedBy: (AnyObject) -> Bool
     ) {
         guard let written = dispatchHandoffsByTurnID[turnID] else { return }
@@ -1959,7 +1995,19 @@ package final class ClaudeAgentModeCoordinator {
         case .cancelled where written.interruptPending, .failed where written.interruptPending:
             // O49: the steer's mark is provisional; the interrupt outcome decides.
             dispatchHandoffsByTurnID[turnID]?.completionDuringInterrupt = status
+        case .cancelled where written.unstartedInterrupt != nil && origin.isExclusiveInterruptedResult:
+            // Step 12: the CLI's own interrupted-turn result for exactly this turn. With the
+            // interrupt acknowledged it proves receipt; before the acknowledgement it waits for it.
+            if written.unstartedInterrupt?.acknowledged == true {
+                dispatchHandoffsByTurnID.removeValue(forKey: turnID)
+                written.handoff.noteAccepted()
+            } else {
+                dispatchHandoffsByTurnID[turnID]?.unstartedInterrupt?.providerCancelledResultHeld = true
+            }
         case .cancelled, .failed:
+            // Includes Step 12's non-qualifying ends: a synthesized or shared-FIFO completion, a
+            // result that does not itself report an interruption or names another message, or
+            // `.failed`, never proves receipt of a turn that showed no output.
             dispatchHandoffsByTurnID.removeValue(forKey: turnID)
             written.handoff.noteDeliveryUnknown()
         }
@@ -1975,24 +2023,74 @@ package final class ClaudeAgentModeCoordinator {
         return turnID
     }
 
+    /// Step 12: the one written turn of `controller` with no completion yet, when there is exactly
+    /// one. More than one means the CLI's next result cannot be tied to a specific turn (FIFO
+    /// attribution; a skipped message would take another turn's result).
+    private func soleUnresolvedWrittenTurnID(of controller: any NativeAgentRuntimeControlling) -> UUID? {
+        let unresolved = dispatchHandoffsByTurnID.filter { _, written in
+            written.controller === (controller as AnyObject)
+                && written.completionDuringInterrupt == nil
+                && written.unstartedInterrupt?.providerCancelledResultHeld != true
+        }
+        guard unresolved.count == 1 else { return nil }
+        return unresolved.first?.key
+    }
+
     /// O49: RepoPrompt is about to interrupt `controller`'s started turn (steer or cleanup). The
     /// mark is provisional until `resolveRepoPromptInterrupt` learns the outcome. Call before
-    /// `interruptTurn`, so a result that races the acknowledgement waits for it. Returns the turn
-    /// this call marked (nil when nothing was marked or another interrupt is already pending).
-    private func noteRepoPromptInterruptRequested(controller: any NativeAgentRuntimeControlling) -> UUID? {
-        guard let turnID = startedWrittenTurnID(of: controller),
-              dispatchHandoffsByTurnID[turnID]?.interruptPending == false
+    /// `interruptTurn`, so a result that races the acknowledgement waits for it. Returns the mark
+    /// this call placed (nil when nothing was marked or another interrupt is already pending).
+    ///
+    /// Step 12: with no started turn, the controller's sole unresolved written turn gets the gated
+    /// `unstartedInterrupt` mark instead. Steer interrupts before writing its own message, so that
+    /// message is never counted here.
+    ///
+    /// A started turn that still carries an acknowledged unstarted mark gets no O49 mark: after an
+    /// acknowledged interrupt and no result of its own, the output now credited to it (FIFO head)
+    /// is almost certainly a later message's, so it stays under the Step 12 gate. A started turn
+    /// with an unacknowledged unstarted mark drops it and the started path (O49) decides it.
+    private func noteRepoPromptInterruptRequested(
+        controller: any NativeAgentRuntimeControlling
+    ) -> RepoPromptInterruptMark? {
+        if let turnID = startedWrittenTurnID(of: controller) {
+            guard dispatchHandoffsByTurnID[turnID]?.interruptPending == false,
+                  !Self.hasAcknowledgedUnstartedInterrupt(dispatchHandoffsByTurnID[turnID])
+            else { return nil }
+            dispatchHandoffsByTurnID[turnID]?.interruptPending = true
+            dispatchHandoffsByTurnID[turnID]?.unstartedInterrupt = nil
+            return .started(turnID)
+        }
+        guard let turnID = soleUnresolvedWrittenTurnID(of: controller),
+              let written = dispatchHandoffsByTurnID[turnID],
+              !written.interruptPending,
+              written.unstartedInterrupt == nil
         else { return nil }
-        dispatchHandoffsByTurnID[turnID]?.interruptPending = true
-        return turnID
+        dispatchHandoffsByTurnID[turnID]?.unstartedInterrupt = UnstartedInterrupt()
+        return .unstarted(turnID)
     }
 
     /// O49: the interrupt that marked `turnID` returned. Acknowledged: the started message was
     /// received and settles accepted. Otherwise the provisional mark is withdrawn, and a
     /// completion that arrived meanwhile gets its normal outcome. A teardown mark is never
     /// withdrawn here.
-    private func resolveRepoPromptInterrupt(_ turnID: UUID?, outcome: NativeAgentRuntimeInterruptOutcome) {
-        guard let turnID, let written = dispatchHandoffsByTurnID[turnID] else { return }
+    private func resolveRepoPromptInterrupt(
+        _ mark: RepoPromptInterruptMark?,
+        outcome: NativeAgentRuntimeInterruptOutcome
+    ) {
+        let turnID: UUID
+        switch mark {
+        case nil:
+            return
+        case let .unstarted(markedTurnID):
+            guard let written = dispatchHandoffsByTurnID[markedTurnID],
+                  let unstarted = written.unstartedInterrupt
+            else { return }
+            resolveUnstartedInterrupt(markedTurnID, written: written, unstarted: unstarted, outcome: outcome)
+            return
+        case let .started(markedTurnID):
+            turnID = markedTurnID
+        }
+        guard let written = dispatchHandoffsByTurnID[turnID] else { return }
         if outcome == .acknowledged {
             dispatchHandoffsByTurnID.removeValue(forKey: turnID)
             written.handoff.noteAccepted()
@@ -2010,15 +2108,50 @@ package final class ClaudeAgentModeCoordinator {
         }
     }
 
+    /// Step 12: the gated half of `resolveRepoPromptInterrupt`. Acknowledged: accepts when the
+    /// CLI's exclusive cancelled result is already held, otherwise waits for it (run end without it
+    /// leaves the message uncertain). Not acknowledged (timed out, failed, no turn in flight): the
+    /// mark is withdrawn and a held result proves nothing.
+    private func resolveUnstartedInterrupt(
+        _ turnID: UUID,
+        written: WrittenDispatchHandoff,
+        unstarted: UnstartedInterrupt,
+        outcome: NativeAgentRuntimeInterruptOutcome
+    ) {
+        guard outcome == .acknowledged else {
+            guard unstarted.providerCancelledResultHeld else {
+                dispatchHandoffsByTurnID[turnID]?.unstartedInterrupt = nil
+                return
+            }
+            dispatchHandoffsByTurnID.removeValue(forKey: turnID)
+            written.handoff.noteDeliveryUnknown()
+            return
+        }
+        guard unstarted.providerCancelledResultHeld else {
+            dispatchHandoffsByTurnID[turnID]?.unstartedInterrupt?.acknowledged = true
+            return
+        }
+        dispatchHandoffsByTurnID.removeValue(forKey: turnID)
+        written.handoff.noteAccepted()
+    }
+
     /// O49 (Stop and quit): RepoPrompt is about to stop this session's run. Called synchronously
     /// before the run detaches its controller, so the started turn is marked before run end
     /// settles its written messages; the CLI's result is not awaited.
     package func noteRepoPromptTeardownRequested(_ session: AgentTabSession) {
         guard session.selectedAgent.usesClaudeNativeRuntime,
               let controller = session.claudeController,
-              let turnID = startedWrittenTurnID(of: controller)
+              let turnID = startedWrittenTurnID(of: controller),
+              // Step 12: a suspect started credit (see `noteRepoPromptInterruptRequested`).
+              !Self.hasAcknowledgedUnstartedInterrupt(dispatchHandoffsByTurnID[turnID])
         else { return }
         dispatchHandoffsByTurnID[turnID]?.teardownRequestedByRepoPrompt = true
+    }
+
+    /// Step 12: `written` carries an unstarted interrupt the CLI acknowledged and no result of its
+    /// own has decided it. Such a turn is never promoted to O49 acceptance by a later started credit.
+    private static func hasAcknowledgedUnstartedInterrupt(_ written: WrittenDispatchHandoff?) -> Bool {
+        written?.unstartedInterrupt?.acknowledged == true
     }
 
     /// O49: how a written message without its turn's completion ends tracking. Only a teardown
@@ -2068,6 +2201,17 @@ package final class ClaudeAgentModeCoordinator {
         /// Whether a cancelled/failed completion of `turnID` is held for a pending interrupt.
         func test_holdsCompletionDuringInterrupt(turnID: UUID) -> Bool {
             dispatchHandoffsByTurnID[turnID]?.completionDuringInterrupt != nil
+                || dispatchHandoffsByTurnID[turnID]?.unstartedInterrupt?.providerCancelledResultHeld == true
+        }
+
+        /// Step 12: whether `turnID` carries the gated unstarted-interrupt mark.
+        func test_hasUnstartedInterruptMark(turnID: UUID) -> Bool {
+            dispatchHandoffsByTurnID[turnID]?.unstartedInterrupt != nil
+        }
+
+        /// Whether `turnID`'s written message is still tracked (no final evidence decided yet).
+        func test_tracksWrittenDispatchHandoff(turnID: UUID) -> Bool {
+            dispatchHandoffsByTurnID[turnID] != nil
         }
 
         /// Records `handoff` as written by `controller` under `turnID`, exactly as a successful
@@ -2636,6 +2780,37 @@ package final class ClaudeAgentModeCoordinator {
         }
     }
 
+    /// Step 12 (P1-B): after an acknowledged interrupt of a turn with no visible output, holds the
+    /// steer's own write until the controller has processed that turn's result. The controller fixes
+    /// a result's exclusivity when it processes it, so writing the steer first would make the
+    /// interrupted turn's result shared and never acceptable. Ends when the turn's evidence is
+    /// decided, the controller has no turn in flight (its result was processed), the reservation or
+    /// controller ownership is lost, or after `unstartedInterruptResultWaitSeconds`. A timeout is not
+    /// a failure: the steer is written and the interrupted turn stays uncertain. Steers that target a
+    /// started turn, or whose interrupt was not acknowledged, never wait here.
+    private func awaitUnstartedInterruptedTurnResult(
+        turnID: UUID,
+        session: AgentTabSession,
+        controller: any NativeAgentRuntimeControlling,
+        dispatchReservation: DispatchReservation
+    ) async {
+        let deadline = ContinuousClock.now.advanced(
+            by: .milliseconds(Int64(min(unstartedInterruptResultWaitSeconds, 1.5) * 1000))
+        )
+        while ContinuousClock.now < deadline {
+            guard dispatchHandoffsByTurnID[turnID]?.unstartedInterrupt?.acknowledged == true,
+                  dispatchReservationIsCurrent(dispatchReservation, for: session),
+                  sessionOwnsClaudeController(controller, for: session)
+            else { return }
+            guard await controller.hasTurnInFlight else { return }
+            do {
+                try await Task.sleep(nanoseconds: 25_000_000)
+            } catch {
+                return
+            }
+        }
+    }
+
     private func interruptClaudeTurnIfNeeded(
         session: AgentTabSession,
         controller: any NativeAgentRuntimeControlling,
@@ -2670,9 +2845,17 @@ package final class ClaudeAgentModeCoordinator {
             return false
         }
 
-        let markedTurnID = noteRepoPromptInterruptRequested(controller: controller)
+        let mark = noteRepoPromptInterruptRequested(controller: controller)
         let interruptOutcome = await controller.interruptTurn(reason: "interrupt")
-        resolveRepoPromptInterrupt(markedTurnID, outcome: interruptOutcome)
+        resolveRepoPromptInterrupt(mark, outcome: interruptOutcome)
+        if interruptOutcome == .acknowledged, case let .unstarted(turnID)? = mark {
+            await awaitUnstartedInterruptedTurnResult(
+                turnID: turnID,
+                session: session,
+                controller: controller,
+                dispatchReservation: dispatchReservation
+            )
+        }
         guard dispatchReservationIsCurrent(dispatchReservation, for: session),
               sessionOwnsClaudeController(controller, for: session)
         else {
@@ -2861,9 +3044,9 @@ package final class ClaudeAgentModeCoordinator {
         oldController: DetachedClaudeController
     ) async -> NativeAgentRuntimeSessionRef {
         let controller = oldController.controller
-        let markedTurnID = noteRepoPromptInterruptRequested(controller: controller)
+        let mark = noteRepoPromptInterruptRequested(controller: controller)
         let interruptOutcome = await controller.interruptTurn(reason: "interrupt")
-        resolveRepoPromptInterrupt(markedTurnID, outcome: interruptOutcome)
+        resolveRepoPromptInterrupt(mark, outcome: interruptOutcome)
         await stopToolTracking(oldController, for: session)
         if interruptOutcome == .acknowledged {
             // Give Claude ~200 ms to persist any in-flight state before we

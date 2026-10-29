@@ -3125,6 +3125,45 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         streamContinuation.yield(.turnCompleted(turnID: turnID, status: .cancelled))
     }
 
+    /// Step 12: the CLI's own `.cancelled` result for `turnID`, classified on the real
+    /// controller's result path. The evidence is what the real controller records when it processes
+    /// the result (see ClaudeNativeTurnTeardownTests): `soleOutstandingTurn`, whether `turnID` was
+    /// its only written turn without a result; `reportsInterruption`, whether the payload itself
+    /// reports an interrupted turn; `messageIdentity`, the result's `user_message_uuid(s)` against
+    /// the turn's outbound UUID (default: the result names exactly that UUID).
+    func emitProviderCancelledTurnCompletion(
+        turnID: UUID,
+        soleOutstandingTurn: Bool = true,
+        reportsInterruption: Bool = true,
+        messageIdentity: NativeAgentRuntimeTurnCompletionOrigin.MessageIdentity = .namesTurn
+    ) {
+        turnInFlight = false
+        if pendingTurnCompletionID == turnID {
+            pendingTurnCompletionID = nil
+        }
+        clearStartedTurnID(ifEqualTo: turnID)
+        streamContinuation.yield(.turnCompleted(
+            turnID: turnID,
+            status: .cancelled,
+            origin: .providerResult(.init(
+                soleOutstandingTurn: soleOutstandingTurn,
+                reportsInterruption: reportsInterruption,
+                messageIdentity: messageIdentity
+            ))
+        ))
+    }
+
+    /// Step 12: a completion the real controller emits without a CLI boundary for `turnID`
+    /// (process exit, protocol failure, idle-fallback timer, or shutdown/EOF flush).
+    func emitControllerSynthesizedTurnCompletion(turnID: UUID, status: NativeAgentRuntimeTurnStatus) {
+        turnInFlight = false
+        if pendingTurnCompletionID == turnID {
+            pendingTurnCompletionID = nil
+        }
+        clearStartedTurnID(ifEqualTo: turnID)
+        streamContinuation.yield(.turnCompleted(turnID: turnID, status: status, origin: .controllerSynthesized))
+    }
+
     /// A failed completion, like the real controller's on process loss.
     func emitFailedTurnCompletion(turnID: UUID) {
         turnInFlight = false
