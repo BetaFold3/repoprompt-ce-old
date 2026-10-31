@@ -199,7 +199,7 @@ const state = {
   transcriptToken: 0, // bumped on session switch and manual Refresh; drops in-flight pages
   transcriptLiveRequest: null, // the in-flight newest-page load; at most one at a time
   transcriptLivePending: false, // a newest-page load was asked for while one was in flight
-  transcriptOlderRequest: null, // the in-flight "Load more transcript" request
+  transcriptOlderRequest: null, // the in-flight "Load earlier messages" request
   transcriptStart: null,
   transcriptLiveStart: null,
   transcriptTotal: null, // total_turns from the last newest page
@@ -357,6 +357,7 @@ function resetIdentityState() {
   setActionStatus('');
   $('sessions-panel').classList.add('hidden');
   $('detail-panel').classList.add('hidden');
+  hideDetailChrome();
 }
 
 async function forgetIdentity() {
@@ -695,11 +696,18 @@ function sessionName(payload, sessionId) {
   return (payload.session && payload.session.name) || payload.session_name || payload.name || shortID(sessionId);
 }
 
+// Back and Stop live in the header and show only with the session detail view.
+function hideDetailChrome() {
+  $('back-to-sessions').classList.add('hidden');
+  $('stop-button').classList.add('hidden');
+}
+
 function showSessionsList() {
   state.viewGeneration += 1;
   state.currentSessionId = null;
   state.deepLinkSessionId = null;
   $('detail-panel').classList.add('hidden');
+  hideDetailChrome();
   $('sessions-panel').classList.remove('hidden');
   refreshSessions();
 }
@@ -733,11 +741,16 @@ function renderSessions() {
   }
   for (const [sessionId, payload] of entries) {
     const item = element('li');
+    const row = element('button', 'session-row');
+    row.type = 'button';
     const name = element('span', 'name', sessionName(payload, sessionId));
     const status = element('span', 'badge', sessionStatus(payload));
     if (sessionStatus(payload) === 'waiting_for_input') status.classList.add('warn');
-    item.append(name, status);
-    item.onclick = () => openSession(sessionId);
+    const chevron = element('span', 'chevron', '›');
+    chevron.setAttribute('aria-hidden', 'true');
+    row.append(name, status, chevron);
+    row.onclick = () => openSession(sessionId);
+    item.appendChild(row);
     list.appendChild(item);
   }
 }
@@ -752,10 +765,12 @@ async function openSession(sessionId) {
   state.currentSessionId = sessionId;
   $('sessions-panel').classList.add('hidden');
   $('detail-panel').classList.remove('hidden');
+  $('back-to-sessions').classList.remove('hidden');
   $('detail-session-id').textContent = shortID(sessionId);
   if (switching) {
     resetTranscriptView();
     $('composer-input').value = '';
+    sizeComposer();
     setActionStatus('');
   }
   renderSessionDetail();
@@ -771,7 +786,7 @@ async function openSession(sessionId) {
   await pollSession(sessionId);
   if (!viewIsCurrent(generation)) return;
   // Reopening the same session (for example after a reconnect) keeps pages already
-  // loaded with "Load more transcript"; Refresh returns to the newest output.
+  // loaded with "Load earlier messages"; Refresh returns to the newest output.
   if (!switching && state.transcriptBrowsing) return;
   await loadTranscript();
 }
@@ -823,7 +838,10 @@ function renderSessionDetail() {
   const composer = $('composer');
   const active = ACTIVE_STATUSES.includes(status);
   const idle = IDLE_STATUSES.includes(status);
+  const wasHidden = composer.classList.contains('hidden');
   composer.classList.toggle('hidden', !(active || idle));
+  // A kept draft is measured again once the composer is shown.
+  if (wasHidden && (active || idle)) sizeComposer();
   const verb = active ? 'Steer' : 'Follow up';
   $('composer-label').textContent = verb;
   $('composer-send').textContent = verb;
@@ -947,7 +965,7 @@ function collectAnswers() {
 function transcriptText(result) {
   if (typeof result === 'string') return result;
   if (!result) return '';
-  // get_log returns the page as transcript XML; it is shown as literal text.
+  // get_log returns the page as transcript_xml text; see segmentTranscript().
   if (typeof result.transcript_xml === 'string') return result.transcript_xml;
   if (result.log && typeof result.log === 'string') return result.log;
   const items = result.entries || result.messages || result.log || result.transcript;
@@ -973,17 +991,447 @@ function requestTranscriptPage(sessionId, offset, limit) {
   return sendCommand({ type: 'get_log', session_id: sessionId, payload: { offset, limit } });
 }
 
-function renderTranscript(follow) {
-  const transcript = $('transcript');
-  const nearBottom = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 48;
-  transcript.textContent = [state.transcriptOlderText, state.transcriptLiveText].filter(Boolean).join('\n');
-  // Follow new output only when the reader was already at the bottom.
-  if (follow && nearBottom) transcript.scrollTop = transcript.scrollHeight;
-  $('load-older').disabled = Boolean(state.transcriptOlderRequest) || !(state.transcriptStart > 0);
+// ---------------------------------------------------------------------------
+// Transcript presentation
+//
+// get_log's transcript_xml looks like XML but is not: role bodies and tool arguments
+// are written unescaped, so it is never handed to a parser. segmentTranscript() is a
+// conservative forward line scan that recognizes only the serializer's own record
+// lines and keeps every other line as visible text. Concatenating the segments' raw
+// text reproduces the input exactly; the exact text also stays in "Raw transcript".
+// Exact protocol-shaped text outside a code fence is ambiguous and can be attributed
+// to the wrong record; nothing is decoded or dropped.
+
+const ROW_ATTRIBUTES = '((?: id="[0-9A-Fa-f-]{36}")?(?: ts="\\d+(?:\\.\\d+)?")?)';
+const ROLE_OPEN = new RegExp(`^<(user|assistant|system|error|note)${ROW_ATTRIBUTES}>`);
+const TOOL_OPEN = new RegExp(`^<tool_call name="([^"]*)"${ROW_ATTRIBUTES}(/?)>`);
+const TOOL_RESULT = /^<tool_result name="([^"]*)" status="(success|warning|failed)"\/>$/;
+const FENCE_OPEN = /^ {0,3}(`{3,})([^`]*)$/;
+const FENCE_CLOSE = /^ {0,3}(`{3,})[ \t]*$/;
+const TOOL_CLOSE = '</tool_call>';
+const ROLE_LABELS = { user: 'You', assistant: 'Agent', system: 'System', error: 'Error', note: 'Note' };
+
+function isWrapperLine(line) {
+  return line === '<transcript>' || line === '</transcript>';
 }
 
-// Clears the transcript for a new session view.
+// A tool call line the scan recognizes: an opening tag, or a self-closing tag that is
+// the whole line.
+function toolOpening(line) {
+  const match = TOOL_OPEN.exec(line);
+  return match && (match[3] !== '/' || line === match[0]) ? match : null;
+}
+
+function isRecordBoundary(line) {
+  return isWrapperLine(line) || ROLE_OPEN.test(line) || Boolean(toolOpening(line)) || TOOL_RESULT.test(line);
+}
+
+function closesFence(text, length) {
+  const match = FENCE_CLOSE.exec(text);
+  return Boolean(match) && match[1].length >= length;
+}
+
+// Backtick fence state after `text`: the open fence's length, or 0 outside a fence.
+function nextFence(fence, text) {
+  if (fence) return closesFence(text, fence) ? 0 : fence;
+  const open = FENCE_OPEN.exec(text);
+  return open ? open[1].length : 0;
+}
+
+// Serializer attribute escapes, with &amp; last. Bodies are never decoded.
+function decodeAttribute(text) {
+  return text.replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+}
+
+// Finds the line that closes a record opened on line `start` (`first` is the body text
+// after the opening tag). A closing line ends with `close` and is followed by another
+// record line or the end of input. A candidate inside a fenced code example in the body
+// is not structural. Returns {end}, or on failure the first unfenced-rule candidate
+// (`naive`, -1 when none) and the line where the scan stopped (`stop`).
+// A fenced example and a body cut off inside a fence look the same line by line. The
+// serializer cuts only grouped system summaries and tool arguments (`truncated`), so
+// there a fence-hidden candidate ends the scan: the record is shown as raw text up to
+// that candidate and later records are scanned normally, never swallowed. Other bodies
+// are written whole, so a candidate hidden by a fence is body text; the record is still
+// uncertain until a later close outside the fence. That scan stops at the end of the
+// page, at the next record line after the fence closes, at a later opening line of the
+// same record type (which may own any later close: an interrupted body's unclosed fence
+// must not swallow later records), or when the shared `budget` for uncertain scans runs
+// out; the caller then shows the record up to its first candidate as raw text.
+function findRecordClose(lines, start, first, close, budget, truncated) {
+  let fence = 0;
+  let naive = -1;
+  for (let j = start; j < lines.length; j += 1) {
+    const text = j === start ? first : lines[j];
+    if (j > start && lines[j] === '</transcript>'
+      && (j + 1 === lines.length || lines[j + 1] === '<transcript>'
+        || (j + 2 === lines.length && lines[j + 1] === ''))) {
+      return { end: -1, naive, stop: j };
+    }
+    if (naive >= 0) {
+      budget.left -= 1;
+      const open = ROLE_OPEN.exec(lines[j]);
+      if (budget.left < 0 || (!fence && isRecordBoundary(lines[j])) || (open && `</${open[1]}>` === close)) {
+        return { end: -1, naive, stop: j };
+      }
+    }
+    if (text.endsWith(close)) {
+      const next = j + 1;
+      const atEnd = next === lines.length || (next === lines.length - 1 && lines[next] === '');
+      if (atEnd || isRecordBoundary(lines[next])) {
+        if (!fence || closesFence(text.slice(0, text.length - close.length), fence)) return { end: j };
+        if (truncated) return { end: -1, naive: j, stop: j + 1 };
+        if (naive < 0) naive = j;
+      }
+    }
+    fence = nextFence(fence, text);
+  }
+  return { end: -1, naive, stop: lines.length };
+}
+
+// Pure: raw page text -> [{kind, raw, body?, name?, args?, status?}]. Kinds: wrapper and
+// space (not displayed), user, assistant, system, error, note, tool, result (a result
+// without its call) and raw (unrecognized or uncertain text, shown verbatim).
+function segmentTranscript(raw) {
+  if (!raw) return [];
+  const lines = raw.split('\n');
+  const segments = [];
+  const budget = { left: lines.length * 2 + 1024 };
+  const sourceOf = (from, to) => lines.slice(from, to).join('\n') + (to < lines.length ? '\n' : '');
+  let loose = -1; // first line of pending unrecognized text
+  const flushLoose = (to) => {
+    if (loose < 0) return;
+    const text = sourceOf(loose, to);
+    if (text) segments.push({ kind: text.trim() ? 'raw' : 'space', raw: text });
+    loose = -1;
+  };
+  const keepLoose = (from) => {
+    if (loose < 0) loose = from;
+  };
+  // Closes a record or keeps uncertain source visible; returns the next line to scan.
+  const closeRecord = (i, openLength, close, build) => {
+    const truncated = close === '</system>' || close === TOOL_CLOSE;
+    const found = findRecordClose(lines, i, lines[i].slice(openLength), close, budget, truncated);
+    if (found.end < 0) {
+      keepLoose(i);
+      return found.naive >= 0 ? found.naive + 1 : found.stop;
+    }
+    const text = lines.slice(i, found.end + 1).join('\n');
+    flushLoose(i);
+    build(text.slice(openLength, text.length - close.length), found.end);
+    return found.end + 1;
+  };
+
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (isWrapperLine(line)) {
+      flushLoose(i);
+      segments.push({ kind: 'wrapper', raw: sourceOf(i, i + 1) });
+      i += 1;
+      continue;
+    }
+    const role = ROLE_OPEN.exec(line);
+    if (role) {
+      const kind = role[1];
+      i = closeRecord(i, role[0].length, `</${kind}>`, (body, end) => {
+        segments.push({ kind, raw: sourceOf(i, end + 1), body });
+      });
+      continue;
+    }
+    const tool = toolOpening(line);
+    if (tool) {
+      const start = i;
+      const pushTool = (args, end) => {
+        let last = end;
+        let status = null;
+        const result = last + 1 < lines.length ? TOOL_RESULT.exec(lines[last + 1]) : null;
+        if (result && result[1] === tool[1]) {
+          status = result[2];
+          last += 1;
+        }
+        segments.push({
+          kind: 'tool', raw: sourceOf(start, last + 1), name: decodeAttribute(tool[1]), args: args || null, status,
+        });
+        return last + 1;
+      };
+      if (tool[3] === '/') {
+        flushLoose(i);
+        i = pushTool(null, i);
+      } else {
+        let afterTool = -1;
+        const next = closeRecord(i, tool[0].length, TOOL_CLOSE, (args, end) => {
+          afterTool = pushTool(args, end);
+        });
+        i = afterTool >= 0 ? afterTool : next;
+      }
+      continue;
+    }
+    const result = TOOL_RESULT.exec(line);
+    if (result) {
+      flushLoose(i);
+      segments.push({ kind: 'result', raw: sourceOf(i, i + 1), name: decodeAttribute(result[1]), status: result[2] });
+      i += 1;
+      continue;
+    }
+    keepLoose(i);
+    i += 1;
+  }
+  flushLoose(lines.length);
+  return segments;
+}
+
+function isDisplayedSegment(segment) {
+  return segment.kind !== 'wrapper' && segment.kind !== 'space';
+}
+
+function trimBlankEdges(text) {
+  return text.replace(/^(?:[ \t]*\n)+/, '').replace(/(?:\n[ \t]*)+$/, '');
+}
+
+// Body text as prose plus complete backtick-fenced code blocks. No other Markdown is
+// interpreted. An unmatched fence stays literal, together with the rest of the body.
+function appendBody(container, text) {
+  const lines = text.split('\n');
+  let prose = [];
+  const flushProse = () => {
+    const chunk = trimBlankEdges(prose.join('\n'));
+    prose = [];
+    if (chunk.trim()) container.appendChild(element('div', 'prose', chunk));
+  };
+  let fences = true;
+  let i = 0;
+  while (i < lines.length) {
+    const open = fences ? FENCE_OPEN.exec(lines[i]) : null;
+    if (open) {
+      let end = i + 1;
+      while (end < lines.length && !closesFence(lines[end], open[1].length)) end += 1;
+      if (end < lines.length) {
+        flushProse();
+        const block = element('div', 'code-block');
+        const language = open[2].trim();
+        if (language) block.appendChild(element('div', 'code-lang', language));
+        const pre = element('pre', 'code');
+        pre.appendChild(element('code', null, lines.slice(i + 1, end).join('\n')));
+        block.appendChild(pre);
+        container.appendChild(block);
+        i = end + 1;
+        continue;
+      }
+      fences = false;
+    }
+    prose.push(lines[i]);
+    i += 1;
+  }
+  flushProse();
+}
+
+function appendToolSummary(container, label, segment) {
+  container.appendChild(element('span', 'tool-label', label));
+  container.appendChild(element('span', 'tool-name', segment.name));
+  if (segment.status) container.appendChild(element('span', `tool-status ${segment.status}`, segment.status));
+}
+
+function transcriptNode(segment) {
+  if (segment.kind === 'raw') return element('pre', 'msg raw', segment.raw.replace(/\n$/, ''));
+  if (segment.kind === 'result') {
+    const row = element('div', 'msg tool result');
+    appendToolSummary(row, 'Result', segment);
+    return row;
+  }
+  if (segment.kind === 'tool') {
+    if (!segment.args) {
+      const row = element('div', 'msg tool');
+      appendToolSummary(row, 'Tool', segment);
+      return row;
+    }
+    const details = element('details', 'msg tool');
+    const summary = element('summary');
+    appendToolSummary(summary, 'Tool', segment);
+    details.append(summary, element('pre', 'tool-args', segment.args));
+    return details;
+  }
+  const node = element('div', `msg ${segment.kind}`);
+  node.appendChild(element('div', 'role', ROLE_LABELS[segment.kind]));
+  const body = element('div', 'body');
+  appendBody(body, segment.body);
+  node.appendChild(body);
+  return node;
+}
+
+// Render-owned state: the last rendered text, the turn it starts at, and its
+// [{key, node}] entries in order. A node is kept only where its position establishes
+// the same record occurrence, so an opened tool stays open, focus stays put, and the
+// reading anchor never moves to an identical copy elsewhere.
+const transcriptRender = { text: null, start: null, entries: [] };
+
+function resetTranscriptRender() {
+  transcriptRender.text = null;
+  transcriptRender.start = null;
+  transcriptRender.entries = [];
+  $('transcript-view').replaceChildren();
+}
+
+// Pairs the previous render's nodes with new entries only where their position shows
+// they are the same record occurrences:
+// - the view still starts at the same turn (the newest page grew or was re-read in
+//   place): entries at the same position from the start;
+// - the view starts earlier and its text ends with the previous text (older pages were
+//   prepended): entries at the same distance from the end.
+// Every other change, in particular a start that moved forward (the newest window
+// rolled, or Refresh dropped the older pages), gets fresh, closed nodes, even for
+// identical text: get_log carries no row identities, so an evicted record and a new
+// identical one cannot be told apart. Matching stops at the first difference.
+function matchTranscriptNodes(previous, next, text, start) {
+  const old = transcriptRender.text;
+  const oldStart = transcriptRender.start;
+  if (old === null || !previous.length) return;
+  if (start === oldStart) {
+    for (let a = 0; a < previous.length && a < next.length; a += 1) {
+      if (previous[a].key !== next[a].key) break;
+      next[a].node = previous[a].node;
+    }
+  } else if (start !== null && oldStart !== null && start < oldStart && text.endsWith(old)) {
+    for (let a = previous.length - 1, b = next.length - 1; a >= 0 && b >= 0; a -= 1, b -= 1) {
+      if (previous[a].key !== next[b].key) break;
+      next[b].node = previous[a].node;
+    }
+  }
+}
+
+// A focused element that is hidden (for example the composer of a session view left
+// behind) does not count.
+function readerIsInteracting() {
+  const active = document.activeElement;
+  if (!active || active === document.body || !active.getClientRects().length) return false;
+  if (['TEXTAREA', 'INPUT', 'SELECT'].includes(active.tagName) || active.isContentEditable) return true;
+  return $('transcript-view').contains(active) || $('transcript-raw').contains(active);
+}
+
+// Measured before the DOM changes: whether the page is at its bottom, and an anchor
+// to hold on screen. A focused, on-screen composer or question field is preferred, so
+// the field being typed in stays put while output arrives above it; otherwise the
+// first transcript block below the header that survives this render. Without either,
+// the document position is kept.
+function captureTranscriptScroll(kept) {
+  const scroller = document.scrollingElement || document.documentElement;
+  const snapshot = {
+    scroller,
+    scrollTop: scroller.scrollTop,
+    nearBottom: scroller.scrollHeight - scroller.scrollTop - window.innerHeight < 48,
+    anchor: null,
+    anchorTop: 0,
+  };
+  const headerBottom = $('app-header').getBoundingClientRect().bottom;
+  const active = document.activeElement;
+  if (active && active !== document.body && readerIsInteracting()
+    && ($('composer').contains(active) || $('interaction-box').contains(active))) {
+    const rect = active.getBoundingClientRect();
+    if (rect.bottom > headerBottom && rect.top < window.innerHeight) {
+      snapshot.anchor = active;
+      snapshot.anchorTop = rect.top;
+      return snapshot;
+    }
+  }
+  for (const entry of transcriptRender.entries) {
+    if (!kept.has(entry.node)) continue;
+    const rect = entry.node.getBoundingClientRect();
+    if (rect.bottom > headerBottom) {
+      snapshot.anchor = entry.node;
+      snapshot.anchorTop = rect.top;
+      break;
+    }
+  }
+  return snapshot;
+}
+
+// Follows new output only when the reader was at the bottom and is not typing or
+// using a disclosure; otherwise keeps the anchor where it was on screen, or else the
+// document position. Unless the reader is typing or using a disclosure, the first
+// records of a session view land on the newest output, or on the question when the
+// agent is waiting for an answer.
+function restoreTranscriptScroll(snapshot, follow, initial) {
+  const { scroller } = snapshot;
+  if (follow && (snapshot.nearBottom || initial) && !readerIsInteracting()) {
+    const question = $('interaction-box');
+    if (initial && !question.classList.contains('hidden')) {
+      const headerBottom = $('app-header').getBoundingClientRect().bottom;
+      scroller.scrollTop += question.getBoundingClientRect().top - headerBottom - 8;
+    } else {
+      scroller.scrollTop = scroller.scrollHeight;
+    }
+  } else if (snapshot.anchor && snapshot.anchor.isConnected) {
+    const delta = snapshot.anchor.getBoundingClientRect().top - snapshot.anchorTop;
+    if (delta) scroller.scrollTop += delta;
+  } else {
+    scroller.scrollTop = Math.min(snapshot.scrollTop, Math.max(0, scroller.scrollHeight - window.innerHeight));
+  }
+}
+
+function planTranscriptView(text, start) {
+  const previous = transcriptRender.entries;
+  const next = [];
+  for (const segment of segmentTranscript(text)) {
+    if (!isDisplayedSegment(segment)) continue;
+    next.push({ key: `${segment.kind}\u0000${segment.raw}`, node: null, segment });
+  }
+  if (!next.length) next.push({ key: 'empty', node: null, segment: null });
+  matchTranscriptNodes(previous, next, text, start);
+  return {
+    text,
+    start,
+    previous,
+    next,
+    initial: !previous.some((entry) => entry.key !== 'empty'),
+    kept: new Set(next.map((entry) => entry.node).filter(Boolean)),
+  };
+}
+
+function applyTranscriptView(plan) {
+  const view = $('transcript-view');
+  for (const entry of plan.previous) {
+    if (!plan.kept.has(entry.node)) entry.node.remove();
+  }
+  let cursor = view.firstChild;
+  for (const entry of plan.next) {
+    if (!entry.node) {
+      entry.node = entry.segment
+        ? transcriptNode(entry.segment)
+        : element('p', 'transcript-empty', 'No messages to show yet.');
+    }
+    if (entry.node === cursor) {
+      cursor = cursor.nextSibling;
+    } else {
+      view.insertBefore(entry.node, cursor);
+    }
+  }
+  transcriptRender.entries = plan.next.map(({ key, node }) => ({ key, node }));
+  transcriptRender.text = plan.text;
+  transcriptRender.start = plan.start;
+}
+
+// Re-rendered when the text or its start turn changes; the start alone decides node
+// reuse and whether "Load earlier messages" shows. Scroll is measured once before any
+// layout write (paging button, raw text, records) and corrected once after all of them.
+function renderTranscript(follow) {
+  const text = [state.transcriptOlderText, state.transcriptLiveText].filter(Boolean).join('\n');
+  const start = state.transcriptStart;
+  const changed = text !== transcriptRender.text || start !== transcriptRender.start;
+  const plan = changed ? planTranscriptView(text, start) : null;
+  const scroll = plan ? captureTranscriptScroll(plan.kept) : null;
+  // Shown only while older turns exist; disabled while one older page is loading.
+  const hasOlder = start > 0;
+  $('load-older').classList.toggle('hidden', !hasOlder);
+  $('load-older').disabled = Boolean(state.transcriptOlderRequest) || !hasOlder;
+  if (!plan) return;
+  $('transcript').textContent = text;
+  applyTranscriptView(plan);
+  restoreTranscriptScroll(scroll, follow, plan.initial);
+}
+
+// Clears the transcript for a new session view, including its render-owned state.
 function resetTranscriptView() {
+  resetTranscriptRender();
   state.transcriptToken += 1;
   state.transcriptLiveRequest = null;
   state.transcriptLivePending = false;
@@ -1061,7 +1509,7 @@ async function loadTranscript() {
   }
 }
 
-// "Load more transcript": fetches the turns just before the oldest shown turn, so the
+// "Load earlier messages": fetches the turns just before the oldest shown turn, so the
 // prepended range never overlaps the view. The window moves only after success; a
 // failure leaves it in place for a retry.
 async function loadOlderTranscript() {
@@ -1094,7 +1542,7 @@ async function loadOlderTranscript() {
 }
 
 // Background refreshes reload the newest page only while no older pages are loaded;
-// after "Load more transcript", only the Refresh button resets the history.
+// after "Load earlier messages", only the Refresh button resets the history.
 let transcriptRefreshTimer = null;
 function maybeRefreshTranscript() {
   if (transcriptRefreshTimer || state.transcriptBrowsing) return;
@@ -1130,6 +1578,25 @@ async function runAction(button, pendingText, action) {
   }
 }
 
+// The composer grows with its text up to 40% of the viewport, then scrolls inside.
+const COMPOSER_MIN_HEIGHT = 44;
+// Measuring sets the height to auto for a moment, which can shorten the page; the
+// scroll position is put back afterwards. A hidden composer is not measured.
+function sizeComposer() {
+  const input = $('composer-input');
+  if (input.offsetParent === null) return;
+  const scroller = document.scrollingElement || document.documentElement;
+  const scrollTop = scroller.scrollTop;
+  const border = input.offsetHeight - input.clientHeight;
+  const max = Math.max(COMPOSER_MIN_HEIGHT, Math.round(window.innerHeight * 0.4));
+  input.style.height = 'auto';
+  const wanted = input.scrollHeight + border;
+  input.style.height = `${Math.min(max, Math.max(COMPOSER_MIN_HEIGHT, wanted))}px`;
+  input.style.overflowY = wanted > max ? 'auto' : 'hidden';
+  // Only when measuring moved it: a redundant write can stop momentum scrolling.
+  if (scroller.scrollTop !== scrollTop) scroller.scrollTop = scrollTop;
+}
+
 function respond() {
   return runAction($('respond-button'), 'Sending answer…', async (sessionId) => {
     const interactionId = $('interaction-box').dataset.interactionId;
@@ -1150,7 +1617,10 @@ function sendComposer() {
     if (!message) throw new Error('Type a message first.');
     await sendCommand({ type: 'steer', session_id: sessionId, payload: { message } });
     // Clear only the draft that was sent, and only in the view it was sent from.
-    if (viewIsCurrent(generation) && input.value === draft) input.value = '';
+    if (viewIsCurrent(generation) && input.value === draft) {
+      input.value = '';
+      sizeComposer();
+    }
     return verb === 'Steer' ? 'Steer sent.' : 'Follow-up sent.';
   });
 }
@@ -1250,6 +1720,8 @@ async function main() {
   $('respond-button').onclick = () => respond();
   $('composer-send').onclick = () => sendComposer();
   $('stop-button').onclick = () => stopSession();
+  $('composer-input').addEventListener('input', () => sizeComposer());
+  window.addEventListener('resize', () => sizeComposer());
   $('binding-retry').onclick = () => {
     $('binding-overlay').classList.add('hidden');
     refreshSessions();

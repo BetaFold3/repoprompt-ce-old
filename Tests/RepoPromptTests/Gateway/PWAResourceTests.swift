@@ -52,7 +52,7 @@ final class PWAResourceTests: XCTestCase {
 
     func testServedAssetsNeverUseMarkupOrCodeEvaluatingAPIs() throws {
         let unsafe = try NSRegularExpression(
-            pattern: #"innerHTML|outerHTML|insertAdjacentHTML|document\.write|eval\(|new Function"#
+            pattern: #"innerHTML|outerHTML|insertAdjacentHTML|document\.write|eval\(|new Function|DOMParser|createContextualFragment|setHTMLUnsafe|parseHTMLUnsafe|srcdoc"#
         )
         for asset in GatewayPWAResources.requiredAssets {
             let data = try XCTUnwrap(GatewayPWAResources.data(forAsset: asset), asset)
@@ -72,6 +72,10 @@ final class PWAResourceTests: XCTestCase {
             text.contains("bound window"),
             "The UI must surface that sessions are scoped to the bound window's active workspace"
         )
+        XCTAssertTrue(text.contains("<details id=\"activity-panel\" class=\"panel\">"), "Activity starts collapsed")
+        XCTAssertTrue(text.contains("<details id=\"transcript-raw\" class=\"disclosure\">"), "Raw transcript starts collapsed")
+        XCTAssertFalse(text.contains("aria-live"), "the refreshed transcript is not a live region")
+        XCTAssertFalse(text.contains("user-scalable"), "browser zoom stays available")
 
         let appJS = try XCTUnwrap(GatewayPWAResources.data(forAsset: "app.js"))
         let appText = try XCTUnwrap(String(data: appJS, encoding: .utf8))
