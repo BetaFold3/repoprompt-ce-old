@@ -76,7 +76,12 @@ final class GatewayHTTPServer: @unchecked Sendable {
             let logger = logger
             let upgrader = NIOWebSocketServerUpgrader(
                 shouldUpgrade: { channel, head in
-                    guard GatewayHTTPHandler.pathOnly(from: head.uri) == "/ws",
+                    let hostAllowlist = GatewayHostAllowlist(
+                        configuration: configuration,
+                        localAddress: channel.localAddress
+                    )
+                    guard hostAllowlist.allows(head),
+                          GatewayHTTPHandler.pathOnly(from: head.uri) == "/ws",
                           GatewayHTTPHandler.isWebSocketUpgrade(head),
                           GatewayHTTPHandler.isUpgradeAuthorized(head, configuration: configuration)
                     else {
@@ -104,6 +109,10 @@ final class GatewayHTTPServer: @unchecked Sendable {
                 .childChannelInitializer { channel in
                     let httpHandler = GatewayHTTPHandler(
                         configuration: configuration,
+                        hostAllowlist: GatewayHostAllowlist(
+                            configuration: configuration,
+                            localAddress: channel.localAddress
+                        ),
                         pairingRelay: pairingRelay
                     )
                     // The plain HTTP handler must leave the pipeline once the WebSocket
@@ -203,14 +212,20 @@ final class GatewayHTTPHandler: ChannelInboundHandler, RemovableChannelHandler {
     private static let maximumBodyBytes = 64 * 1024
 
     private let configuration: GatewayConfiguration
+    private let hostAllowlist: GatewayHostAllowlist
     private let pairingRelay: GatewayPairingRelay?
     private var requestHead: HTTPRequestHead?
     private var requestBody = Data()
     private var bodyTooLarge = false
     private var requestBodyLimit = maximumBodyBytes
 
-    init(configuration: GatewayConfiguration, pairingRelay: GatewayPairingRelay? = nil) {
+    init(
+        configuration: GatewayConfiguration,
+        hostAllowlist: GatewayHostAllowlist,
+        pairingRelay: GatewayPairingRelay? = nil
+    ) {
         self.configuration = configuration
+        self.hostAllowlist = hostAllowlist
         self.pairingRelay = pairingRelay
     }
 
@@ -263,6 +278,17 @@ final class GatewayHTTPHandler: ChannelInboundHandler, RemovableChannelHandler {
     }
 
     private func route(_ head: HTTPRequestHead, body: Data, context: ChannelHandlerContext) {
+        // Before any route. A WebSocket upgrade with a wrong Host is refused earlier, in
+        // `shouldUpgrade` (NIO reports that refusal through errorCaught, which closes the channel).
+        guard hostAllowlist.allows(head) else {
+            sendResponse(
+                status: .misdirectedRequest,
+                body: "host not allowed\n",
+                contentType: "text/plain; charset=utf-8",
+                context: context
+            )
+            return
+        }
         let path = Self.pathOnly(from: head.uri)
         if head.method == .GET, path == "/healthz" {
             sendResponse(

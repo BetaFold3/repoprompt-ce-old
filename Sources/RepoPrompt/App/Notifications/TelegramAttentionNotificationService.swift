@@ -2,6 +2,7 @@ import Combine
 import Foundation
 import Observation
 import RepoPromptAgentCore
+import RepoPromptRemoteWire
 
 // Executing-Mac Telegram configuration for attention notifications
 // (docs/context/plans/2026-10-10-telegram-attention-notifications-contract.md, Slice 8).
@@ -141,6 +142,9 @@ final class TelegramAttentionNotificationService {
         }
     }
 
+    /// Fixed Settings hint while alerts carry no Open session button.
+    static let sessionLinkUnavailableHint = "Alerts are text-only. To add an Open session button, turn on Remote Control and set its browser HTTPS port in Remote Control settings."
+
     /// App-wide instance: inert (no settings, storage, or HTTP access) until `start(launch:)`.
     static let shared = TelegramAttentionNotificationService()
 
@@ -156,9 +160,15 @@ final class TelegramAttentionNotificationService {
     private(set) var isDeliveryConfigured = false
     private(set) var lastAction: ActionResult?
     private(set) var lastTestKey: AttentionNotificationEventKey?
+    /// The gateway's active browser origin as last observed (drives the Settings hint only;
+    /// each delivery attempt reads the origin itself). nil means alerts are text-only.
+    private(set) var activeBrowserOrigin: RemoteGatewayOrigin?
 
     @ObservationIgnored let admission: AttentionNotificationAdmission
     @ObservationIgnored private let settingsOverride: GlobalSettingsStore?
+    @ObservationIgnored private let gatewayStatusOverride: RemoteGatewayStatusStore?
+    @ObservationIgnored private var gatewayStatus: RemoteGatewayStatusStore?
+    @ObservationIgnored private var gatewayStatusObservation: AnyCancellable?
     @ObservationIgnored private let pacer: TelegramAttentionPacer
     @ObservationIgnored private let makeDependencies: @MainActor () -> Dependencies
     @ObservationIgnored private var settings: GlobalSettingsStore?
@@ -178,11 +188,13 @@ final class TelegramAttentionNotificationService {
     init(
         admission: AttentionNotificationAdmission? = nil,
         settings: GlobalSettingsStore? = nil,
+        gatewayStatus: RemoteGatewayStatusStore? = nil,
         pacer: TelegramAttentionPacer = TelegramAttentionPacer(),
         makeDependencies: @escaping @MainActor () -> Dependencies = { Dependencies.production() }
     ) {
         self.admission = admission ?? .shared
         settingsOverride = settings
+        gatewayStatusOverride = gatewayStatus
         self.pacer = pacer
         self.makeDependencies = makeDependencies
     }
@@ -213,6 +225,11 @@ final class TelegramAttentionNotificationService {
         return notices
     }
 
+    /// Shown in Settings while alerts would be sent without an Open session button.
+    var sessionLinkHint: String? {
+        isStarted && activeBrowserOrigin == nil ? Self.sessionLinkUnavailableHint : nil
+    }
+
     var isTestPending: Bool {
         lastTestKey.map { admission.pendingEventKeys.contains($0) } ?? false
     }
@@ -232,6 +249,9 @@ final class TelegramAttentionNotificationService {
         self.dependencies = dependencies
         let settings = settingsOverride ?? .shared
         self.settings = settings
+        let gatewayStatus = gatewayStatusOverride ?? .shared
+        self.gatewayStatus = gatewayStatus
+        activeBrowserOrigin = gatewayStatus.activeBrowserOrigin
         storagePersistsAcrossLaunches = dependencies.tokenStore.persistsAcrossLaunches
         observedEnabled = settings.telegramNotificationsEnabled()
         observedChatID = settings.telegramChatID()
@@ -255,6 +275,14 @@ final class TelegramAttentionNotificationService {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
                 MainActor.assumeIsolated { self?.reconcileWithSettings() }
+            }
+        // Hint only: the origin is link metadata and never reinstalls delivery, so a gateway
+        // refresh, restart, or loss cannot invalidate queued alerts. The published value is the
+        // new origin (delivered before the property is updated).
+        gatewayStatusObservation = gatewayStatus.$activeBrowserOrigin
+            .dropFirst()
+            .sink { [weak self] origin in
+                MainActor.assumeIsolated { self?.activeBrowserOrigin = origin }
             }
     }
 
@@ -434,7 +462,14 @@ final class TelegramAttentionNotificationService {
     private func installDelivery() {
         var delivery: TelegramPacedAttentionDelivery?
         if !deliverySuspended, let dependencies, let token, let chat = chatID.flatMap(TelegramChatID.init) {
-            delivery = TelegramPacedAttentionDelivery(token: token, chatID: chat, client: dependencies.client, pacer: pacer)
+            let gatewayStatus = gatewayStatus
+            delivery = TelegramPacedAttentionDelivery(
+                token: token,
+                chatID: chat,
+                client: dependencies.client,
+                pacer: pacer,
+                browserOrigin: { await gatewayStatus?.activeBrowserOrigin }
+            )
         }
         let installedChatID = chatID
         admission.setDeliveryConfiguration(delivery) { [weak self] policy in

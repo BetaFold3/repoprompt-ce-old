@@ -1,3 +1,4 @@
+import AppKit
 import RepoPromptAgentCore
 import RepoPromptUI
 import SwiftUI
@@ -11,6 +12,8 @@ struct RemoteControlSettingsView: View {
     @State private var hostFingerprint = ""
     @State private var pairedDevices: [PairedDeviceRecord] = []
     @State private var storeError: String?
+    @State private var browserPortDraft = ""
+    @State private var browserPortError: String?
 
     private let buildIdentity = RemoteControlBuildIdentity.current
     private var fontPreset: FontScalePreset {
@@ -30,6 +33,8 @@ struct RemoteControlSettingsView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             gatewaySection
+            Divider()
+            browserLinkSection
             Divider()
             identitySection
             Divider()
@@ -72,6 +77,98 @@ struct RemoteControlSettingsView: View {
                 Spacer()
             }
         }
+    }
+
+    private var suggestedBrowserPort: Int {
+        GlobalScalarPreferences.MCPSettings.suggestedBrowserHTTPSPort
+    }
+
+    /// Paired-browser HTTPS link: an owner-run `tailscale serve` listener on a non-443 port that
+    /// forwards to this build's gateway. The app never changes Tailscale configuration.
+    private var browserLinkSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Browser link (HTTPS)").font(fontPreset.font)
+            Text("Telegram alerts get an Open session button for your paired phone browser when this port is set and Remote Control is running. Leave it blank for text-only alerts. Port 443 is not allowed.")
+                .font(fontPreset.captionFont).foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 8) {
+                TextField("\(suggestedBrowserPort)", text: $browserPortDraft)
+                    .onSubmit(saveBrowserPort)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(maxWidth: 100)
+                Button("Save Port", action: saveBrowserPort).buttonStyle(CustomButtonStyle())
+                Button("Use \(suggestedBrowserPort)") {
+                    browserPortDraft = String(suggestedBrowserPort)
+                    saveBrowserPort()
+                }
+                .buttonStyle(CustomButtonStyle())
+                Spacer()
+            }
+            if let browserPortError {
+                Text(browserPortError).font(fontPreset.captionFont).foregroundColor(.red)
+            }
+            if let browserOrigin = gatewayStatus.browserOrigin {
+                labeledMonospace("Browser origin", browserOrigin.string)
+            } else if globalSettings.mcpRemoteGatewayBrowserHTTPSPort() != nil, gatewayStatus.status.origin != nil {
+                Text("Tailscale reported no MagicDNS name for this Mac, so there is no browser origin. Enable MagicDNS, then click Refresh Status.")
+                    .font(fontPreset.captionFont).foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let gatewayOrigin = gatewayStatus.status.origin {
+                let command = RemoteGatewayBrowserOrigin.serveCommand(
+                    browserPort: globalSettings.mcpRemoteGatewayBrowserHTTPSPort() ?? suggestedBrowserPort,
+                    gatewayOrigin: gatewayOrigin
+                )
+                HStack(alignment: .bottom, spacing: 8) {
+                    labeledMonospace("Run once in Terminal (\(buildIdentity.channel.rawValue.capitalized) build)", command)
+                    Spacer()
+                    Button("Copy") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(command, forType: .string)
+                        showFeedback("Copied tailscale serve command", false)
+                    }
+                    .buttonStyle(CustomButtonStyle())
+                }
+            } else {
+                Text("Turn on Remote Control to see the exact tailscale serve command for this build.")
+                    .font(fontPreset.captionFont).foregroundColor(.secondary)
+            }
+            Text("Requires MagicDNS and HTTPS certificates in Tailscale. One Serve port forwards to one build's gateway: after switching between the release and Dev builds, run the command shown in the build you use. It replaces the earlier target; until then, links fail.")
+                .font(fontPreset.captionFont).foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    /// Blank clears the port; otherwise a whole number 1–65535 other than 443. Only a saved
+    /// change is reported and relaunches the gateway with the new browser origin; a failed save
+    /// keeps the draft and changes nothing.
+    private func saveBrowserPort() {
+        let trimmed = browserPortDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let port: Int?
+        if trimmed.isEmpty {
+            port = nil
+        } else if trimmed.allSatisfy(\.isASCII), trimmed.allSatisfy(\.isNumber), let value = Int(trimmed),
+                  GlobalScalarPreferences.MCPSettings.isValidBrowserHTTPSPort(value)
+        {
+            port = value
+        } else {
+            browserPortError = "Enter a port from 1 to 65535 other than 443, or leave it blank. Nothing was changed."
+            return
+        }
+        guard port != globalSettings.mcpRemoteGatewayBrowserHTTPSPort() else {
+            browserPortError = nil
+            browserPortDraft = port.map(String.init) ?? ""
+            return
+        }
+        guard globalSettings.setMCPRemoteGatewayBrowserHTTPSPort(port) else {
+            browserPortError = "Couldn't save the browser HTTPS port. Nothing was changed."
+            showFeedback("Couldn't save the browser HTTPS port", true)
+            return
+        }
+        browserPortError = nil
+        browserPortDraft = port.map(String.init) ?? ""
+        showFeedback(port.map { "Browser HTTPS port set to \($0)" } ?? "Browser HTTPS port cleared", false)
+        Task { await ServerController.shared.applyRemoteGatewaySettings() }
     }
 
     private var identitySection: some View {
@@ -142,6 +239,7 @@ struct RemoteControlSettingsView: View {
     }
 
     private func refreshAll() {
+        browserPortDraft = globalSettings.mcpRemoteGatewayBrowserHTTPSPort().map(String.init) ?? ""
         refreshHostIdentity()
         refreshDevices()
     }

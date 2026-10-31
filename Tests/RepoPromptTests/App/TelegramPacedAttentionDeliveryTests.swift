@@ -2,6 +2,7 @@ import Foundation
 @testable import RepoPromptAgentCore
 @testable import RepoPromptApp
 @testable import RepoPromptPlatform
+import RepoPromptRemoteWire
 @testable import RepoPromptUI
 @testable import RepoPromptWorkspace
 import XCTest
@@ -42,6 +43,139 @@ final class TelegramPacedAttentionDeliveryTests: XCTestCase {
         XCTAssertEqual(clock.waits, [.seconds(1), .seconds(1), .seconds(1)])
         XCTAssertTrue(admission.pendingEventKeys.isEmpty)
         XCTAssertNil(admission.activeEventKey)
+    }
+
+    /// The snapshotted browser origin adds one Open session button to part 1 only; texts, part
+    /// count, pacing, and outcomes are the renderer's and admission's, unchanged.
+    func testBrowserOriginAddsSessionLinkButtonToPartOneOnly() async throws {
+        let origin = try RemoteGatewayOrigin(string: "https://mac.example.ts.net:8443")
+        let clock = ManualPacingClock()
+        let http = PacedStubHTTPClient(clock: clock)
+        let token = try XCTUnwrap(TelegramBotToken(PacedTelegramTestSupport.syntheticToken))
+        let delivery = TelegramPacedAttentionDelivery(
+            token: token,
+            chatID: .numeric(7),
+            client: TelegramSendMessageClient(httpClient: http),
+            pacer: pacer(clock),
+            browserOrigin: { origin }
+        )
+        let admission = makeAdmission(delivery)
+        let completionSession = UUID()
+        let questionSession = UUID()
+        let longText = (0 ..< 400).map { "line \($0) of the final assistant reply" }.joined(separator: "\n")
+        let completion = makeEvent(
+            .turnCompleted(sessionID: completionSession, attemptID: UUID()),
+            content: .turnCompleted(finalAssistantText: longText)
+        )
+        let question = makeEvent(
+            .question(sessionID: questionSession, interactionID: UUID()),
+            content: .question(contentLines: ["Questions:", "1. Which option?"])
+        )
+        let completionParts = TelegramAttentionMessageRenderer.render(completion).map(\.text)
+        let questionParts = TelegramAttentionMessageRenderer.render(question).map(\.text)
+        XCTAssertEqual(completionParts.count, 3)
+
+        admission.submit(capture(admission, completion))
+        admission.submit(capture(admission, question))
+        let testKey = admission.submitManualTest { true }
+        try await waitForRecord(admission, testKey) { $0 == .delivered(.sent) }
+        XCTAssertEqual(admission.records[completion.key], .delivered(.sent))
+        XCTAssertEqual(admission.records[question.key], .delivered(.sent))
+
+        XCTAssertEqual(
+            http.texts,
+            completionParts + questionParts + [TelegramAttentionMessageRenderer.testMessage],
+            "Exact renderer parts"
+        )
+        XCTAssertEqual(http.requestTimes, (0 ... completionParts.count + questionParts.count).map { Duration.seconds($0) })
+        let completionLink = "https://mac.example.ts.net:8443/?session_id=\(completionSession.uuidString)"
+        let questionLink = "https://mac.example.ts.net:8443/?session_id=\(questionSession.uuidString)"
+        XCTAssertEqual(
+            http.requests.map(sessionLinkButtonURL),
+            [completionLink, nil, nil, questionLink, nil],
+            "Part 1 of each session event only; never the Send test"
+        )
+        XCTAssertEqual(
+            TelegramPacedAttentionDelivery.openSessionURL(origin: origin, key: completion.key)?.absoluteString,
+            completionLink
+        )
+    }
+
+    /// Review S3-01: the origin is read once when an admitted attempt starts and kept for all of
+    /// its parts, even if it changes mid-attempt; the next attempt reads it again; the Send test
+    /// never reads it.
+    func testOriginIsSnapshottedOncePerAdmittedAttemptAcrossParts() async throws {
+        let first = try RemoteGatewayOrigin(string: "https://mac.example.ts.net:8443")
+        let second = try RemoteGatewayOrigin(string: "https://mac.example.ts.net:9443")
+        let origins = OriginSequence([first, second, nil])
+        let clock = ManualPacingClock(holdsWaits: true)
+        let http = PacedStubHTTPClient(clock: clock)
+        let token = try XCTUnwrap(TelegramBotToken(PacedTelegramTestSupport.syntheticToken))
+        let delivery = TelegramPacedAttentionDelivery(
+            token: token,
+            chatID: .numeric(7),
+            client: TelegramSendMessageClient(httpClient: http),
+            pacer: pacer(clock),
+            browserOrigin: { origins.next() }
+        )
+        let admission = makeAdmission(delivery)
+        let longText = (0 ..< 400).map { "line \($0) of the final assistant reply" }.joined(separator: "\n")
+        let multipart = makeEvent(
+            .turnCompleted(sessionID: UUID(), attemptID: UUID()),
+            content: .turnCompleted(finalAssistantText: longText)
+        )
+        let next = makeEvent(questionKey(), content: .question(contentLines: ["Questions:", "1. Which option?"]))
+        let last = makeEvent(questionKey(), content: .question(contentLines: ["Questions:", "2. Another?"]))
+        XCTAssertEqual(TelegramAttentionMessageRenderer.render(multipart).count, 3)
+
+        admission.submit(capture(admission, multipart))
+        try await waitUntil("part 1 sent and part 2 pacing") { http.requestCount == 1 && clock.waits.count == 1 }
+        XCTAssertEqual(origins.reads, 1)
+        clock.releaseWaits()
+        try await waitForRecord(admission, multipart.key) { $0 == .delivered(.sent) }
+        XCTAssertEqual(origins.reads, 1, "Parts 2 and 3 reuse the attempt's snapshot")
+
+        let testKey = admission.submitManualTest { true }
+        try await waitForRecord(admission, testKey) { $0 == .delivered(.sent) }
+        XCTAssertEqual(origins.reads, 1, "The Send test does not read the origin")
+        admission.submit(capture(admission, next))
+        try await waitForRecord(admission, next.key) { $0 == .delivered(.sent) }
+        admission.submit(capture(admission, last))
+        try await waitForRecord(admission, last.key) { $0 == .delivered(.sent) }
+        XCTAssertEqual(origins.reads, 3)
+
+        XCTAssertEqual(
+            http.requests.map(sessionLinkButtonURL),
+            [
+                TelegramPacedAttentionDelivery.openSessionURL(origin: first, key: multipart.key)?.absoluteString,
+                nil,
+                nil,
+                nil,
+                TelegramPacedAttentionDelivery.openSessionURL(origin: second, key: next.key)?.absoluteString,
+                nil
+            ],
+            "Snapshot per attempt: first origin for the multipart alert, then the second, then none"
+        )
+    }
+
+    func testWithoutBrowserOriginEveryPartIsTextOnly() async throws {
+        let http = PacedStubHTTPClient()
+        let admission = makeAdmission(PacedTelegramTestSupport.delivery(http: http, pacer: pacer(ManualPacingClock())))
+        let event = makeEvent(questionKey(), content: .question(contentLines: Array(repeating: String(repeating: "q", count: 100), count: 50)))
+        admission.submit(capture(admission, event))
+        try await waitForRecord(admission, event.key) { $0 == .delivered(.sent) }
+
+        XCTAssertEqual(http.requestCount, 2)
+        XCTAssertEqual(http.requests.map(sessionLinkButtonURL), [nil, nil])
+        for request in http.requests {
+            let body = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(request.httpBody)) as? [String: Any])
+            XCTAssertEqual(Set(body.keys), ["chat_id", "text"])
+        }
+        let plainHTTPOrigin = try RemoteGatewayOrigin(string: "http://100.64.0.8:47391")
+        XCTAssertNil(
+            TelegramPacedAttentionDelivery.openSessionURL(origin: plainHTTPOrigin, key: event.key),
+            "Only an HTTPS origin produces a link"
+        )
     }
 
     func testPacingIsMarkedAtRequestInitiationNotResponse() async throws {
@@ -489,6 +623,19 @@ final class TelegramPacedAttentionDeliveryTests: XCTestCase {
         TelegramAttentionPacer(clock: clock.pacingClock)
     }
 
+    /// The single Open session button URL in a request, or nil when it has no reply markup.
+    private func sessionLinkButtonURL(_ request: URLRequest) -> String? {
+        guard let data = request.httpBody,
+              let body = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let markup = body["reply_markup"] as? [String: Any]
+        else { return nil }
+        let rows = markup["inline_keyboard"] as? [[[String: String]]]
+        XCTAssertEqual(rows?.count, 1)
+        XCTAssertEqual(rows?.first?.count, 1)
+        XCTAssertEqual(rows?.first?.first?["text"], "Open session")
+        return rows?.first?.first?["url"]
+    }
+
     private func makeAdmission(
         _ delivery: TelegramPacedAttentionDelivery,
         fence: PacedAdmissionFence? = nil,
@@ -804,5 +951,27 @@ private final class IdleBox {
 
     init(_ value: TimeInterval?) {
         self.value = value
+    }
+}
+
+/// Scripted browser origins, one per read (then nil), with a read count.
+private final class OriginSequence: @unchecked Sendable {
+    private let lock = NSLock()
+    private var remaining: [RemoteGatewayOrigin?]
+    private var count = 0
+
+    init(_ origins: [RemoteGatewayOrigin?]) {
+        remaining = origins
+    }
+
+    var reads: Int {
+        lock.withLock { count }
+    }
+
+    func next() -> RemoteGatewayOrigin? {
+        lock.withLock {
+            count += 1
+            return remaining.isEmpty ? nil : remaining.removeFirst()
+        }
     }
 }

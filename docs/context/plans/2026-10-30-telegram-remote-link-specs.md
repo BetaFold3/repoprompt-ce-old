@@ -53,7 +53,7 @@ Change:
 - `TelegramPacedAttentionDelivery` attaches it to part 1 only, using the origin snapshotted with the delivery configuration. An unset port or inactive gateway gives today's text-only alert plus a settings hint. Renderer and text budgets are unchanged.
 Validation: `TelegramSendMessageClientTests`, `TelegramPacedAttentionDeliveryTests`, `TelegramAttentionNotificationServiceTests`, `TelegramAttentionMessageRendererTests` unchanged, a new gateway Host-allowlist test (HTTP and WS), all with stub HTTP; `make dev-lint`, `make guardrails`.
 Done when: stubbed requests carry the correct session link on part 1 only, content and admission are unchanged, and a wrong Host is refused on HTTP and WS.
-Step 3 — todo | rounds 0/2 | open: none | downgraded: none | assumed: none | deferred: none
+Step 3 — done | rounds 1/2 | open: none | downgraded: none | assumed: snapshot link per admitted attempt to preserve alert admission (step3-completion.md) | deferred: minor P3s and live Serve/button acceptance (step3-completion.md)
 
 ### Step 4 — Owner setup and live acceptance (manual; approvals at each action)
 Change: none in code, except a Host allowlist fix if the check below fails. Setup:

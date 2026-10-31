@@ -174,6 +174,26 @@ final class TelegramSendMessageClientTests: XCTestCase {
         XCTAssertEqual(json["chat_id"] as? String, "@my_channel")
     }
 
+    func testOptionalOpenSessionButtonIsOneInlineURLButtonAndKeepsPlainText() async throws {
+        let stub = StubHTTPClient(behavior: .respond(status: 200, body: Data(#"{"ok":true}"#.utf8)))
+        let link = try XCTUnwrap(URL(string: "https://mac.example.ts.net:8443/?session_id=ABC"))
+        let result = await TelegramSendMessageClient(httpClient: stub)
+            .send(text: "*plain*", to: .numeric(7), token: token, openSessionURL: link)
+
+        XCTAssertEqual(result, .sent)
+        let request = try XCTUnwrap(stub.requests.first)
+        XCTAssertEqual(request.url?.absoluteString, Self.syntheticURL)
+        let json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: XCTUnwrap(request.httpBody)) as? [String: Any]
+        )
+        XCTAssertEqual(Set(json.keys), ["chat_id", "text", "reply_markup"], "No parse_mode: the text stays plain")
+        XCTAssertEqual(json["text"] as? String, "*plain*")
+        let markup = try XCTUnwrap(json["reply_markup"] as? [String: Any])
+        XCTAssertEqual(Set(markup.keys), ["inline_keyboard"])
+        let rows = try XCTUnwrap(markup["inline_keyboard"] as? [[[String: String]]])
+        XCTAssertEqual(rows, [[["text": "Open session", "url": "https://mac.example.ts.net:8443/?session_id=ABC"]]])
+    }
+
     func testInvalidTextIsRejectedWithoutAnyRequest() async {
         let stub = StubHTTPClient(behavior: .respond(status: 200, body: Data(#"{"ok":true}"#.utf8)))
         let client = TelegramSendMessageClient(httpClient: stub)

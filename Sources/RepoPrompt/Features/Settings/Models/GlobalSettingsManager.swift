@@ -1314,6 +1314,36 @@ class GlobalSettingsStore: ObservableObject {
         }
     }
 
+    /// The saved browser HTTPS port, or nil when unset or invalid (including 443).
+    func mcpRemoteGatewayBrowserHTTPSPort() -> Int? {
+        guard let port = scalarPreferences.mcp?.remoteGatewayBrowserHTTPSPort,
+              GlobalScalarPreferences.MCPSettings.isValidBrowserHTTPSPort(port)
+        else { return nil }
+        return port
+    }
+
+    /// Saves a valid browser HTTPS port, or clears it with nil, and returns whether the value is
+    /// now saved. An invalid port (including 443) is rejected without a write; a failed save
+    /// restores the previous value (the same contract as the Telegram setters).
+    @discardableResult
+    func setMCPRemoteGatewayBrowserHTTPSPort(_ port: Int?) -> Bool {
+        if let port, !GlobalScalarPreferences.MCPSettings.isValidBrowserHTTPSPort(port) {
+            return false
+        }
+        let before = scalarPreferences
+        updateMCPScalar(commit: false) { settings in
+            settings.remoteGatewayBrowserHTTPSPort = port
+        }
+        if save() {
+            return true
+        }
+        if scalarPreferences != before {
+            objectWillChange.send()
+            scalarPreferences = before
+        }
+        return false
+    }
+
     func remoteControlShowPairingDetails() -> Bool {
         scalarPreferences.mcp?.remoteControlShowPairingDetails ?? true
     }

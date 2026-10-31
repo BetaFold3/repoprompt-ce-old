@@ -73,6 +73,16 @@ package struct TailscaleStatusSnapshot: Equatable {
         selfNode.eligibleIPv4s.first
     }
 
+    /// This Mac's MagicDNS name (`Self.DNSName`) without the trailing dot, lowercased; nil when
+    /// Tailscale reports none.
+    package var selfDNSName: String? {
+        let trimmed = selfNode.dnsName?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+            .lowercased() ?? ""
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
     var visiblePeers: [TailscaleNode] {
         peers
             .filter { $0.online != false && !$0.eligibleIPv4s.isEmpty }

@@ -583,6 +583,9 @@ struct GlobalScalarPreferences: Codable, Equatable {
     }
 
     struct MCPSettings: Codable, Equatable {
+        /// Suggested `tailscale serve --https` port for the browser remote (Serve's 443 may be taken).
+        static let suggestedBrowserHTTPSPort = 8443
+
         var autoStart: Bool?
         var showModelPresets: Bool?
         var temporarilyDisablePresets: Bool?
@@ -590,6 +593,9 @@ struct GlobalScalarPreferences: Codable, Equatable {
         var remoteGatewayBindAddress: String?
         var remoteGatewayPort: Int?
         var remoteControlShowPairingDetails: Bool?
+        /// The owner's `tailscale serve --https=<port>` listener that forwards to this build's
+        /// gateway. Missing means unset: no browser HTTPS origin and no Telegram session links.
+        var remoteGatewayBrowserHTTPSPort: Int?
 
         init(
             autoStart: Bool? = nil,
@@ -598,7 +604,8 @@ struct GlobalScalarPreferences: Codable, Equatable {
             remoteGatewayEnabled: Bool? = nil,
             remoteGatewayBindAddress: String? = nil,
             remoteGatewayPort: Int? = nil,
-            remoteControlShowPairingDetails: Bool? = nil
+            remoteControlShowPairingDetails: Bool? = nil,
+            remoteGatewayBrowserHTTPSPort: Int? = nil
         ) {
             self.autoStart = autoStart
             self.showModelPresets = showModelPresets
@@ -607,6 +614,12 @@ struct GlobalScalarPreferences: Codable, Equatable {
             self.remoteGatewayBindAddress = remoteGatewayBindAddress
             self.remoteGatewayPort = remoteGatewayPort
             self.remoteControlShowPairingDetails = remoteControlShowPairingDetails
+            self.remoteGatewayBrowserHTTPSPort = remoteGatewayBrowserHTTPSPort
+        }
+
+        /// A usable browser HTTPS port: 1–65535 and not 443 (left to other Serve configurations).
+        static func isValidBrowserHTTPSPort(_ port: Int) -> Bool {
+            (1 ... 65535).contains(port) && port != 443
         }
     }
 

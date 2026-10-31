@@ -63,15 +63,17 @@ actor RemoteGatewayActivationGate {
         return candidate
     }
 
+    /// Invalidates only while `candidate` is current. Returns the invalidation generation
+    /// (for fenced status publication) when it is still current afterwards, else nil.
     @discardableResult
-    func invalidate(ifGeneration candidate: UInt64) async -> Bool {
-        guard candidate == generation else { return false }
+    func invalidate(ifGeneration candidate: UInt64) async -> UInt64? {
+        guard candidate == generation else { return nil }
         generation &+= 1
         let invalidationGeneration = generation
         await authorityMutationLock.acquire()
         await authority.clear()
         await authorityMutationLock.release()
-        return invalidationGeneration == generation
+        return invalidationGeneration == generation ? invalidationGeneration : nil
     }
 
     func currentGenerationForTesting() -> UInt64 {

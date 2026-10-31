@@ -3,6 +3,7 @@ import Foundation
 @testable import RepoPromptAgentCore
 @testable import RepoPromptApp
 @testable import RepoPromptPlatform
+import RepoPromptRemoteWire
 @testable import RepoPromptUI
 @testable import RepoPromptWorkspace
 import XCTest
@@ -449,6 +450,95 @@ final class TelegramAttentionNotificationServiceTests: XCTestCase {
         )
     }
 
+    // MARK: - Session links
+
+    /// Review S3-01: the browser origin is per-attempt link metadata. Gateway status changes
+    /// (an unchanged-origin refresh, or a real gateway loss) never replace the delivery, so
+    /// queued and pending alerts, including a queued Send test, are still sent; each attempt
+    /// carries the button only if an origin is active when it starts.
+    func testSessionLinkIsPerAttemptMetadataAndNeverInvalidatesQueuedAlerts() async throws {
+        let gatewayStatus = RemoteGatewayStatusStore()
+        let fixture = try makeFixture(enabled: true, gatewayStatus: gatewayStatus)
+        fixture.service.start(launch: Self.allowedLaunch)
+        XCTAssertNil(fixture.service.activeBrowserOrigin)
+        XCTAssertEqual(fixture.service.sessionLinkHint, TelegramAttentionNotificationService.sessionLinkUnavailableHint)
+        XCTAssertEqual(fixture.service.notices, [], "The link hint is not a delivery notice")
+
+        let gatewayOrigin = try RemoteGatewayOrigin(tailscaleIPv4: "100.64.0.8", channel: .debug)
+        let browserOrigin = try RemoteGatewayOrigin(string: "https://mac.example.ts.net:8443")
+        let generation = fixture.admission.deliveryGeneration
+        gatewayStatus.publish(.resolvingTailscale, generation: 1)
+        gatewayStatus.publish(.starting(gatewayOrigin), browserOrigin: browserOrigin, generation: 1)
+        XCTAssertNil(fixture.service.activeBrowserOrigin, "A starting gateway is not active")
+        gatewayStatus.publish(.discoverable(gatewayOrigin), browserOrigin: browserOrigin, generation: 1)
+        XCTAssertEqual(fixture.service.activeBrowserOrigin, browserOrigin)
+        XCTAssertNil(fixture.service.sessionLinkHint)
+        XCTAssertEqual(fixture.admission.deliveryGeneration, generation, "Link metadata is not configuration")
+
+        let sessionID = UUID()
+        let linked = AttentionNotificationEvent(
+            key: .turnCompleted(sessionID: sessionID, attemptID: UUID()),
+            workspaceName: "Workspace",
+            sessionName: "Root",
+            content: .turnCompleted(finalAssistantText: "done")
+        )
+        fixture.admission.submit(fixture.admission.makeCapture(event: linked, isStillCurrent: { true }))
+        try await waitForRecord(fixture.admission, linked.key) { $0 == .delivered(.sent) }
+        XCTAssertEqual(fixture.http.texts, TelegramAttentionMessageRenderer.render(linked).map(\.text))
+        XCTAssertEqual(
+            sessionLinkButtonURLs(fixture.http),
+            ["https://mac.example.ts.net:8443/?session_id=\(sessionID.uuidString)"]
+        )
+
+        // An unchanged-origin refresh while one alert is at the fence and another is queued
+        // behind it with a Send test.
+        fixture.fence.holds = true
+        let pending = completionEvent(text: "pending through refresh")
+        let queued = completionEvent(text: "queued through refresh")
+        fixture.admission.submit(fixture.admission.makeCapture(event: pending, isStillCurrent: { true }))
+        try await waitUntil("the pending event to reach the fence") { fixture.fence.pauseCount == 2 }
+        fixture.admission.submit(fixture.admission.makeCapture(event: queued, isStillCurrent: { true }))
+        XCTAssertTrue(fixture.service.sendTest())
+        let refreshTestKey = try XCTUnwrap(fixture.service.lastTestKey)
+        gatewayStatus.publish(.resolvingTailscale, generation: 2)
+        XCTAssertEqual(fixture.service.sessionLinkHint, TelegramAttentionNotificationService.sessionLinkUnavailableHint)
+        gatewayStatus.publish(.starting(gatewayOrigin), browserOrigin: browserOrigin, generation: 2)
+        gatewayStatus.publish(.discoverable(gatewayOrigin), browserOrigin: browserOrigin, generation: 2)
+        XCTAssertEqual(fixture.admission.deliveryGeneration, generation)
+        fixture.fence.release()
+        try await waitForRecord(fixture.admission, pending.key) { $0 == .delivered(.sent) }
+        try await waitForRecord(fixture.admission, queued.key) { $0 == .delivered(.sent) }
+        try await waitForRecord(fixture.admission, refreshTestKey) { $0 == .delivered(.sent) }
+        XCTAssertEqual(
+            Array(sessionLinkButtonURLs(fixture.http).suffix(3)),
+            [sessionLink(browserOrigin, pending), sessionLink(browserOrigin, queued), nil],
+            "Each attempt reads the active origin; the Send test never has a link"
+        )
+
+        // A real gateway loss while an alert is at the fence and a Send test is queued: both are
+        // still sent, the alert text-only.
+        fixture.fence.holds = true
+        let pauses = fixture.fence.pauseCount
+        let lost = completionEvent(text: "pending through gateway loss")
+        fixture.admission.submit(fixture.admission.makeCapture(event: lost, isStillCurrent: { true }))
+        try await waitUntil("the event to reach the fence") { fixture.fence.pauseCount == pauses + 1 }
+        XCTAssertTrue(fixture.service.sendTest())
+        let lossTestKey = try XCTUnwrap(fixture.service.lastTestKey)
+        gatewayStatus.publish(.unavailable("Gateway process exited."), generation: 3)
+        XCTAssertNil(fixture.service.activeBrowserOrigin)
+        XCTAssertEqual(fixture.service.sessionLinkHint, TelegramAttentionNotificationService.sessionLinkUnavailableHint)
+        XCTAssertTrue(fixture.service.isDeliveryConfigured, "Alerts continue text-only")
+        XCTAssertEqual(fixture.admission.deliveryGeneration, generation)
+        fixture.fence.release()
+        try await waitForRecord(fixture.admission, lost.key) { $0 == .delivered(.sent) }
+        try await waitForRecord(fixture.admission, lossTestKey) { $0 == .delivered(.sent) }
+        XCTAssertEqual(Array(sessionLinkButtonURLs(fixture.http).suffix(2)), [nil, nil])
+        XCTAssertEqual(
+            Array(fixture.http.texts.suffix(2)),
+            [TelegramAttentionMessageRenderer.render(lost).map(\.text).first, TelegramAttentionMessageRenderer.testMessage]
+        )
+    }
+
     func testFailingTestRecordsOneAttemptWithFixedResultText() async throws {
         let echoed = Data(#"{"ok":false,"error_code":401,"description":"bad \#(PacedTelegramTestSupport.syntheticToken) https://api.telegram.org/bot"}"#.utf8)
         let fixture = try makeFixture(replies: [
@@ -764,7 +854,8 @@ final class TelegramAttentionNotificationServiceTests: XCTestCase {
         idle: TimeInterval? = nil,
         idleMinutes: Int? = nil,
         ephemeral: Bool = false,
-        replies: [PacedStubHTTPClient.Reply] = []
+        replies: [PacedStubHTTPClient.Reply] = [],
+        gatewayStatus: RemoteGatewayStatusStore? = nil
     ) throws -> Fixture {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("TelegramAttentionNotificationServiceTests-\(UUID().uuidString)")
@@ -795,6 +886,9 @@ final class TelegramAttentionNotificationServiceTests: XCTestCase {
         let service = TelegramAttentionNotificationService(
             admission: admission,
             settings: settings,
+            // Isolated by default: the shared store would let an unrelated gateway publication
+            // reach this fixture.
+            gatewayStatus: gatewayStatus ?? RemoteGatewayStatusStore(),
             pacer: TelegramAttentionPacer(clock: clock.pacingClock),
             makeDependencies: {
                 factory.calls += 1
@@ -826,12 +920,30 @@ final class TelegramAttentionNotificationServiceTests: XCTestCase {
         )
     }
 
+    /// The Open session link for `event` under `origin`.
+    private func sessionLink(_ origin: RemoteGatewayOrigin, _ event: AttentionNotificationEvent) -> String? {
+        TelegramPacedAttentionDelivery.openSessionURL(origin: origin, key: event.key)?.absoluteString
+    }
+
+    /// Each request's Open session button URL, or nil for a text-only request.
+    private func sessionLinkButtonURLs(_ http: PacedStubHTTPClient) -> [String?] {
+        http.requests.map { request in
+            guard let data = request.httpBody,
+                  let body = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let markup = body["reply_markup"] as? [String: Any],
+                  let rows = markup["inline_keyboard"] as? [[[String: String]]]
+            else { return nil }
+            return rows.first?.first?["url"]
+        }
+    }
+
     /// A later startup: a fresh service, admission, and settings store over the same saved file
     /// and secure storage.
     private func restartedService(_ fixture: Fixture) -> TelegramAttentionNotificationService {
         let service = TelegramAttentionNotificationService(
             admission: AttentionNotificationAdmission(),
             settings: GlobalSettingsStore(defaults: fixture.defaults, fileStore: GlobalSettingsFileStore(fileURL: fixture.fileURL)),
+            gatewayStatus: RemoteGatewayStatusStore(),
             pacer: TelegramAttentionPacer(clock: ManualPacingClock().pacingClock),
             makeDependencies: {
                 .init(

@@ -215,6 +215,91 @@ final class RemoteGatewayLifecycleTests: XCTestCase {
         XCTAssertNil(active)
     }
 
+    /// Review S3-02: a stop withdraws the published status, and with it the active browser link,
+    /// for its generation before it awaits process termination; a publication from the
+    /// superseded generation cannot re-advertise the link meanwhile or afterwards.
+    func testStopWithdrawsBrowserLinkBeforeHeldTerminationAndFencesStalePublication() async throws {
+        let fixture = try makeFixture()
+        let recorder = LifecycleMutationRecorder()
+        let terminationPause = LifecycleTerminationPause()
+        let lifecycle = RemoteGatewayProcessLifecycle(dependencies: .init(
+            generateCredential: { recorder.nextCredential() },
+            setCredential: { recorder.setCredential($0) },
+            findOrphan: { _ in nil },
+            launch: { configuration, credential, token, didTerminate in
+                recorder.launch(
+                    configuration: configuration,
+                    credential: credential,
+                    token: token,
+                    didTerminate: didTerminate
+                )
+            },
+            terminateOrphan: { recorder.recordOrphanTermination($0) },
+            forceKill: { recorder.recordForceKill($0) },
+            isProcessRunning: { recorder.isRunning(pid: $0) },
+            removeLease: { recorder.recordLeaseRemoval(configuration: $0, pid: $1) },
+            waitForTermination: { await terminationPause.pauseOnce() },
+            now: { Date(timeIntervalSince1970: 1000) }
+        ))
+        let store = await MainActor.run { RemoteGatewayStatusStore() }
+        let gatewayOrigin = try RemoteGatewayOrigin(tailscaleIPv4: "100.64.0.8", channel: .release)
+        let browserOrigin = try RemoteGatewayOrigin(string: "https://mac.example.ts.net:8443")
+        let running = await fixture.gate.begin()
+        await lifecycle.selectGeneration(running)
+        let identity = try await lifecycle.startIfNeeded(
+            launchConfiguration(ip: "100.64.0.8"),
+            generation: running,
+            didTerminate: { _ in }
+        )
+        let published = await MainActor.run {
+            store.publish(.discoverable(gatewayOrigin), browserOrigin: browserOrigin, generation: running)
+        }
+        XCTAssertTrue(published)
+        let activeWhileRunning = await MainActor.run { store.activeBrowserOrigin }
+        XCTAssertEqual(activeWhileRunning, browserOrigin)
+
+        let stopping = await fixture.gate.invalidate()
+        await lifecycle.selectGeneration(stopping)
+        let stop = Task {
+            await ServerController.stopRemoteGateway(
+                .stopped(reason: ServerController.remoteGatewayStoppedWithServerReason),
+                generation: stopping,
+                statusStore: store,
+                lifecycle: lifecycle
+            )
+        }
+        await terminationPause.waitUntilPaused()
+        XCTAssertEqual(recorder.forceKilledPIDs, [], "Termination is still held")
+        let (heldStatus, heldActive, heldBrowser) = await MainActor.run {
+            (store.status, store.activeBrowserOrigin, store.browserOrigin)
+        }
+        XCTAssertEqual(heldStatus, .unavailable(ServerController.remoteGatewayStoppedWithServerReason))
+        XCTAssertNil(heldActive, "The link is withdrawn before termination completes")
+        XCTAssertNil(heldBrowser)
+
+        let staleAccepted = await MainActor.run {
+            store.publish(.discoverable(gatewayOrigin), browserOrigin: browserOrigin, generation: running)
+        }
+        XCTAssertFalse(staleAccepted, "A late publication from the superseded apply is dropped")
+        let activeAfterStale = await MainActor.run { store.activeBrowserOrigin }
+        XCTAssertNil(activeAfterStale)
+
+        await terminationPause.resume()
+        await stop.value
+        XCTAssertEqual(recorder.forceKilledPIDs, [identity.pid])
+        let (stoppedStatus, stoppedActive) = await MainActor.run { (store.status, store.activeBrowserOrigin) }
+        XCTAssertEqual(stoppedStatus, .unavailable(ServerController.remoteGatewayStoppedWithServerReason))
+        XCTAssertNil(stoppedActive)
+
+        let next = await fixture.gate.begin()
+        let nextAccepted = await MainActor.run {
+            store.publish(.discoverable(gatewayOrigin), browserOrigin: browserOrigin, generation: next)
+        }
+        XCTAssertTrue(nextAccepted, "A newer apply publishes again")
+        let activeAfterNext = await MainActor.run { store.activeBrowserOrigin }
+        XCTAssertEqual(activeAfterNext, browserOrigin)
+    }
+
     private func makeFixture() throws -> Fixture {
         let directory = try RemotePairingTestSupport.temporaryDirectory(testCase: self)
         let (_, keychain) = RemotePairingTestSupport.hostKeychain()

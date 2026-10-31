@@ -22,6 +22,7 @@ struct GatewayConfiguration: Equatable {
         static let appLinkMaximumReconnectAttempts = "REPOPROMPT_GATEWAY_APP_LINK_MAX_RECONNECT_ATTEMPTS"
         static let allowWildcardBind = "REPOPROMPT_GATEWAY_ALLOW_WILDCARD_BIND"
         static let allowStaticTokenAuth = "REPOPROMPT_GATEWAY_ALLOW_STATIC_TOKEN_AUTH"
+        static let browserOrigin = "REPOPROMPT_GATEWAY_BROWSER_ORIGIN"
     }
 
     let bindHost: String
@@ -51,6 +52,10 @@ struct GatewayConfiguration: Equatable {
     /// app build. `/healthz` publishes it so a browser can pick the matching identity and discovery
     /// channel.
     let buildChannel: RemoteControlBuildChannel
+    /// Lowercased `host:port` of the browser HTTPS origin (an owner-run `tailscale serve`
+    /// listener forwarding here), accepted as a request Host besides the bind address. Nil when
+    /// no browser origin was configured.
+    let browserOriginAuthority: String?
 
     static var compiledBuildChannel: RemoteControlBuildChannel {
         #if DEBUG
@@ -101,6 +106,7 @@ struct GatewayConfiguration: Equatable {
             name: "app link maximum reconnect attempts"
         ) ?? (parentPID == nil ? nil : 24)
         let allowWildcardBind = values.allowWildcardBind
+        let browserOriginAuthority = try parseBrowserOriginAuthority(values.browserOrigin)
 
         guard allowWildcardBind || !isWildcardBindHost(bindHost) else {
             throw GatewayConfigurationError.wildcardBindRequiresExplicitOptIn(bindHost)
@@ -122,8 +128,23 @@ struct GatewayConfiguration: Equatable {
             appLinkMaximumReconnectAttempts: appLinkMaximumReconnectAttempts,
             allowWildcardBind: allowWildcardBind,
             allowStaticTokenAuth: values.allowStaticTokenAuth,
-            buildChannel: compiledBuildChannel
+            buildChannel: compiledBuildChannel,
+            browserOriginAuthority: browserOriginAuthority
         )
+    }
+
+    /// Accepts only `https://host:port` with an explicit port and nothing else (no credentials,
+    /// path, query, or fragment). Empty means unset.
+    private static func parseBrowserOriginAuthority(_ raw: String?) throws -> String? {
+        guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return nil }
+        guard let origin = try? RemoteGatewayOrigin(string: raw),
+              origin.scheme == "https",
+              !origin.host.isEmpty,
+              (1 ... 65535).contains(origin.port)
+        else {
+            throw GatewayConfigurationError.invalidBrowserOrigin(raw)
+        }
+        return GatewayHostAllowlist.authority(host: origin.host, port: origin.port)
     }
 
     private static func parsePort(_ raw: String?, defaultValue: Int) throws -> Int {
@@ -165,6 +186,7 @@ enum GatewayConfigurationError: Error, Equatable, CustomStringConvertible {
     case invalidPort(String)
     case invalidInteger(name: String, value: String)
     case wildcardBindRequiresExplicitOptIn(String)
+    case invalidBrowserOrigin(String)
 
     var description: String {
         switch self {
@@ -178,6 +200,8 @@ enum GatewayConfigurationError: Error, Equatable, CustomStringConvertible {
             "Invalid gateway \(name): \(value)"
         case let .wildcardBindRequiresExplicitOptIn(host):
             "Wildcard gateway bind host requires explicit opt-in: \(host)"
+        case let .invalidBrowserOrigin(value):
+            "Invalid gateway browser origin (expected https://host:port): \(value)"
         }
     }
 }
@@ -198,6 +222,7 @@ private struct ParsedValues {
     var appLinkMaximumReconnectAttempts: String?
     var allowWildcardBind: Bool
     var allowStaticTokenAuth: Bool
+    var browserOrigin: String?
 
     init(environment: [String: String]) {
         bindHost = environment[GatewayConfiguration.EnvironmentKey.bindHost]
@@ -215,6 +240,7 @@ private struct ParsedValues {
         appLinkMaximumReconnectAttempts = environment[GatewayConfiguration.EnvironmentKey.appLinkMaximumReconnectAttempts]
         allowWildcardBind = Self.parseBool(environment[GatewayConfiguration.EnvironmentKey.allowWildcardBind]) ?? false
         allowStaticTokenAuth = Self.parseBool(environment[GatewayConfiguration.EnvironmentKey.allowStaticTokenAuth]) ?? false
+        browserOrigin = environment[GatewayConfiguration.EnvironmentKey.browserOrigin]
     }
 
     mutating func apply(arguments: [String]) throws {
@@ -265,6 +291,7 @@ private struct ParsedValues {
             case "--parent-pid": parentPID = value
             case "--process-lease-file": processLeaseFile = value
             case "--app-link-max-reconnect-attempts": appLinkMaximumReconnectAttempts = value
+            case "--browser-origin": browserOrigin = value
             case "--allow-wildcard-bind":
                 allowWildcardBind = Self.parseBool(value) ?? true
             case "--allow-static-token-auth":

@@ -1,20 +1,45 @@
 import Foundation
 import RepoPromptAgentCore
+import RepoPromptRemoteWire
 
 struct RemoteGatewayLaunchConfiguration: Equatable {
     let bindHost: String
     let port: Int
     let appSupportRoot: String
+    /// The browser HTTPS origin served by the owner's `tailscale serve` listener, or nil. The
+    /// gateway also accepts its authority as a request Host. A change relaunches the gateway.
+    var browserOrigin: RemoteGatewayOrigin?
 
     static func production(
         bindHost: String,
+        browserOrigin: RemoteGatewayOrigin? = nil,
         buildIdentity: RemoteControlBuildIdentity = .current
     ) -> Self {
         .init(
             bindHost: bindHost,
             port: buildIdentity.fixedPort,
-            appSupportRoot: RemoteControlStorageNamespace.gatewayRuntimeRootURL().path
+            appSupportRoot: RemoteControlStorageNamespace.gatewayRuntimeRootURL().path,
+            browserOrigin: browserOrigin
         )
+    }
+}
+
+/// The paired-browser HTTPS origin: `https://<Self DNS name>:<browser HTTPS port>`, reached
+/// through a `tailscale serve` listener the owner runs (the app never configures Tailscale).
+enum RemoteGatewayBrowserOrigin {
+    /// Nil unless both the Tailscale DNS name and a valid port (not 443) are known.
+    static func derive(selfDNSName: String?, port: Int?) -> RemoteGatewayOrigin? {
+        guard let selfDNSName, !selfDNSName.isEmpty, let port,
+              GlobalScalarPreferences.MCPSettings.isValidBrowserHTTPSPort(port),
+              let origin = try? RemoteGatewayOrigin(string: "https://\(selfDNSName):\(port)"),
+              origin.scheme == "https", origin.port == port
+        else { return nil }
+        return origin
+    }
+
+    /// The exact Serve command that forwards `browserPort` to this build's direct gateway origin.
+    static func serveCommand(browserPort: Int, gatewayOrigin: RemoteGatewayOrigin) -> String {
+        "tailscale serve --bg --https=\(browserPort) \(gatewayOrigin.string)"
     }
 }
 
