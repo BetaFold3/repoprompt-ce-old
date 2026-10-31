@@ -192,8 +192,20 @@ const state = {
   viewGeneration: 0,
   // Bumped on every streamed snapshot, so an older poll reply cannot overwrite it.
   revisionBySession: new Map(),
-  transcriptOffset: 0,
-  transcriptToken: 0, // bumped by manual Refresh so in-flight transcript pages are dropped
+  // get_log pages are oldest-first turn ranges. The view shows turns from
+  // transcriptStart on: older pages the reader loaded, then the newest page, which
+  // starts at transcriptLiveStart. Loaded older pages mean history browsing, which
+  // pauses background refresh until the Refresh button.
+  transcriptToken: 0, // bumped on session switch and manual Refresh; drops in-flight pages
+  transcriptLiveRequest: null, // the in-flight newest-page load; at most one at a time
+  transcriptLivePending: false, // a newest-page load was asked for while one was in flight
+  transcriptOlderRequest: null, // the in-flight "Load more transcript" request
+  transcriptStart: null,
+  transcriptLiveStart: null,
+  transcriptTotal: null, // total_turns from the last newest page
+  transcriptOlderText: '',
+  transcriptLiveText: '',
+  transcriptBrowsing: false,
   lastSeqBySession: new Map(),
   questionInputs: null, // structured question form controls for the shown interaction
 };
@@ -337,12 +349,11 @@ function resetIdentityState() {
   state.viewGeneration += 1;
   state.currentSessionId = null;
   state.deepLinkSessionId = null;
-  state.transcriptOffset = 0;
+  resetTranscriptView();
   state.questionInputs = null;
   state.sessions.clear();
   state.revisionBySession.clear();
   state.lastSeqBySession.clear();
-  $('transcript').textContent = '';
   setActionStatus('');
   $('sessions-panel').classList.add('hidden');
   $('detail-panel').classList.add('hidden');
@@ -743,8 +754,7 @@ async function openSession(sessionId) {
   $('detail-panel').classList.remove('hidden');
   $('detail-session-id').textContent = shortID(sessionId);
   if (switching) {
-    state.transcriptOffset = 0;
-    $('transcript').textContent = '';
+    resetTranscriptView();
     $('composer-input').value = '';
     setActionStatus('');
   }
@@ -762,8 +772,8 @@ async function openSession(sessionId) {
   if (!viewIsCurrent(generation)) return;
   // Reopening the same session (for example after a reconnect) keeps pages already
   // loaded with "Load more transcript"; Refresh returns to the newest output.
-  if (!switching && state.transcriptOffset > 0) return;
-  await loadTranscript(false);
+  if (!switching && state.transcriptBrowsing) return;
+  await loadTranscript();
 }
 
 async function pollSession(sessionId) {
@@ -936,6 +946,9 @@ function collectAnswers() {
 
 function transcriptText(result) {
   if (typeof result === 'string') return result;
+  if (!result) return '';
+  // get_log returns the page as transcript XML; it is shown as literal text.
+  if (typeof result.transcript_xml === 'string') return result.transcript_xml;
   if (result.log && typeof result.log === 'string') return result.log;
   const items = result.entries || result.messages || result.log || result.transcript;
   if (Array.isArray(items)) {
@@ -951,29 +964,132 @@ function transcriptText(result) {
   return JSON.stringify(result, null, 2);
 }
 
-async function loadTranscript(older) {
+function transcriptTotal(result) {
+  const total = result && result.total_turns;
+  return Number.isInteger(total) && total >= 0 ? total : null;
+}
+
+function requestTranscriptPage(sessionId, offset, limit) {
+  return sendCommand({ type: 'get_log', session_id: sessionId, payload: { offset, limit } });
+}
+
+function renderTranscript(follow) {
+  const transcript = $('transcript');
+  const nearBottom = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 48;
+  transcript.textContent = [state.transcriptOlderText, state.transcriptLiveText].filter(Boolean).join('\n');
+  // Follow new output only when the reader was already at the bottom.
+  if (follow && nearBottom) transcript.scrollTop = transcript.scrollHeight;
+  $('load-older').disabled = Boolean(state.transcriptOlderRequest) || !(state.transcriptStart > 0);
+}
+
+// Clears the transcript for a new session view.
+function resetTranscriptView() {
+  state.transcriptToken += 1;
+  state.transcriptLiveRequest = null;
+  state.transcriptLivePending = false;
+  state.transcriptOlderRequest = null;
+  state.transcriptStart = null;
+  state.transcriptLiveStart = null;
+  state.transcriptTotal = null;
+  state.transcriptOlderText = '';
+  state.transcriptLiveText = '';
+  state.transcriptBrowsing = false;
+  renderTranscript(false);
+}
+
+// Refresh button: drops loaded older pages and in-flight pages, then reloads the newest.
+function refreshTranscript() {
+  state.transcriptToken += 1;
+  state.transcriptLiveRequest = null;
+  state.transcriptLivePending = false;
+  state.transcriptOlderRequest = null;
+  state.transcriptOlderText = '';
+  state.transcriptBrowsing = false;
+  state.transcriptStart = state.transcriptLiveStart;
+  renderTranscript(false);
+  return loadTranscript();
+}
+
+// Loads the newest page. Pages are oldest-first, so it starts at total_turns minus one
+// page. The last known total picks the first offset; when the reply reports another
+// length, one more request fetches the actual newest page.
+// Loads asked for while one is in flight are coalesced: the in-flight load still
+// commits, then one trailing load runs. Refresh and a new session view drop the
+// in-flight load instead.
+async function loadTranscript() {
   const sessionId = state.currentSessionId;
   if (!sessionId) return;
+  if (state.transcriptLiveRequest) {
+    state.transcriptLivePending = true;
+    return;
+  }
   const generation = state.viewGeneration;
   const token = state.transcriptToken;
-  if (older) state.transcriptOffset += TRANSCRIPT_PAGE;
+  const request = {};
+  state.transcriptLiveRequest = request;
+  state.transcriptLivePending = false;
+  // Results for another view, or overtaken by Refresh, are dropped.
+  const isCurrent = () => viewIsCurrent(generation) && state.currentSessionId === sessionId
+    && state.transcriptToken === token;
   try {
-    const result = await sendCommand({
-      type: 'get_log',
-      session_id: sessionId,
-      payload: { offset: state.transcriptOffset, limit: TRANSCRIPT_PAGE },
-    });
-    // Drop results for another view, or ones overtaken by a manual Refresh.
-    if (!viewIsCurrent(generation) || state.currentSessionId !== sessionId) return;
-    if (state.transcriptToken !== token) return;
-    const text = transcriptText(result);
-    const transcript = $('transcript');
-    const nearBottom = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 48;
-    transcript.textContent = older ? `${text}\n${transcript.textContent}` : text;
-    // Follow new output only when the reader was already at the bottom.
-    if (!older && nearBottom) transcript.scrollTop = transcript.scrollHeight;
+    let offset = Math.max(0, (state.transcriptTotal || 0) - TRANSCRIPT_PAGE);
+    let result = await requestTranscriptPage(sessionId, offset, TRANSCRIPT_PAGE);
+    let total = transcriptTotal(result);
+    // Loaded older pages stay until Refresh.
+    if (!isCurrent() || state.transcriptBrowsing) return;
+    if (total !== null && offset !== Math.max(0, total - TRANSCRIPT_PAGE)) {
+      offset = Math.max(0, total - TRANSCRIPT_PAGE);
+      result = await requestTranscriptPage(sessionId, offset, TRANSCRIPT_PAGE);
+      total = transcriptTotal(result);
+      if (!isCurrent() || state.transcriptBrowsing) return;
+    }
+    state.transcriptTotal = total;
+    state.transcriptLiveStart = offset;
+    state.transcriptStart = state.transcriptLiveStart;
+    state.transcriptLiveText = transcriptText(result);
+    renderTranscript(true);
   } catch (error) {
     logLine(`get_log failed: ${error.message}`);
+  } finally {
+    // A load dropped by Refresh or a new session view no longer owns this state.
+    if (state.transcriptLiveRequest === request) {
+      state.transcriptLiveRequest = null;
+      const trailing = state.transcriptLivePending && !state.transcriptBrowsing;
+      state.transcriptLivePending = false;
+      if (trailing) loadTranscript();
+    }
+  }
+}
+
+// "Load more transcript": fetches the turns just before the oldest shown turn, so the
+// prepended range never overlaps the view. The window moves only after success; a
+// failure leaves it in place for a retry.
+async function loadOlderTranscript() {
+  const sessionId = state.currentSessionId;
+  const start = state.transcriptStart;
+  if (!sessionId || state.transcriptOlderRequest || !(start > 0)) return;
+  const generation = state.viewGeneration;
+  const token = state.transcriptToken;
+  const request = {};
+  state.transcriptOlderRequest = request;
+  $('load-older').disabled = true;
+  const offset = Math.max(0, start - TRANSCRIPT_PAGE);
+  try {
+    const result = await requestTranscriptPage(sessionId, offset, start - offset);
+    if (!viewIsCurrent(generation) || state.currentSessionId !== sessionId) return;
+    // A newest page that moved the window, or a Refresh, makes this range stale.
+    if (state.transcriptToken !== token || state.transcriptStart !== start) return;
+    const text = transcriptText(result);
+    state.transcriptOlderText = state.transcriptOlderText ? `${text}\n${state.transcriptOlderText}` : text;
+    state.transcriptStart = offset;
+    state.transcriptBrowsing = true;
+  } catch (error) {
+    logLine(`get_log failed: ${error.message}`);
+  } finally {
+    if (state.transcriptOlderRequest === request) {
+      state.transcriptOlderRequest = null;
+      renderTranscript(false);
+    }
   }
 }
 
@@ -981,11 +1097,11 @@ async function loadTranscript(older) {
 // after "Load more transcript", only the Refresh button resets the history.
 let transcriptRefreshTimer = null;
 function maybeRefreshTranscript() {
-  if (transcriptRefreshTimer || state.transcriptOffset > 0) return;
+  if (transcriptRefreshTimer || state.transcriptBrowsing) return;
   transcriptRefreshTimer = setTimeout(() => {
     transcriptRefreshTimer = null;
-    if (state.transcriptOffset > 0) return;
-    loadTranscript(false);
+    if (state.transcriptBrowsing) return;
+    loadTranscript();
   }, 750);
 }
 
@@ -1127,12 +1243,10 @@ async function main() {
   $('back-to-sessions').onclick = () => showSessionsList();
   $('refresh-detail').onclick = () => {
     pollSession();
-    state.transcriptToken += 1;
-    state.transcriptOffset = 0;
-    loadTranscript(false);
+    refreshTranscript();
   };
   $('gateway-retry').onclick = () => connect();
-  $('load-older').onclick = () => loadTranscript(true);
+  $('load-older').onclick = () => loadOlderTranscript();
   $('respond-button').onclick = () => respond();
   $('composer-send').onclick = () => sendComposer();
   $('stop-button').onclick = () => stopSession();
