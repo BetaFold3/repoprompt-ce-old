@@ -54,6 +54,63 @@ import XCTest
             await manager.debugSetGatewayLaunchCredentialForTesting(nil)
         }
 
+        // MARK: - Plan 2026-10-30 Step 1: verified paired-device identity
+
+        /// Only a `.gateway`-principal connection whose bootstrap name is a per-device app link
+        /// (`remote:<device8>`) carries a device identity into request routing.
+        func testGatewayPrincipalPerDeviceLinkCarriesRemoteDeviceIntoRequestRouting() async {
+            let manager = ServerNetworkManager.shared
+            let deviceConnectionID = UUID()
+            await manager.debugInstallIdentityContextForTesting(
+                connectionID: deviceConnectionID,
+                clientName: "remote:1a2b3c4d",
+                principal: .gateway
+            )
+            let deviceID = await manager.gatewayRemoteDeviceID(for: deviceConnectionID)
+            let routing = await manager.requestRoutingContext(for: deviceConnectionID)
+            XCTAssertEqual(deviceID, "remote:1a2b3c4d")
+            XCTAssertEqual(routing.gatewayRemoteDeviceID, "remote:1a2b3c4d")
+
+            let defaultLinkID = UUID()
+            await manager.debugInstallIdentityContextForTesting(
+                connectionID: defaultLinkID,
+                clientName: "repoprompt-gateway",
+                principal: .gateway
+            )
+            let defaultLinkDevice = await manager.gatewayRemoteDeviceID(for: defaultLinkID)
+            XCTAssertNil(defaultLinkDevice)
+            let unknownConnectionDevice = await manager.gatewayRemoteDeviceID(for: UUID())
+            XCTAssertNil(unknownConnectionDevice)
+        }
+
+        func testRemoteDeviceNameWithoutGatewayPrincipalCarriesNoDeviceIdentity() async {
+            let manager = ServerNetworkManager.shared
+            let forgedConnectionID = UUID()
+            await manager.debugInstallIdentityContextForTesting(
+                connectionID: forgedConnectionID,
+                clientName: "remote:1a2b3c4d",
+                principal: .standard
+            )
+            let deviceID = await manager.gatewayRemoteDeviceID(for: forgedConnectionID)
+            let routing = await manager.requestRoutingContext(for: forgedConnectionID)
+            XCTAssertNil(deviceID)
+            XCTAssertNil(routing.gatewayRemoteDeviceID)
+        }
+
+        func testGatewayRemoteDeviceNameGrammar() {
+            func device(_ name: String?, _ principal: MCPConnectionPrincipal = .gateway) -> String? {
+                ServerNetworkManager.gatewayRemoteDeviceID(bootstrapClientName: name, principal: principal)
+            }
+            XCTAssertEqual(device("remote:1a2b3c4d"), "remote:1a2b3c4d")
+            XCTAssertEqual(device("  remote:1a2b3c4d\n"), "remote:1a2b3c4d")
+            XCTAssertNil(device("remote:1a2b3c4d", .standard))
+            XCTAssertNil(device("remote:"))
+            XCTAssertNil(device("remote:1a2b 3c4d"))
+            XCTAssertNil(device("repoprompt-gateway"))
+            XCTAssertNil(device("Remote:1a2b3c4d"))
+            XCTAssertNil(device(nil))
+        }
+
         // MARK: - M4 connection-approval routing
 
         /// Pairing consent is the authorization event: a gateway-principal-carried

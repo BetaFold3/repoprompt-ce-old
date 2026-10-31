@@ -930,6 +930,8 @@ final class AgentModeViewModel: ObservableObject {
     private nonisolated static let detachedTranscriptEvictionChunkSize = 5
     private nonisolated static let pendingToolFinalizationNonToolBoundary = 200
     nonisolated static let staleComposerSubmitTargetMessage = "This composer changed before the message could be sent. Please try again."
+    nonisolated static let staleInstructionTargetMessage =
+        "The target session changed before the instruction could be sent. Nothing was sent."
     private nonisolated static let childAgentRunWaitDrainTimeoutSeconds: TimeInterval = 2.0
 
     #if DEBUG
@@ -7132,7 +7134,7 @@ final class AgentModeViewModel: ObservableObject {
         return labels
     }
 
-    private func mcpPendingInteraction(for session: AgentTabSession) -> AgentRunMCPSnapshot.Interaction? {
+    func mcpPendingInteraction(for session: AgentTabSession) -> AgentRunMCPSnapshot.Interaction? {
         if let review = session.pendingWorktreeMergeReview {
             var details: [AgentRunMCPSnapshot.Interaction.Detail] = [
                 .init(label: "Operation ID", value: review.operationID, isCode: false),
@@ -9838,6 +9840,33 @@ final class AgentModeViewModel: ObservableObject {
         guard let session = mcpControlledSession(sessionID: sessionID) else {
             throw MCPError.invalidParams("The requested agent run is no longer active.")
         }
+        return try await dispatchSessionInstruction(
+            session: session,
+            sessionID: sessionID,
+            text: text,
+            allowStartingRun: allowStartingRun,
+            workflow: workflow,
+            nativePreparedTurn: nativePreparedTurn,
+            target: .mcpControlled
+        )
+    }
+
+    /// Session-targeted instruction send shared by MCP control and remote attention-root control:
+    /// the normal non-composer send path (durable admission, waiting continuation, provider
+    /// steering, follow-up, or a new run). `target` names the authority that resolved `session`;
+    /// every post-await submission fence re-resolves it and requires the same live object.
+    func dispatchSessionInstruction(
+        session: AgentTabSession,
+        sessionID: UUID,
+        text: String,
+        allowStartingRun: Bool,
+        workflow: AgentWorkflowDefinition?,
+        nativePreparedTurn: NativeSlashPreparedUserTurn?,
+        target: SessionInstructionTarget
+    ) async throws -> MCPInstructionDispatch {
+        guard instructionTargetSession(sessionID: sessionID, target: target) === session else {
+            throw MCPError.invalidParams("The requested agent run is no longer active.")
+        }
         // Step 5b: a linked delegated child start keeps its parent admission through the final
         // pre-submit predicate. Nil (every other dispatch) is unchanged.
         let childLinkFence = mcpDelegatedChildDispatchFence(for: sessionID)
@@ -9883,7 +9912,8 @@ final class AgentModeViewModel: ObservableObject {
                 text: trimmedText,
                 workflow: workflow,
                 nativePreparedTurn: nativePreparedTurn,
-                childLinkFence: childLinkFence
+                childLinkFence: childLinkFence,
+                target: target
             )
         }
 
@@ -9902,7 +9932,18 @@ final class AgentModeViewModel: ObservableObject {
             workflowOverride: workflow,
             nativePreparedTurn: nativePreparedTurn,
             isStillCurrent: { [weak self] in
-                guard let self, mcpControlledSession(sessionID: sessionID) === session else { return false }
+                // Same live target, and (remote roots) still dispatch-ready: loaded, and the text
+                // does not parse as a native control-plane command at this boundary.
+                guard let self,
+                      sessionInstructionTargetIsReady(
+                          session: session,
+                          sessionID: sessionID,
+                          target: target,
+                          text: trimmedText
+                      )
+                else {
+                    return false
+                }
                 // Step 5b final submission fence: this caller's task (never the owned Codex driver)
                 // also refuses a cancelled linked child start.
                 guard let childLinkFence else { return true }
@@ -9950,7 +9991,8 @@ final class AgentModeViewModel: ObservableObject {
         text: String,
         workflow: AgentWorkflowDefinition?,
         nativePreparedTurn: NativeSlashPreparedUserTurn?,
-        childLinkFence: MCPDelegatedChildLinkAdmission?
+        childLinkFence: MCPDelegatedChildLinkAdmission?,
+        target: SessionInstructionTarget
     ) async throws -> MCPInstructionDispatch {
         let tracker = session.codexSteerAckTracker
         let activeDispatchWakeIdentity = mcpActiveDispatchWakeIdentity(for: session, sessionID: sessionID)
@@ -9966,7 +10008,8 @@ final class AgentModeViewModel: ObservableObject {
                 workflow: workflow,
                 nativePreparedTurn: nativePreparedTurn,
                 refusal: refusal,
-                childLinkFence: childLinkFence
+                childLinkFence: childLinkFence,
+                target: target
             )
             self?.codexMCPSubmissionDrivers[attemptID] = nil
         }
@@ -10041,7 +10084,8 @@ final class AgentModeViewModel: ObservableObject {
         workflow: AgentWorkflowDefinition?,
         nativePreparedTurn: NativeSlashPreparedUserTurn?,
         refusal: CodexMCPDispatchRefusal,
-        childLinkFence: MCPDelegatedChildLinkAdmission?
+        childLinkFence: MCPDelegatedChildLinkAdmission?,
+        target: SessionInstructionTarget
     ) async {
         let tracker = session.codexSteerAckTracker
         guard tracker.markOperationStarted(attemptID: attemptID) else { return }
@@ -10060,7 +10104,16 @@ final class AgentModeViewModel: ObservableObject {
             workflowOverride: workflow,
             nativePreparedTurn: nativePreparedTurn,
             isStillCurrent: { [weak self] in
-                guard let self, mcpControlledSession(sessionID: sessionID) === session else { return false }
+                guard let self,
+                      sessionInstructionTargetIsReady(
+                          session: session,
+                          sessionID: sessionID,
+                          target: target,
+                          text: text
+                      )
+                else {
+                    return false
+                }
                 return childLinkFence.map { self.mcpDelegatedChildLinkAdmissionIsCurrent($0) } ?? true
             }
         )
@@ -10122,6 +10175,33 @@ final class AgentModeViewModel: ObservableObject {
         guard let session = mcpControlledSession(sessionID: sessionID) else {
             throw MCPError.invalidParams("The requested agent run is no longer active.")
         }
+        return try await resolveSessionPendingInteraction(
+            session: session,
+            sessionID: sessionID,
+            interactionID: interactionID,
+            payload: payload,
+            workflow: workflow,
+            resolvedBy: resolvedBy,
+            target: .mcpControlled
+        )
+    }
+
+    /// Session-targeted resolution shared by MCP control and remote attention-root control. The
+    /// exact pending interaction must still match `interactionID`; `allowedKinds` (nil = all) is
+    /// checked before any attribution is staged. Staged `resolvedBy` is always cleared on exit.
+    func resolveSessionPendingInteraction(
+        session: AgentTabSession,
+        sessionID: UUID,
+        interactionID: UUID,
+        payload: MCPInteractionResponsePayload,
+        workflow: AgentWorkflowDefinition?,
+        resolvedBy: String?,
+        target: SessionInstructionTarget,
+        allowedKinds: Set<AgentRunMCPSnapshot.Interaction.Kind>? = nil
+    ) async throws -> MCPInstructionDispatch? {
+        guard instructionTargetSession(sessionID: sessionID, target: target) === session else {
+            throw MCPError.invalidParams("The requested agent run is no longer active.")
+        }
 
         // Infer the interaction kind from the live pending interaction
         guard let currentInteraction = mcpPendingInteraction(for: session) else {
@@ -10131,6 +10211,11 @@ final class AgentModeViewModel: ObservableObject {
             throw MCPError.invalidParams("The pending interaction no longer matches interaction_id.")
         }
         let kind = currentInteraction.kind
+        if let allowedKinds, !allowedKinds.contains(kind) {
+            throw MCPError.invalidParams(
+                "This control path cannot resolve \(kind.rawValue) interactions. Resolve it on the Mac."
+            )
+        }
         switch kind {
         case .question, .mcpElicitation, .userInput:
             // Answers are frozen while a shutdown preserves this window: refused before any change.
@@ -10158,11 +10243,14 @@ final class AgentModeViewModel: ObservableObject {
             guard !text.isEmpty else {
                 throw MCPError.invalidParams("response is required for instruction prompts.")
             }
-            return try await mcpDispatchInstruction(
+            return try await dispatchSessionInstruction(
+                session: session,
                 sessionID: sessionID,
                 text: text,
                 allowStartingRun: false,
-                workflow: workflow
+                workflow: workflow,
+                nativePreparedTurn: nil,
+                target: target
             )
         case .question:
             guard let pendingAskUser = session.pendingAskUser,
@@ -16012,12 +16100,16 @@ final class AgentModeViewModel: ObservableObject {
     /// Submits one user turn. `admitted` is the durably admitted snapshot (R12) and is required
     /// whenever recovery admission is not inactive; `nil` selects the legacy untracked input of
     /// inactive admission explicitly (F1: no implicit default).
+    /// `composerInput: false` marks a non-admitted non-composer input (MCP or a paired device): it
+    /// sends only its own text and the active workflow, and never reads or clears the composer's
+    /// attachments, tagged files, workflow, or interview-first choice.
     @discardableResult
     func submitUserTurn(
         text: String,
         tabID: UUID,
         codexAttemptID: UUID?,
-        admitted: AdmittedUserTurnInput?
+        admitted: AdmittedUserTurnInput?,
+        composerInput: Bool = true
     ) -> UserTurnSubmissionResult {
         guard let session = session(for: tabID, createIfNeeded: true) else {
             return .blocked(message: Self.composeTabRemovalInProgressMessage)
@@ -16026,8 +16118,8 @@ final class AgentModeViewModel: ObservableObject {
             return .blocked(message: blockedMessage)
         }
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        let attachmentsToSend = admitted?.attachments ?? session.pendingImageAttachments
-        let taggedFilesToSend = admitted?.taggedFiles ?? session.pendingTaggedFileAttachments
+        let attachmentsToSend = admitted?.attachments ?? (composerInput ? session.pendingImageAttachments : [])
+        let taggedFilesToSend = admitted?.taggedFiles ?? (composerInput ? session.pendingTaggedFileAttachments : [])
         guard !trimmedText.isEmpty || !attachmentsToSend.isEmpty || !taggedFilesToSend.isEmpty else {
             return .blocked(message: "")
         }
@@ -16136,7 +16228,7 @@ final class AgentModeViewModel: ObservableObject {
             if admitted.consumesComposer {
                 consumeSubmittedComposerInput(admitted, session: session)
             }
-        } else {
+        } else if composerInput {
             session.selectedWorkflow = nil
             selectedWorkflow = nil
             session.pendingImageAttachments.removeAll()
@@ -16155,7 +16247,8 @@ final class AgentModeViewModel: ObservableObject {
                     activeWorkflow: bubbleWorkflow,
                     nativePreparedTurn: nativePreparedTurn,
                     codexAttemptID: codexAttemptID,
-                    admitted: admitted
+                    admitted: admitted,
+                    composerInput: composerInput
                 )
             }
             return .submitted
@@ -16170,7 +16263,8 @@ final class AgentModeViewModel: ObservableObject {
             activeWorkflow: bubbleWorkflow,
             nativePreparedTurn: nativePreparedTurn,
             codexAttemptID: codexAttemptID,
-            admitted: admitted
+            admitted: admitted,
+            composerInput: composerInput
         )
     }
 
@@ -16224,10 +16318,20 @@ final class AgentModeViewModel: ObservableObject {
         guard actionAuthorization == nil || reservedPayloadOnly else {
             return .blocked(message: Self.recoveryReservedPayloadUnadmittedMessage)
         }
-        let submit: (AdmittedUserTurnInput?) -> UserTurnSubmissionResult = { [weak self] admitted in
-            guard let self else { return .blocked(message: Self.composeTabRemovalInProgressMessage) }
+        // Every route submits through `submit`. The non-admitted routes (not required, control-plane,
+        // and the post-admission `.notRequired`) take the caller's predicate here as their final
+        // synchronous check before any mutation; the admitted branch below checks it itself,
+        // synchronously before `submit`, and releases a refused admission.
+        let composerInput = origin != .mcp
+        let staleTargetMessage = origin == .mcp
+            ? Self.staleInstructionTargetMessage
+            : Self.staleComposerSubmitTargetMessage
+        func submit(_ admitted: AdmittedUserTurnInput?) -> UserTurnSubmissionResult {
             guard let session = sessions[tabID] else {
                 return .blocked(message: Self.composeTabRemovalInProgressMessage)
+            }
+            if admitted == nil {
+                guard isStillCurrent() else { return .blocked(message: staleTargetMessage) }
             }
             let submitTurn: () -> UserTurnSubmissionResult = {
                 if let nativePreparedTurn {
@@ -16240,14 +16344,16 @@ final class AgentModeViewModel: ObservableObject {
                         activeWorkflow: nativePreparedTurn.bubbleWorkflow,
                         nativePreparedTurn: nativePreparedTurn,
                         codexAttemptID: codexAttemptID,
-                        admitted: admitted
+                        admitted: admitted,
+                        composerInput: composerInput
                     )
                 }
                 return self.submitUserTurn(
                     text: text,
                     tabID: tabID,
                     codexAttemptID: codexAttemptID,
-                    admitted: admitted
+                    admitted: admitted,
+                    composerInput: composerInput
                 )
             }
             // MCP turns always run under their own (possibly empty) workflow; composer turns use the
@@ -16327,7 +16433,7 @@ final class AgentModeViewModel: ObservableObject {
                     )
                 }
                 await releaseRefusedRecoveryAdmission(admitted, lane: lane, session: session)
-                return .blocked(message: Self.staleComposerSubmitTargetMessage)
+                return .blocked(message: staleTargetMessage)
             }
             let result = submit(admitted)
             if result != .submitted {
@@ -16899,7 +17005,8 @@ final class AgentModeViewModel: ObservableObject {
         activeWorkflow: AgentWorkflowDefinition?,
         nativePreparedTurn: NativeSlashPreparedUserTurn?,
         codexAttemptID: UUID?,
-        admitted: AdmittedUserTurnInput?
+        admitted: AdmittedUserTurnInput?,
+        composerInput: Bool
     ) async {
         guard let session = sessions[tabID] else {
             // R01: never withdrawn here; the admitted intent stays held for explicit recovery.
@@ -16920,7 +17027,8 @@ final class AgentModeViewModel: ObservableObject {
             activeWorkflow: activeWorkflow,
             nativePreparedTurn: nativePreparedTurn,
             codexAttemptID: codexAttemptID,
-            admitted: admitted
+            admitted: admitted,
+            composerInput: composerInput
         )
         // The caller already reported `.submitted`; a refusal after hydration releases the admitted
         // intent under R01 (held unless its exact draft is durably back in the composer).
@@ -16981,7 +17089,8 @@ final class AgentModeViewModel: ObservableObject {
         activeWorkflow: AgentWorkflowDefinition?,
         nativePreparedTurn: NativeSlashPreparedUserTurn?,
         codexAttemptID: UUID?,
-        admitted: AdmittedUserTurnInput?
+        admitted: AdmittedUserTurnInput?,
+        composerInput: Bool = true
     ) -> UserTurnSubmissionResult {
         Self.logCodexDebug("[AgentModeVM] submitUserTurn: tabID=\(tabID), selectedAgent=\(session.selectedAgent), attachments=\(attachmentsToSend.count), taggedFiles=\(taggedFilesToSend.count), workflow=\(activeWorkflow?.displayName ?? "none")")
         let admittedIdentity = admitted?.identity
@@ -17027,8 +17136,9 @@ final class AgentModeViewModel: ObservableObject {
             nativePreparedTurn: nativePreparedTurn,
             inputSource: .composer,
             preassignedUserItemID: admittedIdentity?.userItemID,
-            admittedInterviewFirst: admitted.map(\.interviewFirst),
-            consumesComposerInterview: admitted?.consumesComposer ?? true,
+            // A non-composer input never takes or consumes the composer's interview-first choice.
+            admittedInterviewFirst: admitted.map(\.interviewFirst) ?? (composerInput ? nil : false),
+            consumesComposerInterview: admitted?.consumesComposer ?? composerInput,
             reusedUserItem: reusedUserItem
         )
         let userItem = prepared.userItem

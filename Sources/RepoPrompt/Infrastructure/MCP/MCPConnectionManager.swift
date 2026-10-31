@@ -2075,6 +2075,11 @@ actor ServerNetworkManager {
         var hasHandshake: Bool
         var principal: MCPConnectionPrincipal
         var lastUpdated: Date
+        /// Paired device of a per-device gateway app link (`remote:<device8>`), captured once from
+        /// the bootstrap name of a `.gateway`-principal connection. Never updated by the MCP
+        /// handshake and always nil for `.standard` connections. A `let` without a default, so every
+        /// construction site must state it.
+        let gatewayRemoteDeviceID: String?
     }
 
     /// Identity context per connection
@@ -2105,6 +2110,31 @@ actor ServerNetworkManager {
 
     func isGatewayPrincipalConnection(_ connectionID: UUID) -> Bool {
         identityContextByConnection[connectionID]?.principal == .gateway
+    }
+
+    /// The paired device behind a verified per-device gateway app link, or nil. Requires the
+    /// launch-credential `.gateway` principal; a `remote:` client name alone never qualifies.
+    func gatewayRemoteDeviceID(for connectionID: UUID) -> String? {
+        guard let context = identityContextByConnection[connectionID], context.principal == .gateway else {
+            return nil
+        }
+        return context.gatewayRemoteDeviceID
+    }
+
+    /// `remote:<id>` bootstrap names of gateway-principal connections identify a paired device
+    /// (`AppLinkPool` names each per-device link after its device ID). Other names (the default
+    /// link, phase-0 static tokens) carry no device identity.
+    nonisolated static func gatewayRemoteDeviceID(
+        bootstrapClientName: String?,
+        principal: MCPConnectionPrincipal
+    ) -> String? {
+        guard principal == .gateway,
+              let name = bootstrapClientName?.trimmingCharacters(in: .whitespacesAndNewlines),
+              name.hasPrefix("remote:"),
+              name.count > "remote:".count,
+              !name.contains(where: \.isWhitespace)
+        else { return nil }
+        return name
     }
 
     private enum GatewayPrincipalDecision: Equatable {
@@ -4018,11 +4048,17 @@ actor ServerNetworkManager {
     struct RequestRoutingContext {
         let runPurpose: MCPRunPurpose?
         let actorRoutedRunTab: RunPolicyTab?
+        /// `gatewayRemoteDeviceID(for:)` from the same read.
+        var gatewayRemoteDeviceID: String?
     }
 
-    /// The connection's run purpose and actor-side run tab, read together.
+    /// The connection's run purpose, actor-side run tab, and verified gateway device, read together.
     func requestRoutingContext(for connectionID: UUID) -> RequestRoutingContext {
-        RequestRoutingContext(runPurpose: runPurpose(for: connectionID), actorRoutedRunTab: actorRoutedRunPolicyTab(for: connectionID))
+        RequestRoutingContext(
+            runPurpose: runPurpose(for: connectionID),
+            actorRoutedRunTab: actorRoutedRunPolicyTab(for: connectionID),
+            gatewayRemoteDeviceID: gatewayRemoteDeviceID(for: connectionID)
+        )
     }
 
     /// The run tab of the connection's actor-side run route, when the run's policy names one. The
@@ -6401,7 +6437,8 @@ actor ServerNetworkManager {
             source: .handshake,
             hasHandshake: false,
             principal: principal,
-            lastUpdated: Date()
+            lastUpdated: Date(),
+            gatewayRemoteDeviceID: Self.gatewayRemoteDeviceID(bootstrapClientName: clientName, principal: principal)
         )
         identityContextByConnection[connectionID] = identityContext
 
@@ -10676,7 +10713,8 @@ actor ServerNetworkManager {
                     source: .handshake,
                     hasHandshake: true,
                     principal: principal,
-                    lastUpdated: Date()
+                    lastUpdated: Date(),
+                    gatewayRemoteDeviceID: Self.gatewayRemoteDeviceID(bootstrapClientName: clientName, principal: principal)
                 )
             }
 

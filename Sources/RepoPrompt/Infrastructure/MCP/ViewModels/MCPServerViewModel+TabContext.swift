@@ -1496,6 +1496,11 @@ extension MCPServerViewModel {
         /// (`ServerNetworkManager.actorRoutedRunPolicyTab`): a routed connection without its run-tab
         /// binding resolves it (`resolveTabContext`), never active-tab compatibility.
         private(set) var actorRoutedRunTab: ServerNetworkManager.RunPolicyTab?
+        /// Paired device of a verified per-device gateway app link (`remote:<device8>`), from the
+        /// connection's `.gateway` principal and bootstrap identity
+        /// (`ServerNetworkManager.gatewayRemoteDeviceID(for:)`). Nil for every other caller; the
+        /// client-asserted `clientName` alone never sets it.
+        let gatewayRemoteDeviceID: String?
 
         init(
             connectionID: UUID?,
@@ -1505,7 +1510,8 @@ extension MCPServerViewModel {
             tabContextHint: TabContextHint? = nil,
             explicitWindowRoutingHint: MCPExplicitWindowRoutingHint? = nil,
             toolInvocationID: UUID? = nil,
-            actorRoutedRunTab: ServerNetworkManager.RunPolicyTab?
+            actorRoutedRunTab: ServerNetworkManager.RunPolicyTab?,
+            gatewayRemoteDeviceID: String? = nil
         ) {
             self.connectionID = connectionID
             self.clientName = clientName
@@ -1515,6 +1521,7 @@ extension MCPServerViewModel {
             self.explicitWindowRoutingHint = explicitWindowRoutingHint
             self.toolInvocationID = toolInvocationID
             self.actorRoutedRunTab = actorRoutedRunTab
+            self.gatewayRemoteDeviceID = gatewayRemoteDeviceID
         }
 
         func withActorRoutedRunTab(_ runTab: ServerNetworkManager.RunPolicyTab?) -> RequestMetadata {
@@ -1532,7 +1539,8 @@ extension MCPServerViewModel {
             }
         #endif
         let connectionID = await service.currentRequestConnectionID()
-        // One actor read: the run purpose and the actor-side run tab, from the same state.
+        // One actor read: the run purpose, the actor-side run tab, and the verified gateway device,
+        // from the same state.
         let routing = if let connectionID {
             await ServerNetworkManager.shared.requestRoutingContext(for: connectionID)
         } else {
@@ -1548,7 +1556,8 @@ extension MCPServerViewModel {
             tabContextHint: ServerNetworkManager.currentTabContextHint,
             explicitWindowRoutingHint: service.currentRequestExplicitWindowRoutingHint(),
             toolInvocationID: ServerNetworkManager.currentToolInvocationID,
-            actorRoutedRunTab: actorRoutedRunTab
+            actorRoutedRunTab: actorRoutedRunTab,
+            gatewayRemoteDeviceID: routing.gatewayRemoteDeviceID
         )
     }
 

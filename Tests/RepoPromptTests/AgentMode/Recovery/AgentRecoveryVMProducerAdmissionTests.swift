@@ -565,6 +565,67 @@ final class AgentRecoveryVMProducerAdmissionTests: XCTestCase {
         XCTAssertEqual(harness.viewModel.retrieveDraftText(for: harness.tabID), "kept draft")
     }
 
+    // MARK: - Plan 2026-10-30 Step 1 fixes (review A R1): the final submit-time currency check
+
+    /// An MCP input whose target changed while admission was suspended sends nothing: its
+    /// committed intent is withdrawn and the composer is untouched. The predicate is evaluated
+    /// once, after the awaits and synchronously before the submit.
+    func testMandatoryMCPInputRefusedAfterAdmissionWithdrawsItsAdmission() async throws {
+        let controller = ProducerFakeCodexController()
+        let harness = try await makeHarness(windowID: 4794, controller: controller)
+        let lane = try await persistAndClaimLane(harness)
+        prepareActiveCodexTurn(harness, controller: controller)
+        harness.viewModel.storeDraftText(for: harness.tabID, "desktop draft")
+        let itemsBefore = harness.session.items.map(\.id)
+        var checks = 0
+
+        let result = await harness.viewModel.submitUserTurnAdmittingRecoveryInput(
+            text: "from the phone",
+            tabID: harness.tabID,
+            origin: .mcp,
+            isStillCurrent: {
+                checks += 1
+                return false
+            }
+        )
+
+        XCTAssertEqual(result, .blocked(message: AgentModeViewModel.staleInstructionTargetMessage))
+        XCTAssertEqual(checks, 1, "Checked once, after admission")
+        XCTAssertEqual(harness.session.items.map(\.id), itemsBefore, "No optimistic bubble")
+        XCTAssertTrue(controller.steerTexts.isEmpty, "Nothing reached the provider")
+        XCTAssertEqual(harness.viewModel.retrieveDraftText(for: harness.tabID), "desktop draft")
+        let read = await lane.store.read(sessionID: lane.sessionID)
+        let record = try XCTUnwrap(read.record)
+        XCTAssertEqual(record.intents.map(\.deliveryState), [.withdrawn], "The admitted intent is released")
+        XCTAssertTrue(record.attempts.isEmpty, "No dispatch was ever begun")
+    }
+
+    /// The control-plane route (no admission) also takes the final check before any projection.
+    func testControlPlaneSlashCommandRefusedAtTheFinalSubmitCheckProjectsNothing() async throws {
+        let controller = ProducerFakeCodexController()
+        let harness = try await makeHarness(windowID: 4795, controller: controller)
+        let lane = try await persistAndClaimLane(harness)
+        prepareActiveCodexTurn(harness, controller: controller)
+        let itemsBefore = harness.session.items.map(\.id)
+
+        for origin in [AgentRecoveryIntentOrigin.mcp, .composer] {
+            let result = await harness.viewModel.submitUserTurnAdmittingRecoveryInput(
+                text: "/compact",
+                tabID: harness.tabID,
+                origin: origin,
+                isStillCurrent: { false }
+            )
+            let expectedMessage = origin == .mcp
+                ? AgentModeViewModel.staleInstructionTargetMessage
+                : AgentModeViewModel.staleComposerSubmitTargetMessage
+            XCTAssertEqual(result, .blocked(message: expectedMessage), "\(origin)")
+        }
+        XCTAssertEqual(harness.session.items.map(\.id), itemsBefore, "No progress row or bubble")
+        XCTAssertTrue(controller.steerTexts.isEmpty)
+        let read = await lane.store.read(sessionID: lane.sessionID)
+        XCTAssertTrue(read.record?.intents.isEmpty ?? true, "A control-plane command is never admitted")
+    }
+
     // MARK: - Review A P1-06 / O11: Send saved places its same saved input at the execution end
 
     private struct SavedIntentScenario {

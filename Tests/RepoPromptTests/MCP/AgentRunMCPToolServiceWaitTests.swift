@@ -3734,6 +3734,158 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
         }
     }
 
+    // MARK: - Plan 2026-10-30 Step 1 fixes: mixed controlled + live unregistered waits
+
+    /// A user-driven live session bound to a durable ID with no MCP control (a desktop root).
+    private func installLiveUnregisteredRoot(
+        in viewModel: AgentModeViewModel
+    ) async throws -> (session: AgentTabSession, sessionID: UUID) {
+        let sessionID = UUID()
+        let session = try await viewModel.ensureSessionReady(tabID: UUID())
+        _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
+        session.origin = .user
+        session.runState = .running
+        XCTAssertNil(viewModel.mcpRegistration(sessionID: sessionID))
+        XCTAssertNil(viewModel.mcpWaitCursor(sessionID: sessionID))
+        return (session, sessionID)
+    }
+
+    /// Review B P2-1: a mixed wait keeps the controlled target's cursor wait and wait scope, and the
+    /// live unregistered target can still win when it settles first.
+    func testMixedWaitReturnsLiveUnregisteredTargetThatSettlesFirst() async throws {
+        let window = makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        AgentRunMCPToolService.liveUnregisteredWaitPollSecondsOverride = 0.01
+        defer { AgentRunMCPToolService.liveUnregisteredWaitPollSecondsOverride = nil }
+        let liveSnapshots = LiveSnapshots()
+        let recorder = WaitScopeRecorder()
+        let viewModel = makeViewModel(windowID: window.windowID)
+        let controlled = try await installRunningSession(in: viewModel, liveSnapshots: liveSnapshots)
+        defer { Task { await AgentRunSessionStore.cleanup(registration: controlled.registration) } }
+        let root = try await installLiveUnregisteredRoot(in: viewModel)
+        let service = makeService(window: window, viewModel: viewModel, liveSnapshots: liveSnapshots, recorder: recorder)
+
+        let waitTask = Task { @MainActor in
+            try await service.execute(args: [
+                "op": .string("wait"),
+                "session_ids": .array([.string(controlled.sessionID.uuidString), .string(root.sessionID.uuidString)]),
+                "timeout": .double(5)
+            ])
+        }
+        // The controlled target parks on its ordinary cursor wait.
+        try await waitForAgentRunSessionStoreWaiter(registration: controlled.registration)
+        root.session.runState = .completed
+
+        let value = try await waitTask.value
+        let object = try XCTUnwrap(value.objectValue)
+        let wait = try XCTUnwrap(object["wait"]?.objectValue, "\(value)")
+        XCTAssertEqual(object["session_id"]?.stringValue, root.sessionID.uuidString)
+        XCTAssertEqual(object["status"]?.stringValue, AgentRunMCPSnapshot.Status.completed.rawValue)
+        XCTAssertEqual(wait["result"]?.stringValue, "snapshot_ready")
+        XCTAssertEqual(wait["winner_session_id"]?.stringValue, root.sessionID.uuidString)
+        XCTAssertEqual(
+            wait["pending_session_ids"]?.arrayValue?.compactMap(\.stringValue),
+            [controlled.sessionID.uuidString]
+        )
+        let begun = await recorder.beginRecords()
+        XCTAssertEqual(begun, [Set([controlled.sessionID, root.sessionID])], "The ordinary wait scope is still opened")
+        let completions = await recorder.completions()
+        XCTAssertEqual(completions.count, 1)
+        XCTAssertEqual(completions.first?.reason, .snapshotReady)
+        XCTAssertEqual(completions.first?.winnerSessionID, root.sessionID)
+        XCTAssertNotNil(controlled.session.mcpControlContext)
+        XCTAssertNil(root.session.mcpControlContext, "Waiting never installs control on the root")
+    }
+
+    func testMixedWaitReturnsControlledTargetThatSettlesFirst() async throws {
+        let window = makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        AgentRunMCPToolService.liveUnregisteredWaitPollSecondsOverride = 0.01
+        defer { AgentRunMCPToolService.liveUnregisteredWaitPollSecondsOverride = nil }
+        let liveSnapshots = LiveSnapshots()
+        let recorder = WaitScopeRecorder()
+        let viewModel = makeViewModel(windowID: window.windowID)
+        let controlled = try await installRunningSession(in: viewModel, liveSnapshots: liveSnapshots)
+        defer { Task { await AgentRunSessionStore.cleanup(registration: controlled.registration) } }
+        let root = try await installLiveUnregisteredRoot(in: viewModel)
+        let service = makeService(window: window, viewModel: viewModel, liveSnapshots: liveSnapshots, recorder: recorder)
+
+        let waitTask = Task { @MainActor in
+            try await service.execute(args: [
+                "op": .string("wait"),
+                "session_ids": .array([.string(root.sessionID.uuidString), .string(controlled.sessionID.uuidString)]),
+                "timeout": .double(5)
+            ])
+        }
+        try await waitForAgentRunSessionStoreWaiter(registration: controlled.registration)
+        let terminal = makeSnapshot(sessionID: controlled.sessionID, status: .completed)
+        await liveSnapshots.set(terminal)
+        _ = await AgentRunSessionStore.publishTerminal(
+            .init(epoch: controlled.epoch, snapshot: terminal),
+            registration: controlled.registration,
+            commitID: UUID(),
+            successorKind: nil
+        )
+
+        let value = try await waitTask.value
+        let object = try XCTUnwrap(value.objectValue)
+        let wait = try XCTUnwrap(object["wait"]?.objectValue, "\(value)")
+        XCTAssertEqual(object["session_id"]?.stringValue, controlled.sessionID.uuidString)
+        XCTAssertEqual(wait["result"]?.stringValue, "snapshot_ready")
+        XCTAssertEqual(wait["winner_session_id"]?.stringValue, controlled.sessionID.uuidString)
+        XCTAssertEqual(wait["pending_session_ids"]?.arrayValue?.compactMap(\.stringValue), [root.sessionID.uuidString])
+        XCTAssertEqual(root.session.runState, .running)
+        let completions = await recorder.completions()
+        XCTAssertEqual(completions.count, 1)
+        XCTAssertEqual(completions.first?.winnerSessionID, controlled.sessionID)
+    }
+
+    /// The controlled target's delegated-question wake still interrupts a mixed wait.
+    func testMixedWaitKeepsControlledDelegatedQuestionInterrupt() async throws {
+        let window = makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        AgentRunMCPToolService.liveUnregisteredWaitPollSecondsOverride = 0.01
+        defer { AgentRunMCPToolService.liveUnregisteredWaitPollSecondsOverride = nil }
+        let liveSnapshots = LiveSnapshots()
+        let recorder = WaitScopeRecorder()
+        let viewModel = makeViewModel(windowID: window.windowID)
+        let controlled = try await installRunningSession(in: viewModel, liveSnapshots: liveSnapshots)
+        defer { Task { await AgentRunSessionStore.cleanup(registration: controlled.registration) } }
+        let root = try await installLiveUnregisteredRoot(in: viewModel)
+        let question = DelegatedQuestionAvailability()
+        var service = makeService(window: window, viewModel: viewModel, liveSnapshots: liveSnapshots, recorder: recorder)
+        service.hasDeliverableDelegatedQuestionNotices = { _, excluded in
+            XCTAssertEqual(excluded, Set([controlled.sessionID, root.sessionID]))
+            return question.isDeliverable(excluding: excluded)
+        }
+
+        let waitTask = Task { @MainActor in
+            try await service.execute(args: [
+                "op": .string("wait"),
+                "session_ids": .array([.string(controlled.sessionID.uuidString), .string(root.sessionID.uuidString)]),
+                "timeout": .double(5)
+            ])
+        }
+        try await waitForAgentRunSessionStoreWaiter(registration: controlled.registration)
+        question.childID = UUID()
+        await AgentRunSessionStore.wakeCurrentWaiters(
+            controlled.runningSnapshot, cursor: controlled.cursor, reason: .delegatedQuestionPending
+        )
+
+        let value = try await waitTask.value
+        let object = try XCTUnwrap(value.objectValue)
+        XCTAssertEqual(
+            object["wait"]?.objectValue?["result"]?.stringValue,
+            AgentDelegatedQuestionNoticeWire.agentRunWaitResult,
+            "\(value)"
+        )
+        XCTAssertEqual(object["snapshots"]?.arrayValue?.count, 2)
+        let completions = await recorder.completions()
+        XCTAssertEqual(completions.count, 1)
+        XCTAssertEqual(completions.first?.reason, .delegatedQuestionPending)
+        XCTAssertEqual(root.session.runState, .running)
+    }
+
     private func makeWindow() -> WindowState {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
