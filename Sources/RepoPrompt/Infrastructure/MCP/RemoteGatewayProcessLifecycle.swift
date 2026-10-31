@@ -37,9 +37,12 @@ enum RemoteGatewayBrowserOrigin {
         return origin
     }
 
-    /// The exact Serve command that forwards `browserPort` to this build's direct gateway origin.
+    /// The exact Serve command that forwards `browserPort` to this build's gateway port on
+    /// `127.0.0.1`. Serve dials its backend outside the tailnet, so it targets the loopback
+    /// companion listener the gateway adds while a browser origin is set, not the direct tailnet
+    /// address (which stays the paired apps' origin).
     static func serveCommand(browserPort: Int, gatewayOrigin: RemoteGatewayOrigin) -> String {
-        "tailscale serve --bg --https=\(browserPort) \(gatewayOrigin.string)"
+        "tailscale serve --bg --https=\(browserPort) http://127.0.0.1:\(gatewayOrigin.port)"
     }
 }
 

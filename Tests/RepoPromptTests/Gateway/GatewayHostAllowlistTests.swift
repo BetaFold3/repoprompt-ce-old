@@ -1,5 +1,7 @@
 import Darwin
 import Foundation
+import NIOCore
+import NIOHTTP1
 @testable import RepoPromptGateway
 import XCTest
 
@@ -84,16 +86,98 @@ final class GatewayHostAllowlistTests: XCTestCase {
         XCTAssertEqual(browser, 421)
     }
 
+    /// Step 4: an accepted socket on the `127.0.0.1` companion allows its own exact authority and
+    /// the browser authority; the direct (tailnet) listener gains no loopback authority because a
+    /// companion exists, and forwarded headers rescue neither.
+    func testCompanionSocketAddsOnlyItsOwnLoopbackAuthority() throws {
+        let root = try GatewayTestHelpers.temporaryRoot()
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        let configuration = try GatewayConfiguration.parse(
+            arguments: [
+                "--app-support-root", root.path,
+                "--bootstrap-socket", root.appendingPathComponent("bootstrap.sock").path,
+                "--bind-host", "100.64.0.8",
+                "--port", "47392",
+                "--browser-origin", Self.browserOrigin
+            ],
+            environment: [:]
+        )
+        let companion = try GatewayHostAllowlist(
+            configuration: configuration,
+            localAddress: SocketAddress(ipAddress: "127.0.0.1", port: 47392)
+        )
+        let direct = try GatewayHostAllowlist(
+            configuration: configuration,
+            localAddress: SocketAddress(ipAddress: "100.64.0.8", port: 47392)
+        )
+        XCTAssertEqual(companion.authorities, ["100.64.0.8:47392", "127.0.0.1:47392", Self.browserAuthority])
+        XCTAssertEqual(direct.authorities, ["100.64.0.8:47392", Self.browserAuthority])
+
+        func head(_ headers: [(String, String)]) -> HTTPRequestHead {
+            HTTPRequestHead(version: .http1_1, method: .GET, uri: "/healthz", headers: HTTPHeaders(headers))
+        }
+        XCTAssertTrue(companion.allows(head([("Host", "127.0.0.1:47392")])))
+        XCTAssertTrue(companion.allows(head([("Host", Self.browserAuthority)])))
+        XCTAssertFalse(direct.allows(head([("Host", "127.0.0.1:47392")])), "No loopback authority on the direct listener")
+        XCTAssertFalse(companion.allows(head([("Host", "localhost:47392")])))
+        XCTAssertFalse(companion.allows(head([("Host", "127.0.0.1:8443")])))
+        XCTAssertFalse(companion.allows(head([
+            ("Host", "attacker.example"),
+            ("X-Forwarded-Host", Self.browserAuthority),
+            ("Forwarded", "host=\(Self.browserAuthority)")
+        ])))
+    }
+
+    /// Step 4 over the real companion: the primary binds `::1`, so IPv4 requests to `127.0.0.1`
+    /// reach the companion, which applies the same allowlist to HTTP and the WebSocket upgrade.
+    func testLoopbackCompanionListenerEnforcesTheSameHostAllowlist() async throws {
+        let port = try await startServer(browserOrigin: Self.browserOrigin, bindHost: "::1")
+        let cases: [(name: String, headers: [String], status: Int)] = [
+            ("companion address", ["Host: 127.0.0.1:\(port)"], 200),
+            ("browser authority, as Serve forwards it", ["Host: \(Self.browserAuthority)"], 200),
+            ("rebinding name on the gateway port", ["Host: attacker.example:\(port)"], 421),
+            ("browser name on the gateway port", ["Host: mac.example-tailnet.ts.net:\(port)"], 421),
+            ("localhost alias", ["Host: localhost:\(port)"], 421),
+            ("missing Host", [], 421),
+            (
+                "forwarded headers are not trusted",
+                ["Host: attacker.example", "X-Forwarded-Host: \(Self.browserAuthority)"],
+                421
+            )
+        ]
+        for testCase in cases {
+            let status = try await statusCode(port: port, requestLine: "GET /healthz HTTP/1.1", headers: testCase.headers)
+            XCTAssertEqual(status, testCase.status, testCase.name)
+        }
+        for (host, expected) in [(Self.browserAuthority, 101), ("attacker.example:\(port)", nil)] as [(String, Int?)] {
+            let status = try await optionalStatusCode(
+                port: port,
+                requestLine: "GET /ws HTTP/1.1",
+                headers: [
+                    "Host: \(host)",
+                    "Upgrade: websocket",
+                    "Connection: Upgrade",
+                    "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==",
+                    "Sec-WebSocket-Version: 13"
+                ]
+            )
+            XCTAssertEqual(status, expected, host)
+        }
+    }
+
     // MARK: - Helpers
 
-    private func startServer(browserOrigin: String?) async throws -> Int {
+    private func startServer(browserOrigin: String?, bindHost: String = "127.0.0.1") async throws -> Int {
+        if bindHost.contains(":") {
+            try GatewayTestHelpers.requireIPv6Loopback()
+        }
         let root = try GatewayTestHelpers.temporaryRoot()
         var arguments = [
             "--app-support-root", root.path,
             "--audit-dir", root.appendingPathComponent("audit", isDirectory: true).path,
             "--bootstrap-token", "bootstrap-token",
             "--bootstrap-socket", root.appendingPathComponent("bootstrap.sock").path,
-            "--bind-host", "127.0.0.1",
+            "--bind-host", bindHost,
             "--port", "0"
         ]
         if let browserOrigin {
@@ -116,12 +200,16 @@ final class GatewayHostAllowlistTests: XCTestCase {
             runtime: runtime,
             pairingRelay: GatewayPairingRelay(appLink: appLink)
         )
-        try await server.start()
-        let port = try XCTUnwrap(server.localAddress?.port)
         addTeardownBlock {
             await server.shutdown()
             await appLink.shutdown()
             try? FileManager.default.removeItem(at: root)
+        }
+        try await server.start()
+        let port = try XCTUnwrap(server.localAddress?.port)
+        if bindHost != "127.0.0.1", browserOrigin != nil {
+            XCTAssertEqual(server.companionLocalAddress?.ipAddress, "127.0.0.1")
+            XCTAssertEqual(server.companionLocalAddress?.port, port)
         }
         return port
     }

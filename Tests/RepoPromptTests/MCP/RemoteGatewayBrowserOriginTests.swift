@@ -120,16 +120,27 @@ final class RemoteGatewayBrowserOriginTests: XCTestCase {
         XCTAssertNil(RemoteGatewayBrowserOrigin.derive(selfDNSName: "bad host/name", port: 8443))
     }
 
-    func testServeCommandTargetsThisBuildsDirectGatewayOrigin() throws {
+    /// Step 4: Serve dials its backend outside the tailnet, so the command targets this build's
+    /// gateway port on the 127.0.0.1 companion listener, never the direct tailnet address.
+    func testServeCommandTargetsThisBuildsLoopbackGatewayPort() throws {
         let debugOrigin = try RemoteGatewayOrigin(tailscaleIPv4: "100.64.0.8", channel: .debug)
         let releaseOrigin = try RemoteGatewayOrigin(tailscaleIPv4: "100.64.0.8", channel: .release)
         XCTAssertEqual(
             RemoteGatewayBrowserOrigin.serveCommand(browserPort: 8443, gatewayOrigin: debugOrigin),
-            "tailscale serve --bg --https=8443 http://100.64.0.8:47392"
+            "tailscale serve --bg --https=8443 http://127.0.0.1:47392"
         )
         XCTAssertEqual(
             RemoteGatewayBrowserOrigin.serveCommand(browserPort: 8443, gatewayOrigin: releaseOrigin),
-            "tailscale serve --bg --https=8443 http://100.64.0.8:47391"
+            "tailscale serve --bg --https=8443 http://127.0.0.1:47391"
+        )
+        XCTAssertEqual(
+            RemoteGatewayBrowserOrigin.serveCommand(browserPort: 9443, gatewayOrigin: debugOrigin),
+            "tailscale serve --bg --https=9443 http://127.0.0.1:47392",
+            "The browser HTTPS port is chosen independently of the gateway port"
+        )
+        XCTAssertFalse(
+            RemoteGatewayBrowserOrigin.serveCommand(browserPort: 8443, gatewayOrigin: debugOrigin).contains("100.64.0.8"),
+            "The direct tailnet address is not a Serve backend"
         )
     }
 

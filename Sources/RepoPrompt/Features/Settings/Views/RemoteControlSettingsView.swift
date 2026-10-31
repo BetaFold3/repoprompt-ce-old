@@ -65,7 +65,7 @@ struct RemoteControlSettingsView: View {
             if let origin = gatewayStatus.status.origin {
                 labeledMonospace("Tailnet origin", origin.string)
             }
-            Text("Tailscale must be installed, signed in, and running. Remote Control never falls back to loopback, LAN, or wildcard binding.")
+            Text("Tailscale must be installed, signed in, and running. The gateway listens on this Mac's Tailscale address and never falls back to loopback, LAN, or wildcard binding. It also listens on 127.0.0.1 only while a browser origin is set below, for Tailscale Serve.")
                 .font(fontPreset.captionFont).foregroundColor(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             HStack {
@@ -84,11 +84,12 @@ struct RemoteControlSettingsView: View {
     }
 
     /// Paired-browser HTTPS link: an owner-run `tailscale serve` listener on a non-443 port that
-    /// forwards to this build's gateway. The app never changes Tailscale configuration.
+    /// forwards to this build's gateway on 127.0.0.1. A saved port also makes the gateway listen on
+    /// 127.0.0.1 for that forwarding. The app never changes Tailscale configuration.
     private var browserLinkSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Browser link (HTTPS)").font(fontPreset.font)
-            Text("Telegram alerts get an Open session button for your paired phone browser when this port is set and Remote Control is running. Leave it blank for text-only alerts. Port 443 is not allowed.")
+            Text("Telegram alerts get an Open session button for your paired phone browser when this port is set and Remote Control is running. While a browser origin is shown, this build's gateway also listens on 127.0.0.1 for the Tailscale Serve command below. Leave it blank for text-only alerts. Port 443 is not allowed.")
                 .font(fontPreset.captionFont).foregroundColor(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             HStack(spacing: 8) {
@@ -133,7 +134,7 @@ struct RemoteControlSettingsView: View {
                 Text("Turn on Remote Control to see the exact tailscale serve command for this build.")
                     .font(fontPreset.captionFont).foregroundColor(.secondary)
             }
-            Text("Requires MagicDNS and HTTPS certificates in Tailscale. One Serve port forwards to one build's gateway: after switching between the release and Dev builds, run the command shown in the build you use. It replaces the earlier target; until then, links fail.")
+            Text("Requires MagicDNS and HTTPS certificates in Tailscale. Run the command after saving a port. One Serve port forwards to one build's gateway: after switching between the release and Dev builds, run the command shown in the build you use. It replaces the earlier target; until then, links fail. Clearing the port stops the 127.0.0.1 listener and returns alerts to text only, but leaves your Serve setup in place; remove it with tailscale serve --https=\(globalSettings.mcpRemoteGatewayBrowserHTTPSPort() ?? suggestedBrowserPort) off. Serve's port 443 is never changed.")
                 .font(fontPreset.captionFont).foregroundColor(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }

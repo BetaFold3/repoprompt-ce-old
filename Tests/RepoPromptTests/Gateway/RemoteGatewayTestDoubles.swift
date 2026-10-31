@@ -3,6 +3,7 @@ import Logging
 import MCP
 @testable import RepoPromptGateway
 import RepoPromptRemoteWire
+import XCTest
 
 struct RecordedGatewayToolCall: Equatable {
     let name: String
@@ -187,6 +188,26 @@ actor RecordingFrameSink: RemoteFrameSink {
 }
 
 enum GatewayTestHelpers {
+    /// Skips the test unless this host can bind an IPv6 loopback (`::1`) socket. Loopback-companion
+    /// fixtures use a `::1` primary so it and the `127.0.0.1` companion are distinct listeners
+    /// without Tailscale or extra IPv4 aliases. This is a separate probe, run before the gateway
+    /// starts, so a gateway or IPv4 startup failure is still reported as a failure, never a skip.
+    static func requireIPv6Loopback() throws {
+        let socketFD = socket(AF_INET6, SOCK_STREAM, 0)
+        guard socketFD >= 0 else { throw XCTSkip("IPv6 sockets are unavailable (errno \(errno))") }
+        defer { close(socketFD) }
+        var address = sockaddr_in6()
+        address.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+        address.sin6_family = sa_family_t(AF_INET6)
+        address.sin6_addr = in6addr_loopback
+        let bound = withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(socketFD, $0, socklen_t(MemoryLayout<sockaddr_in6>.size))
+            }
+        }
+        guard bound == 0 else { throw XCTSkip("IPv6 loopback ::1 is unavailable (errno \(errno))") }
+    }
+
     static func temporaryRoot(_ name: String = #function) throws -> URL {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("RepoPromptGatewayTests-\(name)-\(UUID().uuidString)", isDirectory: true)

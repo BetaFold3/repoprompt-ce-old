@@ -18,7 +18,10 @@ final class GatewayHTTPServer: @unchecked Sendable {
     private let logger: Logger
     private let connectionRegistry = GatewayWebSocketConnectionRegistry()
     private var eventLoopGroup: MultiThreadedEventLoopGroup?
+    /// The primary listener on the configured bind host.
     private var channel: Channel?
+    /// The optional `127.0.0.1` listener at the primary's port; see `needsLoopbackCompanion`.
+    private var companionChannel: Channel?
 
     init(
         configuration: GatewayConfiguration,
@@ -58,6 +61,34 @@ final class GatewayHTTPServer: @unchecked Sendable {
 
     var localAddress: SocketAddress? {
         channel?.localAddress
+    }
+
+    var companionLocalAddress: SocketAddress? {
+        companionChannel?.localAddress
+    }
+
+    static let loopbackCompanionHost = "127.0.0.1"
+
+    /// Whether a browser origin also needs a `127.0.0.1` listener at the primary's port. The
+    /// owner's same-host `tailscale serve` dials its backend outside the tailnet, so it cannot reach
+    /// a listener bound only to this Mac's Tailscale address. The companion shares the primary's
+    /// pipeline, Host allowlist, and authentication; a local source address grants nothing.
+    /// `127.0.0.1` and the IPv4 wildcard already cover it; an IPv6 wildcard covers it only when the
+    /// bound socket is dual-stack (`isIPv6Only == false`), and unknown coverage is an error.
+    static func needsLoopbackCompanion(primary: SocketAddress?, isIPv6Only: Bool?) throws -> Bool {
+        switch primary {
+        case .v4:
+            let ip = primary?.ipAddress
+            return ip != loopbackCompanionHost && ip != "0.0.0.0"
+        case .v6:
+            guard primary?.ipAddress == "::" else { return true }
+            guard let isIPv6Only else {
+                throw GatewayHTTPServerError.loopbackCoverageUnknown(String(describing: primary))
+            }
+            return isIPv6Only
+        case .unixDomainSocket, .none:
+            throw GatewayHTTPServerError.loopbackCoverageUnknown(String(describing: primary))
+        }
     }
 
     func start() async throws {
@@ -137,13 +168,48 @@ final class GatewayHTTPServer: @unchecked Sendable {
                 host: configuration.bindHost,
                 port: configuration.port
             ).get()
+            let boundCompanion: Channel?
+            do {
+                boundCompanion = try await Self.bindLoopbackCompanionIfNeeded(
+                    primary: boundChannel,
+                    configuration: configuration,
+                    bootstrap: bootstrap
+                )
+            } catch {
+                // All or nothing: a browser origin without its backend is a failed start.
+                try? await boundChannel.close().get()
+                throw error
+            }
             eventLoopGroup = group
             channel = boundChannel
+            companionChannel = boundCompanion
             logger.notice("Gateway HTTP server listening on \(String(describing: boundChannel.localAddress))")
+            if let boundCompanion {
+                logger.notice("Gateway HTTP server loopback companion listening on \(String(describing: boundCompanion.localAddress))")
+            }
         } catch {
             try? await group.shutdownGracefully()
             throw error
         }
+    }
+
+    private static func bindLoopbackCompanionIfNeeded(
+        primary: Channel,
+        configuration: GatewayConfiguration,
+        bootstrap: ServerBootstrap
+    ) async throws -> Channel? {
+        guard configuration.browserOriginAuthority != nil else { return nil }
+        let primaryAddress = primary.localAddress
+        var isIPv6Only: Bool?
+        if case .v6 = primaryAddress, primaryAddress?.ipAddress == "::" {
+            let option = ChannelOptions.Types.SocketOption(level: .ipv6, name: .ipv6_v6only)
+            isIPv6Only = try await primary.getOption(option).get() != 0
+        }
+        guard try needsLoopbackCompanion(primary: primaryAddress, isIPv6Only: isIPv6Only) else { return nil }
+        guard let port = primaryAddress?.port else {
+            throw GatewayHTTPServerError.loopbackCoverageUnknown(String(describing: primaryAddress))
+        }
+        return try await bootstrap.bind(host: loopbackCompanionHost, port: port).get()
     }
 
     func closeConnections(forDevice deviceID: String) {
@@ -151,15 +217,27 @@ final class GatewayHTTPServer: @unchecked Sendable {
     }
 
     func shutdown() async {
-        let currentChannel = channel
+        let currentChannels = [channel, companionChannel].compactMap(\.self)
         channel = nil
-        if let currentChannel {
+        companionChannel = nil
+        for currentChannel in currentChannels {
             try? await currentChannel.close().get()
         }
         if let eventLoopGroup {
             try? await eventLoopGroup.shutdownGracefully()
         }
         eventLoopGroup = nil
+    }
+}
+
+enum GatewayHTTPServerError: Error, Equatable, CustomStringConvertible {
+    case loopbackCoverageUnknown(String)
+
+    var description: String {
+        switch self {
+        case let .loopbackCoverageUnknown(address):
+            "Cannot tell whether the gateway listener \(address) covers 127.0.0.1 for the browser origin"
+        }
     }
 }
 
