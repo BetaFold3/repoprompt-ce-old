@@ -41,6 +41,9 @@ Implemented and accepted by the owner for the Dev build with Safari on iPhone, w
 - **Transcript paging.** Pages are oldest-first: the newest page starts at `max(0, total_turns − 200)`, and "Load earlier messages" prepends the 200 turns before the oldest one shown. Background refresh pauses while older pages are loaded, and Refresh returns to the newest page. Newest-page loads coalesce overlapping refreshes and make at most one corrective page request; a turn added during that second request can appear on the next refresh.
 - **Revocation.** A phone revoked on the Mac is disconnected within about 15 s (the gateway's trust-refresh loop). After that, ticket requests are refused and the page tells the user to pair again. The owner accepted the delay; there is no per-action re-check.
 
+## Proposed follow-up (not implemented)
+The [optional passkey-unlock spec](plans/2026-10-31-remote-passkey-unlock-spec.md) proposes additional user verification for already paired browsers, including 1Password on iPhone. Pairing-only access remains the current behavior; its timeout, enrollment and enforcement design are not deployed or owner-approved for implementation.
+
 ## Setup (owner-run)
 1. In the Tailscale admin console, enable MagicDNS and HTTPS certificates.
 2. In Remote Control settings, set Browser link (HTTPS) to 8443 (never 443) and make sure the gateway is running and ready.
