@@ -65,7 +65,7 @@ Change: none in code, except a Host allowlist fix if the check below fails. Setu
 On approval, trigger one real completion alert and one real question alert.
 Validation: on the iPhone, open each link, then answer, steer, follow up and Stop; switch builds, re-run the Serve command and confirm the link opens without re-pairing; revoke the phone on the Mac and confirm its connection closes within about 15 s and `/api/ticket` refuses it; delete site data and confirm a clear "pair again on your Mac" state. Record the results in the evidence directory as live results.
 Done when: both browsers pass. An unpaired browser sees no session content. When the plan completes, record the setup and recovery steps in the owning context document.
-Step 4 — blocked | rounds 0/2 | open: owner setup approvals and iPhone live acceptance (step4-live-results.md) | downgraded: none | assumed: none | deferred: none
+Step 4 — blocked | rounds 0/2 | open: deployed build and live acceptance not verified (step4-live-results.md) | downgraded: none | assumed: none | deferred: setup and live acceptance; read-only inspection complete (step4-live-results.md)
 
 ## Decisions
 - Goal confirmed: Telegram link to the paired browser remote, with a focused phone UI (owner answer 2026-10-30).
@@ -79,6 +79,7 @@ Step 4 — blocked | rounds 0/2 | open: owner setup approvals and iPhone live ac
 - Live test order: Brave first, then Safari (owner answer 2026-10-30).
 - A follow-up sent from the phone alerts on completion under the normal rules (owner answer 2026-10-30).
 - Unsigned local commits are allowed during this plan; re-sign them at plan closure (owner answer 2026-10-31).
+- Proceed with read-only Tailscale/build inspection; do not require manual actions yet (owner answer 2026-10-31).
 
 ## Disagreements
 - Control path: an authority envelope plus an extracted operations file vs a gateway-caller gate reusing the notifier predicate. Gate chosen; the envelope's lane withdrew it.
