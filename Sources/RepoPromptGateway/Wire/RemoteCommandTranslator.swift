@@ -347,7 +347,7 @@ struct RemoteCommandTranslator {
                 || key == "workflow_id" || key == "workflow_name" || key == "model_id"
                 || key == "session_name" || key == "timeout" || key == "timeout_seconds"
                 || key == "wait" || key == "skip" || key.hasPrefix("worktree") || key == "detach"
-                || key == "allow_external_worktree_path"
+                || key == "allow_external_worktree_path" || key == "run_id"
             {
                 arguments[key] = value.mcpValue
             }
@@ -511,7 +511,11 @@ struct RemoteCommandTranslator {
         "workflow_name"
     ]
 
-    private static let cancelPayloadKeys: Set<String> = []
+    /// `run_id` is the run the caller last observed. The app refuses the cancel when a newer
+    /// run has replaced it, so a stale Stop can't end a later run.
+    private static let cancelPayloadKeys: Set<String> = [
+        "run_id"
+    ]
 
     private static let pollPayloadKeys: Set<String> = [
         "session_ids",

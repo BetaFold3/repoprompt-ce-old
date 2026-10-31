@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptRemoteWire
 import RepoPromptShared
 
 struct GatewayConfiguration: Equatable {
@@ -45,6 +46,19 @@ struct GatewayConfiguration: Equatable {
     /// Paired-device tickets are the normal remote path; this flag must be explicitly
     /// enabled for the static token to authorize a WebSocket hello.
     let allowStaticTokenAuth: Bool
+    /// The build channel this gateway binary belongs to. It comes from the same compile-time
+    /// flag as the app's `RemoteControlBuildIdentity.current`, so a gateway always reports its own
+    /// app build. `/healthz` publishes it so a browser can pick the matching identity and discovery
+    /// channel.
+    let buildChannel: RemoteControlBuildChannel
+
+    static var compiledBuildChannel: RemoteControlBuildChannel {
+        #if DEBUG
+            .debug
+        #else
+            .release
+        #endif
+    }
 
     var listenAddressDescription: String {
         "\(bindHost):\(port)"
@@ -107,7 +121,8 @@ struct GatewayConfiguration: Equatable {
             processLeaseFileURL: processLeaseFile,
             appLinkMaximumReconnectAttempts: appLinkMaximumReconnectAttempts,
             allowWildcardBind: allowWildcardBind,
-            allowStaticTokenAuth: values.allowStaticTokenAuth
+            allowStaticTokenAuth: values.allowStaticTokenAuth,
+            buildChannel: compiledBuildChannel
         )
     }
 

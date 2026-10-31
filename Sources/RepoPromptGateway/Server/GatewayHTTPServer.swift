@@ -267,7 +267,7 @@ final class GatewayHTTPHandler: ChannelInboundHandler, RemovableChannelHandler {
         if head.method == .GET, path == "/healthz" {
             sendResponse(
                 status: .ok,
-                body: "{\"status\":\"ok\",\"service\":\"repoprompt-gateway\"}\n",
+                body: Self.healthBody(configuration: configuration),
                 contentType: "application/json; charset=utf-8",
                 context: context
             )
@@ -334,6 +334,13 @@ final class GatewayHTTPHandler: ChannelInboundHandler, RemovableChannelHandler {
                 contentType: "application/json; charset=utf-8"
             )
         }
+    }
+
+    /// `/healthz` also reports the build channel. The PWA keys its stored identity by it and
+    /// sends it with pairing discovery, because the release and Dev gateways can share one browser
+    /// origin while keeping separate paired-device lists and host keys.
+    static func healthBody(configuration: GatewayConfiguration) -> String {
+        "{\"status\":\"ok\",\"service\":\"repoprompt-gateway\",\"channel\":\"\(configuration.buildChannel.rawValue)\"}\n"
     }
 
     static func bodyLimit(for head: HTTPRequestHead) -> Int {

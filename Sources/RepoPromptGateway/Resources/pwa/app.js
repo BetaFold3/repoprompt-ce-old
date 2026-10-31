@@ -1,15 +1,21 @@
 // RepoPrompt Remote — plain ES module PWA client (no build toolchain).
 //
 // Implements the paired-device remote wire protocol v1:
-// - pairing bootstrap via the gateway pairing relay (/api/pair/*, /api/ticket),
+// - pairing bootstrap via the gateway pairing relay (discovery, /api/pair/*, /api/ticket),
 // - one-time app-minted ticket + per-frame P256 device signatures (DPoP-lite),
-// - sessions list / transcript catch-up / respond / steer / cancel,
-// - binding_required window picker surface,
+// - direct session subscribe / poll / transcript catch-up / respond / steer / cancel,
+// - binding_required surface for the sessions list,
 // - Web Push wake registration (push_subscribe) with identifier-only payloads.
+//
+// Every piece of agent or server text reaches the page through textContent or
+// DOM node construction only; this file never parses strings as markup.
 
 const WIRE_VERSION = 1;
 const SIGNING_CONTEXT = 'RemoteFrameV1';
 const PROOF_CONTEXT = 'RepoPromptRemotePairingDeviceChallengeV1';
+const DISCOVERY_PATH = '/.well-known/repoprompt/remote-pairing/v1';
+const DISCOVERY_KIND = 'repoprompt_remote_discovery';
+const BUILD_CHANNELS = ['release', 'debug'];
 const SCOPES = {
   observe: 'sessions:observe',
   operate: 'sessions:operate',
@@ -18,6 +24,9 @@ const SCOPES = {
 const DB_NAME = 'repoprompt-remote';
 const DB_STORE = 'identity';
 const TRANSCRIPT_PAGE = 200;
+const COMMAND_TIMEOUT_MS = 120000;
+const ACTIVE_STATUSES = ['running', 'waiting_for_input'];
+const IDLE_STATUSES = ['completed', 'failed', 'cancelled'];
 
 // ---------------------------------------------------------------------------
 // Small utilities
@@ -25,10 +34,21 @@ const TRANSCRIPT_PAGE = 200;
 const $ = (id) => document.getElementById(id);
 const utf8 = (text) => new TextEncoder().encode(text);
 
+function element(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined && text !== null) node.textContent = String(text);
+  return node;
+}
+
 function bytesToBase64(bytes) {
   let binary = '';
   for (const byte of bytes) binary += String.fromCharCode(byte);
   return btoa(binary);
+}
+
+function bytesToBase64URL(bytes) {
+  return bytesToBase64(bytes).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
 function base64ToBytes(base64) {
@@ -76,14 +96,39 @@ async function postJSON(path, body) {
     body: JSON.stringify(body || {}),
   });
   const payload = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    throw new Error(payload.error || `HTTP ${response.status}`);
+  if (!response.ok || payload.ok === false) {
+    const error = new Error(payload.error || payload.message || `HTTP ${response.status}`);
+    error.code = payload.code;
+    throw error;
   }
   return payload;
 }
 
+// The release and Dev gateways can be reached at the same browser origin, but each
+// build keeps its own paired-device list and host key. The gateway reports which
+// build it is; the identity and pairing discovery both follow that channel.
+async function fetchBuildChannel() {
+  const unreachable = 'The RepoPrompt gateway did not report its build channel. '
+    + 'Check that RepoPrompt is running on your Mac, then try again.';
+  let response;
+  try {
+    response = await fetch('/healthz', { cache: 'no-store' });
+  } catch {
+    throw new Error(unreachable);
+  }
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || !BUILD_CHANNELS.includes(payload.channel)) {
+    throw new Error(unreachable);
+  }
+  return payload.channel;
+}
+
 // ---------------------------------------------------------------------------
-// Device identity (non-extractable P-256 key pair in IndexedDB)
+// Device identity (non-extractable P-256 key pair in IndexedDB, one record per channel)
+
+function identityKey(channel) {
+  return `identity:${channel}`;
+}
 
 function openDB() {
   return new Promise((resolve, reject) => {
@@ -97,27 +142,22 @@ function openDB() {
 async function dbGet(key) {
   const db = await openDB();
   return new Promise((resolve, reject) => {
-    const tx = db.transaction(DB_STORE, 'readonly').objectStore(DB_STORE).get(key);
-    tx.onsuccess = () => resolve(tx.result);
-    tx.onerror = () => reject(tx.error);
+    const request = db.transaction(DB_STORE, 'readonly').objectStore(DB_STORE).get(key);
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
   });
 }
 
-async function dbSet(key, value) {
+// One readwrite transaction per call; resolves only once the transaction commits,
+// so a record is either fully stored or absent.
+async function dbWrite(apply) {
   const db = await openDB();
   return new Promise((resolve, reject) => {
-    const tx = db.transaction(DB_STORE, 'readwrite').objectStore(DB_STORE).put(value, key);
-    tx.onsuccess = () => resolve();
+    const tx = db.transaction(DB_STORE, 'readwrite');
+    apply(tx.objectStore(DB_STORE));
+    tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
-  });
-}
-
-async function dbDelete(key) {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(DB_STORE, 'readwrite').objectStore(DB_STORE).delete(key);
-    tx.onsuccess = () => resolve();
-    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error || new Error('Identity storage was aborted.'));
   });
 }
 
@@ -131,22 +171,40 @@ async function signP256(privateKey, bytes) {
 // Client state
 
 const state = {
+  channel: null,
   keyPair: null,
   deviceId: null,
   displayName: null,
   scopes: [],
   ws: null,
+  connecting: false,
   ticketId: null,
   counter: 0,
   connected: false,
   vapidPublicKey: null,
-  pending: new Map(), // request_id -> {resolve, reject}
+  sendChain: Promise.resolve(),
+  pending: new Map(), // request_id -> {resolve, reject, timer, ws}
   sessions: new Map(), // session_id -> snapshot payload
   currentSessionId: null,
+  deepLinkSessionId: null,
+  // Bumped whenever the detail view switches session or closes. An async completion
+  // writes to the view only if the generation it started under is still current.
+  viewGeneration: 0,
+  // Bumped on every streamed snapshot, so an older poll reply cannot overwrite it.
+  revisionBySession: new Map(),
   transcriptOffset: 0,
+  transcriptToken: 0, // bumped by manual Refresh so in-flight transcript pages are dropped
   lastSeqBySession: new Map(),
-  pendingStartMessage: null, // last start message refused with binding_required/ambiguous_start_target
+  questionInputs: null, // structured question form controls for the shown interaction
 };
+
+function viewIsCurrent(generation) {
+  return state.viewGeneration === generation;
+}
+
+function bumpRevision(sessionId) {
+  state.revisionBySession.set(sessionId, (state.revisionBySession.get(sessionId) || 0) + 1);
+}
 
 function setBadge(text, cls) {
   const badge = $('conn-badge');
@@ -154,19 +212,31 @@ function setBadge(text, cls) {
   badge.className = `badge ${cls || ''}`;
 }
 
+function setActionStatus(text, cls) {
+  const status = $('action-status');
+  status.textContent = text || '';
+  status.className = `hint ${cls || ''}`;
+}
+
+function isPaired() {
+  return Boolean(state.keyPair && state.deviceId);
+}
+
 // ---------------------------------------------------------------------------
 // Pairing flow
 
+function randomNonce() {
+  return bytesToBase64URL(crypto.getRandomValues(new Uint8Array(32)));
+}
+
 async function pairDevice() {
+  if (!state.channel) throw new Error('The RepoPrompt gateway is not reachable.');
+  const channel = state.channel;
   const displayName = ($('device-name').value || '').trim() || 'Remote device';
   const scopes = [SCOPES.observe];
   if ($('scope-operate').checked) scopes.push(SCOPES.operate);
   if ($('scope-respond').checked) scopes.push(SCOPES.respond);
   const sortedScopes = [...scopes].sort();
-
-  $('pair-status').textContent = 'Requesting pairing challenge…';
-  const begin = await postJSON('/api/pair/begin', {});
-  $('host-fingerprint').textContent = begin.host_fingerprint || '–';
 
   const keyPair = await crypto.subtle.generateKey(
     { name: 'ECDSA', namedCurve: 'P-256' },
@@ -179,6 +249,18 @@ async function pairDevice() {
   const publicKeyBase64 = bytesToBase64(raw64);
   const fingerprintHex = bytesToHex(await sha256Bytes(raw64));
   const deviceId = `remote:${fingerprintHex.slice(0, 8)}`;
+
+  $('pair-status').textContent = 'Contacting your Mac…';
+  const nonce = randomNonce();
+  const discovery = await postJSON(DISCOVERY_PATH, { v: 1, kind: DISCOVERY_KIND, nonce, channel });
+  if (discovery.nonce !== nonce || discovery.channel !== channel || !discovery.approval_context) {
+    throw new Error('The gateway returned an unexpected discovery response.');
+  }
+  $('host-fingerprint').textContent = discovery.host_fingerprint || '–';
+
+  $('pair-status').textContent = 'Requesting pairing challenge…';
+  const begin = await postJSON('/api/pair/begin', { approval_context: discovery.approval_context });
+  if (begin.host_fingerprint) $('host-fingerprint').textContent = begin.host_fingerprint;
 
   const proofPayload = [
     PROOF_CONTEXT,
@@ -202,44 +284,111 @@ async function pairDevice() {
   });
 
   const device = complete.device || {};
-  state.keyPair = keyPair;
-  state.deviceId = device.id || deviceId;
-  state.displayName = device.display_name || displayName;
-  state.scopes = device.scopes || sortedScopes;
-  await dbSet('keyPair', keyPair);
-  await dbSet('device', {
-    deviceId: state.deviceId,
-    displayName: state.displayName,
-    scopes: state.scopes,
-  });
+  const record = {
+    keyPair,
+    device: {
+      deviceId: device.id || deviceId,
+      displayName: device.display_name || displayName,
+      scopes: device.scopes || sortedScopes,
+    },
+  };
+  // Key and device record are written together, so a failure leaves no half identity.
+  await dbWrite((store) => store.put(record, identityKey(channel)));
+  applyIdentity(record);
   $('pair-status').textContent = '';
-  logLine(`Paired as ${state.deviceId}`);
+  logLine(`Paired as ${state.deviceId} (${channel})`);
   renderIdentity();
+  connect();
+}
+
+function applyIdentity(record) {
+  state.keyPair = record.keyPair;
+  state.deviceId = record.device.deviceId;
+  state.displayName = record.device.displayName;
+  state.scopes = record.device.scopes || [];
 }
 
 async function loadIdentity() {
-  const [keyPair, device] = await Promise.all([dbGet('keyPair'), dbGet('device')]);
-  if (keyPair && device) {
-    state.keyPair = keyPair;
-    state.deviceId = device.deviceId;
-    state.displayName = device.displayName;
-    state.scopes = device.scopes || [];
+  if (!state.channel) return;
+  let record;
+  try {
+    record = await dbGet(identityKey(state.channel));
+  } catch (error) {
+    throw new Error(
+      `This browser could not read its saved pairing (${error.message || 'storage unavailable'}). `
+        + 'Browser storage may be disabled, for example in a private window.',
+    );
+  }
+  if (record && record.keyPair && record.keyPair.privateKey && record.device && record.device.deviceId) {
+    applyIdentity(record);
   }
 }
 
-async function forgetIdentity() {
-  await dbDelete('keyPair');
-  await dbDelete('device');
+// Drops the in-memory identity, connection and every session view, so nothing from
+// the previous pairing or build is reopened afterwards.
+function resetIdentityState() {
+  disconnect();
   state.keyPair = null;
   state.deviceId = null;
-  disconnect();
+  state.displayName = null;
+  state.scopes = [];
+  state.ticketId = null;
+  state.vapidPublicKey = null;
+  state.viewGeneration += 1;
+  state.currentSessionId = null;
+  state.deepLinkSessionId = null;
+  state.transcriptOffset = 0;
+  state.questionInputs = null;
+  state.sessions.clear();
+  state.revisionBySession.clear();
+  state.lastSeqBySession.clear();
+  $('transcript').textContent = '';
+  setActionStatus('');
+  $('sessions-panel').classList.add('hidden');
+  $('detail-panel').classList.add('hidden');
+}
+
+async function forgetIdentity() {
+  if (state.channel) {
+    try {
+      await dbWrite((store) => store.delete(identityKey(state.channel)));
+    } catch (error) {
+      $('connect-status').textContent = `Could not delete the saved pairing: ${error.message}`;
+      return;
+    }
+  }
+  resetIdentityState();
   renderIdentity();
 }
 
+// The release and Dev builds can take turns behind the same address. Before each
+// connection, re-read the gateway's channel and switch to that build's saved pairing.
+async function selectGatewayIdentity() {
+  const channel = await fetchBuildChannel();
+  if (channel === state.channel) return;
+  if (state.channel) {
+    // A real build switch: nothing from the other build's pairing carries over.
+    logLine(`Gateway is now the ${channel} build.`);
+    resetIdentityState();
+  }
+  state.channel = channel;
+  try {
+    await loadIdentity();
+  } catch (error) {
+    // An unreadable record is not an absent pairing: forget the channel so the next
+    // connect retries the read instead of offering to pair again.
+    state.channel = null;
+    throw error;
+  } finally {
+    renderIdentity();
+  }
+}
+
 function renderIdentity() {
-  const paired = Boolean(state.keyPair && state.deviceId);
-  $('pair-panel').classList.toggle('hidden', paired);
+  const paired = isPaired();
+  $('pair-panel').classList.toggle('hidden', paired || !state.channel);
   $('connect-panel').classList.toggle('hidden', !paired);
+  $('build-channel').textContent = state.channel || '–';
   if (paired) {
     $('paired-name').textContent = state.displayName || '–';
     $('paired-device-id').textContent = state.deviceId || '–';
@@ -248,17 +397,22 @@ function renderIdentity() {
 
 // ---------------------------------------------------------------------------
 // Signed WebSocket frames
+//
+// Signing and sending run one frame at a time: each frame takes the next counter
+// only after the previous frame was sent, so frames reach the gateway in counter
+// order even while another request (for example a poll) is still in flight.
 
 async function signedFrame(frame) {
   const unsigned = { ...frame };
   delete unsigned.sig;
   const hashHex = bytesToHex(await sha256Bytes(utf8(canonicalJSON(unsigned))));
-  state.counter = Math.max(state.counter + 1, Date.now());
+  const counter = Math.max(state.counter + 1, Date.now());
+  state.counter = counter;
   const signingPayload = [
     SIGNING_CONTEXT,
     state.ticketId,
     state.deviceId,
-    String(state.counter),
+    String(counter),
     hashHex,
   ].join('\n') + '\n';
   const signature = await signP256(state.keyPair.privateKey, utf8(signingPayload));
@@ -267,66 +421,112 @@ async function signedFrame(frame) {
     sig: {
       ticket_id: state.ticketId,
       device_id: state.deviceId,
-      counter: state.counter,
+      counter,
       algorithm: 'P256-SHA256',
       signature: bytesToBase64(signature),
     },
   };
 }
 
+function enqueueSignedSend(ws, frame) {
+  const run = state.sendChain.then(async () => {
+    if (state.ws !== ws || ws.readyState !== WebSocket.OPEN) throw new Error('Not connected.');
+    const signed = await signedFrame(frame);
+    if (state.ws !== ws || ws.readyState !== WebSocket.OPEN) throw new Error('Not connected.');
+    ws.send(JSON.stringify(signed));
+  });
+  state.sendChain = run.catch(() => {});
+  return run;
+}
+
+function settlePending(requestId) {
+  const entry = state.pending.get(requestId);
+  if (!entry) return null;
+  state.pending.delete(requestId);
+  clearTimeout(entry.timer);
+  return entry;
+}
+
+function rejectPendingFor(ws, message) {
+  for (const [requestId, entry] of [...state.pending.entries()]) {
+    if (entry.ws === ws) {
+      settlePending(requestId);
+      entry.reject(new Error(message));
+    }
+  }
+}
+
 function sendCommand(frame) {
   return new Promise((resolve, reject) => {
-    if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+    const ws = state.ws;
+    if (!ws || !state.connected || ws.readyState !== WebSocket.OPEN) {
       reject(new Error('Not connected.'));
       return;
     }
     const requestId = frame.request_id || crypto.randomUUID();
     const complete = { v: WIRE_VERSION, request_id: requestId, ...frame };
-    state.pending.set(requestId, { resolve, reject });
-    signedFrame(complete)
-      .then((signed) => state.ws.send(JSON.stringify(signed)))
-      .catch((error) => {
-        state.pending.delete(requestId);
-        reject(error);
-      });
-    setTimeout(() => {
-      if (state.pending.delete(requestId)) {
-        reject(new Error(`Timed out waiting for ${frame.type}.`));
-      }
-    }, 120000);
+    const timer = setTimeout(() => {
+      if (settlePending(requestId)) reject(new Error(`Timed out waiting for ${frame.type}.`));
+    }, COMMAND_TIMEOUT_MS);
+    state.pending.set(requestId, { resolve, reject, timer, ws });
+    enqueueSignedSend(ws, complete).catch((error) => {
+      if (settlePending(requestId)) reject(error);
+    });
   });
 }
 
 async function connect() {
-  if (!state.keyPair || !state.deviceId) return;
-  $('connect-status').textContent = 'Requesting connection ticket…';
-  let ticket;
+  if (state.ws || state.connecting) return;
+  state.connecting = true;
   try {
-    const minted = await postJSON('/api/ticket', { device_id: state.deviceId });
-    ticket = minted.ticket;
+    await openConnection();
+  } finally {
+    state.connecting = false;
+  }
+}
+
+async function openConnection() {
+  try {
+    await selectGatewayIdentity();
+    $('gateway-status').textContent = '';
+    $('gateway-retry').classList.add('hidden');
   } catch (error) {
-    $('connect-status').textContent = `Ticket request failed: ${error.message}`;
+    $('gateway-status').textContent = error.message;
+    $('gateway-retry').classList.remove('hidden');
     return;
   }
+  if (!isPaired()) return;
+  const deviceId = state.deviceId;
+  $('connect-status').textContent = 'Requesting connection ticket…';
+  setBadge('connecting…', 'warn');
+  let ticket;
+  try {
+    const minted = await postJSON('/api/ticket', { device_id: deviceId });
+    ticket = minted.ticket;
+  } catch (error) {
+    setBadge('disconnected', 'err');
+    const stale = error.code === 'unknown_device' || error.code === 'device_revoked';
+    $('connect-status').textContent = stale
+      ? `${error.message} Forget pairing here, then pair again on your Mac.`
+      : `Ticket request failed: ${error.message}`;
+    return;
+  }
+  if (state.ws || state.deviceId !== deviceId) return;
   state.ticketId = String(ticket.ticket_id).toLowerCase();
-  state.counter = Date.now();
+  state.counter = Math.max(state.counter, Date.now());
 
   const wsURL = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
   const ws = new WebSocket(wsURL);
   state.ws = ws;
-  setBadge('connecting…', 'warn');
   $('connect-status').textContent = 'Connecting…';
 
-  ws.onopen = async () => {
-    const hello = await signedFrame({
-      v: WIRE_VERSION,
-      type: 'hello',
-      payload: { ticket },
-    });
-    ws.send(JSON.stringify(hello));
+  ws.onopen = () => {
+    enqueueSignedSend(ws, { v: WIRE_VERSION, type: 'hello', payload: { ticket } })
+      .catch((error) => logLine(`hello failed: ${error.message}`));
   };
   ws.onmessage = (event) => handleServerFrame(event.data);
   ws.onclose = () => {
+    rejectPendingFor(ws, 'Connection closed.');
     if (state.ws === ws) {
       state.connected = false;
       state.ws = null;
@@ -339,14 +539,25 @@ async function connect() {
 }
 
 function disconnect() {
-  if (state.ws) state.ws.close();
+  const ws = state.ws;
   state.ws = null;
   state.connected = false;
+  if (ws) {
+    rejectPendingFor(ws, 'Connection closed.');
+    ws.close();
+  }
   setBadge('disconnected', '');
 }
 
 // ---------------------------------------------------------------------------
 // Server frame handling
+
+function commandError(payload) {
+  const message = (payload && payload.message) || 'Command failed.';
+  const error = new Error(message);
+  error.code = payload && payload.code;
+  return error;
+}
 
 function handleServerFrame(raw) {
   let frame;
@@ -365,33 +576,30 @@ function handleServerFrame(raw) {
         state.vapidPublicKey = payload.vapid_public_key;
         $('push-button').disabled = false;
       }
-      $('sessions-panel').classList.remove('hidden');
-      refreshSessions();
       logLine(`hello_ack auth=${payload.auth || '?'}`);
+      const target = state.currentSessionId || state.deepLinkSessionId;
+      if (target) {
+        openSession(target);
+      } else {
+        showSessionsList();
+      }
       break;
     }
     case 'command_result':
     case 'command_error': {
-      const pending = frame.request_id ? state.pending.get(frame.request_id) : null;
+      const pending = frame.request_id ? settlePending(frame.request_id) : null;
+      const isError = frame.type === 'command_error';
+      const code = frame.payload && frame.payload.code;
+      if (isError && (code === 'binding_required' || code === 'ambiguous_start_target')) {
+        showBindingOverlay(frame.payload.message);
+      }
       if (pending) {
-        state.pending.delete(frame.request_id);
-        if (frame.type === 'command_result') {
-          pending.resolve(frame.payload || {});
+        if (isError) {
+          pending.reject(commandError(frame.payload));
         } else {
-          const code = frame.payload && frame.payload.code;
-          const message = (frame.payload && frame.payload.message) || 'Command failed.';
-          if (code === 'binding_required' || code === 'ambiguous_start_target') {
-            showBindingOverlay(message, frame.payload && frame.payload.details);
-          }
-          const error = new Error(message);
-          error.code = code;
-          pending.reject(error);
+          pending.resolve(frame.payload || {});
         }
-      } else if (frame.type === 'command_error') {
-        const code = frame.payload && frame.payload.code;
-        if (code === 'binding_required' || code === 'ambiguous_start_target') {
-          showBindingOverlay(frame.payload.message, frame.payload.details);
-        }
+      } else if (isError) {
         logLine(`error: ${code || 'unknown'}`);
       }
       break;
@@ -400,11 +608,12 @@ function handleServerFrame(raw) {
     case 'session_terminal': {
       if (frame.session_id) {
         detectSeqGap(frame);
+        bumpRevision(frame.session_id);
         state.sessions.set(frame.session_id, frame.payload || {});
         renderSessions();
         if (frame.session_id === state.currentSessionId) {
           renderSessionDetail();
-          if (frame.type === 'session_update') maybeRefreshTranscript();
+          maybeRefreshTranscript();
         }
         if (frame.type === 'session_terminal') {
           logLine(`session ${shortID(frame.session_id)} finished`);
@@ -418,13 +627,19 @@ function handleServerFrame(raw) {
         // updates/terminal frames; track it so the next snapshot does not look
         // like a missed update and trigger a spurious get_log catch-up.
         detectSeqGap(frame);
+        if (frame.session_id === state.currentSessionId) scheduleDetailRefresh();
       }
       break;
     }
     case 'session_expired': {
       if (frame.session_id) {
+        bumpRevision(frame.session_id);
         state.sessions.delete(frame.session_id);
         renderSessions();
+        if (frame.session_id === state.currentSessionId) {
+          state.sessions.set(frame.session_id, { status: 'expired' });
+          renderSessionDetail();
+        }
         logLine(`session ${shortID(frame.session_id)} expired`);
       }
       break;
@@ -464,6 +679,20 @@ function sessionStatus(payload) {
   return (payload && payload.status) || 'unknown';
 }
 
+function sessionName(payload, sessionId) {
+  if (!payload) return shortID(sessionId);
+  return (payload.session && payload.session.name) || payload.session_name || payload.name || shortID(sessionId);
+}
+
+function showSessionsList() {
+  state.viewGeneration += 1;
+  state.currentSessionId = null;
+  state.deepLinkSessionId = null;
+  $('detail-panel').classList.add('hidden');
+  $('sessions-panel').classList.remove('hidden');
+  refreshSessions();
+}
+
 async function refreshSessions() {
   try {
     const result = await sendCommand({ type: 'list_sessions', payload: { limit: 50 } });
@@ -484,23 +713,17 @@ async function refreshSessions() {
 
 function renderSessions() {
   const list = $('sessions-list');
-  list.textContent = '';
+  list.replaceChildren();
   const entries = [...state.sessions.entries()];
   if (!entries.length) {
-    const empty = document.createElement('li');
-    empty.textContent = 'No sessions in the bound workspace.';
-    empty.style.color = 'var(--muted)';
+    const empty = element('li', 'empty', 'No sessions in the bound workspace.');
     list.appendChild(empty);
     return;
   }
   for (const [sessionId, payload] of entries) {
-    const item = document.createElement('li');
-    const name = document.createElement('span');
-    name.className = 'name';
-    name.textContent = payload.session_name || payload.name || shortID(sessionId);
-    const status = document.createElement('span');
-    status.className = 'badge';
-    status.textContent = sessionStatus(payload);
+    const item = element('li');
+    const name = element('span', 'name', sessionName(payload, sessionId));
+    const status = element('span', 'badge', sessionStatus(payload));
     if (sessionStatus(payload) === 'waiting_for_input') status.classList.add('warn');
     item.append(name, status);
     item.onclick = () => openSession(sessionId);
@@ -509,38 +732,206 @@ function renderSessions() {
 }
 
 // ---------------------------------------------------------------------------
-// Session detail: transcript pager + respond / steer / cancel
+// Session detail: transcript pager + answer / steer / follow up / stop
 
 async function openSession(sessionId) {
+  const switching = state.currentSessionId !== sessionId;
+  if (switching) state.viewGeneration += 1;
+  const generation = state.viewGeneration;
   state.currentSessionId = sessionId;
-  state.transcriptOffset = 0;
+  $('sessions-panel').classList.add('hidden');
   $('detail-panel').classList.remove('hidden');
   $('detail-session-id').textContent = shortID(sessionId);
-  $('transcript').textContent = '';
+  if (switching) {
+    state.transcriptOffset = 0;
+    $('transcript').textContent = '';
+    $('composer-input').value = '';
+    setActionStatus('');
+  }
   renderSessionDetail();
-  await sendCommand({ type: 'subscribe', session_id: sessionId }).catch(() => {});
+  try {
+    // Subscribe to this session directly; it does not need to be in the bound
+    // workspace's sessions list.
+    await sendCommand({ type: 'subscribe', session_id: sessionId });
+  } catch (error) {
+    if (viewIsCurrent(generation)) setActionStatus(error.message, 'err');
+    logLine(`subscribe failed: ${error.code || error.message}`);
+  }
+  if (!viewIsCurrent(generation)) return;
+  await pollSession(sessionId);
+  if (!viewIsCurrent(generation)) return;
+  // Reopening the same session (for example after a reconnect) keeps pages already
+  // loaded with "Load more transcript"; Refresh returns to the newest output.
+  if (!switching && state.transcriptOffset > 0) return;
   await loadTranscript(false);
 }
 
+async function pollSession(sessionId) {
+  const target = sessionId || state.currentSessionId;
+  if (!target) return null;
+  const generation = state.viewGeneration;
+  const revision = state.revisionBySession.get(target) || 0;
+  try {
+    const snapshot = await sendCommand({ type: 'poll', session_id: target });
+    if ((state.revisionBySession.get(target) || 0) !== revision) {
+      // A streamed update arrived while this poll was in flight; it is newer.
+      return state.sessions.get(target) || null;
+    }
+    if (snapshot && typeof snapshot.status === 'string') {
+      state.sessions.set(target, snapshot);
+      if (target === state.currentSessionId) renderSessionDetail();
+    }
+    return snapshot;
+  } catch (error) {
+    if (target === state.currentSessionId && viewIsCurrent(generation)) setActionStatus(error.message, 'err');
+    logLine(`poll failed: ${error.code || error.message}`);
+    return null;
+  }
+}
+
+let detailRefreshTimer = null;
+function scheduleDetailRefresh() {
+  if (detailRefreshTimer) return;
+  detailRefreshTimer = setTimeout(() => {
+    detailRefreshTimer = null;
+    pollSession();
+    maybeRefreshTranscript();
+  }, 750);
+}
+
 function renderSessionDetail() {
-  const payload = state.sessions.get(state.currentSessionId) || {};
+  const sessionId = state.currentSessionId;
+  if (!sessionId) return;
+  const payload = state.sessions.get(sessionId) || {};
   const status = sessionStatus(payload);
   const badge = $('detail-status');
   badge.textContent = status;
   badge.className = `badge ${status === 'waiting_for_input' ? 'warn' : ''}`;
-  const interaction = payload.interaction || null;
-  const interactionId = payload.interaction_id || (interaction && interaction.id) || null;
+  $('detail-name').textContent = sessionName(payload, sessionId);
+  renderInteraction(status === 'waiting_for_input' ? payload.interaction : null, payload);
+
+  const composer = $('composer');
+  const active = ACTIVE_STATUSES.includes(status);
+  const idle = IDLE_STATUSES.includes(status);
+  composer.classList.toggle('hidden', !(active || idle));
+  const verb = active ? 'Steer' : 'Follow up';
+  $('composer-label').textContent = verb;
+  $('composer-send').textContent = verb;
+  $('composer-input').placeholder = active ? 'Steer the running agent…' : 'Send a follow-up message…';
+  $('stop-button').classList.toggle('hidden', !active);
+}
+
+function renderInteraction(interaction, payload) {
   const box = $('interaction-box');
-  if (status === 'waiting_for_input') {
-    box.classList.remove('hidden');
-    box.dataset.interactionId = interactionId || '';
-    const text = interaction
-      ? (interaction.prompt || interaction.title || interaction.question || 'The agent is waiting for input.')
-      : 'The agent is waiting for input.';
-    $('interaction-text').textContent = text;
-  } else {
+  if (!interaction) {
     box.classList.add('hidden');
+    box.dataset.interactionId = '';
+    state.questionInputs = null;
+    return;
   }
+  const interactionId = payload.interaction_id || interaction.id || '';
+  box.classList.remove('hidden');
+  if (box.dataset.interactionId === interactionId && interactionId) {
+    // Keep in-progress selections when the same interaction is re-reported.
+    return;
+  }
+  box.dataset.interactionId = interactionId;
+  $('interaction-title').textContent = interaction.title || 'The agent is waiting for input.';
+  $('interaction-text').textContent = interaction.prompt || '';
+  $('interaction-context').textContent = interaction.context || '';
+  // Only ask_user questions (kind "question") can be answered from the phone. Approvals,
+  // MCP elicitations, Codex user input and instruction waits stay on the Mac.
+  const fields = Array.isArray(interaction.fields) ? interaction.fields : [];
+  const answerable = interaction.kind === 'question' && fields.length > 0;
+  $('answer-on-mac').classList.toggle('hidden', answerable);
+  $('respond-button').classList.toggle('hidden', !answerable);
+  if (answerable) {
+    renderQuestionForm(fields);
+  } else {
+    $('question-form').replaceChildren();
+    state.questionInputs = null;
+  }
+}
+
+function renderQuestionForm(fields) {
+  const form = $('question-form');
+  form.replaceChildren();
+  state.questionInputs = fields.map((field, index) => {
+    const fieldset = element('fieldset', 'question');
+    fieldset.appendChild(element('legend', null, field.header || `Question ${index + 1}`));
+    if (field.prompt) fieldset.appendChild(element('p', 'q-prompt', field.prompt));
+    if (field.context) fieldset.appendChild(element('p', 'hint', field.context));
+
+    const multiple = field.allows_multiple === true;
+    const options = Array.isArray(field.options) ? field.options : [];
+    const optionInputs = options.map((option, optionIndex) => {
+      const label = element('label', 'check option');
+      const input = document.createElement('input');
+      input.type = multiple ? 'checkbox' : 'radio';
+      input.name = `question-${index}`;
+      input.value = String(option.label);
+      input.id = `question-${index}-option-${optionIndex}`;
+      const text = element('span', 'option-text');
+      text.appendChild(element('span', null, option.label));
+      if (option.description) text.appendChild(element('span', 'hint option-desc', option.description));
+      label.append(input, text);
+      fieldset.appendChild(label);
+      return input;
+    });
+
+    let customInput = null;
+    if (field.allows_custom !== false) {
+      customInput = document.createElement('input');
+      customInput.type = field.is_secret === true ? 'password' : 'text';
+      customInput.autocomplete = 'off';
+      customInput.placeholder = options.length ? 'Other answer (optional)…' : 'Your answer…';
+      fieldset.appendChild(customInput);
+      if (!multiple) {
+        // Single choice: one option or a custom answer, never both.
+        const custom = customInput;
+        custom.addEventListener('input', () => {
+          if (custom.value.trim()) for (const input of optionInputs) input.checked = false;
+        });
+        for (const input of optionInputs) {
+          input.addEventListener('change', () => {
+            if (input.checked) custom.value = '';
+          });
+        }
+      }
+    }
+
+    const skipLabel = element('label', 'check skip');
+    const skipInput = document.createElement('input');
+    skipInput.type = 'checkbox';
+    skipLabel.append(skipInput, element('span', null, 'Skip this question'));
+    skipInput.onchange = () => {
+      for (const input of optionInputs) input.disabled = skipInput.checked;
+      if (customInput) customInput.disabled = skipInput.checked;
+    };
+    fieldset.appendChild(skipLabel);
+    form.appendChild(fieldset);
+    return { id: field.id, label: field.header || field.prompt || `Question ${index + 1}`, optionInputs, customInput, skipInput };
+  });
+}
+
+// Builds answers[questionID] = {selected_options, custom_response} or {skipped: true}.
+function collectAnswers() {
+  const answers = {};
+  for (const question of state.questionInputs || []) {
+    if (question.skipInput.checked) {
+      answers[question.id] = { skipped: true };
+      continue;
+    }
+    const selected = question.optionInputs.filter((input) => input.checked).map((input) => input.value);
+    const custom = question.customInput ? question.customInput.value.trim() : '';
+    if (!selected.length && !custom) {
+      throw new Error(`Answer or skip: ${question.label}`);
+    }
+    const answer = { selected_options: selected };
+    if (custom) answer.custom_response = custom;
+    answers[question.id] = answer;
+  }
+  return answers;
 }
 
 function transcriptText(result) {
@@ -561,124 +952,116 @@ function transcriptText(result) {
 }
 
 async function loadTranscript(older) {
-  if (!state.currentSessionId) return;
+  const sessionId = state.currentSessionId;
+  if (!sessionId) return;
+  const generation = state.viewGeneration;
+  const token = state.transcriptToken;
   if (older) state.transcriptOffset += TRANSCRIPT_PAGE;
   try {
     const result = await sendCommand({
       type: 'get_log',
-      session_id: state.currentSessionId,
+      session_id: sessionId,
       payload: { offset: state.transcriptOffset, limit: TRANSCRIPT_PAGE },
     });
+    // Drop results for another view, or ones overtaken by a manual Refresh.
+    if (!viewIsCurrent(generation) || state.currentSessionId !== sessionId) return;
+    if (state.transcriptToken !== token) return;
     const text = transcriptText(result);
     const transcript = $('transcript');
+    const nearBottom = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 48;
     transcript.textContent = older ? `${text}\n${transcript.textContent}` : text;
-    if (!older) transcript.scrollTop = transcript.scrollHeight;
+    // Follow new output only when the reader was already at the bottom.
+    if (!older && nearBottom) transcript.scrollTop = transcript.scrollHeight;
   } catch (error) {
     logLine(`get_log failed: ${error.message}`);
   }
 }
 
+// Background refreshes reload the newest page only while no older pages are loaded;
+// after "Load more transcript", only the Refresh button resets the history.
 let transcriptRefreshTimer = null;
 function maybeRefreshTranscript() {
-  if (transcriptRefreshTimer) return;
+  if (transcriptRefreshTimer || state.transcriptOffset > 0) return;
   transcriptRefreshTimer = setTimeout(() => {
     transcriptRefreshTimer = null;
-    state.transcriptOffset = 0;
+    if (state.transcriptOffset > 0) return;
     loadTranscript(false);
   }, 750);
 }
 
-async function respond() {
-  const response = $('respond-input').value;
-  if (!state.currentSessionId) return;
-  const interactionId = $('interaction-box').dataset.interactionId;
-  const payload = { response };
-  if (interactionId) payload.interaction_id = interactionId;
+// Runs one phone action, shows the server's own error text on refusal, and
+// refreshes the session afterwards so the view stays current.
+// Completion writes go to the view only if it still shows the same session view the
+// action started in.
+async function runAction(button, pendingText, action) {
+  const sessionId = state.currentSessionId;
+  if (!sessionId) return;
+  const generation = state.viewGeneration;
+  button.disabled = true;
+  setActionStatus(pendingText);
   try {
-    await sendCommand({ type: 'respond', session_id: state.currentSessionId, payload });
-    $('respond-input').value = '';
-    logLine('respond delivered');
+    const doneText = await action(sessionId, generation);
+    if (viewIsCurrent(generation)) setActionStatus(doneText, 'ok');
   } catch (error) {
-    logLine(`respond failed: ${error.code || error.message}`);
-  }
-}
-
-async function steer() {
-  const message = $('steer-input').value.trim();
-  if (!message || !state.currentSessionId) return;
-  try {
-    await sendCommand({ type: 'steer', session_id: state.currentSessionId, payload: { message } });
-    $('steer-input').value = '';
-    logLine('steer delivered');
-  } catch (error) {
-    logLine(`steer failed: ${error.code || error.message}`);
-  }
-}
-
-async function cancelSession() {
-  if (!state.currentSessionId) return;
-  try {
-    await sendCommand({ type: 'cancel', session_id: state.currentSessionId });
-    logLine('cancel delivered');
-  } catch (error) {
-    logLine(`cancel failed: ${error.code || error.message}`);
-  }
-}
-
-async function startSession(message, target) {
-  try {
-    const payload = { message };
-    if (target && target.window_id != null) payload.window_id = target.window_id;
-    if (target && target.workspace_id) payload.workspace_id = target.workspace_id;
-    const result = await sendCommand({ type: 'start', payload });
-    state.pendingStartMessage = null;
-    const sessionId = result.session_id;
-    logLine(`started session ${sessionId ? shortID(sessionId) : '?'}`);
-    await refreshSessions();
-    if (sessionId) openSession(sessionId);
-  } catch (error) {
-    if (error.code === 'binding_required' || error.code === 'ambiguous_start_target') {
-      // Keep the message so the binding overlay's window picker can re-issue
-      // the start with an explicit window_id target (M6.6).
-      state.pendingStartMessage = message;
-      updateBindingConfirmVisibility();
+    if (viewIsCurrent(generation)) setActionStatus(error.message, 'err');
+    logLine(`${pendingText} failed: ${error.code || error.message}`);
+  } finally {
+    button.disabled = false;
+    if (viewIsCurrent(generation) && state.connected) {
+      await pollSession(sessionId);
+      maybeRefreshTranscript();
     }
-    logLine(`start failed: ${error.code || error.message}`);
   }
+}
+
+function respond() {
+  return runAction($('respond-button'), 'Sending answer…', async (sessionId) => {
+    const interactionId = $('interaction-box').dataset.interactionId;
+    if (!state.questionInputs || !interactionId) throw new Error('Answer this on your Mac.');
+    const payload = { interaction_id: interactionId, answers: collectAnswers() };
+    await sendCommand({ type: 'respond', session_id: sessionId, payload });
+    return 'Answer sent.';
+  });
+}
+
+function sendComposer() {
+  const button = $('composer-send');
+  const verb = button.textContent;
+  return runAction(button, `${verb}…`, async (sessionId, generation) => {
+    const input = $('composer-input');
+    const draft = input.value;
+    const message = draft.trim();
+    if (!message) throw new Error('Type a message first.');
+    await sendCommand({ type: 'steer', session_id: sessionId, payload: { message } });
+    // Clear only the draft that was sent, and only in the view it was sent from.
+    if (viewIsCurrent(generation) && input.value === draft) input.value = '';
+    return verb === 'Steer' ? 'Steer sent.' : 'Follow-up sent.';
+  });
+}
+
+// Stop names the run this page last observed. Without one it polls first and
+// refuses rather than cancelling whatever run happens to be current.
+function stopSession() {
+  return runAction($('stop-button'), 'Stopping…', async (sessionId) => {
+    let runId = (state.sessions.get(sessionId) || {}).run_id;
+    if (!runId) {
+      const snapshot = await pollSession(sessionId);
+      runId = snapshot && snapshot.run_id;
+    }
+    if (!runId) {
+      throw new Error('Stop was not sent: the current run could not be identified. Refresh and try again.');
+    }
+    await sendCommand({ type: 'cancel', session_id: sessionId, payload: { run_id: runId } });
+    return 'Stop sent.';
+  });
 }
 
 // ---------------------------------------------------------------------------
-// binding_required window/workspace picker
+// binding_required surface (sessions list only)
 
-function showBindingOverlay(message, details) {
+function showBindingOverlay(message) {
   $('binding-message').textContent = message || 'The gateway link is not bound to a RepoPrompt window.';
-  const pickerRow = $('binding-picker-row');
-  const picker = $('binding-picker');
-  picker.textContent = '';
-  const windows = details && Array.isArray(details.windows) ? details.windows : [];
-  if (windows.length) {
-    for (const window of windows) {
-      const option = document.createElement('option');
-      const windowId = window.window_id != null ? window.window_id : window.id;
-      option.value = windowId != null ? String(windowId) : '';
-      option.textContent = window.workspace_name || window.title || window.workspace || `Window ${option.value}`;
-      picker.appendChild(option);
-    }
-    pickerRow.classList.remove('hidden');
-  } else {
-    pickerRow.classList.add('hidden');
-  }
-  updateBindingConfirmVisibility();
   $('binding-overlay').classList.remove('hidden');
-}
-
-// The explicit start-target confirm is only useful when the picker has windows
-// AND a start was just refused for missing/ambiguous binding (M6.6).
-function updateBindingConfirmVisibility() {
-  const confirmButton = $('binding-confirm');
-  if (!confirmButton) return;
-  const hasOptions = $('binding-picker').options.length > 0;
-  confirmButton.classList.toggle('hidden', !(hasOptions && state.pendingStartMessage));
 }
 
 // ---------------------------------------------------------------------------
@@ -723,57 +1106,51 @@ async function enablePush() {
 // Wire-up
 
 async function main() {
-  await registerServiceWorker();
-  await loadIdentity();
-  renderIdentity();
+  // Deep link (?session_id=…): kept in memory through first-time pairing and
+  // opened as soon as the connection is authenticated.
+  state.deepLinkSessionId = new URLSearchParams(location.search).get('session_id');
 
-  $('pair-button').onclick = () => pairDevice().catch((error) => {
-    $('pair-status').textContent = `Pairing failed: ${error.message}`;
-  });
+  $('pair-button').onclick = () => {
+    $('pair-button').disabled = true;
+    pairDevice()
+      .catch((error) => {
+        $('pair-status').textContent = `Pairing failed: ${error.message}`;
+      })
+      .finally(() => {
+        $('pair-button').disabled = false;
+      });
+  };
   $('connect-button').onclick = () => connect();
   $('unpair-button').onclick = () => forgetIdentity();
   $('push-button').onclick = () => enablePush();
   $('refresh-sessions').onclick = () => refreshSessions();
-  $('back-to-sessions').onclick = () => {
-    state.currentSessionId = null;
-    $('detail-panel').classList.add('hidden');
+  $('back-to-sessions').onclick = () => showSessionsList();
+  $('refresh-detail').onclick = () => {
+    pollSession();
+    state.transcriptToken += 1;
+    state.transcriptOffset = 0;
+    loadTranscript(false);
   };
+  $('gateway-retry').onclick = () => connect();
   $('load-older').onclick = () => loadTranscript(true);
   $('respond-button').onclick = () => respond();
-  $('steer-button').onclick = () => steer();
-  $('cancel-button').onclick = () => cancelSession();
-  $('start-session').onclick = () => $('start-overlay').classList.remove('hidden');
-  $('start-cancel').onclick = () => $('start-overlay').classList.add('hidden');
-  $('start-confirm').onclick = () => {
-    const message = $('start-message').value.trim();
-    $('start-overlay').classList.add('hidden');
-    if (message) startSession(message);
-  };
+  $('composer-send').onclick = () => sendComposer();
+  $('stop-button').onclick = () => stopSession();
   $('binding-retry').onclick = () => {
     $('binding-overlay').classList.add('hidden');
     refreshSessions();
   };
-  $('binding-confirm').onclick = () => {
-    const value = $('binding-picker').value;
-    const message = state.pendingStartMessage;
-    $('binding-overlay').classList.add('hidden');
-    if (!message || !value) return;
-    const windowId = Number(value);
-    startSession(message, { window_id: Number.isFinite(windowId) ? windowId : value });
-  };
   $('binding-dismiss').onclick = () => $('binding-overlay').classList.add('hidden');
+  // Returning to the tab reconnects, after re-reading which build the gateway is.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && !state.ws) connect();
+  });
 
-  // Push-wake deep link: ?session_id=… opens the session after connect.
-  const wakeSession = new URLSearchParams(location.search).get('session_id');
-  if (wakeSession) {
-    const openOnConnect = setInterval(() => {
-      if (state.connected) {
-        clearInterval(openOnConnect);
-        openSession(wakeSession);
-      }
-    }, 500);
-    setTimeout(() => clearInterval(openOnConnect), 30000);
-  }
+  await registerServiceWorker();
+  // connect() reads the gateway's build channel, loads that build's saved pairing,
+  // and connects when one exists.
+  await connect();
+  renderIdentity();
 }
 
 main();

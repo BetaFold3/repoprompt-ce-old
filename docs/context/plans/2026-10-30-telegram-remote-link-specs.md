@@ -40,7 +40,7 @@ Change (`pwa/app.js`, `index.html`, `GatewayHTTPServer`):
 - Render all agent text through DOM text APIs only.
 Validation: one `PWAResourceTests` assertion that no served PWA asset contains `innerHTML|outerHTML|insertAdjacentHTML|document.write|eval(|new Function`; a gateway test for the `/healthz` channel; `make dev-lint`. Real WebKit behaviour is checked in Step 4.
 Done when: with a stored identity, `?session_id` opens that session without manual Connect, and every form or action emits the existing wire shape.
-Step 2 — todo | rounds 0/2 | open: none | downgraded: none | assumed: none | deferred: none
+Step 2 — done | rounds 1/2 | open: none | downgraded: none | assumed: none | deferred: minor P3s and browser acceptance (step2-completion.md)
 
 ### Step 3 — HTTPS origin, Host allowlist, Telegram button
 Change:

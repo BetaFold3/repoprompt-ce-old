@@ -50,6 +50,19 @@ final class PWAResourceTests: XCTestCase {
         XCTAssertNil(GatewayHTTPHandler.pwaAsset(forPath: "/pwa/index.html"))
     }
 
+    func testServedAssetsNeverUseMarkupOrCodeEvaluatingAPIs() throws {
+        let unsafe = try NSRegularExpression(
+            pattern: #"innerHTML|outerHTML|insertAdjacentHTML|document\.write|eval\(|new Function"#
+        )
+        for asset in GatewayPWAResources.requiredAssets {
+            let data = try XCTUnwrap(GatewayPWAResources.data(forAsset: asset), asset)
+            let text = try XCTUnwrap(String(data: data, encoding: .utf8), asset)
+            let matches = unsafe.matches(in: text, range: NSRange(text.startIndex..., in: text))
+            let found = matches.compactMap { Range($0.range, in: text).map { String(text[$0]) } }
+            XCTAssertEqual(found, [], "PWA asset \(asset) must render agent text through DOM text APIs only")
+        }
+    }
+
     func testShellWiresModuleServiceWorkerAndManifest() throws {
         let html = try XCTUnwrap(GatewayPWAResources.data(forAsset: "index.html"))
         let text = try XCTUnwrap(String(data: html, encoding: .utf8))

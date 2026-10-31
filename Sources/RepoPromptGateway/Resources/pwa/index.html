@@ -86,6 +86,22 @@ ul.sessions .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-sp
   border: 1px solid var(--warn); border-radius: 8px; padding: 10px; margin-top: 10px;
   background: rgba(217, 161, 59, 0.08);
 }
+.q-title { font-weight: 600; margin-bottom: 4px; }
+fieldset.question {
+  border: 1px solid var(--border); border-radius: 8px; margin: 10px 0 0; padding: 8px 10px;
+}
+fieldset.question legend { font-weight: 600; padding: 0 4px; }
+.q-prompt { margin: 0 0 6px; white-space: pre-wrap; }
+label.option { align-items: flex-start; }
+.option-text { display: flex; flex-direction: column; }
+.option-desc { margin: 0; }
+label.skip { color: var(--muted); }
+#interaction-text, #interaction-context { white-space: pre-wrap; }
+#composer { margin-top: 12px; }
+.composer-label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px; }
+.hint.ok { color: var(--ok); }
+.hint.err { color: var(--danger); }
+ul.sessions li.empty { color: var(--muted); cursor: default; }
 .overlay {
   position: fixed; inset: 0; background: rgba(0,0,0,0.65); z-index: 20;
   display: flex; align-items: center; justify-content: center; padding: 20px;
@@ -104,6 +120,9 @@ ul.sessions .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-sp
   <span id="conn-badge" class="badge">disconnected</span>
 </header>
 <main>
+  <p id="gateway-status" class="hint err" role="status"></p>
+  <div class="row"><button id="gateway-retry" class="secondary hidden">Retry</button></div>
+
   <!-- Pairing -->
   <section id="pair-panel" class="panel hidden">
     <h2>Pair this device</h2>
@@ -111,7 +130,7 @@ ul.sessions .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-sp
     <p id="host-fingerprint" class="mono">–</p>
     <div class="row"><input type="text" id="device-name" placeholder="Device name (e.g. iPhone)"></div>
     <label class="check"><input type="checkbox" id="scope-observe" checked disabled> Observe sessions</label>
-    <label class="check"><input type="checkbox" id="scope-operate" checked> Start / steer / cancel sessions</label>
+    <label class="check"><input type="checkbox" id="scope-operate" checked> Steer, follow up and stop sessions</label>
     <label class="check"><input type="checkbox" id="scope-respond" checked> Respond to interactions</label>
     <div class="row">
       <button id="pair-button">Pair</button>
@@ -122,7 +141,7 @@ ul.sessions .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-sp
   <!-- Connection -->
   <section id="connect-panel" class="panel hidden">
     <h2>Connection</h2>
-    <p class="hint">Paired as <span id="paired-name">–</span> (<span id="paired-device-id" class="mono">–</span>)</p>
+    <p class="hint">Paired as <span id="paired-name">–</span> (<span id="paired-device-id" class="mono">–</span>) with the <span id="build-channel" class="mono">–</span> build</p>
     <div class="row">
       <button id="connect-button">Connect</button>
       <button id="push-button" class="secondary" disabled>Enable push wake</button>
@@ -138,28 +157,36 @@ ul.sessions .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-sp
     <ul id="sessions-list" class="sessions"></ul>
     <div class="row">
       <button id="refresh-sessions" class="secondary">Refresh</button>
-      <button id="start-session" class="secondary">New session…</button>
     </div>
   </section>
 
   <!-- Session detail -->
   <section id="detail-panel" class="panel hidden">
     <h2>Session <span id="detail-session-id" class="mono"></span> <span id="detail-status" class="badge"></span></h2>
+    <p id="detail-name" class="hint"></p>
     <div class="row">
       <button id="load-older" class="secondary">Load more transcript</button>
-      <button id="back-to-sessions" class="secondary">Back</button>
+      <button id="refresh-detail" class="secondary">Refresh</button>
+      <button id="back-to-sessions" class="secondary">All sessions</button>
     </div>
     <div id="transcript" aria-live="polite"></div>
     <div id="interaction-box" class="hidden">
+      <div id="interaction-title" class="q-title"></div>
       <div id="interaction-text" class="hint"></div>
-      <textarea id="respond-input" placeholder="Response…"></textarea>
-      <div class="row"><button id="respond-button">Respond</button></div>
+      <div id="interaction-context" class="hint"></div>
+      <div id="question-form"></div>
+      <p id="answer-on-mac" class="hint hidden">Answer this on your Mac. Only questions can be answered from this page.</p>
+      <div class="row"><button id="respond-button">Send answers</button></div>
     </div>
-    <textarea id="steer-input" placeholder="Steer the agent…" style="margin-top:10px"></textarea>
-    <div class="row">
-      <button id="steer-button">Steer</button>
-      <button id="cancel-button" class="danger">Cancel session</button>
+    <div id="composer" class="hidden">
+      <label id="composer-label" class="composer-label" for="composer-input">Steer</label>
+      <textarea id="composer-input" placeholder="Steer the running agent…"></textarea>
+      <div class="row">
+        <button id="composer-send">Steer</button>
+        <button id="stop-button" class="danger hidden">Stop</button>
+      </div>
     </div>
+    <p id="action-status" class="hint" role="status"></p>
   </section>
 
   <!-- Activity log -->
@@ -174,26 +201,10 @@ ul.sessions .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-sp
   <div class="panel">
     <h2>Window binding required</h2>
     <p class="hint" id="binding-message">The gateway link is not bound to a RepoPrompt window.</p>
-    <div class="row hidden" id="binding-picker-row">
-      <select id="binding-picker"></select>
-    </div>
-    <p class="hint">RepoPrompt has multiple windows open. Leave a single window open on your Mac (or select a target above when available), then retry. Sessions are scoped to the bound window&rsquo;s active workspace.</p>
+    <p class="hint">RepoPrompt has multiple windows open. Leave a single window open on your Mac, then retry. The sessions list is scoped to the bound window&rsquo;s active workspace; a session opened from a notification link does not need it.</p>
     <div class="row">
-      <button id="binding-confirm" class="hidden">Start in selected window</button>
       <button id="binding-retry">Retry</button>
       <button id="binding-dismiss" class="secondary">Dismiss</button>
-    </div>
-  </div>
-</div>
-
-<!-- Start session -->
-<div id="start-overlay" class="overlay hidden">
-  <div class="panel">
-    <h2>New session</h2>
-    <textarea id="start-message" placeholder="First message for the agent…"></textarea>
-    <div class="row">
-      <button id="start-confirm">Start</button>
-      <button id="start-cancel" class="secondary">Cancel</button>
     </div>
   </div>
 </div>
