@@ -65,7 +65,7 @@ Change: none in code, except a Host allowlist fix if the check below fails. Setu
 On approval, trigger one real completion alert and one real question alert.
 Validation: on the iPhone, open each link, then answer, steer, follow up and Stop; switch builds, re-run the Serve command and confirm the link opens without re-pairing; revoke the phone on the Mac and confirm its connection closes within about 15 s and `/api/ticket` refuses it; delete site data and confirm a clear "pair again on your Mac" state. Record the results in the evidence directory as live results.
 Done when: both browsers pass. An unpaired browser sees no session content. When the plan completes, record the setup and recovery steps in the owning context document.
-Step 4 — todo | rounds 0/2 | open: none | downgraded: none | assumed: none | deferred: none
+Step 4 — blocked | rounds 0/2 | open: owner setup approvals and iPhone live acceptance (step4-live-results.md) | downgraded: none | assumed: none | deferred: none
 
 ## Decisions
 - Goal confirmed: Telegram link to the paired browser remote, with a focused phone UI (owner answer 2026-10-30).
