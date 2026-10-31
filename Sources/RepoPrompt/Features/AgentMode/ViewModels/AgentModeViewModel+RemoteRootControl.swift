@@ -3,7 +3,7 @@ import MCP
 import RepoPromptAgentCore
 
 // Paired-browser (gateway) control of UI-driven root sessions
-// (docs/context/plans/2026-10-30-telegram-remote-link-specs.md, Step 1).
+// (docs/context/telegram-paired-browser-remote.md).
 //
 // A verified per-device gateway caller acts on exactly the sessions that alert: the authoritative
 // live session for a durable session ID that passes `isAttentionNotificationRoot` (no MCP control,

@@ -1,3 +1,5 @@
+> Completed 2026-10-31 for the owner-accepted Dev + Safari scope. Paired phone questions, steering, follow-up, later completion alerts, Stop, revocation and explicit pairing recovery passed live acceptance. Owner-approved repairs use a loopback Serve companion and literal-text transcript paging. Full Brave acceptance, release/Dev pairing reuse and Safari website-data deletion acceptance remain deferred, not passed. Setup, recovery and current limitations live in `docs/context/telegram-paired-browser-remote.md`; the original plan below is retained with status and owner Decisions updated.
+
 # Telegram link to paired web remote — specs
 
 Scope: read when the task touches a remote-control link in Telegram attention notifications, paired-browser (PWA) control of UI-driven root sessions, the gateway's browser HTTPS origin, or Host validation.
@@ -65,7 +67,7 @@ Change: none in code, except a Host allowlist fix if the check below fails. Setu
 On approval, trigger one real completion alert and one real question alert.
 Validation: on the iPhone, open each link, then answer, steer, follow up and Stop; switch builds, re-run the Serve command and confirm the link opens without re-pairing; revoke the phone on the Mac and confirm its connection closes within about 15 s and `/api/ticket` refuses it; delete site data and confirm a clear "pair again on your Mac" state. Record the results in the evidence directory as live results.
 Done when: both browsers pass. An unpaired browser sees no session content. When the plan completes, record the setup and recovery steps in the owning context document.
-Step 4 — blocked | rounds 1/2 | open: owner participation for Stop and remaining live acceptance; restore idle threshold while paused (step4-live-results.md) | downgraded: none | assumed: none | deferred: optional wildcard fixture coverage and test relocation (step4-loopback-implementation.md); transcript P3 follow-ups (step4-transcript-implementation.md)
+Step 4 — done | rounds 1/2 | open: none | downgraded: none | assumed: none | deferred: owner-accepted full Brave, release/Dev reuse and Safari site-data deletion acceptance (step4-live-results.md); optional wildcard fixture coverage and test relocation (step4-loopback-implementation.md); transcript P3 follow-ups (step4-transcript-implementation.md)
 
 ## Decisions
 - Goal confirmed: Telegram link to the paired browser remote, with a focused phone UI (owner answer 2026-10-30).
@@ -84,6 +86,8 @@ Step 4 — blocked | rounds 1/2 | open: owner participation for Stop and remaini
 - Cleared and saved the browser HTTPS port for text-only alerts while the transport fix is implemented (owner answer 2026-10-31).
 - Use Safari for live Telegram link testing because the installed Telegram offers Telegram/Safari/Chrome but not Brave (owner answer 2026-10-31).
 - Fix the phone transcript response parsing and pagination without building a new rich log viewer (owner answer “Fix”, 2026-10-31).
+- Accept Dev + Safari and close with documented limits; defer full Brave, release/Dev pairing reuse and Safari website-data deletion acceptance without claiming they passed (owner answer 2026-10-31).
+- Restore Telegram's original 5-minute idle threshold after live tests; restoration confirmed (owner answer 2026-10-31).
 
 ## Disagreements
 - Control path: an authority envelope plus an extracted operations file vs a gateway-caller gate reusing the notifier predicate. Gate chosen; the envelope's lane withdrew it.
