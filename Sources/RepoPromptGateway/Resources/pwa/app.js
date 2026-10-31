@@ -1189,36 +1189,207 @@ function trimBlankEdges(text) {
   return text.replace(/^(?:[ \t]*\n)+/, '').replace(/(?:\n[ \t]*)+$/, '');
 }
 
-// Body text as prose plus complete backtick-fenced code blocks. No other Markdown is
-// interpreted. An unmatched fence stays literal, together with the rest of the body.
+// Basic Markdown, built with DOM nodes and text only: paragraphs (line breaks kept),
+// ATX headings, bullet and numbered lists (nested by indentation), `code` spans,
+// **strong** / __strong__ and *em* / _em_ (not inside words). Everything else, such as
+// links, images, quotes, tables, rules and HTML, stays literal text.
+const MD_HEADING = /^ {0,3}(#{1,6})[ \t]+(.*?)(?:[ \t]+#+)?[ \t]*$/;
+const MD_ITEM = /^( *)(?:([-*+])|(\d{1,9})[.)])[ \t]+(.*)$/;
+const MD_RULE = /^ {0,3}([-*_])[ \t]*(?:\1[ \t]*){2,}$/;
+// Emphasis text: complete single-backtick code spans count as whole units and no other
+// backtick may appear, so emphasis never opens or closes inside code. `excluded` is the
+// emphasis delimiter when it may not appear in its own text.
+const MD_SPAN = '`[^`\\n]+`';
+const mdEmphasisText = (excluded) => `((?:${MD_SPAN}|[^\`${excluded}\\n])*?(?:${MD_SPAN}|[^\`${excluded}\\s]))`;
+const MD_INLINE = new RegExp([
+  '(`+)([^`\\n](?:[^\\n]*?[^`\\n])??)\\1(?!`)', // 1 run, 2 code (shortest span first)
+  `\\*\\*(?!\\s)${mdEmphasisText('')}\\*\\*`, // 3 strong
+  `\\*(?!\\s)${mdEmphasisText('*')}\\*`, // 4 em
+  `(^|[^A-Za-z0-9_])(__?)(?!\\s)${mdEmphasisText('_')}\\6(?![A-Za-z0-9_])`, // 5 prefix, 6 delimiter, 7 text
+].join('|'), 'g');
+// Inline markup never spans lines. A line longer than this stays literal, so a render
+// never rescans an unusually long line for closing delimiters.
+const MD_INLINE_MAX_LINE = 2000;
+
+function appendInline(parent, text) {
+  text.split('\n').forEach((line, index) => {
+    if (index) parent.appendChild(document.createTextNode('\n'));
+    if (line.length > MD_INLINE_MAX_LINE) {
+      parent.appendChild(document.createTextNode(line));
+    } else {
+      appendInlineLine(parent, line);
+    }
+  });
+}
+
+function appendInlineLine(parent, text) {
+  const pattern = new RegExp(MD_INLINE.source, 'g');
+  let last = 0;
+  let match;
+  while ((match = pattern.exec(text))) {
+    const start = match.index + (match[5] === undefined ? 0 : match[5].length);
+    if (start > last) parent.appendChild(document.createTextNode(text.slice(last, start)));
+    if (match[1]) {
+      parent.appendChild(element('code', null, match[2]));
+    } else {
+      const strong = match[3] !== undefined || match[6] === '__';
+      const node = element(strong ? 'strong' : 'em');
+      appendInlineLine(node, match[3] !== undefined ? match[3] : match[4] !== undefined ? match[4] : match[7]);
+      parent.appendChild(node);
+    }
+    last = match.index + match[0].length;
+  }
+  if (last < text.length) parent.appendChild(document.createTextNode(text.slice(last)));
+}
+
+function appendMarkdown(container, text) {
+  let paragraph = [];
+  // Open lists, outermost first: {indent, ordered, list, item, lines, contentIndent}.
+  // Continuation lines lose indentation only up to their item's text column.
+  const levels = [];
+  const flushItem = (level) => {
+    if (level.lines.length) appendInline(level.item, level.lines.join('\n'));
+    level.lines = [];
+  };
+  const closeLists = () => {
+    while (levels.length) flushItem(levels.pop());
+  };
+  const flushParagraph = () => {
+    if (!paragraph.length) return;
+    const node = element('p');
+    appendInline(node, paragraph.join('\n'));
+    container.appendChild(node);
+    paragraph = [];
+  };
+  for (const line of text.split('\n')) {
+    const heading = MD_HEADING.exec(line);
+    const item = MD_RULE.test(line) ? null : MD_ITEM.exec(line);
+    if (!line.trim()) {
+      flushParagraph();
+      closeLists();
+    } else if (heading && heading[2]) {
+      flushParagraph();
+      closeLists();
+      const node = element(`h${Math.min(6, heading[1].length + 2)}`);
+      appendInline(node, heading[2]);
+      container.appendChild(node);
+    } else if (item && (levels.length || item[1].length <= 3)) {
+      flushParagraph();
+      const indent = item[1].length;
+      const ordered = item[3] !== undefined;
+      let top = levels[levels.length - 1];
+      let parent = container;
+      if (top && indent >= top.indent + 2) {
+        flushItem(top);
+        parent = top.item;
+        top = null;
+      } else {
+        while (levels.length > 1 && indent < top.indent) {
+          flushItem(levels.pop());
+          top = levels[levels.length - 1];
+        }
+        if (top && top.ordered !== ordered) {
+          flushItem(levels.pop());
+          parent = levels.length ? levels[levels.length - 1].item : container;
+          top = null;
+        }
+      }
+      if (top) {
+        flushItem(top);
+      } else {
+        const list = element(ordered ? 'ol' : 'ul');
+        if (ordered && Number(item[3]) !== 1) list.start = Number(item[3]);
+        parent.appendChild(list);
+        top = { indent, ordered, list, item: null, lines: [] };
+        levels.push(top);
+      }
+      top.item = element('li');
+      top.list.appendChild(top.item);
+      top.lines = [item[4]];
+      top.contentIndent = line.length - item[4].length;
+    } else if (levels.length) {
+      const level = levels[levels.length - 1];
+      const lead = /^ */.exec(line)[0].length;
+      level.lines.push(line.slice(Math.min(lead, level.contentIndent)));
+    } else {
+      paragraph.push(line);
+    }
+  }
+  flushParagraph();
+  closeLists();
+}
+
+// A complete fenced block: language label, Copy, and the code scrolling sideways.
+// Without clipboard access (a plain-HTTP origin, or a refused write) Copy selects the
+// code for the system Copy menu instead and says Selected; when neither works it says
+// Not copied. It never reports a copy that did not happen.
+function codeBlock(language, text) {
+  const block = element('div', 'code-block');
+  const head = element('div', 'code-head');
+  const copy = element('button', 'link code-copy');
+  copy.type = 'button';
+  const what = language ? `${language} code` : 'code';
+  const show = (label) => {
+    copy.textContent = label;
+    copy.setAttribute('aria-label', `${label} (${what})`);
+  };
+  show('Copy');
+  head.append(element('span', 'code-lang', language), copy);
+  const code = element('code', null, text);
+  const pre = element('pre', 'code');
+  pre.appendChild(code);
+  block.append(head, pre);
+  let reset = null;
+  copy.onclick = async () => {
+    let label = 'Copied';
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      label = 'Not copied';
+      try {
+        const selection = window.getSelection();
+        selection.selectAllChildren(code);
+        if (selection.rangeCount > 0) label = 'Selected';
+      } catch {
+        // Neither copied nor selected.
+      }
+    }
+    show(label);
+    clearTimeout(reset);
+    reset = setTimeout(() => show('Copy'), 1500);
+  };
+  return block;
+}
+
+// Body text as basic Markdown prose plus complete backtick-fenced code blocks. An
+// unmatched fence stays literal, together with the rest of the body.
 function appendBody(container, text) {
   const lines = text.split('\n');
   let prose = [];
   const flushProse = () => {
     const chunk = trimBlankEdges(prose.join('\n'));
     prose = [];
-    if (chunk.trim()) container.appendChild(element('div', 'prose', chunk));
+    if (!chunk.trim()) return;
+    const node = element('div', 'prose');
+    appendMarkdown(node, chunk);
+    container.appendChild(node);
   };
-  let fences = true;
   let i = 0;
   while (i < lines.length) {
-    const open = fences ? FENCE_OPEN.exec(lines[i]) : null;
+    const open = FENCE_OPEN.exec(lines[i]);
     if (open) {
       let end = i + 1;
       while (end < lines.length && !closesFence(lines[end], open[1].length)) end += 1;
-      if (end < lines.length) {
+      if (end === lines.length) {
         flushProse();
-        const block = element('div', 'code-block');
-        const language = open[2].trim();
-        if (language) block.appendChild(element('div', 'code-lang', language));
-        const pre = element('pre', 'code');
-        pre.appendChild(element('code', null, lines.slice(i + 1, end).join('\n')));
-        block.appendChild(pre);
-        container.appendChild(block);
-        i = end + 1;
-        continue;
+        const rest = trimBlankEdges(lines.slice(i).join('\n'));
+        if (rest.trim()) container.appendChild(element('div', 'prose literal', rest));
+        return;
       }
-      fences = false;
+      flushProse();
+      container.appendChild(codeBlock(open[2].trim(), lines.slice(i + 1, end).join('\n')));
+      i = end + 1;
+      continue;
     }
     prose.push(lines[i]);
     i += 1;
@@ -1553,6 +1724,25 @@ function maybeRefreshTranscript() {
   }, 750);
 }
 
+// Top: the start of the loaded transcript ("Load earlier messages" while older turns
+// exist) lands under the header; nothing is fetched. Latest: the end of the page, where
+// new output is followed again. While older pages are loaded, Latest first returns to
+// the newest page, as Refresh does, since background refresh is paused there.
+function jumpToTranscriptTop() {
+  const scroller = document.scrollingElement || document.documentElement;
+  const loadOlder = $('load-older');
+  const target = loadOlder.classList.contains('hidden') ? $('transcript-view').firstElementChild : loadOlder;
+  if (!target) return;
+  const headerBottom = $('app-header').getBoundingClientRect().bottom;
+  scroller.scrollTop += target.getBoundingClientRect().top - headerBottom - 8;
+}
+
+function jumpToLatest() {
+  const scroller = document.scrollingElement || document.documentElement;
+  if (state.transcriptBrowsing) refreshTranscript();
+  scroller.scrollTop = scroller.scrollHeight;
+}
+
 // Runs one phone action, shows the server's own error text on refusal, and
 // refreshes the session afterwards so the view stays current.
 // Completion writes go to the view only if it still shows the same session view the
@@ -1717,6 +1907,8 @@ async function main() {
   };
   $('gateway-retry').onclick = () => connect();
   $('load-older').onclick = () => loadOlderTranscript();
+  $('jump-top').onclick = () => jumpToTranscriptTop();
+  $('jump-latest').onclick = () => jumpToLatest();
   $('respond-button').onclick = () => respond();
   $('composer-send').onclick = () => sendComposer();
   $('stop-button').onclick = () => stopSession();

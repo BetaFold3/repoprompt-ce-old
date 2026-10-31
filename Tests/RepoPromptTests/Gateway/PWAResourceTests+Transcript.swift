@@ -344,9 +344,11 @@ extension PWAResourceTests {
             harness.run("$('transcript-view').childNodes[0].childNodes[1].childNodes.map(function (n) { return n.className; }).join(',')").toString(),
             "prose,code-block,prose,code-block"
         )
+        let codeBlock = "$('transcript-view').childNodes[0].childNodes[1].childNodes[1]"
+        XCTAssertEqual(harness.run("\(codeBlock).childNodes[0].textContent").toString(), "xmlCopy", "language label and Copy")
         XCTAssertEqual(
-            harness.run("$('transcript-view').childNodes[0].childNodes[1].childNodes[1].textContent").toString(),
-            "xml<assistant>inner</assistant>\n<tool_call name=\"read_file\">{\"path\":\"a\"}</tool_call>\n</assistant>\n<tool_call name=\"x\"/>"
+            harness.run("\(codeBlock).childNodes[1].textContent").toString(),
+            "<assistant>inner</assistant>\n<tool_call name=\"read_file\">{\"path\":\"a\"}</tool_call>\n</assistant>\n<tool_call name=\"x\"/>"
         )
         harness.run("refreshTranscript();")
         try harness.answer(1, total: 2, xml: unclosed)
@@ -693,6 +695,194 @@ extension PWAResourceTests {
         harness.assertNoException()
     }
 
+    func testBodiesRenderBasicMarkdownAsDOMNodesAndKeepEverythingElseLiteral() throws {
+        let harness = try PWATranscriptHarness()
+        let body = """
+        # Plan #
+        ## Summary
+        Fixed **two** bugs in `app.js` and *one* in snake_case_name.
+        Second line stays.
+
+        - first item
+          - nested `a*b*c`
+        - second __strong__ and _em_ with **bold `code` inside**
+
+        3. third
+        4. fourth
+           continued
+
+        * * *
+        > quoted [link](https://example.com) ![img](x.png) <b>tag</b> &amp;
+        | a | b |
+        2*3 and ** loose * stars, `unclosed code
+        """
+        let expected = [
+            "<div><h3>Plan</h3><h4>Summary</h4>",
+            "<p>Fixed <strong>two</strong> bugs in <code>app.js</code> and <em>one</em> in snake_case_name.\nSecond line stays.</p>",
+            "<ul><li>first item<ul><li>nested <code>a*b*c</code></li></ul></li>",
+            "<li>second <strong>strong</strong> and <em>em</em> with <strong>bold <code>code</code> inside</strong></li></ul>",
+            "<ol start=3><li>third</li><li>fourth\ncontinued</li></ol>",
+            "<p>* * *\n> quoted [link](https://example.com) ![img](x.png) <b>tag</b> &amp;\n| a | b |\n",
+            "2*3 and ** loose * stars, `unclosed code</p></div>"
+        ].joined()
+        let bodyJSON = try harness.jsonString(body)
+        XCTAssertEqual(harness.run("__rendered(\(bodyJSON))").toString(), expected)
+
+        // An unmatched fence keeps itself and the rest of the body literal, Markdown included.
+        let unmatchedJSON = try harness.jsonString("Intro **bold**\n```js\n- not a list\n**x**")
+        XCTAssertEqual(
+            harness.run("__rendered(\(unmatchedJSON))").toString(),
+            "<div><p>Intro <strong>bold</strong></p></div><div>```js\n- not a list\n**x**</div>"
+        )
+
+        // Code spans: one-character spans close at once, and emphasis never opens or closes
+        // inside code. List continuations keep indentation past the item's text column. A
+        // line over 2000 characters stays literal.
+        let long = "**b** " + String(repeating: "x", count: 2000)
+        let inline = """
+        Set `x` to `1`, `ab` to `cd`.
+        **Files: `**/*.swift`** and *a `b*` c*
+        Use *args, e.g. `f(*args)`, or *.swift in `Sources/*.swift`.
+        \(long)
+        - Layout:
+            src/
+              app.js
+        """
+        let inlineExpected = [
+            "<div><p>Set <code>x</code> to <code>1</code>, <code>ab</code> to <code>cd</code>.\n",
+            "<strong>Files: <code>**/*.swift</code></strong> and <em>a <code>b*</code> c</em>\n",
+            "Use *args, e.g. <code>f(*args)</code>, or *.swift in <code>Sources/*.swift</code>.\n",
+            "\(long)</p><ul><li>Layout:\n  src/\n    app.js</li></ul></div>"
+        ].joined()
+        let inlineJSON = try harness.jsonString(inline)
+        XCTAssertEqual(harness.run("__rendered(\(inlineJSON))").toString(), inlineExpected)
+        harness.assertNoException()
+    }
+
+    func testCodeBlocksScrollAsCodeAndCopyTheirExactText() throws {
+        let harness = try PWATranscriptHarness()
+        let code = "let veryLongLine = \"\(String(repeating: "x", count: 200))\"\n  indented **not bold**"
+        let codeJSON = try harness.jsonString(code)
+        let bodyJSON = try harness.jsonString("Run:\n```swift\n\(code)\n```\n\n```\nplain\n```")
+        harness.run("""
+        var __body = document.createElement('div');
+        appendBody(__body, \(bodyJSON));
+        var __copy = __body.childNodes[1].childNodes[0].childNodes[1];
+        var __code = __body.childNodes[1].childNodes[1].childNodes[0];
+        var __copied = [];
+        var __selected = null;
+        """)
+        XCTAssertEqual(harness.run("__body.childNodes.map(function (n) { return n.className; }).join(',')").toString(), "prose,code-block,code-block")
+        XCTAssertEqual(
+            harness.run("__shape(__body.childNodes[1])").toString(),
+            "<div><div><span>swift</span><button>Copy</button></div><pre><code>\(code)</code></pre></div>"
+        )
+        XCTAssertEqual(harness.run("__body.childNodes[1].childNodes[1].className").toString(), "code")
+        XCTAssertEqual(harness.run("__shape(__body.childNodes[2].childNodes[0])").toString(), "<div><span></span><button>Copy</button></div>")
+        let copyLabel = "__copy.getAttribute('aria-label')"
+        XCTAssertEqual(harness.run(copyLabel).toString(), "Copy (swift code)")
+        XCTAssertEqual(harness.run("__body.childNodes[2].childNodes[0].childNodes[1].getAttribute('aria-label')").toString(), "Copy (code)")
+
+        harness.run("""
+        navigator.clipboard = { writeText: function (text) { __copied.push(text); return Promise.resolve(); } };
+        __copy.onclick();
+        """)
+        XCTAssertEqual(harness.run("JSON.stringify(__copied)").toString(), "[\(codeJSON)]")
+        XCTAssertEqual(harness.run("__copy.textContent").toString(), "Copied")
+        XCTAssertEqual(harness.run(copyLabel).toString(), "Copied (swift code)")
+        harness.run("__flushTimers();")
+        XCTAssertEqual(harness.run("__copy.textContent").toString(), "Copy")
+        XCTAssertEqual(harness.run(copyLabel).toString(), "Copy (swift code)")
+
+        // Without clipboard access, or when the write is refused, the code is selected.
+        harness.run("""
+        var __selection = { rangeCount: 0, selectAllChildren: function (node) { __selected = node; this.rangeCount = 1; } };
+        window.getSelection = function () { return __selection; };
+        navigator.clipboard = { writeText: function () { return Promise.reject(new Error('denied')); } };
+        __copy.onclick();
+        """)
+        XCTAssertEqual(harness.run("__selected === __code && __copy.textContent === 'Selected'").toBool(), true)
+        harness.run("__selected = null; __selection.rangeCount = 0; delete navigator.clipboard; __copy.onclick();")
+        XCTAssertEqual(harness.run("__selected === __code && __copy.textContent === 'Selected'").toBool(), true)
+
+        // Neither a copy nor a selection: it says so instead of claiming success.
+        harness.run("__selection = { rangeCount: 0, selectAllChildren: function () {} }; __copy.onclick();")
+        XCTAssertEqual(harness.run("__copy.textContent").toString(), "Not copied")
+        harness.run("window.getSelection = undefined; __copy.textContent = 'Copy'; __copy.onclick();")
+        XCTAssertEqual(harness.run("__copy.textContent").toString(), "Not copied")
+        XCTAssertEqual(harness.run(copyLabel).toString(), "Not copied (swift code)")
+        harness.assertNoException()
+    }
+
+    func testTopAndLatestMoveWithinTheLoadedTranscriptAndLatestLeavesOlderPages() throws {
+        let harness = try PWATranscriptHarness()
+        harness.run("state.currentSessionId = 'S'; loadTranscript();")
+        harness.answer(0, total: 450)
+        harness.answer(1, total: 450)
+        let bottom = 700 + 60 + 200 * 100 + 400 - 600
+        XCTAssertEqual(harness.scrollTop, bottom)
+
+        // Top lands "Load earlier messages" 8px under the 50px header and fetches nothing.
+        harness.run("$('jump-top').onclick();")
+        XCTAssertEqual(harness.scrollTop, 700 - 58)
+        XCTAssertEqual(harness.requests().count, 2)
+        // New output does not pull the reader back down.
+        harness.run("maybeRefreshTranscript(); __flushTimers();")
+        harness.answer(2, total: 451)
+        harness.answer(3, total: 451)
+        XCTAssertEqual(harness.visibleTurns().first, 251)
+        XCTAssertEqual(harness.scrollTop, 700 - 58)
+
+        harness.run("$('jump-latest').onclick();")
+        XCTAssertEqual(harness.scrollTop, bottom)
+        XCTAssertEqual(harness.requests().count, 4, "Latest on the newest page fetches nothing")
+
+        // With older pages loaded, Top stays within them and Latest returns to the newest page.
+        harness.run("loadOlderTranscript();")
+        harness.answer(4, total: 451)
+        XCTAssertEqual(harness.visibleTurns().count, 400)
+        harness.run("$('jump-top').onclick();")
+        XCTAssertEqual(harness.scrollTop, 700 - 58)
+        XCTAssertEqual(harness.requests().count, 5, "Top never loads earlier pages")
+        harness.run("$('jump-latest').onclick();")
+        XCTAssertEqual(harness.run("state.transcriptBrowsing").toBool(), false)
+        XCTAssertEqual(harness.visibleTurns().first, 251, "older pages are dropped, as by Refresh")
+        XCTAssertEqual(harness.scrollTop, bottom)
+        XCTAssertEqual(harness.requests().last, .init(type: "get_log", session: "S", offset: 251, limit: 200))
+        // The cached newest page was stale: the reload brings four more turns, and the
+        // reader is at their end as soon as they land.
+        harness.answer(5, total: 455)
+        harness.answer(6, total: 455)
+        XCTAssertEqual(harness.visibleTurns().last, 454)
+        XCTAssertEqual(harness.scrollTop, bottom)
+        // Background refresh runs again, and new output is followed from the bottom.
+        harness.run("maybeRefreshTranscript(); __flushTimers();")
+        harness.answer(7, total: 456)
+        harness.answer(8, total: 456)
+        XCTAssertEqual(harness.visibleTurns().last, 455)
+        XCTAssertEqual(harness.scrollTop, bottom)
+        harness.assertNoException()
+    }
+
+    func testTopLandsTheFirstRecordOfAFullyLoadedOrEmptyTranscript() throws {
+        let harness = try PWATranscriptHarness()
+        harness.run("state.currentSessionId = 'S'; loadTranscript();")
+        harness.answer(0, total: 3)
+        XCTAssertEqual(harness.scrollTop, 700 + 3 * 100 + 400 - 600)
+        // Without older turns, the first record lands 8px under the 50px header.
+        harness.run("$('jump-top').onclick();")
+        XCTAssertEqual(harness.blockTop(0), 58)
+        XCTAssertEqual(harness.requests().count, 1, "Top fetches nothing")
+
+        // An empty transcript (its placeholder) and a view with no nodes at all.
+        harness.run("refreshTranscript();")
+        harness.answer(1, total: 0)
+        XCTAssertEqual(harness.blocks().map(\.className), ["transcript-empty"])
+        harness.run("$('jump-top').onclick(); $('transcript-view').replaceChildren(); $('jump-top').onclick();")
+        XCTAssertEqual(harness.requests().count, 2)
+        harness.assertNoException()
+    }
+
     func testHiddenComposerIsNotMeasuredAndIsSizedWhenShown() throws {
         let harness = try PWATranscriptHarness()
         harness.run("""
@@ -790,6 +980,9 @@ private final class PWATranscriptHarness {
         set: function (value) { node.childNodes.slice().forEach(__detach); node._text = String(value); }
       });
       Object.defineProperty(node, 'firstChild', { get: function () { return node.childNodes[0] || null; } });
+      Object.defineProperty(node, 'firstElementChild', {
+        get: function () { return node.childNodes.filter(function (c) { return c.tagName !== '#TEXT'; })[0] || null; }
+      });
       Object.defineProperty(node, 'nextSibling', {
         get: function () {
           var parent = node.parentNode;
@@ -872,6 +1065,7 @@ private final class PWATranscriptHarness {
         return __elements[id];
       },
       createElement: function (tag) { return __node(tag, ''); },
+      createTextNode: function (text) { var node = __node('#text', ''); node._text = String(text); return node; },
       addEventListener: function () {}
     };
     document.activeElement = document.body;
@@ -910,6 +1104,18 @@ private final class PWATranscriptHarness {
         session_id: call.frame.session_id, turn_offset: call.frame.payload.offset, turn_limit: call.frame.payload.limit,
         total_turns: total, completed_turn_count: total, transcript_xml: xml
       });
+    }
+    // An element tree as tags and text, for checking rendered Markdown structure.
+    function __shape(node) {
+      if (node.tagName === '#TEXT') return node._text;
+      var tag = node.tagName.toLowerCase();
+      var inner = node.childNodes.length ? node.childNodes.map(__shape).join('') : node._text;
+      return '<' + tag + (node.start ? ' start=' + node.start : '') + '>' + inner + '</' + tag + '>';
+    }
+    function __rendered(text) {
+      var body = document.createElement('div');
+      appendBody(body, text);
+      return body.childNodes.map(__shape).join('');
     }
     function __blocks() {
       return $('transcript-view').childNodes.map(function (node) {

@@ -76,6 +76,25 @@ final class PWAResourceTests: XCTestCase {
         XCTAssertTrue(text.contains("<details id=\"transcript-raw\" class=\"disclosure\">"), "Raw transcript starts collapsed")
         XCTAssertFalse(text.contains("aria-live"), "the refreshed transcript is not a live region")
         XCTAssertFalse(text.contains("user-scalable"), "browser zoom stays available")
+        let order = try ["id=\"transcript-view\"", "id=\"transcript-nav\"", "id=\"jump-top\"", "id=\"jump-latest\"", "id=\"transcript-raw\""]
+            .map { try XCTUnwrap(text.range(of: $0)?.lowerBound, $0) }
+        XCTAssertEqual(order, order.sorted(), "Top and Latest follow the transcript, before Raw transcript")
+        let composer = try ["<textarea id=\"composer-input\"", "<button id=\"composer-send\">"]
+            .map { try XCTUnwrap(text.range(of: $0)?.lowerBound, $0) }
+        XCTAssertLessThan(composer[0], composer[1], "Send follows the text box in its row")
+        /// The body of the stylesheet rule that starts a line with `selector`.
+        func rule(_ selector: String) throws -> String {
+            let start = try XCTUnwrap(text.range(of: "\n\(selector) {"), selector)
+            let end = try XCTUnwrap(text.range(of: "}", range: start.upperBound ..< text.endIndex), selector)
+            return String(text[start.upperBound ..< end.lowerBound])
+        }
+        // The row never wraps, the text box may shrink below its intrinsic width, and Send keeps its size.
+        let row = try rule(".composer-row")
+        XCTAssertTrue(row.contains("display: flex") && !row.contains("wrap"), row)
+        let input = try rule("#composer-input")
+        XCTAssertTrue(input.contains("flex: 1; min-width: 0;"), input)
+        let send = try rule("#composer-send")
+        XCTAssertTrue(send.contains("flex: none"), send)
 
         let appJS = try XCTUnwrap(GatewayPWAResources.data(forAsset: "app.js"))
         let appText = try XCTUnwrap(String(data: appJS, encoding: .utf8))
