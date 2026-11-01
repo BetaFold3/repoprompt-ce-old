@@ -42,7 +42,7 @@ Implemented and accepted by the owner for the Dev build with Safari on iPhone, w
 - **Revocation.** A phone revoked on the Mac is disconnected within about 15 s (the gateway's trust-refresh loop). After that, ticket requests are refused and the page tells the user to pair again. The owner accepted the delay; there is no per-action re-check.
 
 ## Proposed follow-up (not implemented)
-The [optional passkey-unlock spec](plans/2026-10-31-remote-passkey-unlock-spec.md) proposes additional user verification for already paired browsers, including 1Password on iPhone. Pairing-only access remains the current behavior; its timeout, enrollment and enforcement design are not deployed or owner-approved for implementation.
+The [optional passkey-unlock spec](plans/2026-10-31-remote-passkey-unlock-spec.md) proposes additional user verification for already paired browsers, including 1Password on iPhone. The owner authorized implementation on 2026-11-01, but Step 1 stopped at the verifier compatibility gate: source inspection of the pinned candidate found a registration-time malformed-key trap. No dependency or passkey behavior was adopted, and no live crash reproduction was run. Pairing-only access remains the current behavior; deployment and live acceptance are still pending.
 
 ## Setup (owner-run)
 1. In the Tailscale admin console, enable MagicDNS and HTTPS certificates.

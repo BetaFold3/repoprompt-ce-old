@@ -107,7 +107,7 @@ Follow [review policy](../review-policy.md) per implementation step: focused val
 Change: evaluate the canonical [swift-webauthn repository](https://github.com/brokenhandsio/swift-webauthn) at an exact reviewed revision, license and dependency graph. The previously suggested swift-server URL redirects there; no stable/SSWG-support claim is assumed. Keep any adopted dependency in the app target. Add the smallest adapter and offline registration/assertion fixtures; do not build a custom CBOR/COSE/WebAuthn parser.
 Validation: verify toolchain/deployment-target fit, dependency resolution without an unrelated major upgrade, both ceremonies' required-UV enforcement, supported attestation/algorithm and structural rejection, origin/port/RP/challenge/device mismatch, expiry/replay, signature tampering and synced-counter behavior. Use existing security/pairing test ownership, `make dev-test FILTER=<focused suites>`, `make dev-lint`, `make guardrails`. No owner phone action is needed for this offline gate.
 Done when: a pinned library meets the profile with positive and negative fixtures, or the step stops with a concrete incompatibility and the recommendation to defer/cut. Dependency adoption is not predetermined by this spec.
-Step 1 — todo | rounds 0/2 | open: verifier compatibility gate | downgraded: none | assumed: library-first | deferred: live 1Password check to Step 5
+Step 1 — done | rounds 1/2 | open: none (stop/defer outcome; see evidence step-1-crash-gate-0x04.md) | downgraded: none | assumed: library-first | deferred: adoption and Steps 2–5 until a compatible verifier passes the gate
 
 ### Step 2 — App-owned policy, enrollment and recovery
 Change: versioned pairing persistence, explicit required states/epoch, app challenge/verifier service and principal-only operations; Mac Enable/Enroll/Reset/Disable controls with HTTPS prerequisite and truthful synchronization status. Use the existing trusted link; no new transport. Preserve required state on all unsuccessful setup paths.
@@ -140,6 +140,7 @@ No public exposure or app-managed Tailscale; no passwords/OTP/recovery codes; no
 - Owner requested a separate passkey spec for the existing remote and identified 1Password as their preferred credential manager (2026-10-31).
 - Owner deferred relaunch approval; this specification task does not authorize deployment or implementation (2026-10-31).
 - Unlock timeout: one hour, superseding the earlier 15-minute duration proposal throughout this spec (owner answer 2026-11-01).
+- Owner authorized stepwise implementation with scoped workers, independent OracleA/OracleB reviews and local commits; deployment/relaunch and manual credential actions still require separate approval (2026-11-01).
 
 ## Open owner choices and implementation gates
 - Recommended timeout is 15 minutes absolute; alternatives are a shorter window or 30 minutes.
