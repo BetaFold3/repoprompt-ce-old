@@ -23,7 +23,10 @@ package enum KnowledgeSessionPolicy {
         MCPWindowToolName.oracleChatLog,
         // Knowledge roots start and control fresh Knowledge research workers. Delegation leaf
         // restrictions remove it again for workers (`AgentDelegationPolicy.knowledgeLeaf`).
-        MCPWindowToolName.agentRun
+        MCPWindowToolName.agentRun,
+        // Knowledge sessions in an Assistant workspace may list and steer granted workspaces
+        // (docs/context/specs/2026-11-01-assistant-workspace-steering-spec.md).
+        MCPWindowToolName.workspaceSteer
     ]
 
     /// Closed per-operation allowlist for `agent_run` calls from a Knowledge caller. An

@@ -33,6 +33,8 @@ package enum MCPWindowToolName {
 
     package static let history = "history"
 
+    package static let workspaceSteer = "workspace_steer"
+
     package static let shareThoughts = "share_thoughts"
     package static let setStatus = "set_status"
     package static let waitForNextInstruction = "wait_for_next_user_instruction"

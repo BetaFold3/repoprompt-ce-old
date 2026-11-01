@@ -70,7 +70,8 @@ enum MCPToolAdmissionPolicy {
         MCPWindowToolName.shareThoughts: .control,
         MCPWindowToolName.setStatus: .control,
         MCPWindowToolName.waitForNextInstruction: .control,
-        MCPWindowToolName.history: .control
+        MCPWindowToolName.history: .control,
+        MCPWindowToolName.workspaceSteer: .control
     ]
 
     static func classification(forCanonicalToolName toolName: String) -> MCPToolAdmissionClass? {

@@ -5,7 +5,7 @@ Authority: Reference
 Last-verified: 2026-11-01
 
 ## Status and goal
-Proposed specification only; nothing is implemented. Steps follow the [review policy](../review-policy.md).
+Implementation in progress: Step 1 is committed; later steps and live acceptance remain pending. Steps follow the [review policy](../review-policy.md).
 
 An owner-designated "Assistant" workspace runs Agent Mode sessions that periodically read other workspaces' saved transcripts (existing `history` tool), check a long-horizon plan, tell the owner about deviations, and sometimes send a steer or follow-up into a session of another workspace. This spec adds the missing parts: an owner-approved, persistent, one-way workspace→workspace grant, and a tool to list and message sessions in granted workspaces.
 
@@ -51,7 +51,7 @@ Step 1 — done | rounds 1/2 | open: none | downgraded: none | assumed: Settings
 - Validation: `make dev-test FILTER=WorkspaceSteeringToolTests`. The suite covers advertisement in depth-2, explore and Knowledge-worker leases; refusal without a run route and for gateway callers; `_windowID` and `context_id` not changing the source; an ungranted target refused; a closed target giving `is_open: false` with the open-it message; distinct sessions in two windows listed; duplicate bindings omitted with a warning; MCP-controlled, remote-host and Knowledge targets omitted.
 - Done when: `list` shows exactly the eligible sessions of open granted workspaces.
 
-Step 2 — todo | rounds 0/2 | open: none | downgraded: none | assumed: none | deferred: none
+Step 2 — done | rounds 1/2 | open: none | downgraded: none | assumed: shared run-route population; missing identity refused (step2-dispositions.md) | deferred: full dispatcher and live per-provider coverage; nonblocking review items (step2-dispositions.md)
 
 ### Step 3 — `send`
 - Change: entry checks, pinning, the `workspaceGrant` target case and final predicate, attribution prefix, retry rule in the tool description.

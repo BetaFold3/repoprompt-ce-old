@@ -44,7 +44,8 @@ package enum AgentModeMCPToolPolicy {
         .agentReasoningControl,
         .agentSessionControl,
         .agentConversationSend,
-        .conversationLog
+        .conversationLog,
+        .workspaceSteering
     ]
 
     static let grantedTools: Set<String> = MCPToolCapabilities.toolNames(for: grantedCapabilities)
@@ -56,7 +57,8 @@ package enum AgentModeMCPToolPolicy {
         .userInteraction,
         .agentSessionControl,
         .agentConversationSend,
-        .conversationLog
+        .conversationLog,
+        .workspaceSteering
     ]
 
     static let claudeNativeGrantedTools: Set<String> = MCPToolCapabilities.toolNames(for: claudeNativeGrantedCapabilities)
@@ -69,7 +71,8 @@ package enum AgentModeMCPToolPolicy {
         .userInteraction,
         .agentSessionControl,
         .agentConversationSend,
-        .conversationLog
+        .conversationLog,
+        .workspaceSteering
     ]
 
     static let codexNativeGrantedTools: Set<String> = MCPToolCapabilities.toolNames(for: codexNativeGrantedCapabilities)
@@ -79,7 +82,8 @@ package enum AgentModeMCPToolPolicy {
         .userInteraction,
         .agentSessionControl,
         .agentConversationSend,
-        .conversationLog
+        .conversationLog,
+        .workspaceSteering
     ]
 
     static let openCodeGrantedTools: Set<String> = MCPToolCapabilities.toolNames(for: openCodeGrantedCapabilities)
@@ -89,7 +93,8 @@ package enum AgentModeMCPToolPolicy {
         .userInteraction,
         .agentSessionControl,
         .agentConversationSend,
-        .conversationLog
+        .conversationLog,
+        .workspaceSteering
     ]
 
     static let cursorGrantedTools: Set<String> = MCPToolCapabilities.toolNames(for: cursorGrantedCapabilities)
@@ -99,7 +104,8 @@ package enum AgentModeMCPToolPolicy {
         .userInteraction,
         .agentSessionControl,
         .agentConversationSend,
-        .conversationLog
+        .conversationLog,
+        .workspaceSteering
     ]
 
     static let ohMyPiGrantedTools: Set<String> = MCPToolCapabilities.toolNames(for: ohMyPiGrantedCapabilities)

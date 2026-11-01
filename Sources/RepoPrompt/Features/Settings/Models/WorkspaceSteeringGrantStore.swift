@@ -61,6 +61,20 @@ struct WorkspaceSteeringGrantStore {
         return (settings.persistedWorkspaceSteeringGrants() ?? []).contains(where: Self.matching(source, target))
     }
 
+    /// Distinct targets granted to `source`, in grant order, read from the file. Nil when the file
+    /// is unreadable, so callers fail closed.
+    func grantedTargets(source: UUID) -> [UUID]? {
+        guard let grants = settings.persistedWorkspaceSteeringGrants() else { return nil }
+        var seen = Set<UUID>()
+        return grants.compactMap { grant in
+            guard grant.sourceWorkspaceID == source,
+                  grant.targetWorkspaceID != source,
+                  seen.insert(grant.targetWorkspaceID).inserted
+            else { return nil }
+            return grant.targetWorkspaceID
+        }
+    }
+
     /// Adds a directed grant. Nothing is written for a self-grant or an existing pair.
     func add(source: UUID, target: UUID) -> AddResult {
         guard source != target else { return .rejectedSelfGrant }

@@ -425,6 +425,8 @@ final class MCPServerViewModel: ObservableObject {
         /// Replaces the Codex Search toggle read by the Knowledge research-worker web gate so tests
         /// never read or write real settings.
         var agentRunCodexWebSearchEnabledOverrideForTesting: Bool?
+        /// Replaces the shared workspace steering grant store so tests never touch real settings.
+        var workspaceSteeringGrantStoreOverrideForTesting: WorkspaceSteeringGrantStore?
         private var contextBuilderFollowUpOverrideForTesting: MCPWindowToolDependencies.RunMCPPlanOrQuestion?
         private var contextBuilderBeforeFinalReviewAuthorizationForTesting:
             MCPWindowToolDependencies.BeforeContextBuilderFinalReviewAuthorization?
@@ -774,6 +776,22 @@ final class MCPServerViewModel: ObservableObject {
                     await capturedPreparationHook?()
                 #endif
             }
+        )
+    }
+
+    private var workspaceSteeringToolService: WorkspaceSteeringMCPToolService {
+        #if DEBUG
+            let grantStoreOverride = workspaceSteeringGrantStoreOverrideForTesting
+        #else
+            let grantStoreOverride: WorkspaceSteeringGrantStore? = nil
+        #endif
+        return WorkspaceSteeringMCPToolService(
+            captureRequestMetadata: { [self] in await captureRequestMetadata() },
+            isGatewayPrincipalConnection: { connectionID in
+                await ServerNetworkManager.shared.isGatewayPrincipalConnection(connectionID)
+            },
+            windows: { WindowStatesManager.shared.allWindows },
+            grantStore: { grantStoreOverride ?? .shared }
         )
     }
 
@@ -1353,6 +1371,10 @@ final class MCPServerViewModel: ObservableObject {
             guard let self else { throw MCPError.internalError("Window deallocated while executing agent_manage") }
             return try await agentManageToolService.execute(args: args)
         },
+        executeWorkspaceSteer: { [weak self] args in
+            guard let self else { throw MCPError.internalError("Window deallocated while executing workspace_steer") }
+            return try await workspaceSteeringToolService.execute(args: args)
+        },
         requireTargetWindow: { [weak self] in
             guard let self else { throw MCPError.internalError("Window deallocated while resolving target window") }
             return try requireTargetWindow()
@@ -1876,7 +1898,8 @@ final class MCPServerViewModel: ObservableObject {
             MCPRemotePairingToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies),
             MCPAgentControlToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies),
             MCPAgentSessionControlToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies),
-            MCPHistoryToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies)
+            MCPHistoryToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies),
+            MCPWorkspaceSteeringToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies)
         ]
     )
     private var cancellables: Set<AnyCancellable> = []
