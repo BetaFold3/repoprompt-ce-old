@@ -111,6 +111,8 @@ struct ContentRootShellView: View {
                     approvalManager: workspaceApprovalManager,
                     request: request
                 )
+                // A promoted request gets a fresh overlay (visible card, Always Allow reset).
+                .id(request.id)
                 .transition(.opacity.combined(with: .scale(scale: 0.95)))
                 .zIndex(1001)
             }

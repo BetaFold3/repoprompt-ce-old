@@ -16,6 +16,20 @@ public enum WorkspaceApprovalOperation: String, Codable, Sendable, CaseIterable 
     case deleteWorkspace = "delete_workspace"
     case addFolder = "add_folder"
     case removeFolder = "remove_folder"
+    /// Grant one workspace's sessions steering access to another (`workspace_steer request_grant`).
+    /// Owner-only: never auto-approved and never remembered (`allowsAutoApproval`).
+    case workspaceSteeringGrant = "workspace_steering_grant"
+
+    /// Whether global, per-operation or per-client auto-approval and Always Allow may apply.
+    /// False operations always need an owner click on the prompt.
+    var allowsAutoApproval: Bool {
+        self != .workspaceSteeringGrant
+    }
+
+    /// Operations the auto-approval Settings may offer.
+    static var autoApprovableCases: [WorkspaceApprovalOperation] {
+        allCases.filter(\.allowsAutoApproval)
+    }
 
     /// Human-readable action verb for display.
     var actionVerb: String {
@@ -24,6 +38,7 @@ public enum WorkspaceApprovalOperation: String, Codable, Sendable, CaseIterable 
         case .deleteWorkspace: "delete"
         case .addFolder: "add a folder to"
         case .removeFolder: "remove a folder from"
+        case .workspaceSteeringGrant: "steer sessions in"
         }
     }
 
@@ -34,6 +49,7 @@ public enum WorkspaceApprovalOperation: String, Codable, Sendable, CaseIterable 
         case .deleteWorkspace: "Delete Workspace"
         case .addFolder: "Add Folder"
         case .removeFolder: "Remove Folder"
+        case .workspaceSteeringGrant: "Workspace Steering"
         }
     }
 
@@ -44,6 +60,7 @@ public enum WorkspaceApprovalOperation: String, Codable, Sendable, CaseIterable 
         case .deleteWorkspace: "folder.badge.minus"
         case .addFolder: "folder.fill.badge.plus"
         case .removeFolder: "folder.fill.badge.minus"
+        case .workspaceSteeringGrant: "arrow.triangle.branch"
         }
     }
 
@@ -54,8 +71,20 @@ public enum WorkspaceApprovalOperation: String, Codable, Sendable, CaseIterable 
         case .deleteWorkspace: .high
         case .addFolder: .medium
         case .removeFolder: .medium
+        case .workspaceSteeringGrant: .medium
         }
     }
+}
+
+// MARK: - Workspace Steering Grant Details
+
+/// App-resolved workspaces for a `.workspaceSteeringGrant` request. Names and IDs come from the
+/// app's workspace list, never from agent text.
+public struct WorkspaceSteeringGrantApprovalDetails: Sendable, Equatable {
+    public let sourceWorkspaceID: UUID
+    public let sourceWorkspaceName: String
+    public let targetWorkspaceID: UUID
+    public let targetWorkspaceName: String
 }
 
 // MARK: - Risk Levels
@@ -102,6 +131,8 @@ public struct WorkspaceApprovalRequest: Identifiable, Sendable {
     public let workspaceID: UUID?
     public let folderPath: String?
     public let windowID: Int?
+    /// Set only for `.workspaceSteeringGrant`.
+    public let steeringGrant: WorkspaceSteeringGrantApprovalDetails?
 
     /// The target window ID for the operation.
     public var targetWindowID: Int? {
@@ -115,7 +146,8 @@ public struct WorkspaceApprovalRequest: Identifiable, Sendable {
         workspaceName: String? = nil,
         workspaceID: UUID? = nil,
         folderPath: String? = nil,
-        windowID: Int? = nil
+        windowID: Int? = nil,
+        steeringGrant: WorkspaceSteeringGrantApprovalDetails? = nil
     ) {
         self.id = id
         self.clientID = clientID
@@ -125,6 +157,7 @@ public struct WorkspaceApprovalRequest: Identifiable, Sendable {
         self.workspaceID = workspaceID
         self.folderPath = folderPath
         self.windowID = windowID
+        self.steeringGrant = steeringGrant
     }
 
     /// Human-readable summary of what's being requested.
@@ -144,6 +177,10 @@ public struct WorkspaceApprovalRequest: Identifiable, Sendable {
             let folder = (folderPath as NSString?)?.lastPathComponent ?? "folder"
             let ws = workspaceName ?? "current workspace"
             return "Remove \"\(folder)\" from \"\(ws)\""
+        case .workspaceSteeringGrant:
+            let source = steeringGrant?.sourceWorkspaceName ?? "unknown workspace"
+            let target = steeringGrant?.targetWorkspaceName ?? "unknown workspace"
+            return "Let \"\(source)\" steer \"\(target)\""
         }
     }
 
@@ -158,7 +195,27 @@ public struct WorkspaceApprovalRequest: Identifiable, Sendable {
             "The folder at \"\(folderPath ?? "unknown path")\" will be added to the workspace."
         case .removeFolder:
             "The folder \"\(folderPath ?? "unknown")\" will be removed from the workspace. The actual folder on disk will NOT be deleted."
+        case .workspaceSteeringGrant:
+            Self.steeringGrantQuestion(
+                source: steeringGrant?.sourceWorkspaceName ?? "unknown workspace",
+                target: steeringGrant?.targetWorkspaceName ?? "unknown workspace"
+            )
         }
+    }
+
+    /// Warning line under the details.
+    public var warningMessage: String {
+        switch operation {
+        case .workspaceSteeringGrant:
+            "You can revoke this in Settings → Manage Workspaces → Workspace Steering."
+        default:
+            operation.riskLevel.warningMessage
+        }
+    }
+
+    /// The fixed, app-authored grant question.
+    static func steeringGrantQuestion(source: String, target: String) -> String {
+        "Allow every session in '\(source)' to list and steer top-level sessions in '\(target)' until you revoke it?"
     }
 }
 
@@ -192,7 +249,8 @@ public struct WorkspaceApprovalClientPolicy: Codable, Sendable, Identifiable {
 
 /// Global settings for workspace operation approvals.
 public struct WorkspaceApprovalSettings: Codable, Sendable {
-    /// When true, all workspace operations from all clients are auto-approved.
+    /// When true, workspace operations from all clients are auto-approved, except owner-only
+    /// operations (`WorkspaceApprovalOperation.allowsAutoApproval == false`), which always ask.
     public var autoApproveAll: Bool
 
     /// Per-operation global auto-approve settings.
@@ -213,6 +271,9 @@ public struct WorkspaceApprovalSettings: Codable, Sendable {
 
     /// Check if an operation should be auto-approved.
     public func shouldAutoApprove(operation: WorkspaceApprovalOperation, clientID: String) -> Bool {
+        // Owner-only operations ignore every auto-approval setting, including stored ones.
+        guard operation.allowsAutoApproval else { return false }
+
         // Global auto-approve
         if autoApproveAll { return true }
 

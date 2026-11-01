@@ -770,10 +770,10 @@ import XCTest
             XCTAssertEqual(workspace.warnings, [])
         }
 
-        /// `request_grant` is reserved until Step 4 and refuses without touching the target, and an
-        /// unknown op is refused. `send` (Step 3, `WorkspaceSteeringSendTests`) refuses here too:
-        /// this route's tab holds no live session to attribute the message to.
-        func testRequestGrantIsReservedAndSendWithoutALiveSourceSessionRefuses() async throws {
+        /// An unknown op is refused. `send` (Step 3, `WorkspaceSteeringSendTests`) refuses here too:
+        /// this route's tab holds no live session to attribute the message to. `request_grant` is
+        /// covered by `WorkspaceSteeringGrantRequestTests`.
+        func testUnknownOpAndSendWithoutALiveSourceSessionRefuse() async throws {
             let source = try await makeWindow(name: "Assistant")
             let sourceWorkspace = try XCTUnwrap(source.workspaceManager.activeWorkspace)
             let target = try await makeWindow(name: "Target")
@@ -789,10 +789,6 @@ import XCTest
                 "session_id": .string(root.sessionID.uuidString),
                 "message": .string("hello")
             ], message: Service.sourceSessionUnavailableMessage)
-            await assertRefused(source, [
-                "op": .string("request_grant"),
-                "target_workspace_id": .string(targetWorkspace.id.uuidString)
-            ], message: Service.notImplementedMessage(op: "request_grant"))
             await assertRefused(source, ["op": .string("steer")], message: "workspace_steer requires op")
             XCTAssertEqual(root.session.items.count, itemsBefore)
             XCTAssertFalse(root.session.runState.isActive)

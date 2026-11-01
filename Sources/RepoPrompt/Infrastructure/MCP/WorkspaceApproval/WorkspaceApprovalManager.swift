@@ -40,11 +40,19 @@ public final class WorkspaceApprovalManager: ObservableObject {
     /// UserDefaults key for settings persistence.
     private static let settingsKey = "workspace.approvalSettings"
 
+    /// Settings persistence.
+    private let defaults: UserDefaults
+
+    /// Whether presenting a request activates the app and its window (false only in tests).
+    private let presentsWindows: Bool
+
     // MARK: - Init
 
-    private init() {
+    private init(defaults: UserDefaults = .standard, presentsWindows: Bool = true) {
+        self.defaults = defaults
+        self.presentsWindows = presentsWindows
         // Load settings from UserDefaults
-        if let data = UserDefaults.standard.data(forKey: Self.settingsKey),
+        if let data = defaults.data(forKey: Self.settingsKey),
            let decoded = try? JSONDecoder().decode(WorkspaceApprovalSettings.self, from: data)
         {
             settings = decoded
@@ -52,6 +60,13 @@ public final class WorkspaceApprovalManager: ObservableObject {
             settings = WorkspaceApprovalSettings()
         }
     }
+
+    #if DEBUG
+        /// A manager with its own settings storage that never activates the app or a window.
+        static func makeForTesting(defaults: UserDefaults) -> WorkspaceApprovalManager {
+            WorkspaceApprovalManager(defaults: defaults, presentsWindows: false)
+        }
+    #endif
 
     // MARK: - Public API
 
@@ -91,13 +106,13 @@ public final class WorkspaceApprovalManager: ObservableObject {
                 // Bring window to front and request attention
                 bringWindowToFront(windowID: request.windowID)
 
-                if !NSApp.isActive {
+                if presentsWindows, !NSApp.isActive {
                     NSApp.requestUserAttention(.criticalRequest)
                 }
             }
         } onCancel: {
-            Task { @MainActor in
-                WorkspaceApprovalManager.shared.cancelPending(requestID: request.id)
+            Task { @MainActor [weak self] in
+                self?.cancelPending(requestID: request.id)
             }
         }
     }
@@ -119,13 +134,25 @@ public final class WorkspaceApprovalManager: ObservableObject {
         continuation.resume(returning: .denied)
     }
 
-    /// Resolve the current pending approval request.
-    public func resolveApproval(allow: Bool, alwaysAllow: Bool = false) {
+    /// Resolve the current pending approval request. With `expectedRequestID` (the request the
+    /// owner saw, as the overlay passes it), a different current request is left untouched, so a
+    /// click on a prompt that was cancelled and replaced never answers its successor. Owner-only
+    /// operations (`allowsAutoApproval == false`) require the matching ID; an answer without one is
+    /// ignored. Existing operations keep accepting a nil ID.
+    public func resolveApproval(allow: Bool, alwaysAllow: Bool = false, expectedRequestID: UUID? = nil) {
         guard let request = pendingRequest,
               let continuation = currentContinuation
         else {
             return
         }
+        if let expectedRequestID {
+            guard request.id == expectedRequestID else { return }
+        } else if !request.operation.allowsAutoApproval {
+            return
+        }
+
+        // Owner-only operations ignore Always Allow: no policy, and the result never claims it.
+        let alwaysAllow = alwaysAllow && request.operation.allowsAutoApproval
 
         // If always-allow was selected, update the policy
         if allow && alwaysAllow {
@@ -197,6 +224,7 @@ public final class WorkspaceApprovalManager: ObservableObject {
 
     /// Add an auto-approval for a specific client and operation.
     public func addAutoApproval(clientID: String, operation: WorkspaceApprovalOperation) {
+        guard operation.allowsAutoApproval else { return }
         let storageKey = matchingPolicyKeys(for: clientID).first ?? clientID
         var policy = settings.clientPolicies[storageKey] ?? WorkspaceApprovalClientPolicy(clientID: storageKey)
         policy.allowedOperations.insert(operation)
@@ -241,6 +269,7 @@ public final class WorkspaceApprovalManager: ObservableObject {
     /// Set global auto-approve for a specific operation.
     public func setAutoApproveOperation(_ operation: WorkspaceApprovalOperation, enabled: Bool) {
         if enabled {
+            guard operation.allowsAutoApproval else { return }
             settings.autoApproveOperations.insert(operation)
         } else {
             settings.autoApproveOperations.remove(operation)
@@ -297,10 +326,11 @@ public final class WorkspaceApprovalManager: ObservableObject {
 
     private func saveSettings() {
         guard let data = try? JSONEncoder().encode(settings) else { return }
-        UserDefaults.standard.set(data, forKey: Self.settingsKey)
+        defaults.set(data, forKey: Self.settingsKey)
     }
 
     private func bringWindowToFront(windowID: Int?) {
+        guard presentsWindows else { return }
         // Try to find and activate the specific window, or just activate the app
         if let windowID,
            let windowState = WindowStatesManager.shared.allWindows.first(where: { $0.windowID == windowID }),

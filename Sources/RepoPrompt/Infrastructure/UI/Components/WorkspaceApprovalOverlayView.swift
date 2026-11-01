@@ -141,7 +141,7 @@ struct WorkspaceApprovalOverlayView: View {
             }
             .padding(.top, 8)
 
-            Text("Workspace Operation Request")
+            Text(request.operation == .workspaceSteeringGrant ? "Workspace Steering Request" : "Workspace Operation Request")
                 .font(.title2.weight(.semibold))
                 .foregroundColor(.primary)
         }
@@ -162,8 +162,10 @@ struct WorkspaceApprovalOverlayView: View {
             // Risk warning
             riskWarningView
 
-            // Always allow toggle
-            alwaysAllowToggle
+            // Always allow toggle (never offered for owner-only operations)
+            if request.operation.allowsAutoApproval {
+                alwaysAllowToggle
+            }
         }
         .padding(24)
     }
@@ -182,14 +184,26 @@ struct WorkspaceApprovalOverlayView: View {
             }
 
             VStack(alignment: .leading, spacing: 4) {
-                Text(request.clientID)
-                    .font(.headline)
-                    .foregroundColor(.primary)
-                    .lineLimit(1)
+                if let grant = request.steeringGrant {
+                    // App-authored only: no client-reported name or agent text.
+                    Text("An Agent Mode session in '\(grant.sourceWorkspaceName)'")
+                        .font(.headline)
+                        .foregroundColor(.primary)
+                        .lineLimit(1)
 
-                Text("wants to \(request.operation.actionVerb) a workspace")
-                    .font(.subheadline)
-                    .foregroundColor(.secondary)
+                    Text("wants to \(request.operation.actionVerb) another workspace")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                } else {
+                    Text(request.clientID)
+                        .font(.headline)
+                        .foregroundColor(.primary)
+                        .lineLimit(1)
+
+                    Text("wants to \(request.operation.actionVerb) a workspace")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                }
             }
 
             Spacer()
@@ -236,6 +250,11 @@ struct WorkspaceApprovalOverlayView: View {
                 .padding(.top, 4)
             }
 
+            if let grant = request.steeringGrant {
+                steeringGrantRow(label: "From:", name: grant.sourceWorkspaceName, id: grant.sourceWorkspaceID)
+                steeringGrantRow(label: "To:", name: grant.targetWorkspaceName, id: grant.targetWorkspaceID)
+            }
+
             // Show folder path if applicable
             if let folderPath = request.folderPath {
                 HStack(spacing: 8) {
@@ -269,7 +288,7 @@ struct WorkspaceApprovalOverlayView: View {
                 .foregroundColor(riskColor)
                 .font(.system(size: 14, weight: .medium))
 
-            Text(request.operation.riskLevel.warningMessage)
+            Text(request.warningMessage)
                 .font(.caption)
                 .foregroundColor(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -278,7 +297,29 @@ struct WorkspaceApprovalOverlayView: View {
         .padding(.horizontal, 4)
     }
 
+    private func steeringGrantRow(label: String, name: String, id: UUID) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(label)
+                .font(.caption)
+                .foregroundColor(.secondary)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(name)
+                    .font(.caption.weight(.medium))
+                    .foregroundColor(.primary)
+                Text(id.uuidString)
+                    .font(.caption2.monospaced())
+                    .foregroundColor(.secondary)
+                    .textSelection(.enabled)
+            }
+        }
+        .padding(.top, 2)
+    }
+
     private var clientIcon: String {
+        // Fixed for owner-only requests: client-reported names never shape the steering prompt.
+        if request.steeringGrant != nil {
+            return "lock.shield"
+        }
         let lowercased = request.clientID.lowercased()
         if lowercased.contains("claude") {
             return "brain"
@@ -355,39 +396,53 @@ struct WorkspaceApprovalOverlayView: View {
                 HStack(spacing: 6) {
                     Image(systemName: "checkmark")
                         .font(.system(size: 12, weight: .semibold))
-                    Text(alwaysAllow ? "Always Allow" : "Allow Once")
+                    Text(allowButtonTitle)
                         .font(.subheadline.weight(.medium))
                 }
                 .frame(maxWidth: .infinity)
                 .frame(height: 40)
             }
             .buttonStyle(WorkspaceApprovalAllowButtonStyle(riskLevel: request.operation.riskLevel))
-            .keyboardShortcut(.defaultAction)
+            // Owner-only requests need a click: Return never approves them.
+            .keyboardShortcut(request.operation.allowsAutoApproval ? .defaultAction : nil)
         }
         .padding(20)
+    }
+
+    private var allowButtonTitle: String {
+        guard request.operation.allowsAutoApproval else { return "Allow" }
+        return alwaysAllow ? "Always Allow" : "Allow Once"
     }
 
     // MARK: - Actions
 
     private func allow() async {
+        // Bind the answer to the request the owner saw before the animation delay.
+        let requestID = request.id
+        let alwaysAllow = alwaysAllow && request.operation.allowsAutoApproval
         withAnimation(.easeInOut(duration: 0.2)) {
             isAnimating = false
         }
         // Small delay for animation
         try? await Task.sleep(nanoseconds: 150_000_000)
         await MainActor.run {
-            approvalManager.resolveApproval(allow: true, alwaysAllow: alwaysAllow)
+            approvalManager.resolveApproval(
+                allow: true,
+                alwaysAllow: alwaysAllow,
+                expectedRequestID: requestID
+            )
         }
     }
 
     private func deny() async {
+        let requestID = request.id
         withAnimation(.easeInOut(duration: 0.2)) {
             isAnimating = false
         }
         // Small delay for animation
         try? await Task.sleep(nanoseconds: 150_000_000)
         await MainActor.run {
-            approvalManager.resolveApproval(allow: false, alwaysAllow: false)
+            approvalManager.resolveApproval(allow: false, alwaysAllow: false, expectedRequestID: requestID)
         }
     }
 }

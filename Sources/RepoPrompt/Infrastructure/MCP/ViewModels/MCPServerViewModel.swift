@@ -427,6 +427,9 @@ final class MCPServerViewModel: ObservableObject {
         var agentRunCodexWebSearchEnabledOverrideForTesting: Bool?
         /// Replaces the shared workspace steering grant store so tests never touch real settings.
         var workspaceSteeringGrantStoreOverrideForTesting: WorkspaceSteeringGrantStore?
+        /// Replaces the shared workspace approval manager for `workspace_steer request_grant` so tests
+        /// use isolated approval settings and never activate the app.
+        var workspaceApprovalManagerOverrideForTesting: WorkspaceApprovalManager?
         private var contextBuilderFollowUpOverrideForTesting: MCPWindowToolDependencies.RunMCPPlanOrQuestion?
         private var contextBuilderBeforeFinalReviewAuthorizationForTesting:
             MCPWindowToolDependencies.BeforeContextBuilderFinalReviewAuthorization?
@@ -782,8 +785,10 @@ final class MCPServerViewModel: ObservableObject {
     private var workspaceSteeringToolService: WorkspaceSteeringMCPToolService {
         #if DEBUG
             let grantStoreOverride = workspaceSteeringGrantStoreOverrideForTesting
+            let approvalManagerOverride = workspaceApprovalManagerOverrideForTesting
         #else
             let grantStoreOverride: WorkspaceSteeringGrantStore? = nil
+            let approvalManagerOverride: WorkspaceApprovalManager? = nil
         #endif
         return WorkspaceSteeringMCPToolService(
             captureRequestMetadata: { [self] in await captureRequestMetadata() },
@@ -791,7 +796,8 @@ final class MCPServerViewModel: ObservableObject {
                 await ServerNetworkManager.shared.isGatewayPrincipalConnection(connectionID)
             },
             windows: { WindowStatesManager.shared.allWindows },
-            grantStore: { grantStoreOverride ?? .shared }
+            grantStore: { grantStoreOverride ?? .shared },
+            approvalManager: { approvalManagerOverride ?? .shared }
         )
     }
 

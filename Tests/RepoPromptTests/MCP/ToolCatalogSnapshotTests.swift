@@ -893,7 +893,7 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         "22|set_status|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=19bbfd6fc47639e02295de4e9289ea77f25c6a91ad150998726768b84c266783|schema=0854d727c81f1eb8fa0a14edb9d6ab8bb58974d919cc53150bd72473f1ae0196",
         "23|wait_for_next_user_instruction|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=3a59a13a0026414ae04dd21d730a7144b91c67146dce77340fe730c865bea3d7|schema=15335c3bbadf042948d0a1ba52f0fcb01125428dda4952dbda418051904d82ef",
         "24|history|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=c4a738f11afe9f2c43772dfbf9842353c11370be23f3d66c1359b46ec5a01455|schema=62e0b861675086e0619134fac7d8823a71531b2afccb6b4451d9c7f519389e5d",
-        "25|workspace_steer|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=971b8aab331580ceb0195ee0dd7d0c5206d9e74aba61de8eb54f8af1033e1e28|schema=29441c04779b38961bcb724a56dd2613104d7e2bd2a17c38f2d9123941871d6c"
+        "25|workspace_steer|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=369edee840b6334709591f2c990c009a1d74a830a909d04e7494cbeace9ff07f|schema=f1c4d5e91f4ea005cf2d5ac34594703265e6a6062d827489ff9d428c5016378c"
     ]
 
     private static func signatures(for tools: [RepoPromptApp.Tool]) throws -> [String] {

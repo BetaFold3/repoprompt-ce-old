@@ -49,6 +49,8 @@ struct WorkspaceSteeringMCPToolService {
     let isGatewayPrincipalConnection: @Sendable (UUID) async -> Bool
     let windows: @MainActor () -> [WindowState]
     let grantStore: @MainActor () -> WorkspaceSteeringGrantStore
+    /// Presents `request_grant` prompts on the caller's window.
+    var approvalManager: @MainActor () -> WorkspaceApprovalManager = { .shared }
 
     func execute(args: [String: Value]) async throws -> Value {
         let metadata = await captureRequestMetadata()
@@ -62,7 +64,7 @@ struct WorkspaceSteeringMCPToolService {
         case "send":
             return try await send(args: args, caller: caller)
         case "request_grant":
-            throw MCPError.invalidParams(Self.notImplementedMessage(op: op))
+            return try await requestGrant(args: args, caller: caller, metadata: metadata)
         default:
             throw MCPError.invalidParams(
                 "workspace_steer requires op: list, send, or request_grant."
@@ -267,6 +269,82 @@ struct WorkspaceSteeringMCPToolService {
         ))
     }
 
+    // MARK: - request_grant
+
+    /// Asks the owner, on the caller's window, to grant the caller's workspace steering access to
+    /// the target. The prompt is owner-only (`WorkspaceApprovalOperation.workspaceSteeringGrant`:
+    /// no auto-approval, no Always Allow) and every word in it is app-authored from workspace names
+    /// and IDs. After Allow, the caller (from the same captured run route, never from arguments)
+    /// and the target are revalidated before the grant is saved. Deny, cancellation, a closed
+    /// window or the tool watchdog write nothing.
+    private func requestGrant(args: [String: Value], caller: Caller, metadata: RequestMetadata) async throws -> Value {
+        guard let text = args["target_workspace_id"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+              let targetID = UUID(uuidString: text)
+        else {
+            throw MCPError.invalidParams("workspace_steer target_workspace_id must be a workspace UUID." + Self.noGrantRequestedSuffix)
+        }
+        guard targetID != caller.sourceWorkspaceID else {
+            throw MCPError.invalidParams(Self.selfGrantMessage)
+        }
+        guard let targetName = workspaceName(targetID, caller: caller) else {
+            throw MCPError.invalidParams(Self.unknownTargetMessage(workspaceID: targetID.uuidString))
+        }
+        guard let granted = grantStore().grantedTargets(source: caller.sourceWorkspaceID) else {
+            throw MCPError.invalidParams(Self.grantsUnreadableForRequestMessage)
+        }
+        if granted.contains(targetID) {
+            return try Value(GrantRequestReply(status: .alreadyGranted))
+        }
+        // Frozen for revalidation after the prompt: the same run must still be current in its tab.
+        guard let sourceSessionID = try? frozenSourceSessionID(caller: caller) else {
+            throw MCPError.invalidParams(Self.sourceSessionUnavailableForGrantMessage)
+        }
+
+        let request = WorkspaceApprovalRequest(
+            clientID: metadata.clientName ?? "",
+            operation: .workspaceSteeringGrant,
+            windowID: caller.windowID,
+            steeringGrant: WorkspaceSteeringGrantApprovalDetails(
+                sourceWorkspaceID: caller.sourceWorkspaceID,
+                sourceWorkspaceName: workspaceName(caller.sourceWorkspaceID, caller: caller) ?? caller.sourceWorkspaceName,
+                targetWorkspaceID: targetID,
+                targetWorkspaceName: targetName
+            )
+        )
+        let result = await approvalManager().requestApproval(for: request)
+        guard result.isApproved, !Task.isCancelled else {
+            return try Value(GrantRequestReply(status: .denied))
+        }
+
+        // Revalidate from the same captured route: the source window still shows the source
+        // workspace, the same run is still current in its tab, and the target still exists.
+        guard let current = try? await resolveCaller(metadata: metadata),
+              current.sourceWorkspaceID == caller.sourceWorkspaceID,
+              current.windowID == caller.windowID,
+              (try? frozenSourceSessionID(caller: current)) == sourceSessionID
+        else {
+            throw MCPError.invalidParams(Self.callerChangedDuringRequestMessage)
+        }
+        guard workspaceName(targetID, caller: current) != nil else {
+            throw MCPError.invalidParams(Self.targetGoneDuringRequestMessage)
+        }
+        // Final synchronous check after every revalidation await: a watchdog cancellation that
+        // arrived during them writes nothing.
+        guard !Task.isCancelled else {
+            return try Value(GrantRequestReply(status: .denied))
+        }
+        switch grantStore().add(source: current.sourceWorkspaceID, target: targetID) {
+        case .added:
+            return try Value(GrantRequestReply(status: .granted))
+        case .alreadyGranted:
+            return try Value(GrantRequestReply(status: .alreadyGranted))
+        case .rejectedSelfGrant:
+            throw MCPError.invalidParams(Self.selfGrantMessage)
+        case .saveFailed:
+            throw MCPError.invalidParams(Self.grantSaveFailedMessage)
+        }
+    }
+
     private func uuidArgument(_ value: Value?, name: String, kind: String) throws -> UUID {
         guard let text = value?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
               let id = UUID(uuidString: text)
@@ -383,6 +461,16 @@ struct WorkspaceSteeringMCPToolService {
         let workspaces: [Workspace]
     }
 
+    struct GrantRequestReply: Codable, Equatable {
+        enum Status: String, Codable {
+            case granted
+            case alreadyGranted = "already_granted"
+            case denied
+        }
+
+        let status: Status
+    }
+
     struct SendReply: Codable, Equatable {
         let workspaceID: String
         let sessionID: String
@@ -443,7 +531,27 @@ struct WorkspaceSteeringMCPToolService {
         "Session \(sessionID) is bound to more than one tab or window on this Mac and was omitted."
     }
 
-    static func notImplementedMessage(op: String) -> String {
-        "workspace_steer op '\(op)' is not available yet. Nothing was sent and no grant was requested."
+    static let noGrantRequestedSuffix = " No grant was requested."
+
+    static let selfGrantMessage =
+        "A workspace cannot be granted steering access to itself. No grant was requested."
+
+    static let sourceSessionUnavailableForGrantMessage =
+        "The session making this call is not the current run of its tab on this Mac. No grant was requested."
+
+    static let grantsUnreadableForRequestMessage =
+        "Workspace steering grants could not be read from settings. No grant was requested."
+
+    static let callerChangedDuringRequestMessage =
+        "The session that requested the grant, or its window's workspace, changed while the prompt was open. No grant was written."
+
+    static let targetGoneDuringRequestMessage =
+        "The target workspace no longer exists on this Mac. No grant was written."
+
+    static let grantSaveFailedMessage =
+        "The grant was approved but could not be saved to settings. No grant was written; the owner can add it in Settings → Manage Workspaces → Workspace Steering."
+
+    static func unknownTargetMessage(workspaceID: String) -> String {
+        "Workspace \(workspaceID) does not exist on this Mac. No grant was requested."
     }
 }

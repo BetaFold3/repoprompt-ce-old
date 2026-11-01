@@ -5,7 +5,7 @@ Authority: Reference
 Last-verified: 2026-11-01
 
 ## Status and goal
-Implementation in progress: Steps 1–3 are implemented; grant requests and live acceptance remain pending. Steps follow the [review policy](../review-policy.md).
+Implementation in progress: Steps 1–4 are implemented; owner-run live acceptance remains pending. Steps follow the [review policy](../review-policy.md).
 
 An owner-designated "Assistant" workspace runs Agent Mode sessions that periodically read other workspaces' saved transcripts (existing `history` tool), check a long-horizon plan, tell the owner about deviations, and sometimes send a steer or follow-up into a session of another workspace. This spec adds the missing parts: an owner-approved, persistent, one-way workspace→workspace grant, and a tool to list and message sessions in granted workspaces.
 
@@ -70,7 +70,7 @@ Step 3 — done | rounds 1/2 | open: none | downgraded: none | assumed: source p
 - Validation: `make dev-test FILTER=WorkspaceSteeringGrantRequestTests`. The suite covers Allow writing exactly one grant; Deny and queued-request cancellation writing nothing; an existing auto-approve or Always Allow policy for the client not granting; an existing grant returning `already_granted` without a prompt.
 - Done when: only Settings or an owner click on this prompt creates a grant.
 
-Step 4 — todo | rounds 0/2 | open: none | downgraded: none | assumed: none | deferred: none
+Step 4 — done | rounds 0/2 | open: none | downgraded: none | assumed: existing 30-second watchdog retained (step4-dispositions.md) | deferred: nonblocking coverage; live UI acceptance; unrelated formatting (step4-dispositions.md)
 
 ### Step 5 — Live acceptance (owner-run, Dev build)
 - Change: none. Requires owner approval for the visible app launch. Update the routed context documents for the new steering path after acceptance.
