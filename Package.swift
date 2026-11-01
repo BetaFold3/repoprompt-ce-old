@@ -54,6 +54,11 @@ var packageDependencies: [Package.Dependency] = [
     .package(url: "https://github.com/provencher/SwiftOpenAI", revision: "1211782eb337e7968124448a20d9260df1952012"),
     .package(url: "https://github.com/ChimeHQ/Neon.git", exact: "0.6.0"),
     .package(path: "Vendor/UniversalCharsetDetection"),
+    // Bounded passkey verifier experiment: linked only into the root test target (see
+    // repoPromptTestDependencies), not into any production target. Two vendored packages mirror
+    // upstream's own manifests (SwiftCBOR @ tools 5.5, SwiftWebAuthn @ tools 6.0).
+    .package(path: "Vendor/SwiftCBOR"),
+    .package(path: "Vendor/SwiftWebAuthn"),
     .package(url: "https://github.com/loopwork-ai/JSONSchema.git", exact: "1.3.0"),
     .package(url: "https://github.com/loopwork-ai/ontology.git", exact: "0.6.0"),
     .package(url: "https://github.com/getsentry/sentry-cocoa", exact: "9.17.1"),
@@ -125,7 +130,10 @@ var repoPromptTestDependencies: [Target.Dependency] = [
     "RepoPromptRemoteWire",
     .product(name: "RepoPromptShared", package: "RepoPromptCore"),
     .product(name: "RepoPromptMCPClientKit", package: "RepoPromptCore"),
-    .product(name: "RepoPromptMCPCore", package: "RepoPromptCore")
+    .product(name: "RepoPromptMCPCore", package: "RepoPromptCore"),
+    // Bounded passkey verifier experiment (test-only; not in the production runtime graph).
+    .product(name: "WebAuthn", package: "SwiftWebAuthn"),
+    .product(name: "SwiftCBOR", package: "SwiftCBOR")
 ]
 
 var repoPromptTestSwiftSettings: [SwiftSetting] = [

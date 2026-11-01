@@ -1,0 +1,163 @@
+//===----------------------------------------------------------------------===//
+//
+// This source file is part of the Swift WebAuthn open source project
+//
+// Copyright (c) 2022 the Swift WebAuthn project authors
+// Licensed under Apache License v2.0
+//
+// See LICENSE.txt for license information
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+//===----------------------------------------------------------------------===//
+
+#if canImport(FoundationEssentials)
+import FoundationEssentials
+#else
+import Foundation
+#endif
+import Crypto
+
+// RPCE local modification (bounded passkey verifier experiment, 2026-11-01): reject the AT flag
+// in assertions, enforce BS => BE, and optionally check backup-eligible consistency against the
+// stored credential. See Vendor/SwiftWebAuthn/PATCHES.md. Changes are marked inline.
+
+/// This is what the authenticator device returned after we requested it to authenticate a user.
+///
+/// When decoding using `Decodable`, byte arrays are decoded from base64url to bytes.
+public struct AuthenticatorAssertionResponse: Sendable {
+    /// Representation of what we passed to `navigator.credentials.get()`
+    ///
+    /// When decoding using `Decodable`, this is decoded from base64url to bytes.
+    public let clientDataJSON: [UInt8]
+
+    /// Contains the authenticator data returned by the authenticator.
+    ///
+    /// When decoding using `Decodable`, this is decoded from base64url to bytes.
+    public let authenticatorData: [UInt8]
+
+    /// Contains the raw signature returned from the authenticator
+    ///
+    /// When decoding using `Decodable`, this is decoded from base64url to bytes.
+    public let signature: [UInt8]
+
+    /// Contains the user handle returned from the authenticator, or null if the authenticator did not return
+    /// a user handle. Used by to give scope to credentials.
+    ///
+    /// When decoding using `Decodable`, this is decoded from base64url to bytes.
+    public let userHandle: [UInt8]?
+
+    /// Contains an attestation object, if the authenticator supports attestation in assertions.
+    /// The attestation object, if present, includes an attestation statement. Unlike the attestationObject
+    /// in an AuthenticatorAttestationResponse, it does not contain an authData key because the authenticator
+    /// data is provided directly in an AuthenticatorAssertionResponse structure.
+    ///
+    /// When decoding using `Decodable`, this is decoded from base64url to bytes.
+    public let attestationObject: [UInt8]?
+}
+
+extension AuthenticatorAssertionResponse: Codable {
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+
+        clientDataJSON = try container.decodeBytesFromURLEncodedBase64(forKey: .clientDataJSON)
+        authenticatorData = try container.decodeBytesFromURLEncodedBase64(forKey: .authenticatorData)
+        signature = try container.decodeBytesFromURLEncodedBase64(forKey: .signature)
+        userHandle = try container.decodeBytesFromURLEncodedBase64IfPresent(forKey: .userHandle)
+        attestationObject = try container.decodeBytesFromURLEncodedBase64IfPresent(forKey: .attestationObject)
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+
+        try container.encode(clientDataJSON.base64URLEncodedString(), forKey: .clientDataJSON)
+        try container.encode(authenticatorData.base64URLEncodedString(), forKey: .authenticatorData)
+        try container.encode(signature.base64URLEncodedString(), forKey: .signature)
+        try container.encodeIfPresent(userHandle?.base64URLEncodedString(), forKey: .userHandle)
+        try container.encodeIfPresent(attestationObject?.base64URLEncodedString(), forKey: .attestationObject)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case clientDataJSON
+        case authenticatorData
+        case signature
+        case userHandle
+        case attestationObject
+    }
+}
+
+struct ParsedAuthenticatorAssertionResponse: Sendable {
+    let rawClientData: [UInt8]
+    let clientData: CollectedClientData
+    let rawAuthenticatorData: [UInt8]
+    let authenticatorData: AuthenticatorData
+    let signature: URLEncodedBase64
+    let userHandle: [UInt8]?
+
+    init(from authenticatorAssertionResponse: AuthenticatorAssertionResponse) throws {
+        rawClientData = authenticatorAssertionResponse.clientDataJSON
+        clientData = try JSONDecoder().decode(CollectedClientData.self, from: Data(rawClientData))
+
+        rawAuthenticatorData = authenticatorAssertionResponse.authenticatorData
+        authenticatorData = try AuthenticatorData(bytes: rawAuthenticatorData)
+        signature = authenticatorAssertionResponse.signature.base64URLEncodedString()
+        userHandle = authenticatorAssertionResponse.userHandle
+    }
+
+    // swiftlint:disable:next function_parameter_count
+    func verify(
+        expectedChallenge: [UInt8],
+        relyingPartyOrigin: String,
+        relyingPartyID: String,
+        requireUserVerification: Bool,
+        credentialPublicKey: [UInt8],
+        credentialCurrentSignCount: UInt32,
+        credentialBackupEligible: Bool? = nil
+    ) throws {
+        try clientData.verify(
+            storedChallenge: expectedChallenge,
+            ceremonyType: .assert,
+            relyingPartyOrigin: relyingPartyOrigin
+        )
+
+        let expectedRelyingPartyIDData = Data(relyingPartyID.utf8)
+        let expectedRelyingPartyIDHash = SHA256.hash(data: expectedRelyingPartyIDData)
+        guard expectedRelyingPartyIDHash == authenticatorData.relyingPartyIDHash else {
+            throw WebAuthnError.relyingPartyIDHashDoesNotMatch
+        }
+
+        guard authenticatorData.flags.userPresent else { throw WebAuthnError.userPresentFlagNotSet }
+        if requireUserVerification {
+            guard authenticatorData.flags.userVerified else { throw WebAuthnError.userVerifiedFlagNotSet }
+        }
+
+        // RPCE local modification: assertion authenticator data MUST NOT include attested
+        // credential data (AT flag), the backup-state flag requires backup-eligible (BS => BE),
+        // and — when the stored value is provided — backup-eligible is immutable across ceremonies.
+        guard !authenticatorData.flags.attestedCredentialData else {
+            throw WebAuthnError.attestedCredentialDataFlagSetInAssertion
+        }
+        guard !(authenticatorData.flags.isCurrentlyBackedUp && !authenticatorData.flags.isBackupEligible) else {
+            throw WebAuthnError.invalidBackupFlags
+        }
+        if let credentialBackupEligible,
+           credentialBackupEligible != authenticatorData.flags.isBackupEligible {
+            throw WebAuthnError.backupEligibilityMismatch
+        }
+
+        if authenticatorData.counter > 0 || credentialCurrentSignCount > 0 {
+            guard authenticatorData.counter > credentialCurrentSignCount else {
+                // This is a signal that the authenticator may be cloned, i.e. at least two copies of the credential
+                // private key may exist and are being used in parallel.
+                throw WebAuthnError.potentialReplayAttack
+            }
+        }
+
+        let clientDataHash = SHA256.hash(data: rawClientData)
+        let signatureBase = rawAuthenticatorData + clientDataHash
+
+        let credentialPublicKey = try CredentialPublicKey(publicKeyBytes: credentialPublicKey)
+        guard let signatureData = signature.urlDecoded.decoded else { throw WebAuthnError.invalidSignature }
+        try credentialPublicKey.verify(signature: signatureData, data: signatureBase)
+    }
+}
