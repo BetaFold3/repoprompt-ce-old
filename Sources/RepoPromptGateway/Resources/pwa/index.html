@@ -273,6 +273,7 @@ label.skip { color: var(--text-2); }
 }
 #composer-send { flex: none; border-radius: 22px; }
 #action-status { min-height: 1.4em; }
+#lock-message { margin: 0; overflow-wrap: anywhere; }
 
 .overlay {
   position: fixed; inset: 0; z-index: 20; display: flex; align-items: center; justify-content: center;
@@ -296,6 +297,7 @@ details#activity-panel > summary {
   <button id="back-to-sessions" class="link hidden"><span aria-hidden="true">&lsaquo;</span> Sessions</button>
   <h1>RepoPrompt Remote</h1>
   <button id="stop-button" class="danger hidden">Stop</button>
+  <button id="lock-button" class="link hidden" type="button">Lock</button>
   <span id="conn-badge" class="badge">disconnected</span>
 </header>
 <main>
@@ -327,6 +329,19 @@ details#activity-panel > summary {
       <button id="unpair-button" class="secondary">Forget pairing</button>
     </div>
     <p id="connect-status" class="hint"></p>
+  </section>
+
+  <!-- Passkey lock: shown in place of all session content while this browser is locked -->
+  <section id="lock-panel" class="panel hidden" aria-labelledby="lock-title">
+    <h2 id="lock-title">Checking access</h2>
+    <p id="lock-message"></p>
+    <div class="row">
+      <button id="unlock-button" type="button" class="hidden">Unlock</button>
+      <button id="setup-passkey-button" type="button" class="hidden">Set up passkey</button>
+      <button id="lock-reconnect" type="button" class="secondary hidden">Reconnect</button>
+    </div>
+    <p id="lock-status" class="hint" role="status"></p>
+    <p id="lock-uncertain" class="hint err hidden"></p>
   </section>
 
   <!-- Sessions -->

@@ -125,7 +125,7 @@ Step 3 — done | rounds 2/2 | open: none; both lanes cleared; see evidence step
 Change: unlock/enrollment/needs-Mac states, user-gesture-safe ceremonies, Lock, content clearing, draft retention and stale-response fences; preserve deep link and channel identity. No account system or new framework.
 Validation: existing `PWAResourceTests` plus focused JavaScriptCore fixtures for locked rendering, denied/cancelled ceremonies, stale challenges, all async lock transitions, uncertain sends, matching question draft restoration, reconnect and foreground restoration; retain unsafe-rendering API bans. Lint and minimal syntax/layout checks only; do not build browser infrastructure.
 Done when: all deterministic transitions preserve pairing and unsent work while withholding content; phone-only behavior is explicitly pending, not claimed from fixtures.
-Step 4 — todo | rounds 0/2 | open: none | downgraded: none | assumed: hide content while locked; in-page draft retention | deferred: real Safari behavior to Step 5
+Step 4 — done | rounds 1/2 | open: none; both lanes cleared; see evidence step4-review-disposition.md | downgraded: none | assumed: hide content while locked; in-page draft retention; 45-second option cache | deferred: live Safari to Step 5; nonblocking browser edge cases in evidence
 
 ### Step 5 — Owner-approved deployment and live acceptance
 Change: none unless live acceptance exposes an in-scope defect. Ask immediately before deployment/relaunch and every required manual or credential action. First target is Dev + normal iPhone Safari + current 1Password; other build/browser combinations are not prerequisites without separate owner approval.

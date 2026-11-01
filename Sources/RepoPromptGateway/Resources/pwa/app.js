@@ -5,7 +5,9 @@
 // - one-time app-minted ticket + per-frame P256 device signatures (DPoP-lite),
 // - direct session subscribe / poll / transcript catch-up / respond / steer / cancel,
 // - binding_required surface for the sessions list,
-// - Web Push wake registration (push_subscribe) with identifier-only payloads.
+// - Web Push wake registration (push_subscribe) with identifier-only payloads,
+// - optional passkey unlock: lock presentation, native WebAuthn ceremonies started
+//   directly from the user's tap, Lock, and foreground activity reports.
 //
 // Every piece of agent or server text reaches the page through textContent or
 // DOM node construction only; this file never parses strings as markup.
@@ -27,6 +29,28 @@ const TRANSCRIPT_PAGE = 200;
 const COMMAND_TIMEOUT_MS = 120000;
 const ACTIVE_STATUSES = ['running', 'waiting_for_input'];
 const IDLE_STATUSES = ['completed', 'failed', 'cancelled'];
+// Passkey unlock. The app's challenge lives 60 seconds from the begin request; options
+// are used only while at least 15 seconds of that remain, so a prompt is not started
+// on a challenge about to expire. Ages use the monotonic clock.
+const CEREMONY_CHALLENGE_LIFETIME_MS = 60000;
+const CEREMONY_OPTIONS_MARGIN_MS = 15000;
+// At most one foreground activity report per 30 seconds; never a trailing timer.
+const ACTIVITY_THROTTLE_MS = 30000;
+const CREDENTIAL_MAX_BYTES = 64 * 1024;
+// Gateway reason codes (GatewaySafeControlReason raw values).
+const PASSKEY_EXPIRED_REASON = 'passkey_expired';
+const LOCK_CODES = ['passkey_locked', PASSKEY_EXPIRED_REASON];
+const PASSKEY_FAILURE_CODES = {
+  staleCeremony: 'passkey_stale_ceremony',
+  unavailable: 'passkey_unavailable',
+  authenticationFailure: 'authentication_failed',
+};
+// Trusted user input that counts as foreground activity. Scrolling alone does not:
+// the page scrolls itself while rendering.
+const ACTIVITY_EVENTS = ['keydown', 'input', 'change', 'click', 'touchstart', 'wheel'];
+const UNCERTAIN_ACTION_TEXT = 'An action sent before access was checked again may have completed. '
+  + 'Check the refreshed session before trying it again.';
+const monotonicNow = () => performance.now();
 
 // ---------------------------------------------------------------------------
 // Small utilities
@@ -208,6 +232,41 @@ const state = {
   transcriptBrowsing: false,
   lastSeqBySession: new Map(),
   questionInputs: null, // structured question form controls for the shown interaction
+  // Passkey access. `access` is the latest authoritative metadata from hello_ack or
+  // lock_state (null: unknown, so content stays hidden); `accessKey` identifies it
+  // without the advisory reason and display deadline, so repeats are ignored.
+  access: null,
+  accessKey: null,
+  // Session content (list, detail, transcript, questions) is shown only while true.
+  contentOpen: false,
+  // Bumped whenever protected content is cleared; async completions and timers that
+  // started under an older value write nothing.
+  accessGeneration: 0,
+  // Content held closed until the access changes or a fresh hello: after Lock (the
+  // lock frame is re-sent on reconnect) or a generic lock error.
+  hold: null, // {key, resendLock}
+  needsFreshHello: false, // content was hidden for the background; reconnect on return
+  ceremony: null, // {kind, phase, ws, accessKey, initiatedAt, maxAge, publicKey, ceremonyId, stale}
+  ceremonyNotice: '',
+  ceremonyDoneKey: null, // access key when a ceremony completed; buttons wait for new metadata
+  activitySentAt: 0,
+  // Actions still awaiting their reply, and those whose outcome a lock or hidden page
+  // made unknown (dropped again when their success or refusal arrives).
+  actionsInFlight: new Set(),
+  uncertainActions: new Set(),
+  // Status text that only covers the wait for fresh options.
+  noticeEndsWhenReady: false,
+  // A failure notice kept through the one reconnect that follows a ceremony.
+  keepNoticeOnHello: false,
+  // Counts trips to the background; a socket remembers the count it was created under.
+  hideSeq: 0,
+  // Unsent drafts kept in page memory only across a lock: composer text by session,
+  // question answers by session and exact interaction id.
+  composerDrafts: new Map(),
+  questionDrafts: new Map(),
+  // The session whose composer and question form are still in the (possibly hidden)
+  // detail view, including after Sessions cleared currentSessionId.
+  detailSessionId: null,
 };
 
 function viewIsCurrent(generation) {
@@ -354,10 +413,30 @@ function resetIdentityState() {
   state.sessions.clear();
   state.revisionBySession.clear();
   state.lastSeqBySession.clear();
+  state.access = null;
+  state.accessKey = null;
+  state.contentOpen = false;
+  state.accessGeneration += 1;
+  state.hold = null;
+  state.needsFreshHello = false;
+  state.ceremony = null;
+  setCeremonyNotice('');
+  state.keepNoticeOnHello = false;
+  state.ceremonyDoneKey = null;
+  state.uncertainActions.clear();
+  clearTimeout(detailRefreshTimer);
+  detailRefreshTimer = null;
+  clearTimeout(transcriptRefreshTimer);
+  transcriptRefreshTimer = null;
+  state.composerDrafts.clear();
+  state.questionDrafts.clear();
+  state.detailSessionId = null;
+  clearCopyTimers();
   setActionStatus('');
   $('sessions-panel').classList.add('hidden');
   $('detail-panel').classList.add('hidden');
   hideDetailChrome();
+  renderAccess();
 }
 
 async function forgetIdentity() {
@@ -405,6 +484,7 @@ function renderIdentity() {
     $('paired-name').textContent = state.displayName || '–';
     $('paired-device-id').textContent = state.deviceId || '–';
   }
+  renderAccess();
 }
 
 // ---------------------------------------------------------------------------
@@ -468,7 +548,9 @@ function rejectPendingFor(ws, message) {
   }
 }
 
-function sendCommand(frame) {
+// `expect` names a passkey reply ({type, kind}) the request is settled by instead of
+// command_result; command_error settles any request.
+function sendCommand(frame, expect) {
   return new Promise((resolve, reject) => {
     const ws = state.ws;
     if (!ws || !state.connected || ws.readyState !== WebSocket.OPEN) {
@@ -480,7 +562,7 @@ function sendCommand(frame) {
     const timer = setTimeout(() => {
       if (settlePending(requestId)) reject(new Error(`Timed out waiting for ${frame.type}.`));
     }, COMMAND_TIMEOUT_MS);
-    state.pending.set(requestId, { resolve, reject, timer, ws });
+    state.pending.set(requestId, { resolve, reject, timer, ws, expect: expect || null });
     enqueueSignedSend(ws, complete).catch((error) => {
       if (settlePending(requestId)) reject(error);
     });
@@ -490,10 +572,12 @@ function sendCommand(frame) {
 async function connect() {
   if (state.ws || state.connecting) return;
   state.connecting = true;
+  renderAccess();
   try {
     await openConnection();
   } finally {
     state.connecting = false;
+    renderAccess();
   }
 }
 
@@ -529,14 +613,20 @@ async function openConnection() {
 
   const wsURL = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
   const ws = new WebSocket(wsURL);
+  ws.hideSeq = state.hideSeq;
+  ws.createdVisible = document.visibilityState === 'visible';
   state.ws = ws;
   $('connect-status').textContent = 'Connecting…';
+  renderAccess();
 
   ws.onopen = () => {
     enqueueSignedSend(ws, { v: WIRE_VERSION, type: 'hello', payload: { ticket } })
       .catch((error) => logLine(`hello failed: ${error.message}`));
   };
-  ws.onmessage = (event) => handleServerFrame(event.data);
+  // Frames from a replaced or closed socket are dropped before any handling.
+  ws.onmessage = (event) => {
+    if (state.ws === ws) handleServerFrame(event.data);
+  };
   ws.onclose = () => {
     rejectPendingFor(ws, 'Connection closed.');
     if (state.ws === ws) {
@@ -545,6 +635,8 @@ async function openConnection() {
       setBadge('disconnected', 'err');
       $('connect-status').textContent = 'Disconnected.';
       $('push-button').disabled = true;
+      if (protectsContent()) closeProtectedView();
+      renderAccess();
     }
   };
   ws.onerror = () => logLine('WebSocket error.');
@@ -559,6 +651,14 @@ function disconnect() {
     ws.close();
   }
   setBadge('disconnected', '');
+  if (protectsContent()) closeProtectedView();
+  renderAccess();
+}
+
+// Closes this socket and connects again for an authoritative hello.
+function reconnectNow() {
+  disconnect();
+  connect();
 }
 
 // ---------------------------------------------------------------------------
@@ -589,11 +689,33 @@ function handleServerFrame(raw) {
         $('push-button').disabled = false;
       }
       logLine(`hello_ack auth=${payload.auth || '?'}`);
-      const target = state.currentSessionId || state.deepLinkSessionId;
-      if (target) {
-        openSession(target);
+      state.ceremonyDoneKey = null;
+      // A failure notice that led to this reconnect stays readable.
+      if (!state.keepNoticeOnHello) setCeremonyNotice('');
+      state.keepNoticeOnHello = false;
+      // A ceremony begun on an earlier connection can never complete on this one.
+      if (state.ceremony && state.ceremony.ws !== state.ws) state.ceremony = null;
+      // Missing, malformed or inconsistent access metadata keeps content hidden.
+      const access = normalizeAccess(payload.access);
+      const consistent = access && (typeof payload.locked !== 'boolean' || payload.locked === access.locked);
+      applyAccess(consistent ? access : null, true);
+      break;
+    }
+    case 'lock_state':
+      // The payload is the access object itself. It may arrive before hello_ack.
+      applyAccess(normalizeAccess(frame.payload), false);
+      break;
+    case 'passkey_challenge':
+    case 'passkey_ceremony_complete': {
+      // Settles only the begin or complete request it answers, with the expected kind.
+      const pending = frame.request_id ? settlePending(frame.request_id) : null;
+      if (!pending) break;
+      const payload = frame.payload || {};
+      const expect = pending.expect;
+      if (expect && expect.type === frame.type && payload.kind === expect.kind) {
+        pending.resolve(payload);
       } else {
-        showSessionsList();
+        pending.reject(commandError({ code: 'protocol_error', message: 'Unexpected passkey reply.' }));
       }
       break;
     }
@@ -602,12 +724,15 @@ function handleServerFrame(raw) {
       const pending = frame.request_id ? settlePending(frame.request_id) : null;
       const isError = frame.type === 'command_error';
       const code = frame.payload && frame.payload.code;
-      if (isError && (code === 'binding_required' || code === 'ambiguous_start_target')) {
+      if (isError && LOCK_CODES.includes(code)) handleLockError();
+      if (state.contentOpen && isError && (code === 'binding_required' || code === 'ambiguous_start_target')) {
         showBindingOverlay(frame.payload.message);
       }
       if (pending) {
         if (isError) {
           pending.reject(commandError(frame.payload));
+        } else if (pending.expect) {
+          pending.reject(commandError({ code: 'protocol_error', message: 'Unexpected reply.' }));
         } else {
           pending.resolve(frame.payload || {});
         }
@@ -618,6 +743,7 @@ function handleServerFrame(raw) {
     }
     case 'session_update':
     case 'session_terminal': {
+      if (!state.contentOpen) break;
       if (frame.session_id) {
         detectSeqGap(frame);
         bumpRevision(frame.session_id);
@@ -634,6 +760,7 @@ function handleServerFrame(raw) {
       break;
     }
     case 'interaction_resolved': {
+      if (!state.contentOpen) break;
       if (frame.session_id) {
         // interaction_resolved consumes the same per-session seq stream as
         // updates/terminal frames; track it so the next snapshot does not look
@@ -644,6 +771,7 @@ function handleServerFrame(raw) {
       break;
     }
     case 'session_expired': {
+      if (!state.contentOpen) break;
       if (frame.session_id) {
         bumpRevision(frame.session_id);
         state.sessions.delete(frame.session_id);
@@ -713,8 +841,11 @@ function showSessionsList() {
 }
 
 async function refreshSessions() {
+  const accessGeneration = state.accessGeneration;
   try {
     const result = await sendCommand({ type: 'list_sessions', payload: { limit: 50 } });
+    // A list answered after a lock is dropped, not cached or rendered.
+    if (state.accessGeneration !== accessGeneration) return;
     const items = result.sessions || result.items || (Array.isArray(result) ? result : []);
     for (const item of items) {
       const sessionId = item.session_id || item.id;
@@ -726,7 +857,7 @@ async function refreshSessions() {
       await sendCommand({ type: 'subscribe', payload: { session_ids: ids } }).catch(() => {});
     }
   } catch (error) {
-    logLine(`list_sessions failed: ${error.message}`);
+    if (state.accessGeneration === accessGeneration) logLine(`list_sessions failed: ${error.message}`);
   }
 }
 
@@ -762,14 +893,19 @@ async function openSession(sessionId) {
   const switching = state.currentSessionId !== sessionId;
   if (switching) state.viewGeneration += 1;
   const generation = state.viewGeneration;
+  const accessGeneration = state.accessGeneration;
   state.currentSessionId = sessionId;
+  state.detailSessionId = sessionId;
   $('sessions-panel').classList.add('hidden');
   $('detail-panel').classList.remove('hidden');
   $('back-to-sessions').classList.remove('hidden');
   $('detail-session-id').textContent = shortID(sessionId);
   if (switching) {
     resetTranscriptView();
-    $('composer-input').value = '';
+    // An unsent draft kept across a lock comes back exactly as typed; nothing is sent.
+    const kept = state.composerDrafts.get(sessionId);
+    state.composerDrafts.delete(sessionId);
+    $('composer-input').value = kept === undefined ? '' : kept;
     sizeComposer();
     setActionStatus('');
   }
@@ -780,7 +916,7 @@ async function openSession(sessionId) {
     await sendCommand({ type: 'subscribe', session_id: sessionId });
   } catch (error) {
     if (viewIsCurrent(generation)) setActionStatus(error.message, 'err');
-    logLine(`subscribe failed: ${error.code || error.message}`);
+    if (state.accessGeneration === accessGeneration) logLine(`subscribe failed: ${error.code || error.message}`);
   }
   if (!viewIsCurrent(generation)) return;
   await pollSession(sessionId);
@@ -795,9 +931,11 @@ async function pollSession(sessionId) {
   const target = sessionId || state.currentSessionId;
   if (!target) return null;
   const generation = state.viewGeneration;
+  const accessGeneration = state.accessGeneration;
   const revision = state.revisionBySession.get(target) || 0;
   try {
     const snapshot = await sendCommand({ type: 'poll', session_id: target });
+    if (state.accessGeneration !== accessGeneration) return null;
     if ((state.revisionBySession.get(target) || 0) !== revision) {
       // A streamed update arrived while this poll was in flight; it is newer.
       return state.sessions.get(target) || null;
@@ -808,6 +946,7 @@ async function pollSession(sessionId) {
     }
     return snapshot;
   } catch (error) {
+    if (state.accessGeneration !== accessGeneration) return null;
     if (target === state.currentSessionId && viewIsCurrent(generation)) setActionStatus(error.message, 'err');
     logLine(`poll failed: ${error.code || error.message}`);
     return null;
@@ -817,11 +956,14 @@ async function pollSession(sessionId) {
 let detailRefreshTimer = null;
 function scheduleDetailRefresh() {
   if (detailRefreshTimer) return;
-  detailRefreshTimer = setTimeout(() => {
-    detailRefreshTimer = null;
+  const accessGeneration = state.accessGeneration;
+  const timer = setTimeout(() => {
+    if (detailRefreshTimer === timer) detailRefreshTimer = null;
+    if (state.accessGeneration !== accessGeneration) return;
     pollSession();
     maybeRefreshTranscript();
   }, 750);
+  detailRefreshTimer = timer;
 }
 
 function renderSessionDetail() {
@@ -875,6 +1017,7 @@ function renderInteraction(interaction, payload) {
   $('respond-button').classList.toggle('hidden', !answerable);
   if (answerable) {
     renderQuestionForm(fields);
+    restoreQuestionDraft(state.currentSessionId, interactionId);
   } else {
     $('question-form').replaceChildren();
     state.questionInputs = null;
@@ -1341,10 +1484,13 @@ function codeBlock(language, text) {
   block.append(head, pre);
   let reset = null;
   copy.onclick = async () => {
+    const accessGeneration = state.accessGeneration;
     let label = 'Copied';
     try {
       await navigator.clipboard.writeText(text);
     } catch {
+      // Cleared by a lock while the clipboard was answering: nothing to select or label.
+      if (state.accessGeneration !== accessGeneration) return;
       label = 'Not copied';
       try {
         const selection = window.getSelection();
@@ -1354,9 +1500,16 @@ function codeBlock(language, text) {
         // Neither copied nor selected.
       }
     }
+    if (state.accessGeneration !== accessGeneration) return;
     show(label);
     clearTimeout(reset);
-    reset = setTimeout(() => show('Copy'), 1500);
+    copyResetTimers.delete(reset);
+    const timer = setTimeout(() => {
+      copyResetTimers.delete(timer);
+      show('Copy');
+    }, 1500);
+    reset = timer;
+    copyResetTimers.add(timer);
   };
   return block;
 }
@@ -1643,6 +1796,7 @@ async function loadTranscript() {
     return;
   }
   const generation = state.viewGeneration;
+  const accessGeneration = state.accessGeneration;
   const token = state.transcriptToken;
   const request = {};
   state.transcriptLiveRequest = request;
@@ -1668,7 +1822,7 @@ async function loadTranscript() {
     state.transcriptLiveText = transcriptText(result);
     renderTranscript(true);
   } catch (error) {
-    logLine(`get_log failed: ${error.message}`);
+    if (state.accessGeneration === accessGeneration) logLine(`get_log failed: ${error.message}`);
   } finally {
     // A load dropped by Refresh or a new session view no longer owns this state.
     if (state.transcriptLiveRequest === request) {
@@ -1688,6 +1842,7 @@ async function loadOlderTranscript() {
   const start = state.transcriptStart;
   if (!sessionId || state.transcriptOlderRequest || !(start > 0)) return;
   const generation = state.viewGeneration;
+  const accessGeneration = state.accessGeneration;
   const token = state.transcriptToken;
   const request = {};
   state.transcriptOlderRequest = request;
@@ -1703,7 +1858,7 @@ async function loadOlderTranscript() {
     state.transcriptStart = offset;
     state.transcriptBrowsing = true;
   } catch (error) {
-    logLine(`get_log failed: ${error.message}`);
+    if (state.accessGeneration === accessGeneration) logLine(`get_log failed: ${error.message}`);
   } finally {
     if (state.transcriptOlderRequest === request) {
       state.transcriptOlderRequest = null;
@@ -1717,11 +1872,14 @@ async function loadOlderTranscript() {
 let transcriptRefreshTimer = null;
 function maybeRefreshTranscript() {
   if (transcriptRefreshTimer || state.transcriptBrowsing) return;
-  transcriptRefreshTimer = setTimeout(() => {
-    transcriptRefreshTimer = null;
+  const accessGeneration = state.accessGeneration;
+  const timer = setTimeout(() => {
+    if (transcriptRefreshTimer === timer) transcriptRefreshTimer = null;
+    if (state.accessGeneration !== accessGeneration) return;
     if (state.transcriptBrowsing) return;
     loadTranscript();
   }, 750);
+  transcriptRefreshTimer = timer;
 }
 
 // Top: the start of the loaded transcript ("Load earlier messages" while older turns
@@ -1751,16 +1909,28 @@ async function runAction(button, pendingText, action) {
   const sessionId = state.currentSessionId;
   if (!sessionId) return;
   const generation = state.viewGeneration;
+  const accessGeneration = state.accessGeneration;
   button.disabled = true;
   setActionStatus(pendingText);
+  // An action still in flight when the page locks or hides has an unknown outcome until
+  // its reply settles it; it is never sent again automatically.
+  const token = {};
+  state.actionsInFlight.add(token);
   try {
     const doneText = await action(sessionId, generation);
+    state.uncertainActions.delete(token);
     if (viewIsCurrent(generation)) setActionStatus(doneText, 'ok');
   } catch (error) {
+    // A refusal with its own code settled the action; a lock error or a lost
+    // connection leaves it unknown.
+    if (error.code && !LOCK_CODES.includes(error.code)) state.uncertainActions.delete(token);
     if (viewIsCurrent(generation)) setActionStatus(error.message, 'err');
-    logLine(`${pendingText} failed: ${error.code || error.message}`);
+    // Not written into a log cleared by a lock; the uncertain-action notice covers it.
+    if (state.accessGeneration === accessGeneration) logLine(`${pendingText} failed: ${error.code || error.message}`);
   } finally {
+    state.actionsInFlight.delete(token);
     button.disabled = false;
+    if (!state.contentOpen) renderAccess();
     if (viewIsCurrent(generation) && state.connected) {
       await pollSession(sessionId);
       maybeRefreshTranscript();
@@ -1793,6 +1963,8 @@ function respond() {
     if (!state.questionInputs || !interactionId) throw new Error('Answer this on your Mac.');
     const payload = { interaction_id: interactionId, answers: collectAnswers() };
     await sendCommand({ type: 'respond', session_id: sessionId, payload });
+    // Answers known to be sent are never put back from a kept draft.
+    state.questionDrafts.delete(questionDraftKey(sessionId, interactionId));
     return 'Answer sent.';
   });
 }
@@ -1806,8 +1978,12 @@ function sendComposer() {
     const message = draft.trim();
     if (!message) throw new Error('Type a message first.');
     await sendCommand({ type: 'steer', session_id: sessionId, payload: { message } });
-    // Clear only the draft that was sent, and only in the view it was sent from.
-    if (viewIsCurrent(generation) && input.value === draft) {
+    // Text known to be sent is never put back from a draft kept across a lock.
+    if (state.composerDrafts.get(sessionId) === draft) state.composerDrafts.delete(sessionId);
+    // Clear only the draft that was sent, and only in the view it was sent from, also
+    // while that view is kept behind the sessions list; newer text stays.
+    const sameView = viewIsCurrent(generation) || (!state.currentSessionId && state.detailSessionId === sessionId);
+    if (sameView && input.value === draft) {
       input.value = '';
       sizeComposer();
     }
@@ -1830,6 +2006,727 @@ function stopSession() {
     await sendCommand({ type: 'cancel', session_id: sessionId, payload: { run_id: runId } });
     return 'Stop sent.';
   });
+}
+
+// ---------------------------------------------------------------------------
+// Passkey access
+//
+// The gateway decides access; this page only follows its latest hello_ack.access or
+// lock_state metadata. Content shows only while that metadata allows it. Every way of
+// losing access (Lock, lock_state, expiry, a generic lock error, a required-mode
+// disconnect, going to the background) runs closeProtectedView(), which keeps unsent
+// drafts in memory, clears content from the page and state, and advances the
+// generations that every async completion and timer checks before writing.
+
+const copyResetTimers = new Set();
+
+function clearCopyTimers() {
+  for (const timer of copyResetTimers) clearTimeout(timer);
+  copyResetTimers.clear();
+}
+
+// Policy-off browsers keep the ordinary pairing-only behavior. Unknown access counts
+// as protected.
+function protectsContent() {
+  return !(state.access && state.access.policy_state === 'off');
+}
+
+function normalizeAccess(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const counter = (value) => typeof value === 'string' && /^\d{1,20}$/.test(value);
+  if (!['off', 'required', 'unprotected'].includes(raw.policy_state)) return null;
+  if (typeof raw.locked !== 'boolean' || typeof raw.enrolled !== 'boolean') return null;
+  if (typeof raw.enrollment_open !== 'boolean') return null;
+  if (!counter(raw.epoch) || !counter(raw.lock_generation)) return null;
+  if (raw.grant_id !== undefined && (typeof raw.grant_id !== 'string' || !raw.grant_id)) return null;
+  return {
+    policy_state: raw.policy_state,
+    locked: raw.locked,
+    enrolled: raw.enrolled,
+    enrollment_open: raw.enrollment_open,
+    epoch: raw.epoch,
+    lock_generation: raw.lock_generation,
+    grant_id: raw.grant_id || null,
+    reason: typeof raw.reason === 'string' ? raw.reason : null,
+  };
+}
+
+// The reason and the remaining lifetime are advisory, so they are not part of the key.
+function accessKeyOf(access) {
+  return [
+    access.policy_state, access.locked, access.enrolled, access.enrollment_open,
+    access.epoch, access.lock_generation, access.grant_id || '',
+  ].join('|');
+}
+
+function accessAllowsContent(access) {
+  if (!access || access.locked) return false;
+  if (access.policy_state === 'required') return Boolean(access.grant_id);
+  return access.policy_state === 'off' || access.policy_state === 'unprotected';
+}
+
+// Content stays sealed while the page is hidden, and after a return until a hello from
+// a connection made in the foreground: metadata alone never shows it again.
+function presentationSealed() {
+  return document.visibilityState !== 'visible' || state.needsFreshHello;
+}
+
+// Applies authoritative metadata. A repeated lock_state with the same key changes
+// nothing: no clearing, no new begin, no refetch. hello_ack is always re-evaluated.
+function applyAccess(access, fromHello) {
+  const key = access ? accessKeyOf(access) : null;
+  if (!fromHello && access && key === state.accessKey) return;
+  if (fromHello && document.visibilityState === 'visible') state.needsFreshHello = false;
+  const changed = key !== state.accessKey;
+  state.access = access;
+  state.accessKey = key;
+  if (state.hold) {
+    if (!access || access.locked || key !== state.hold.key) {
+      state.hold = null;
+    } else if (fromHello) {
+      // Still unlocked under the same grant after a reconnect: a Lock the gateway
+      // may not have received is sent again; a held lock error is resolved by hello.
+      if (state.hold.resendLock) sendLockFrame();
+      else state.hold = null;
+    }
+  }
+  if (changed) {
+    invalidateCeremony();
+    setCeremonyNotice('');
+    state.ceremonyDoneKey = null;
+  }
+  if (!accessAllowsContent(access) || state.hold) {
+    closeProtectedView();
+  } else if (presentationSealed()) {
+    // Access to reopen is confirmed again by a foreground hello; nothing is refetched now.
+    if (state.contentOpen && protectsContent()) closeProtectedView();
+    if (!state.contentOpen) state.needsFreshHello = true;
+  } else if (state.connected) {
+    if (!state.contentOpen) openProtectedView();
+    else if (fromHello) reopenTarget();
+  }
+  renderAccess();
+  maybePrefetchCeremony();
+}
+
+function reopenTarget() {
+  const target = state.currentSessionId || state.deepLinkSessionId;
+  if (target) {
+    openSession(target);
+  } else {
+    showSessionsList();
+  }
+}
+
+// Unlock refetches and resubscribes through the ordinary paths.
+function openProtectedView() {
+  state.contentOpen = true;
+  state.needsFreshHello = false;
+  setCeremonyNotice('');
+  renderAccess();
+  reopenTarget();
+  if (state.uncertainActions.size > 0) {
+    state.uncertainActions.clear();
+    setActionStatus(UNCERTAIN_ACTION_TEXT, 'err');
+    $('connect-status').textContent = UNCERTAIN_ACTION_TEXT;
+  }
+}
+
+function questionDraftKey(sessionId, interactionId) {
+  return `${sessionId}\u0000${interactionId}`;
+}
+
+// Raw values, exactly as left: partial and whitespace-only text, selections, skips.
+function snapshotDrafts() {
+  const sessionId = state.currentSessionId || state.detailSessionId;
+  if (!sessionId) return;
+  const draft = $('composer-input').value;
+  if (draft) {
+    state.composerDrafts.set(sessionId, draft);
+  } else {
+    state.composerDrafts.delete(sessionId);
+  }
+  const interactionId = $('interaction-box').dataset.interactionId;
+  if (interactionId && state.questionInputs) {
+    state.questionDrafts.set(questionDraftKey(sessionId, interactionId), state.questionInputs.map((question) => ({
+      id: question.id,
+      selected: question.optionInputs.filter((input) => input.checked).map((input) => input.value),
+      custom: question.customInput ? question.customInput.value : null,
+      skipped: question.skipInput.checked,
+    })));
+  }
+}
+
+// Called once a fresh question form was built: answers kept for this session and
+// exact interaction id are put back. Nothing is submitted.
+function restoreQuestionDraft(sessionId, interactionId) {
+  const key = questionDraftKey(sessionId, interactionId);
+  const saved = state.questionDrafts.get(key);
+  if (!saved || !interactionId) return;
+  state.questionDrafts.delete(key);
+  (state.questionInputs || []).forEach((question, index) => {
+    const entry = saved[index];
+    if (!entry || entry.id !== question.id) return;
+    for (const input of question.optionInputs) input.checked = entry.selected.includes(input.value);
+    if (question.customInput && typeof entry.custom === 'string') question.customInput.value = entry.custom;
+    question.skipInput.checked = entry.skipped;
+    question.skipInput.onchange();
+  });
+}
+
+// Clears every piece of session content from the page and from memory. Drafts are
+// kept first, but only while content is shown, so a second transition cannot
+// overwrite them with the already-cleared fields.
+function closeProtectedView() {
+  const wasOpen = state.contentOpen;
+  if (wasOpen) {
+    snapshotDrafts();
+    for (const token of state.actionsInFlight) state.uncertainActions.add(token);
+  }
+  state.detailSessionId = null;
+  state.contentOpen = false;
+  state.accessGeneration += 1;
+  state.viewGeneration += 1;
+  // The target session (deep link or the one being read) is reopened after unlock.
+  if (state.currentSessionId) state.deepLinkSessionId = state.currentSessionId;
+  state.currentSessionId = null;
+  clearTimeout(detailRefreshTimer);
+  detailRefreshTimer = null;
+  clearTimeout(transcriptRefreshTimer);
+  transcriptRefreshTimer = null;
+  clearCopyTimers();
+  resetTranscriptView();
+  state.sessions.clear();
+  state.revisionBySession.clear();
+  state.lastSeqBySession.clear();
+  state.questionInputs = null;
+  const box = $('interaction-box');
+  box.classList.add('hidden');
+  box.dataset.interactionId = '';
+  for (const id of ['interaction-title', 'interaction-text', 'interaction-context']) $(id).textContent = '';
+  $('question-form').replaceChildren();
+  $('sessions-list').replaceChildren();
+  for (const id of ['detail-name', 'detail-status', 'detail-session-id']) $(id).textContent = '';
+  $('composer-input').value = '';
+  $('composer').classList.add('hidden');
+  setActionStatus('');
+  $('sessions-panel').classList.add('hidden');
+  $('detail-panel').classList.add('hidden');
+  $('binding-overlay').classList.add('hidden');
+  hideDetailChrome();
+  // The activity log names sessions and actions.
+  if (wasOpen) $('log').textContent = '';
+}
+
+// A generic lock error for any request: content closes at once and stays closed
+// until the gateway reports new access or a fresh hello.
+function handleLockError() {
+  if (!state.contentOpen) return;
+  if (accessAllowsContent(state.access)) state.hold = { key: state.accessKey, resendLock: false };
+  closeProtectedView();
+  renderAccess();
+}
+
+// Lock clears this page first, then asks the gateway to lock every tab of this
+// browser. The gateway's lock_state is what the page follows afterwards.
+function lockNow() {
+  const access = state.access;
+  if (!state.contentOpen || !access || access.policy_state !== 'required') return;
+  state.hold = { key: state.accessKey, resendLock: true };
+  closeProtectedView();
+  renderAccess();
+  sendLockFrame();
+}
+
+function sendLockFrame() {
+  const ws = state.ws;
+  if (!ws || !state.connected || ws.readyState !== WebSocket.OPEN) return;
+  enqueueSignedSend(ws, { v: WIRE_VERSION, type: 'lock' })
+    .catch((error) => logLine(`lock not sent: ${error.message}`));
+}
+
+// Passkeys need the HTTPS page in a secure context with WebAuthn. There is no
+// password, weaker user-verification or plain-HTTP fallback.
+function passkeySupport() {
+  if (location.protocol !== 'https:' || window.isSecureContext !== true) return 'insecure';
+  const credentials = navigator.credentials;
+  if (!credentials || typeof credentials.get !== 'function' || typeof credentials.create !== 'function'
+    || typeof window.PublicKeyCredential === 'undefined') {
+    return 'unsupported';
+  }
+  return 'ok';
+}
+
+function ceremonyKindFor(access) {
+  if (!access || access.policy_state !== 'required' || !access.locked) return null;
+  if (access.enrolled) return 'assertion';
+  return access.enrollment_open ? 'registration' : null;
+}
+
+function requireText(value) {
+  if (typeof value !== 'string' || !value) throw new Error('The passkey request was incomplete.');
+  return value;
+}
+
+function optionsTimeout(publicKey, options) {
+  if (typeof options.timeout === 'number' && options.timeout > 0) publicKey.timeout = options.timeout;
+  return publicKey;
+}
+
+// The app's begin response (snake_case, base64url binary) to navigator.credentials.create().
+function creationOptions(options) {
+  const rp = options.rp || {};
+  const user = options.user || {};
+  const selection = options.authenticator_selection || {};
+  const params = Array.isArray(options.pub_key_cred_params) ? options.pub_key_cred_params : [];
+  if (selection.user_verification !== 'required' || !params.length) {
+    throw new Error('The passkey request was incomplete.');
+  }
+  const authenticatorSelection = { userVerification: 'required' };
+  if (typeof selection.resident_key === 'string') authenticatorSelection.residentKey = selection.resident_key;
+  return optionsTimeout({
+    challenge: base64ToBytes(requireText(options.challenge)),
+    rp: { id: requireText(rp.id), name: requireText(rp.name) },
+    user: {
+      id: base64ToBytes(requireText(user.id)),
+      name: requireText(user.name),
+      displayName: requireText(user.display_name),
+    },
+    pubKeyCredParams: params.map((param) => {
+      if (typeof param.alg !== 'number') throw new Error('The passkey request was incomplete.');
+      return { type: requireText(param.type), alg: param.alg };
+    }),
+    authenticatorSelection,
+    attestation: typeof options.attestation === 'string' ? options.attestation : 'none',
+  }, options);
+}
+
+// The app's begin response to navigator.credentials.get().
+function requestOptions(options) {
+  const allowed = Array.isArray(options.allow_credentials) ? options.allow_credentials : [];
+  if (options.user_verification !== 'required' || !allowed.length) {
+    throw new Error('The passkey request was incomplete.');
+  }
+  return optionsTimeout({
+    challenge: base64ToBytes(requireText(options.challenge)),
+    rpId: requireText(options.rp_id),
+    allowCredentials: allowed.map((entry) => ({ type: requireText(entry.type), id: base64ToBytes(requireText(entry.id)) })),
+    userVerification: 'required',
+  }, options);
+}
+
+function binaryToBase64URL(value) {
+  if (value === null || value === undefined) return '';
+  const bytes = ArrayBuffer.isView(value)
+    ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
+    : new Uint8Array(value);
+  return bytesToBase64URL(bytes);
+}
+
+// The completed credential as the JSON string the app verifies, every binary value
+// base64url; id and rawId are the same value.
+function serializeCredential(kind, credential) {
+  const unusable = 'This browser returned a passkey response that cannot be used.';
+  if (!credential || credential.type !== 'public-key' || !credential.response) throw new Error(unusable);
+  const rawId = binaryToBase64URL(credential.rawId);
+  if (!rawId || (typeof credential.id === 'string' && credential.id !== rawId)) throw new Error(unusable);
+  const response = credential.response;
+  const fields = { clientDataJSON: binaryToBase64URL(response.clientDataJSON) };
+  if (kind === 'registration') {
+    fields.attestationObject = binaryToBase64URL(response.attestationObject);
+  } else {
+    fields.authenticatorData = binaryToBase64URL(response.authenticatorData);
+    fields.signature = binaryToBase64URL(response.signature);
+    const userHandle = binaryToBase64URL(response.userHandle);
+    if (userHandle) fields.userHandle = userHandle;
+  }
+  if (Object.values(fields).some((value) => !value)) throw new Error(unusable);
+  const json = JSON.stringify({ id: rawId, rawId, type: 'public-key', response: fields });
+  if (utf8(json).length > CREDENTIAL_MAX_BYTES) throw new Error(unusable);
+  return json;
+}
+
+function ceremonyBindingCurrent(entry) {
+  return entry.ws === state.ws && entry.accessKey === state.accessKey && !entry.stale;
+}
+
+function ceremonyIsFresh(entry) {
+  return monotonicNow() - entry.initiatedAt < entry.maxAge;
+}
+
+function setCeremonyNotice(text, endsWhenReady) {
+  state.ceremonyNotice = text;
+  state.noticeEndsWhenReady = Boolean(endsWhenReady);
+}
+
+// A socket created in the foreground since the last trip to the background, whose
+// hello has not arrived yet: that hello is the fresh one, so the socket is kept.
+function socketAwaitsForegroundHello() {
+  const ws = state.ws;
+  return Boolean(ws) && !state.connected && ws.createdVisible === true && ws.hideSeq === state.hideSeq;
+}
+
+// The app binds a ceremony to the connection that began it, so a native prompt or its
+// complete keeps that socket open until it settles.
+function ceremonyHoldsSocket() {
+  const entry = state.ceremony;
+  return Boolean(entry) && Boolean(state.ws) && entry.ws === state.ws
+    && (entry.phase === 'native' || entry.phase === 'completing');
+}
+
+// After a ceremony settles: when its socket closed meanwhile, or it outlived a trip to the
+// background, a fresh connection's hello decides what to show. Nothing is resent on it.
+// `keepNotice` keeps a failure notice readable through that reconnect.
+function followUpCeremony(keepNotice) {
+  if (document.visibilityState === 'visible' && !ceremonyHoldsSocket()
+    && (!state.ws || (state.needsFreshHello && !socketAwaitsForegroundHello()))) {
+    state.keepNoticeOnHello = Boolean(keepNotice);
+    if (state.ws) reconnectNow();
+    else connect();
+    return;
+  }
+  maybePrefetchCeremony();
+}
+
+// Options fetched under older access are not used. A begin or native prompt in
+// progress finishes and is then discarded; a running complete is left to settle.
+function invalidateCeremony() {
+  const entry = state.ceremony;
+  if (!entry) return;
+  if (entry.phase === 'ready') {
+    state.ceremony = null;
+  } else if (entry.phase === 'fetching' || entry.phase === 'native') {
+    entry.stale = true;
+  }
+}
+
+// Fetches options for the shown Unlock or Set up button ahead of the tap. Only one
+// ceremony runs at a time: no begin while another begin or a complete is outstanding.
+function maybePrefetchCeremony() {
+  const entry = state.ceremony;
+  if (entry && entry.phase === 'ready' && !(ceremonyBindingCurrent(entry) && ceremonyIsFresh(entry))) {
+    state.ceremony = null;
+  }
+  const kind = ceremonyKindFor(state.access);
+  if (!kind || state.ceremony || state.hold || state.contentOpen) return;
+  if (!state.ws || !state.connected || document.visibilityState !== 'visible') return;
+  if (passkeySupport() !== 'ok' || state.ceremonyDoneKey === state.accessKey) return;
+  prefetchCeremony(kind);
+}
+
+function prefetchCeremony(kind) {
+  const entry = {
+    kind,
+    phase: 'fetching',
+    ws: state.ws,
+    accessKey: state.accessKey,
+    // Freshness counts from the request, not from the reply.
+    initiatedAt: monotonicNow(),
+    maxAge: CEREMONY_CHALLENGE_LIFETIME_MS - CEREMONY_OPTIONS_MARGIN_MS,
+    publicKey: null,
+    ceremonyId: null,
+    stale: false,
+  };
+  state.ceremony = entry;
+  renderAccess();
+  const type = kind === 'assertion' ? 'passkey_unlock_begin' : 'passkey_register_begin';
+  sendCommand({ type }, { type: 'passkey_challenge', kind }).then((payload) => {
+    if (state.ceremony !== entry) return;
+    if (!ceremonyBindingCurrent(entry)) {
+      state.ceremony = null;
+      renderAccess();
+      maybePrefetchCeremony();
+      return;
+    }
+    try {
+      const options = payload.options || {};
+      entry.publicKey = kind === 'assertion' ? requestOptions(options) : creationOptions(options);
+      entry.ceremonyId = requireText(payload.ceremony_id);
+      if (entry.publicKey.timeout) {
+        entry.maxAge = Math.max(0, Math.min(CEREMONY_CHALLENGE_LIFETIME_MS, entry.publicKey.timeout)
+          - CEREMONY_OPTIONS_MARGIN_MS);
+      }
+      entry.phase = 'ready';
+      if (state.noticeEndsWhenReady) setCeremonyNotice('');
+    } catch (error) {
+      state.ceremony = null;
+      setCeremonyNotice(`${error.message} Tap ${actionLabel(kind)} to try again.`);
+    }
+    renderAccess();
+  }, () => {
+    if (state.ceremony !== entry) return;
+    state.ceremony = null;
+    // Closed by this page's own reconnect: not a failure to report.
+    if (entry.ws !== state.ws) {
+      renderAccess();
+      return;
+    }
+    // A refused or unanswered begin is not retried automatically.
+    setCeremonyNotice('Could not get a passkey request from your Mac. Check that RepoPrompt is running, '
+      + `then tap ${actionLabel(kind)} again.`);
+    renderAccess();
+  });
+}
+
+function actionLabel(kind) {
+  return kind === 'registration' ? 'Set up passkey' : 'Unlock';
+}
+
+// Unlock / Set up tap. With fresh options the native prompt starts right here, before
+// anything is awaited, so the tap still counts as the user's gesture. Stale or
+// missing options are fetched again and the user taps once more.
+function beginNativeCeremony(kind) {
+  const entry = state.ceremony;
+  const usable = entry && entry.kind === kind && entry.phase === 'ready'
+    && ceremonyBindingCurrent(entry) && ceremonyIsFresh(entry);
+  if (!usable) {
+    // While a request is being prepared or running, the buttons are disabled.
+    if (!entry || entry.phase === 'ready') {
+      state.ceremony = null;
+      state.ceremonyDoneKey = null;
+      setCeremonyNotice(`Getting a fresh passkey request. Tap ${actionLabel(kind)} again when it is ready.`, true);
+      maybePrefetchCeremony();
+    }
+    renderAccess();
+    return;
+  }
+  entry.phase = 'native';
+  let credential;
+  try {
+    credential = kind === 'assertion'
+      ? navigator.credentials.get({ publicKey: entry.publicKey })
+      : navigator.credentials.create({ publicKey: entry.publicKey });
+  } catch (error) {
+    credential = Promise.reject(error);
+  }
+  setCeremonyNotice('');
+  renderAccess();
+  completeNativeCeremony(entry, credential);
+}
+
+async function completeNativeCeremony(entry, pendingCredential) {
+  const kind = entry.kind;
+  let credential;
+  try {
+    credential = await pendingCredential;
+  } catch (error) {
+    if (state.ceremony !== entry) return;
+    state.ceremony = null;
+    setCeremonyNotice(nativeFailureText(kind, error));
+    renderAccess();
+    // Fresh options for the retry tap; the next begin replaces this ceremony.
+    followUpCeremony(true);
+    return;
+  }
+  if (state.ceremony !== entry) return;
+  if (!ceremonyBindingCurrent(entry)) {
+    state.ceremony = null;
+    setCeremonyNotice(`The lock state changed while the passkey prompt was open. Tap ${actionLabel(kind)} again.`);
+    renderAccess();
+    followUpCeremony(true);
+    return;
+  }
+  let json;
+  try {
+    json = serializeCredential(kind, credential);
+  } catch (error) {
+    state.ceremony = null;
+    setCeremonyNotice(`${error.message} Tap ${actionLabel(kind)} to try again.`);
+    renderAccess();
+    followUpCeremony(true);
+    return;
+  }
+  entry.phase = 'completing';
+  renderAccess();
+  const type = kind === 'assertion' ? 'passkey_unlock_complete' : 'passkey_register_complete';
+  let keepNotice = false;
+  try {
+    await sendCommand(
+      { type, payload: { ceremony_id: entry.ceremonyId, credential: json } },
+      { type: 'passkey_ceremony_complete', kind },
+    );
+    if (state.ceremony !== entry) return;
+    state.ceremony = null;
+    // Completion only ends the ceremony. Access changes come from lock_state alone: the
+    // buttons wait while the access is still the one this ceremony started under. When
+    // the gateway's new access already arrived (registration's enrollment usually does),
+    // there is nothing left to wait for.
+    const unchanged = state.accessKey === entry.accessKey;
+    if (unchanged) state.ceremonyDoneKey = entry.accessKey;
+    if (kind === 'registration') setCeremonyNotice('Passkey saved. Unlock with it next.');
+    else if (unchanged) setCeremonyNotice('Passkey verified. Waiting for the gateway to unlock this browser…');
+  } catch (error) {
+    if (state.ceremony !== entry) return;
+    state.ceremony = null;
+    // Saved by the app but not yet confirmed to the gateway: no second setup is offered,
+    // and Reconnect stays available, until the gateway reports new access. Its notice
+    // asks for that reconnect, so it is not kept through one.
+    const unavailable = kind === 'registration' && error && error.code === PASSKEY_FAILURE_CODES.unavailable;
+    if (unavailable && state.accessKey === entry.accessKey) state.ceremonyDoneKey = entry.accessKey;
+    keepNotice = !unavailable;
+    setCeremonyNotice(completeFailureText(kind, error));
+  }
+  renderAccess();
+  followUpCeremony(keepNotice);
+}
+
+function nativeFailureText(kind, error) {
+  const name = error && error.name;
+  if (name === 'NotAllowedError' || name === 'AbortError') {
+    return `The passkey request was cancelled or not allowed. Tap ${actionLabel(kind)} to try again.`;
+  }
+  if (name === 'InvalidStateError' && kind === 'registration') {
+    return 'Your passkey provider may already have a passkey for this browser. To start over, '
+      + 'choose Reset for this browser in Remote Control settings on your Mac.';
+  }
+  if (name === 'NotSupportedError' || name === 'SecurityError') {
+    return 'This browser cannot use a passkey on this page. Open the HTTPS link in Safari, '
+      + 'or turn protection off for this browser on your Mac.';
+  }
+  return `The passkey request did not finish. Tap ${actionLabel(kind)} to try again, or check this `
+    + 'browser in Remote Control settings on your Mac.';
+}
+
+function completeFailureText(kind, error) {
+  const code = error && error.code;
+  if (code === PASSKEY_FAILURE_CODES.staleCeremony) {
+    return `That passkey request expired or was replaced. Tap ${actionLabel(kind)} to try again.`;
+  }
+  if (code === PASSKEY_FAILURE_CODES.unavailable && kind === 'registration') {
+    return 'Your passkey was saved, but the gateway could not confirm it yet. Tap Reconnect, then Unlock.';
+  }
+  if (code === PASSKEY_FAILURE_CODES.authenticationFailure) {
+    return `The passkey could not be verified. Tap ${actionLabel(kind)} to try again. If it keeps failing, `
+      + 'check this browser in Remote Control settings on your Mac.';
+  }
+  return `No answer from your Mac. Tap ${actionLabel(kind)} to try again, or Reconnect.`;
+}
+
+// Shows the lock, setup and recovery presentation in place of session content.
+function renderAccess() {
+  const paired = isPaired();
+  const access = state.access;
+  const canLock = paired && state.contentOpen && Boolean(access) && access.policy_state === 'required';
+  $('lock-button').classList.toggle('hidden', !canLock);
+  $('lock-button').disabled = !canLock;
+  const panel = $('lock-panel');
+  if (!paired || state.contentOpen) {
+    panel.classList.add('hidden');
+    return;
+  }
+  panel.classList.remove('hidden');
+  const kind = ceremonyKindFor(access);
+  const support = passkeySupport();
+  const waiting = state.ceremonyDoneKey !== null && state.ceremonyDoneKey === state.accessKey;
+  let message;
+  if (!state.ws && !state.connecting) {
+    message = 'Not connected. Connect to check whether this browser is unlocked.';
+  } else if (!state.connected) {
+    message = 'Connecting…';
+  } else if (!access) {
+    message = 'The gateway did not report whether this browser is unlocked, so sessions stay hidden. '
+      + 'Update RepoPrompt on your Mac, then reconnect.';
+  } else if (state.hold) {
+    message = 'Locked. Waiting for the gateway to confirm…';
+  } else if (waiting) {
+    message = 'Waiting for your Mac to confirm the passkey…';
+  } else if (accessAllowsContent(access)) {
+    message = 'Checking access with your Mac…';
+  } else if (access.policy_state !== 'required') {
+    message = 'Sessions are not available on this connection.';
+  } else if (access.enrolled) {
+    message = 'Unlock with your passkey to see and control sessions.';
+  } else if (access.enrollment_open) {
+    message = 'Set up a passkey for this browser. Your Mac has approved setup.';
+  } else {
+    message = 'Finish passkey setup on your Mac: in Remote Control settings, choose Enroll for this '
+      + 'browser, then return here. If setup does not appear shortly, tap Reconnect.';
+  }
+  if (access && access.reason === PASSKEY_EXPIRED_REASON && access.locked) {
+    message = `Locked after 30 minutes without activity. ${message}`;
+  }
+  if (kind && support === 'insecure') {
+    message += ' Passkeys need the HTTPS link. Open the link from Telegram or from Remote Control settings on your Mac.';
+  } else if (kind && support === 'unsupported') {
+    message += ' This browser does not support passkeys here. Use Safari, or turn protection off for this browser on your Mac.';
+  }
+  $('lock-message').textContent = message;
+  let title = 'Checking access';
+  if (!state.ws && !state.connecting) title = 'Not connected';
+  else if (!state.connected) title = 'Connecting';
+  else if (access && access.policy_state === 'required' && (access.locked || state.hold)) title = 'Locked';
+  $('lock-title').textContent = title;
+  const entry = state.ceremony;
+  // Disabled from the options request until the prompt and its complete have settled.
+  const busy = Boolean(entry) && entry.phase !== 'ready';
+  const offer = state.connected && support === 'ok' && !state.hold && !waiting;
+  $('unlock-button').classList.toggle('hidden', !(offer && kind === 'assertion'));
+  $('setup-passkey-button').classList.toggle('hidden', !(offer && kind === 'registration'));
+  $('unlock-button').disabled = busy;
+  $('setup-passkey-button').disabled = busy;
+  // Reconnect is always a working recovery here, except while a prompt or its complete
+  // is still running on this connection.
+  const recover = Boolean(state.ws) && state.connected && !ceremonyHoldsSocket();
+  $('lock-reconnect').classList.toggle('hidden', !recover);
+  let status = state.ceremonyNotice;
+  if (!status && entry) {
+    if (entry.phase === 'fetching') status = 'Preparing the passkey request…';
+    else if (entry.phase === 'native') status = 'Waiting for your passkey…';
+    else if (entry.phase === 'completing') status = 'Checking with your Mac…';
+  }
+  $('lock-status').textContent = status || '';
+  $('lock-uncertain').textContent = UNCERTAIN_ACTION_TEXT;
+  $('lock-uncertain').classList.toggle('hidden', state.uncertainActions.size === 0);
+}
+
+// Foreground activity: only trusted user input on a shown, unlocked page, at most once
+// per 30 seconds. Never from rendering, scrolling by the page, polling, network,
+// reconnects or visibility changes, and never from a timer.
+function noteUserActivity(event) {
+  if (!event || event.isTrusted !== true) return;
+  if (document.visibilityState !== 'visible' || !state.contentOpen) return;
+  if (event.target && $('lock-button').contains(event.target)) return;
+  const access = state.access;
+  if (!access || access.policy_state !== 'required' || access.locked || !access.grant_id) return;
+  const now = Date.now();
+  if (state.activitySentAt && now - state.activitySentAt < ACTIVITY_THROTTLE_MS) return;
+  const ws = state.ws;
+  if (!ws || !state.connected || ws.readyState !== WebSocket.OPEN) return;
+  state.activitySentAt = now;
+  const payload = { grant_id: access.grant_id, epoch: access.epoch, lock_generation: access.lock_generation };
+  enqueueSignedSend(ws, { v: WIRE_VERSION, type: 'passkey_activity', payload }).catch(() => {});
+}
+
+// Leaving the page hides protected content at once, so it is not shown again before
+// the gateway confirms access on return.
+function hideForBackground() {
+  if (!isPaired()) return;
+  state.hideSeq += 1;
+  if (state.contentOpen && protectsContent()) closeProtectedView();
+  // Options are not kept while away: another tab may replace their ceremony meanwhile.
+  if (state.ceremony && state.ceremony.phase === 'ready') state.ceremony = null;
+  // Every return is reconciled by a fresh foreground hello, locked or not. A passkey
+  // prompt still open on this socket settles there first (followUpCeremony()).
+  state.needsFreshHello = true;
+  renderAccess();
+}
+
+// Returning (visible again, or restored from the back-forward cache): content is
+// hidden first under any last-known policy, since the Mac may have turned protection
+// on meanwhile; then a fresh connection's hello decides. An unexpired grant reopens
+// without a passkey prompt. A locked page keeps its socket and any open ceremony.
+function resumeForeground() {
+  if (state.contentOpen) closeProtectedView();
+  if (isPaired()) state.needsFreshHello = true;
+  // A passkey prompt still open on this socket settles first; see followUpCeremony().
+  // A socket already made for this return keeps waiting for its hello.
+  if (state.needsFreshHello && state.ws && !ceremonyHoldsSocket() && !socketAwaitsForegroundHello()) disconnect();
+  if (!state.ws) {
+    connect();
+    return;
+  }
+  maybePrefetchCeremony();
+  renderAccess();
 }
 
 // ---------------------------------------------------------------------------
@@ -1906,6 +2803,14 @@ async function main() {
     refreshTranscript();
   };
   $('gateway-retry').onclick = () => connect();
+  // The native prompt must start inside these tap handlers; see beginNativeCeremony().
+  $('unlock-button').onclick = () => beginNativeCeremony('assertion');
+  $('setup-passkey-button').onclick = () => beginNativeCeremony('registration');
+  $('lock-button').onclick = () => lockNow();
+  $('lock-reconnect').onclick = () => reconnectNow();
+  for (const type of ACTIVITY_EVENTS) {
+    document.addEventListener(type, noteUserActivity, { capture: true, passive: true });
+  }
   $('load-older').onclick = () => loadOlderTranscript();
   $('jump-top').onclick = () => jumpToTranscriptTop();
   $('jump-latest').onclick = () => jumpToLatest();
@@ -1920,8 +2825,17 @@ async function main() {
   };
   $('binding-dismiss').onclick = () => $('binding-overlay').classList.add('hidden');
   // Returning to the tab reconnects, after re-reading which build the gateway is.
+  // Protected content is hidden on leaving and stays hidden until a fresh hello.
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible' && !state.ws) connect();
+    if (document.visibilityState === 'visible') {
+      resumeForeground();
+    } else {
+      hideForBackground();
+    }
+  });
+  window.addEventListener('pagehide', () => hideForBackground());
+  window.addEventListener('pageshow', (event) => {
+    if (event.persisted) resumeForeground();
   });
 
   await registerServiceWorker();
