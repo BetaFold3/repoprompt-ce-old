@@ -1,3 +1,4 @@
+import MCP
 @testable import RepoPromptAgentCore
 @testable import RepoPromptApp
 @testable import RepoPromptPlatform
@@ -1152,6 +1153,92 @@ final class AgentToolResultPersistencePolicyTests: XCTestCase {
         let legacy = try XCTUnwrap(persistedSummary(toolName: "ask_user", rawResultJSON: legacyStub, argsJSON: argsJSON))
         XCTAssertTrue(legacy.summaryOnly)
         XCTAssertEqual(try decodedObject(legacy.resultJSON)["summary_only"] as? Bool, true)
+    }
+
+    /// Exchanges produced by the Claude tool-tracking handler (completion-only with arguments, completion-only
+    /// without arguments in a content envelope, and a normal provider-first exchange) survive canonical save,
+    /// cold reload, and re-save byte-for-byte, and the reloaded cards keep their honest presentation.
+    @MainActor
+    func testHandlerProducedAskUserExchangesSurviveCanonicalSaveAndColdReload() async throws {
+        let handler = ClaudeAgentToolTrackingHandler(mcpHost: ServerNetworkManager.shared)
+        let tab = AgentTabSession(tabID: UUID())
+        tab.selectedAgent = .claudeCode
+        tab.setItemsSilently([AgentChatItem(kind: .user, text: "Interview me.", sequenceIndex: 0)], reason: .testOverride)
+        tab.runState = .running
+        handler.resetTurnState(for: tab)
+
+        let argsJSON = #"{"title":"Rollout","questions":[{"id":"decision","question":"Approve DECISION_TOKEN_41aa?","options":["Yes","No"]}]}"#
+        let args = try JSONDecoder().decode([String: Value].self, from: Data(argsJSON.utf8))
+        handler.handleTrackerToolResult(
+            invocationID: UUID(),
+            toolName: "ask_user",
+            args: args,
+            resultJSON: #"{"answers":{"decision":{"answers":["Yes"]}}}"#,
+            isError: false,
+            session: tab
+        )
+        handler.handleTrackerToolResult(
+            invocationID: UUID(),
+            toolName: "ask_user",
+            args: nil,
+            resultJSON: #"{"content":[{"type":"text","text":"{\"answers\":{\"actions\":{\"answers\":[\"ORPHAN_TOKEN_9d1e\"]}}}"}]}"#,
+            isError: false,
+            session: tab
+        )
+        let followUpArgsJSON = #"{"title":"Follow-up","questions":[{"id":"decision","question":"Approve FOLLOWUP_TOKEN_2b7c?"}]}"#
+        let followUpArgs = try JSONDecoder().decode([String: Value].self, from: Data(followUpArgsJSON.utf8))
+        let providerID = UUID()
+        let trackerID = UUID()
+        handler.handleClaudeProviderRepoPromptToolCall(
+            invocationID: providerID,
+            toolName: "mcp__RepoPromptCE__ask_user",
+            argsJSON: followUpArgsJSON,
+            session: tab
+        )
+        handler.handleTrackerToolCall(invocationID: trackerID, toolName: "ask_user", args: followUpArgs, session: tab)
+        handler.handleTrackerToolResult(
+            invocationID: trackerID,
+            toolName: "ask_user",
+            args: followUpArgs,
+            resultJSON: #"{"answers":{"decision":{"answers":["No"]}}}"#,
+            isError: false,
+            session: tab
+        )
+        tab.appendItem(AgentChatItem(kind: .assistant, text: "Done.", sequenceIndex: tab.nextSequenceIndex))
+
+        let produced = tab.items.filter { $0.kind == .toolResult && $0.toolName == "ask_user" }
+        XCTAssertEqual(produced.count, 3)
+        XCTAssertEqual(produced.last?.toolInvocationID, providerID)
+        XCTAssertNotNil(produced.first?.toolArgsJSON, "Unmatched completion keeps its arguments")
+        XCTAssertNil(produced.dropFirst().first?.toolArgsJSON, "Missing arguments stay missing")
+
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AgentToolResultPersistencePolicyTests", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let workspace = WorkspaceModel(name: "Ask User Handler Persistence", repoPaths: ["/tmp/repo"], customStoragePath: directory)
+        let session = AgentSession(id: UUID(), workspaceID: workspace.id, composeTabID: UUID(), name: "Interview")
+            .withItems(tab.items)
+        let fileURL = try await AgentSessionDataService().saveAgentSession(session, for: workspace)
+        let onDisk = try String(contentsOf: fileURL, encoding: .utf8)
+        XCTAssertTrue(onDisk.contains("DECISION_TOKEN_41aa"))
+        XCTAssertTrue(onDisk.contains("ORPHAN_TOKEN_9d1e"))
+        XCTAssertTrue(onDisk.contains("FOLLOWUP_TOKEN_2b7c"))
+
+        let reloaded = try await AgentSessionDataService().loadAgentSession(from: fileURL)
+        _ = try await AgentSessionDataService().saveAgentSession(reloaded, for: workspace)
+        let resaved = try await AgentSessionDataService().loadAgentSession(from: fileURL)
+        for (label, restored) in [("reload", reloaded), ("re-save", resaved)] {
+            let items = restored.toLiveItems().filter { $0.kind == .toolResult && $0.toolName == "ask_user" }
+            XCTAssertEqual(items.map(\.toolArgsJSON), produced.map(\.toolArgsJSON), label)
+            XCTAssertEqual(items.map(\.toolResultJSON), produced.map(\.toolResultJSON), label)
+
+            let summaries = items.map { parseAskUserQuestionSummaryRobust(args: $0.toolArgsJSON, result: $0.toolResultJSON) }
+            XCTAssertEqual(summaries.map { $0.questions.map(\.answer) }, [["Yes"], [], ["No"]], label)
+            XCTAssertEqual(summaries.map(\.isQuestionTextUnavailable), [false, true, false], label)
+            XCTAssertEqual(summaries.map { $0.unmatchedAnswers.map(\.answer) }, [[], ["ORPHAN_TOKEN_9d1e"], []], label)
+            XCTAssertEqual(summaries.map(\.isHistoricalScalar), [false, false, false], label)
+        }
     }
 
     /// Cold hydration preparation over a real store: a stored pending `ask_user` call is accepted

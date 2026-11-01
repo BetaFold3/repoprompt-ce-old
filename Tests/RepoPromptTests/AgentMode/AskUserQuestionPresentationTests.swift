@@ -237,6 +237,140 @@ final class AskUserQuestionPresentationTests: XCTestCase {
         XCTAssertFalse(question.skipped)
     }
 
+    /// Contract change: answers for a malformed (discarded) question sibling are no longer hidden. They stay
+    /// off the surviving question and appear as unmatched saved answers labeled by their answer ID.
+    func testMalformedSiblingAnswerRemainsVisibleWithoutPositionalMatching() {
+        let args = #"{"questions":[null,{"question":"Second?","options":["Yes","No"]}]}"#
+        let result = #"{"answers":{"question_1":{"answers":["Wrong sibling answer"]},"question_2":{"answers":["Yes"]}}}"#
+
+        let summary = parseAskUserQuestionSummaryRobust(args: args, result: result)
+
+        XCTAssertEqual(summary.questions.map(\.id), ["question_2"])
+        XCTAssertEqual(summary.questions.map(\.answer), ["Yes"])
+        XCTAssertEqual(summary.unmatchedAnswers.map(\.id), ["question_1"])
+        XCTAssertEqual(summary.unmatchedAnswers.map(\.answer), ["Wrong sibling answer"])
+        XCTAssertFalse(summary.isQuestionTextUnavailable)
+        XCTAssertNotNil(summary.unmatchedAnswersCaption)
+    }
+
+    /// A completed exchange whose arguments were lost still shows every saved answer, by answer ID, without
+    /// inventing question text; it is not rendered as a historical scalar "No response" card.
+    func testAnswersOnlyExchangeShowsSavedAnswersByID() {
+        let result = #"""
+        {
+          "answers": {
+            "stop_blocks_send": {"selected_options": ["Yes"], "custom_response": "Only while offline"},
+            "actions": {"answers": ["Ship"], "selected_options": ["Ship"]},
+            "notice": {"skipped": true}
+          },
+          "timed_out": false
+        }
+        """#
+
+        for args in [nil, "", #"{"questions":[null, 7]}"#] {
+            let label = args ?? "nil"
+            let summary = parseAskUserQuestionSummaryRobust(args: args, result: result)
+
+            XCTAssertFalse(summary.isHistoricalScalar, label)
+            XCTAssertTrue(summary.questions.isEmpty, label)
+            XCTAssertTrue(summary.isQuestionTextUnavailable, label)
+            XCTAssertEqual(summary.displayTitle, "Saved answers (3)", label)
+            XCTAssertEqual(summary.unmatchedAnswers.map(\.id), ["actions", "notice", "stop_blocks_send"], label)
+            XCTAssertEqual(summary.unmatchedAnswers.map(\.answer), ["Ship", "Skipped", "Yes, Only while offline"], label)
+            XCTAssertEqual(summary.unmatchedAnswers.map(\.skipped), [false, true, false], label)
+            XCTAssertEqual(summary.unmatchedAnswers.map(\.customResponse), [nil, nil, "Only while offline"], label)
+            XCTAssertEqual(
+                summary.unmatchedAnswersCaption,
+                "Question text unavailable. Saved answers are shown by answer ID.",
+                label
+            )
+            XCTAssertNil(summary.statusText, label)
+        }
+    }
+
+    /// Saved questions whose IDs match none of the saved answers keep their text, do not claim "No response",
+    /// and the surviving answers remain visible separately.
+    func testMismatchedAndPartiallyMatchedAnswersRemainVisible() {
+        let args = #"{"questions":[{"id":"stop_blocks_send","question":"Block sends?"},{"id":"notice","question":"Notice style?"}]}"#
+
+        let mismatched = parseAskUserQuestionSummaryRobust(
+            args: args,
+            result: #"{"answers":{"actions":{"answers":["Ship"]}}}"#
+        )
+        XCTAssertFalse(mismatched.isHistoricalScalar)
+        XCTAssertEqual(mismatched.questions.map(\.question), ["Block sends?", "Notice style?"])
+        XCTAssertEqual(mismatched.questions.map(\.answer), [nil, nil])
+        XCTAssertEqual(mismatched.missingAnswerText, "No matching saved answer")
+        XCTAssertEqual(mismatched.unmatchedAnswers.map(\.id), ["actions"])
+        XCTAssertEqual(mismatched.unmatchedAnswers.map(\.answer), ["Ship"])
+        XCTAssertEqual(
+            mismatched.unmatchedAnswersCaption,
+            "Saved answers that match none of the questions above, shown by answer ID."
+        )
+
+        let partial = parseAskUserQuestionSummaryRobust(
+            args: args,
+            result: #"{"answers":{"notice":{"answers":["Banner"]},"zeta":{"answers":["Orphan"]}}}"#
+        )
+        XCTAssertEqual(partial.questions.map(\.answer), [nil, "Banner"])
+        XCTAssertEqual(partial.unmatchedAnswers.map(\.id), ["zeta"])
+        XCTAssertEqual(partial.unmatchedAnswers.map(\.answer), ["Orphan"])
+
+        let matched = parseAskUserQuestionSummaryRobust(
+            args: args,
+            result: #"{"answers":{"notice":{"answers":["Banner"]}}}"#
+        )
+        XCTAssertTrue(matched.unmatchedAnswers.isEmpty)
+        XCTAssertNil(matched.unmatchedAnswersCaption)
+        XCTAssertEqual(matched.missingAnswerText, "No response")
+    }
+
+    /// Supported ToolJSON result envelopes decode the same answers-only exchange.
+    func testAnswersOnlyExchangeDecodesSupportedResultEnvelopes() {
+        let inner = #"{"answers":{"actions":{"answers":["Ship"]}},"timed_out":true}"#
+        let escaped = inner.replacingOccurrences(of: "\"", with: "\\\"")
+        let envelopes = [
+            "direct": inner,
+            "content text": #"{"content":[{"type":"text","text":"\#(escaped)"}]}"#,
+            "structured content": #"{"structuredContent":\#(inner)}"#
+        ]
+
+        for (label, result) in envelopes {
+            let summary = parseAskUserQuestionSummaryRobust(args: nil, result: result)
+            XCTAssertTrue(summary.isQuestionTextUnavailable, label)
+            XCTAssertEqual(summary.unmatchedAnswers.map(\.id), ["actions"], label)
+            XCTAssertEqual(summary.unmatchedAnswers.map(\.answer), ["Ship"], label)
+            XCTAssertTrue(summary.timedOut, label)
+            XCTAssertEqual(summary.statusText, "Timed out", label)
+        }
+    }
+
+    /// Review R3: mixed history (scalar arguments, structured answers) keeps the scalar question and can expand
+    /// to show the surviving multiline answer in full; genuine scalar-only exchanges keep their fixed preview.
+    func testScalarArgumentsWithStructuredAnswersCanExpandUnmatchedAnswers() {
+        let scalarArgs = #"{"question":"Historical question"}"#
+        let mixed = parseAskUserQuestionSummaryRobust(
+            args: scalarArgs,
+            result: #"{"answers":{"notes":{"answers":["Line one\nLine two\nLine three\nLine four"]}}}"#
+        )
+        XCTAssertTrue(mixed.isHistoricalScalar)
+        XCTAssertEqual(mixed.questions.map(\.question), ["Historical question"])
+        XCTAssertEqual(mixed.unmatchedAnswers.map(\.id), ["notes"])
+        XCTAssertEqual(mixed.unmatchedAnswers.map(\.answer), ["Line one\nLine two\nLine three\nLine four"])
+        XCTAssertTrue(mixed.allowsExpansion)
+
+        let scalarOnly = parseAskUserQuestionSummaryRobust(args: scalarArgs, result: #"{"response":"Legacy answer"}"#)
+        XCTAssertTrue(scalarOnly.isHistoricalScalar)
+        XCTAssertTrue(scalarOnly.unmatchedAnswers.isEmpty)
+        XCTAssertFalse(scalarOnly.allowsExpansion)
+
+        let structured = parseAskUserQuestionSummaryRobust(
+            args: #"{"questions":[{"id":"notes","question":"Notes?"}]}"#,
+            result: #"{"answers":{"notes":{"answers":["Kept"]}}}"#
+        )
+        XCTAssertTrue(structured.allowsExpansion)
+    }
+
     func testHistoricalScalarPayloadsRemainUnchanged() throws {
         let args = #"{"question":"  Historical question  ","title":"Ignored title","context":"Ignored context"}"#
         let cases: [(name: String, result: String?, answer: String, skipped: Bool, timedOut: Bool, status: String?)] = [
