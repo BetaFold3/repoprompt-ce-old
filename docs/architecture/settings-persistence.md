@@ -40,6 +40,12 @@ representing its content. Schema-requiring features have fixed introduction cons
 
 - `baselineSchemaVersion = 2`
 - `workspaceAgentModelsSchemaVersion = 4`
+- `mcpAgentRoleOhMyPiThinkingSchemaVersion = 5`
+- `workspaceSteeringGrantsSchemaVersion = 6` (nonempty `scalarPreferences.workspaceSteeringGrants`).
+  A pre-grant build preserves this future-schema file and uses in-memory defaults. The
+  preservation block is latched for that file-store instance: removing the final grant does
+  not automatically unblock an already-running older build. Relaunch that build after the
+  file returns to a schema it supports; use a grant-capable build for live steering checks.
 
 `requiredSchemaVersion` returns the maximum fixed feature version required by the
 document. It must never use `currentSchemaVersion` as the version of an existing feature:
@@ -108,6 +114,17 @@ the preserved file until the user chooses an action:
 
 Every save re-checks the on-disk header before writing. This matters because CE dev builds
 can share the live app support folder; a future/foreign file may appear after launch.
+
+Workspace steering grants are permissions, so they are not last-writer-wins. Every
+`GlobalSettingsStore` save and grant write takes a nonblocking exclusive `flock` on
+`globalSettings.json.lock` and first adopts the grant list on disk (none when the file is
+missing), so a running build never writes back a grant another build removed. If the lock is
+held elsewhere or the on-disk grants are unreadable, nothing is written and the save reports
+`.saveFailed` (an existing block reason is kept); the banner's retry saves again. A
+future/foreign file is still refused by the file store with its own reason.
+`WorkspaceSteeringGrantStore.isGranted` reads the file on every call and fails closed.
+Limits: user-initiated recovery and compatible import write without the lock, and builds
+without grant support do not take it (schema v6 keeps them from writing while grants exist).
 
 Blocked-persistence warnings may be dismissed in workspace windows for the current app
 session. The store owns dismissal across workspace windows and clears it when the reason

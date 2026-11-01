@@ -352,7 +352,7 @@ struct SettingsView: View {
             PromptOrderSettingsView(promptViewModel: promptViewModel)
                 .transition(.opacity.animation(.easeInOut(duration: 0.15)))
         case .manageWorkspaces:
-            ManageWorkspacesView(isPresented: .constant(true), showCloseButton: false)
+            ManageWorkspacesView(isPresented: .constant(true), showCloseButton: false, showsSteeringGrants: true)
                 .environmentObject(windowState.workspaceManager)
                 .environmentObject(WindowStatesManager.shared)
                 .transition(.opacity.animation(.easeInOut(duration: 0.15)))
@@ -974,6 +974,12 @@ enum SettingsTab: String, CaseIterable {
                 "workspace",
                 "workspaces",
                 "manage workspaces",
+                "workspace steering",
+                "steering",
+                "steer",
+                "grant",
+                "grants",
+                "assistant",
                 "add workspace",
                 "delete workspace",
                 "rename workspace",

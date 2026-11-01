@@ -11,6 +11,9 @@ struct ManageWorkspacesView: View {
     // NEW: Optional param to control close button visibility
     var showCloseButton: Bool = true
 
+    /// Shows the workspace steering grants section (Settings only).
+    var showsSteeringGrants: Bool = false
+
     @State private var workspaceBeingRenamed: WorkspaceModel?
     @State private var renameField: String = ""
     @State private var renameRemoteHostID: String?
@@ -111,6 +114,10 @@ struct ManageWorkspacesView: View {
                     createNewWorkspaceSection
                     Divider()
                     existingWorkspacesSection
+                    if showsSteeringGrants {
+                        Divider()
+                        WorkspaceSteeringGrantsSettingsView(settings: .shared)
+                    }
                 }
                 .padding(16)
             }

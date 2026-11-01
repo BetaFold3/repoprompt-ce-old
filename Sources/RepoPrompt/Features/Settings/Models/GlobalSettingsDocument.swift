@@ -7,7 +7,7 @@ import RepoPromptAgentCore
 /// Schema v1 contains copy settings, chat settings, and cross-workspace global
 /// defaults. Schema v2 adds optional scalar preference groups. Schema v4 adds
 /// workspace-scoped Agent Models profiles. Schema v5 protects persisted per-role OMP
-/// thinking intent. Scalar fields stay optional so missing
+/// thinking intent. Schema v6 protects workspace steering grants. Scalar fields stay optional so missing
 /// JSON fields fall back through the typed GlobalSettingsStore accessors without
 /// losing current default behavior.
 struct GlobalSettingsDocument: Codable {
@@ -17,7 +17,9 @@ struct GlobalSettingsDocument: Codable {
     static let baselineSchemaVersion = 2
     static let workspaceAgentModelsSchemaVersion = 4
     static let mcpAgentRoleOhMyPiThinkingSchemaVersion = 5
-    static let currentSchemaVersion = 5
+    /// Nonempty grants stamp v6 so builds without grant support preserve (never overwrite) them.
+    static let workspaceSteeringGrantsSchemaVersion = 6
+    static let currentSchemaVersion = 6
     /// Lineage marker for settings files written by this open-source CE schema family.
     ///
     /// CE inherited numeric schema versions from classic/internal builds, so version numbers
@@ -94,6 +96,9 @@ struct GlobalSettingsDocument: Codable {
         } == true
         if hasGlobalRoleThinking || hasWorkspaceRoleThinking {
             requiredVersion = max(requiredVersion, Self.mcpAgentRoleOhMyPiThinkingSchemaVersion)
+        }
+        if scalarPreferences?.workspaceSteeringGrants?.isEmpty == false {
+            requiredVersion = max(requiredVersion, Self.workspaceSteeringGrantsSchemaVersion)
         }
         return requiredVersion
     }
@@ -447,6 +452,9 @@ struct GlobalScalarPreferences: Codable, Equatable {
     /// Telegram attention notifications (enable flag and chat ID only; the bot token lives in
     /// secure storage, never here).
     var telegram: TelegramSettings?
+    /// One-way workspace→workspace steering grants; nil (the old-file default) means none.
+    /// Nonempty grants require schema v6. Written only through `WorkspaceSteeringGrantStore`.
+    var workspaceSteeringGrants: [WorkspaceSteeringGrant]?
 
     init(
         ui: UISettings? = nil,
@@ -457,7 +465,8 @@ struct GlobalScalarPreferences: Codable, Equatable {
         agentMode: AgentModeSettings? = nil,
         telemetry: TelemetrySettings? = nil,
         modelOverrides: ModelOverrideSettingsData? = nil,
-        telegram: TelegramSettings? = nil
+        telegram: TelegramSettings? = nil,
+        workspaceSteeringGrants: [WorkspaceSteeringGrant]? = nil
     ) {
         self.ui = ui
         self.promptPackaging = promptPackaging
@@ -468,6 +477,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
         self.telemetry = telemetry
         self.modelOverrides = modelOverrides
         self.telegram = telegram
+        self.workspaceSteeringGrants = workspaceSteeringGrants
     }
 
     struct UISettings: Codable, Equatable {

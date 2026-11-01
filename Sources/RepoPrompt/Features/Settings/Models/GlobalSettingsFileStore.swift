@@ -33,6 +33,43 @@ enum GlobalSettingsPersistenceBlockReason: Equatable {
     case automaticSchemaNormalizationFailed
 }
 
+/// Cross-process advisory lock (`flock` on `globalSettings.json.lock`) that serializes
+/// read-modify-write of the settings file between running builds sharing it (Dev and release).
+enum GlobalSettingsFileLock {
+    /// Runs `body` while holding the exclusive lock. Never waits (callers run on the main actor):
+    /// returns nil without running `body` when the lock file cannot be opened or another holder
+    /// has the lock.
+    static func withExclusiveLock<T>(for fileURL: URL, _ body: () -> T) -> T? {
+        let lockURL = lockFileURL(for: fileURL)
+        try? FileManager.default.createDirectory(
+            at: lockURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let descriptor = open(lockURL.path, O_RDWR | O_CREAT | O_CLOEXEC, 0o644)
+        guard descriptor >= 0 else { return nil }
+        defer { close(descriptor) }
+        while flock(descriptor, LOCK_EX | LOCK_NB) != 0 {
+            guard errno == EINTR else { return nil }
+        }
+        defer { flock(descriptor, LOCK_UN) }
+        return body()
+    }
+
+    static func lockFileURL(for fileURL: URL) -> URL {
+        fileURL.appendingPathExtension("lock")
+    }
+}
+
+/// Result of reading only the workspace steering grants from the settings file.
+enum PersistedWorkspaceSteeringGrantsRead: Equatable {
+    case missingFile
+    case grants([WorkspaceSteeringGrant])
+    /// Future or foreign schema; the file store refuses to overwrite it.
+    case preservedSchema
+    /// Unreadable bytes or an undecodable grant list.
+    case unreadable
+}
+
 /// File-backed store for the versioned global settings document.
 ///
 /// Primary location:
@@ -537,6 +574,29 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
 
     private static func preservationBlockReason(for header: GlobalSettingsDocumentHeader) -> GlobalSettingsPersistenceBlockReason? {
         preservationBlockReason(schemaVersion: header.schemaVersion, schemaLineage: header.schemaLineage)
+    }
+
+    /// Side-effect-free read of the workspace steering grants in the file at `fileURL`, which
+    /// another running build may have changed. Preserved-schema classification matches `save`.
+    static func readWorkspaceSteeringGrants(at fileURL: URL) -> PersistedWorkspaceSteeringGrantsRead {
+        guard FileManager.default.fileExists(atPath: fileURL.path) else { return .missingFile }
+        guard let data = try? Data(contentsOf: fileURL) else { return .unreadable }
+        guard let header = try? decoder.decode(GlobalSettingsDocumentHeader.self, from: data) else {
+            return isJSONDocument(data) ? .preservedSchema : .unreadable
+        }
+        guard preservationBlockReason(for: header) == nil else { return .preservedSchema }
+        guard let probe = try? decoder.decode(WorkspaceSteeringGrantsProbe.self, from: data) else {
+            return .unreadable
+        }
+        return .grants(probe.scalarPreferences?.workspaceSteeringGrants ?? [])
+    }
+
+    private struct WorkspaceSteeringGrantsProbe: Decodable {
+        struct Scalars: Decodable {
+            let workspaceSteeringGrants: [WorkspaceSteeringGrant]?
+        }
+
+        let scalarPreferences: Scalars?
     }
 
     private static func isJSONDocument(_ data: Data) -> Bool {
