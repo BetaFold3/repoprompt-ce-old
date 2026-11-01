@@ -882,7 +882,7 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
         XCTAssertEqual(viewModel.snapshot.effectiveContextWindowTokens, 1_000_000)
     }
 
-    func testProviderUsagePresentationFormatsCompletePartialUnknownZeroAndTinyValues() {
+    func testProviderUsagePresentationFormatsCompletePartialUnknownZeroAndTinyValues() throws {
         typealias Usage = AgentProviderUsageSnapshot
         let execution = UUID()
 
@@ -906,8 +906,15 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
             sessionCacheCoverageDetail: "Complete: every finalized turn supplied cache counters.",
             sessionCostCoverageDetail: "Complete: every contributing cost segment is measured."
         ).presentation
-        XCTAssertEqual(complete.title, "Claude latest request CH · session cost")
-        XCTAssertEqual(complete.readoutText, "CH 99.1% · Est. $2.171")
+        XCTAssertEqual(complete.accessibilityLabel, "Claude usage")
+        XCTAssertEqual(complete.cacheHitRatioLabel, "Cache Hit Ratio")
+        XCTAssertEqual(complete.cacheHitRatioValue, "99.1%")
+        XCTAssertEqual(complete.costEstimateLabel, "API Cost Estimates")
+        XCTAssertEqual(complete.costEstimateValue, "$2.17")
+        XCTAssertEqual(complete.cacheHitRatioLine, "Cache Hit Ratio: 99.1%")
+        XCTAssertEqual(complete.costEstimateLine, "API Cost Estimates: $2.17")
+        XCTAssertEqual(complete.readoutText, "Cache Hit Ratio: 99.1% · API Cost Estimates: $2.17")
+        XCTAssertTrue(complete.detailText.contains("Accumulated session cost: $2.17 (complete coverage)"))
         XCTAssertTrue(complete.detailText.contains("Latest-request CH: 99.1%"))
         XCTAssertTrue(complete.detailText.contains("Session-average CH: 50.0%"))
         XCTAssertTrue(complete.detailText.contains("Tracking period: since"))
@@ -919,19 +926,25 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
             XCTAssertFalse(complete.detailText.localizedCaseInsensitiveContains(forbidden))
         }
 
-        let partial = Usage(
+        let partialSnapshot = Usage(
             scope: .claude,
             latestRequestCacheHit: latest(decimal("0.09")),
             cacheHitShare: .init(ratio: decimal("0.75"), coverage: .partial),
             costEstimate: .init(amount: decimal("1.25"), currency: "USD", coverage: .partial),
             sessionCacheCoverageDetail: "Partial: one finalized turn omitted cache-read counters.",
             sessionCostCoverageDetail: "Partial: cost segment 2 has no accepted checkpoint."
-        ).presentation
-        XCTAssertEqual(partial.readoutText, "CH 9.0% · Est. $1.250 partial")
+        )
+        let partial = partialSnapshot.presentation
+        // Coverage moves out of the values into the expanded popover text.
+        let partialExpanded = try XCTUnwrap(partial.expandedDetailText)
+        XCTAssertTrue(partialExpanded.contains("Accumulated session cost: $1.25 (partial coverage)"))
+        XCTAssertFalse(partial.costEstimateValue.contains("partial"))
+        XCTAssertEqual(partial.readoutText, "Cache Hit Ratio: 9.0% · API Cost Estimates: $1.25", "coverage is never a value suffix")
+        XCTAssertTrue(partial.detailText.contains("Accumulated session cost: $1.25 (partial coverage)"))
         XCTAssertTrue(partial.detailText.contains("Session-average CH: 75.0% (partial coverage)"))
         XCTAssertTrue(partial.detailText.contains("cost segment 2 has no accepted checkpoint"))
 
-        XCTAssertEqual(Usage(scope: .claude).presentation.readoutText, "CH — · Est. —")
+        XCTAssertEqual(Usage(scope: .claude).presentation.readoutText, "Cache Hit Ratio: — · API Cost Estimates: —")
         XCTAssertEqual(
             Usage(
                 scope: .claude,
@@ -939,7 +952,7 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
                 cacheHitShare: .init(ratio: decimal("0.5"), coverage: .complete),
                 costEstimate: .init(amount: 0, currency: "USD", coverage: .complete)
             ).presentation.readoutText,
-            "CH 0.0% · Est. $0.000"
+            "Cache Hit Ratio: 0.0% · API Cost Estimates: $0.00"
         )
         XCTAssertEqual(
             Usage(
@@ -948,12 +961,18 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
                 cacheHitShare: .init(ratio: decimal("0.5"), coverage: .complete),
                 costEstimate: .init(amount: decimal("0.00001"), currency: "USD", coverage: .complete)
             ).presentation.readoutText,
-            "CH <0.1% · Est. $0.00001"
+            "Cache Hit Ratio: <0.1% · API Cost Estimates: <$0.01"
         )
 
         let codex = Usage.unavailable(for: .codexExec).presentation
-        XCTAssertEqual(codex.title, "Codex latest request CH · session cost")
-        XCTAssertEqual(codex.readoutText, "CH — · Est. —")
+        XCTAssertEqual(codex.accessibilityLabel, "Codex usage")
+        XCTAssertEqual(codex.cacheHitRatioValue, "—")
+        XCTAssertEqual(codex.costEstimateValue, "—")
+        XCTAssertEqual(codex.readoutText, "Cache Hit Ratio: — · API Cost Estimates: —")
+
+        let unsupported = Usage.unavailable(for: .cursor).presentation
+        XCTAssertEqual(unsupported.cacheHitRatioLine, "Cache Hit Ratio: —")
+        XCTAssertEqual(unsupported.costEstimateLine, "API Cost Estimates: —")
         XCTAssertTrue(codex.detailText.contains("No usage has been recorded"))
         XCTAssertTrue(codex.detailText.contains("not billed spend"))
     }
@@ -992,7 +1011,7 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
         XCTAssertNil(ownedProjection.latestRequestCacheHit, "restored result aggregates never claim a latest request")
         XCTAssertEqual(
             ownedProjection.presentation.readoutText,
-            "CH — · Est. $2.171"
+            "Cache Hit Ratio: — · API Cost Estimates: $2.17"
         )
         XCTAssertTrue(ownedProjection.presentation.detailText.contains("Session-average CH: 90.0%"))
         XCTAssertTrue(ownedProjection.presentation.detailText.contains("not restored from turn/result aggregates"))
@@ -1109,7 +1128,7 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
         typealias Usage = AgentProviderUsageSnapshot
         let owner = UUID()
         let noUsage = Usage.claudeNoUsageRecordedReason
-        let dash = "CH — · Est. —"
+        let dash = "Cache Hit Ratio: — · API Cost Estimates: —"
 
         // No owner at all (no session / no accumulator): explicit explanation, never a silent dash.
         let noOwner = Usage.unavailable(for: .claudeCode)
@@ -1201,7 +1220,7 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
         )
         let ownedProjection = Usage.projected(selectedAgent: .claudeCode, accounting: owned, expectedOwnerSessionID: owner)
         XCTAssertNil(ownedProjection.unavailableReason)
-        XCTAssertEqual(ownedProjection.presentation.readoutText, "CH — · Est. $2.171")
+        XCTAssertEqual(ownedProjection.presentation.readoutText, "Cache Hit Ratio: — · API Cost Estimates: $2.17")
         XCTAssertFalse(ownedProjection.presentation.detailText.contains("No live figures"))
         XCTAssertNil(ownedProjection.coverageDetail)
         XCTAssertNil(ownedProjection.presentation.noteText)
@@ -1315,7 +1334,7 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
         )
         XCTAssertEqual(
             vm.ui.runtimeMetrics.runtimeVM.snapshot.providerUsage.presentation.readoutText,
-            "CH 90.0% · Est. $2.171"
+            "Cache Hit Ratio: 90.0% · API Cost Estimates: $2.17"
         )
         XCTAssertTrue(
             vm.ui.runtimeMetrics.runtimeVM.snapshot.providerUsage.presentation.expandedDetailText?
@@ -1362,8 +1381,9 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
         )
         XCTAssertEqual(
             vm.ui.runtimeMetrics.runtimeVM.snapshot.providerUsage.presentation.readoutText,
-            "CH — · Est. $2.171 partial"
+            "Cache Hit Ratio: — · API Cost Estimates: $2.17"
         )
+        XCTAssertEqual(vm.ui.runtimeMetrics.runtimeVM.snapshot.providerUsage.costEstimate?.coverage, .partial)
         assertContextOccupancyUnchanged(from: baselineContext, to: vm.ui.runtimeMetrics.runtimeVM.snapshot)
 
         let hydratedRecord = makeProviderUsageRecord(
@@ -1386,7 +1406,7 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
         // A hydrated complete record with no live execution is complete under the production policy.
         XCTAssertEqual(
             vm.ui.runtimeMetrics.runtimeVM.snapshot.providerUsage.presentation.readoutText,
-            "CH — · Est. $3.000"
+            "Cache Hit Ratio: — · API Cost Estimates: $3.00"
         )
         assertContextOccupancyUnchanged(from: baselineContext, to: vm.ui.runtimeMetrics.runtimeVM.snapshot)
 
@@ -1418,7 +1438,7 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
         )
         XCTAssertEqual(
             vm.ui.runtimeMetrics.runtimeVM.snapshot.providerUsage.presentation.readoutText,
-            "CH — · Est. $4.000"
+            "Cache Hit Ratio: — · API Cost Estimates: $4.00"
         )
         assertContextOccupancyUnchanged(from: baselineContext, to: vm.ui.runtimeMetrics.runtimeVM.snapshot)
 

@@ -69,25 +69,23 @@ struct RemoteControlSettingsView: View {
                     .hoverTooltip("Start the packaged gateway on the current Tailscale address")
             }
 
-            HStack(spacing: 16) {
-                labeledValue("Build channel", buildIdentity.channel.rawValue.capitalized)
-                labeledValue("Fixed port", String(buildIdentity.fixedPort))
-                labeledValue("Status", gatewayStatus.status.summary)
-            }
-            if let origin = gatewayStatus.status.origin {
-                labeledMonospace("Tailnet origin", origin.string)
-            }
-            Text("Tailscale must be installed, signed in, and running. The gateway listens on this Mac's Tailscale address and never falls back to loopback, LAN, or wildcard binding. It also listens on 127.0.0.1 only while a browser origin is set below, for Tailscale Serve.")
-                .font(fontPreset.captionFont).foregroundColor(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            HStack {
-                Button("Refresh Status") {
-                    Task { await ServerController.shared.applyRemoteGatewaySettings() }
+            Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 12, verticalSpacing: 4) {
+                factRow("Build channel", buildIdentity.channel.rawValue.capitalized)
+                factRow("Fixed port", String(buildIdentity.fixedPort))
+                factRow("Status", gatewayStatus.status.summary)
+                if let origin = gatewayStatus.status.origin {
+                    factRow("Tailnet origin", origin.string, monospaced: true)
                 }
-                .buttonStyle(CustomButtonStyle())
-                .disabled(!globalSettings.mcpRemoteGatewayEnabled())
-                Spacer()
             }
+            detailsDisclosure([
+                "Tailscale must be installed, signed in, and running. The gateway listens on this Mac's Tailscale address and never falls back to loopback, LAN, or wildcard binding. It also listens on 127.0.0.1 only while a browser origin is set below, for Tailscale Serve."
+            ])
+            .frame(maxWidth: .infinity, alignment: .leading)
+            Button("Refresh Status") {
+                Task { await ServerController.shared.applyRemoteGatewaySettings() }
+            }
+            .buttonStyle(CustomButtonStyle())
+            .disabled(!globalSettings.mcpRemoteGatewayEnabled())
         }
     }
 
@@ -99,18 +97,22 @@ struct RemoteControlSettingsView: View {
     /// forwards to this build's gateway on 127.0.0.1. A saved port also makes the gateway listen on
     /// 127.0.0.1 for that forwarding. The app never changes Tailscale configuration.
     private var browserLinkSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        let configuredOrSuggestedPort = globalSettings.mcpRemoteGatewayBrowserHTTPSPort() ?? suggestedBrowserPort
+        return VStack(alignment: .leading, spacing: 8) {
             Text("Browser link (HTTPS)").font(fontPreset.font)
-            Text("Telegram alerts get an Open session button for your paired phone browser when this port is set and Remote Control is running. While a browser origin is shown, this build's gateway also listens on 127.0.0.1 for the Tailscale Serve command below. Leave it blank for text-only alerts. Port 443 is not allowed.")
+            Text("Set a port (not 443) to add an Open session button for your paired phone browser to Telegram alerts while Remote Control is running, or leave it blank for text-only alerts.")
                 .font(fontPreset.captionFont).foregroundColor(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             HStack(spacing: 8) {
-                TextField("\(suggestedBrowserPort)", text: $browserPortDraft)
+                Text("HTTPS port").font(fontPreset.captionFont).foregroundColor(.secondary)
+                // String titles: an Int inside a LocalizedStringKey literal would render with
+                // locale digit grouping (for example "8.443").
+                TextField(String(suggestedBrowserPort), text: $browserPortDraft)
                     .onSubmit(saveBrowserPort)
                     .textFieldStyle(.roundedBorder)
-                    .frame(maxWidth: 100)
+                    .frame(maxWidth: 90)
                 Button("Save Port", action: saveBrowserPort).buttonStyle(CustomButtonStyle())
-                Button("Use \(suggestedBrowserPort)") {
+                Button("Use " + String(suggestedBrowserPort)) {
                     browserPortDraft = String(suggestedBrowserPort)
                     saveBrowserPort()
                 }
@@ -121,7 +123,7 @@ struct RemoteControlSettingsView: View {
                 Text(browserPortError).font(fontPreset.captionFont).foregroundColor(.red)
             }
             if let browserOrigin = gatewayStatus.browserOrigin {
-                labeledMonospace("Browser origin", browserOrigin.string)
+                copyableField("Browser origin", browserOrigin.string) { EmptyView() }
             } else if globalSettings.mcpRemoteGatewayBrowserHTTPSPort() != nil, gatewayStatus.status.origin != nil {
                 Text("Tailscale reported no MagicDNS name for this Mac, so there is no browser origin. Enable MagicDNS, then click Refresh Status.")
                     .font(fontPreset.captionFont).foregroundColor(.secondary)
@@ -129,12 +131,10 @@ struct RemoteControlSettingsView: View {
             }
             if let gatewayOrigin = gatewayStatus.status.origin {
                 let command = RemoteGatewayBrowserOrigin.serveCommand(
-                    browserPort: globalSettings.mcpRemoteGatewayBrowserHTTPSPort() ?? suggestedBrowserPort,
+                    browserPort: configuredOrSuggestedPort,
                     gatewayOrigin: gatewayOrigin
                 )
-                HStack(alignment: .bottom, spacing: 8) {
-                    labeledMonospace("Run once in Terminal (\(buildIdentity.channel.rawValue.capitalized) build)", command)
-                    Spacer()
+                copyableField("Run once in Terminal (\(buildIdentity.channel.rawValue.capitalized) build)", command) {
                     Button("Copy") {
                         NSPasteboard.general.clearContents()
                         NSPasteboard.general.setString(command, forType: .string)
@@ -146,9 +146,11 @@ struct RemoteControlSettingsView: View {
                 Text("Turn on Remote Control to see the exact tailscale serve command for this build.")
                     .font(fontPreset.captionFont).foregroundColor(.secondary)
             }
-            Text("Requires MagicDNS and HTTPS certificates in Tailscale. Run the command after saving a port. One Serve port forwards to one build's gateway: after switching between the release and Dev builds, run the command shown in the build you use. It replaces the earlier target; until then, links fail. Clearing the port stops the 127.0.0.1 listener and returns alerts to text only, but leaves your Serve setup in place; remove it with tailscale serve --https=\(globalSettings.mcpRemoteGatewayBrowserHTTPSPort() ?? suggestedBrowserPort) off. Serve's port 443 is never changed.")
-                .font(fontPreset.captionFont).foregroundColor(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+            detailsDisclosure([
+                "Requires MagicDNS and HTTPS certificates in Tailscale. Run the command after saving a port. While a browser origin is shown, this build's gateway also listens on 127.0.0.1 for that Tailscale Serve command.",
+                "One Serve port forwards to one build's gateway: after switching between the release and Dev builds, run the command shown in the build you use. It replaces the earlier target; until then, links fail.",
+                "Clearing the port stops the 127.0.0.1 listener and returns alerts to text only, but leaves your Serve setup in place; remove it with tailscale serve --https=\(String(configuredOrSuggestedPort)) off. Serve's port 443 is never changed."
+            ])
         }
     }
 
@@ -192,9 +194,10 @@ struct RemoteControlSettingsView: View {
             if let storeError {
                 Text(storeError).font(fontPreset.captionFont).foregroundColor(.red)
             }
-            labeledMonospace("Host fingerprint", hostFingerprint.isEmpty ? "Unavailable" : hostFingerprint)
-            Text("Pairing requests are approved in the host app and are bound to a short-lived, single-use discovery context. No pairing payload or editable endpoint is required.")
-                .font(fontPreset.captionFont).foregroundColor(.secondary)
+            copyableField("Host fingerprint", hostFingerprint.isEmpty ? "Unavailable" : hostFingerprint) { EmptyView() }
+            detailsDisclosure([
+                "Pairing requests are approved in the host app and are bound to a short-lived, single-use discovery context. No pairing payload or editable endpoint is required."
+            ])
         }
     }
 
@@ -214,27 +217,33 @@ struct RemoteControlSettingsView: View {
     }
 
     private func deviceRow(_ device: PairedDeviceRecord) -> some View {
-        HStack(alignment: .top, spacing: 12) {
+        HStack(alignment: .top, spacing: 10) {
             Image(systemName: device.isRevoked ? "iphone.slash" : "iphone")
-                .foregroundColor(device.isRevoked ? .secondary : .accentColor).frame(width: 24)
-            VStack(alignment: .leading, spacing: 4) {
+                .foregroundColor(device.isRevoked ? .secondary : .accentColor).frame(width: 20)
+            VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
                     Text(device.displayName).font(fontPreset.font)
                     if device.isRevoked {
                         Text("Revoked").font(fontPreset.captionFont)
-                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .padding(.horizontal, 6).padding(.vertical, 1)
                             .background(Color.secondary.opacity(0.12), in: Capsule())
                     }
                 }
-                Text(device.id).font(.system(size: 11, design: .monospaced)).foregroundColor(.secondary)
-                Text(device.scopes.sorted().map(\.rawValue).joined(separator: ", "))
-                    .font(fontPreset.captionFont).foregroundColor(.secondary)
+                Text(verbatim: device.id)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(.secondary)
+                    .textSelection(.enabled)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text(verbatim: device.scopes.sorted().map(\.rawValue).joined(separator: ", "))
+                    .font(fontPreset.captionFont)
+                    .foregroundColor(.secondary)
                 passkeyBlock(device)
             }
             Spacer()
             Button("Revoke") { revoke(device) }.buttonStyle(CustomButtonStyle()).disabled(device.isRevoked)
         }
-        .padding(10)
+        .padding(8)
         .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 
@@ -345,17 +354,50 @@ struct RemoteControlSettingsView: View {
         }
     }
 
-    private func labeledValue(_ label: String, _ value: String) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
+    /// One gateway fact as a label/value grid row; monospaced values are selectable.
+    private func factRow(_ label: String, _ value: String, monospaced: Bool = false) -> some View {
+        GridRow {
             Text(label).font(fontPreset.captionFont).foregroundColor(.secondary)
-            Text(value).font(fontPreset.captionFont)
+            Text(verbatim: value)
+                .font(monospaced ? .system(size: 11, design: .monospaced) : fontPreset.captionFont)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
-    private func labeledMonospace(_ label: String, _ value: String) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
+    /// Label above a monospaced, selectable value, with an optional trailing action aligned to
+    /// the value's first line.
+    private func copyableField(
+        _ label: String,
+        _ value: String,
+        @ViewBuilder trailing: () -> some View
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
             Text(label).font(fontPreset.captionFont).foregroundColor(.secondary)
-            Text(value).font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(verbatim: value)
+                    .font(.system(size: 11, design: .monospaced))
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 8)
+                trailing()
+            }
+        }
+    }
+
+    /// Collapsed operational detail: available on demand without a wall of captions.
+    private func detailsDisclosure(_ paragraphs: [String]) -> some View {
+        DisclosureGroup {
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(paragraphs, id: \.self) { paragraph in
+                    Text(verbatim: paragraph)
+                        .font(fontPreset.captionFont).foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .padding(.top, 4)
+        } label: {
+            Text("Details").font(fontPreset.captionFont).foregroundColor(.secondary)
         }
     }
 

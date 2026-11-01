@@ -1841,7 +1841,7 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(codexUsageEvent(1, turn: "late-turn", codexTotal(1000, 100, 10)), session: session)
         XCTAssertEqual(session.usageAccounting?.codexIntervalCount, 1)
         XCTAssertEqual(session.usageAccounting?.record?.codexIntervals?.first?.turnID, "late-turn")
-        XCTAssertEqual(session.usageAccounting?.codexSessionCostEstimate?.lower, Decimal(string: "0.0017325"), "the pending basis survived the rejected completion and priced the bound turn")
+        XCTAssertEqual(session.usageAccounting?.codexSessionCostEstimate?.amount, Decimal(string: "0.0017325"), "the pending basis survived the rejected completion and priced the bound turn")
         XCTAssertEqual(session.usageAccounting?.codexSessionCostEstimate?.coverage, .complete)
     }
 
@@ -2475,7 +2475,7 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         XCTAssertEqual(session.usageAccounting?.codexSessionCostEstimate?.coverage, .partial)
         // Bundled seed rates for gpt-5.3-codex ($1.75 / $0.175 / $14.00 per million):
         // 900 ordinary × 1.75 + 100 cached × 0.175 + 10 output × 14 = 1732.5 → $0.0017325.
-        XCTAssertEqual(session.usageAccounting?.codexSessionCostEstimate?.lower, Decimal(string: "0.0017325"), "accepted amounts are retained")
+        XCTAssertEqual(session.usageAccounting?.codexSessionCostEstimate?.amount, Decimal(string: "0.0017325"), "accepted amounts are retained")
 
         await coordinator.test_handleCodexNativeEvent(usage(2, turn: "turn-2", total(2000, 200, 20)), session: session)
         XCTAssertEqual(session.usageAccounting?.codexUnmeasuredWorkCount, 0, "a provably owned late observation replaces the marker")
@@ -2495,7 +2495,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
             accounting: session.usageAccounting,
             expectedOwnerSessionID: session.activeAgentSessionID
         )
-        XCTAssertTrue(projection.presentation.readoutText.hasSuffix(" partial"))
+        XCTAssertEqual(projection.costEstimate?.coverage, .partial)
+        XCTAssertFalse(projection.presentation.readoutText.contains("partial"), "coverage lives in the details, not the value")
+        XCTAssertTrue(projection.presentation.detailText.contains("Accumulated session cost: <$0.01 (partial coverage)"))
         XCTAssertTrue(
             try XCTUnwrap(projection.coverageDetail)
                 .contains(AgentUsageAccumulator.codexUnmeasuredTurnDiagnostic)

@@ -7,30 +7,67 @@ package struct AgentProviderUsageSnapshot: Equatable {
         case unsupported(String)
     }
 
+    /// Two labelled values for every scope: the latest-request cache-hit ratio and the
+    /// accumulated session API cost estimate. Coverage, scope, pricing basis and provenance live
+    /// only in `detailText` / `expandedDetailText`, never in the values themselves.
     package struct Presentation: Equatable {
-        package var title: String
-        package var readoutText: String
+        package static let cacheHitRatioLabel = "Cache Hit Ratio"
+        package static let costEstimateLabel = "API Cost Estimates"
+        package static let unavailableValue = "—"
+
+        /// Names the accounted provider for assistive technologies; never a visible label.
+        package var accessibilityLabel: String
+        /// Latest-request CH such as `99.8%`, or `—`.
+        package var cacheHitRatioValue: String
+        /// Accumulated session cost such as `$206.70` (or `<$0.01`), or `—`.
+        package var costEstimateValue: String
         /// Full scope/coverage explanation for tooltips and accessibility.
         package var detailText: String
         /// Additional content rendered inside the context-pill popover. It keeps the compact
-        /// main line limited to latest-request CH plus accumulated session cost.
+        /// rows limited to latest-request CH plus accumulated session cost.
         package var expandedDetailText: String?
         /// Short explanation hosts may render visibly next to the readout: why no figures are
         /// shown, or why shown figures are only partial. `nil` when nothing needs explaining.
         package var noteText: String?
 
         init(
-            title: String,
-            readoutText: String,
+            accessibilityLabel: String,
+            cacheHitRatioValue: String,
+            costEstimateValue: String,
             detailText: String,
             expandedDetailText: String? = nil,
             noteText: String? = nil
         ) {
-            self.title = title
-            self.readoutText = readoutText
+            self.accessibilityLabel = accessibilityLabel
+            self.cacheHitRatioValue = cacheHitRatioValue
+            self.costEstimateValue = costEstimateValue
             self.detailText = detailText
             self.expandedDetailText = expandedDetailText
             self.noteText = noteText
+        }
+
+        /// Fixed for every scope; never carries a provider name or coverage qualifier.
+        package var cacheHitRatioLabel: String {
+            Self.cacheHitRatioLabel
+        }
+
+        package var costEstimateLabel: String {
+            Self.costEstimateLabel
+        }
+
+        /// `Cache Hit Ratio: 99.8%`
+        package var cacheHitRatioLine: String {
+            "\(cacheHitRatioLabel): \(cacheHitRatioValue)"
+        }
+
+        /// `API Cost Estimates: $206.70`
+        package var costEstimateLine: String {
+            "\(costEstimateLabel): \(costEstimateValue)"
+        }
+
+        /// Single-line convenience form of both labelled values.
+        package var readoutText: String {
+            "\(cacheHitRatioLine) · \(costEstimateLine)"
         }
     }
 
@@ -41,8 +78,6 @@ package struct AgentProviderUsageSnapshot: Equatable {
     /// Token-weighted CH over the persisted session ledger.
     var cacheHitShare: AgentUsageCacheHitShare?
     var costEstimate: AgentUsageCostEstimate?
-    /// Upper bound of a Codex envelope-priced estimate; `nil` (or equal to the amount) for a point.
-    var costUpperBound: Decimal?
     /// Pricing provenance for Codex (frozen pricing version(s) used by the priced intervals).
     var pricingProvenance: String?
     /// Explains why restored read-only values cannot claim current full-session coverage.
@@ -69,7 +104,6 @@ package struct AgentProviderUsageSnapshot: Equatable {
         latestRequestCacheHit: AgentUsageLatestRequestCacheHit? = nil,
         cacheHitShare: AgentUsageCacheHitShare? = nil,
         costEstimate: AgentUsageCostEstimate? = nil,
-        costUpperBound: Decimal? = nil,
         pricingProvenance: String? = nil,
         coverageDetail: String? = nil,
         sessionCacheCoverageDetail: String? = nil,
@@ -82,7 +116,6 @@ package struct AgentProviderUsageSnapshot: Equatable {
         self.latestRequestCacheHit = latestRequestCacheHit
         self.cacheHitShare = cacheHitShare
         self.costEstimate = costEstimate
-        self.costUpperBound = costUpperBound
         self.pricingProvenance = pricingProvenance
         self.coverageDetail = coverageDetail
         self.sessionCacheCoverageDetail = sessionCacheCoverageDetail
@@ -282,8 +315,11 @@ package struct AgentProviderUsageSnapshot: Equatable {
         let intervals = record.codexIntervals ?? []
         let cacheShare = accounting.codexCacheHitShare
         let cost = accounting.codexSessionCostEstimate
-        let intervalDiagnostics = uniqueDetails(intervals.compactMap(\.diagnostic))
-        var details = intervalDiagnostics
+        // A completely priced interval's diagnostic is only a stated pricing assumption; it is
+        // disclosed with the session cost coverage, not as a coverage problem.
+        var details = uniqueDetails(intervals.compactMap { interval in
+            interval.estimatedCostLowerUSD != nil && interval.coverage == .complete ? nil : interval.diagnostic
+        })
         if record.hasUnmeasuredHistory {
             details.append(
                 "Earlier Codex usage is marked unmeasured; the persisted record does not store a separate historical cause."
@@ -294,8 +330,7 @@ package struct AgentProviderUsageSnapshot: Equatable {
             trackingStartedAt: intervals.isEmpty ? nil : record.trackingStartedAt,
             latestRequestCacheHit: latest,
             cacheHitShare: cacheShare,
-            costEstimate: cost.map { .init(amount: $0.lower, currency: $0.currency, coverage: $0.coverage) },
-            costUpperBound: cost.flatMap { $0.isPoint ? nil : $0.upper },
+            costEstimate: cost.map { .init(amount: $0.amount, currency: $0.currency, coverage: $0.coverage) },
             pricingProvenance: accounting.codexPricingProvenance.map(codexPricingProvenanceText),
             coverageDetail: details.isEmpty ? nil : details.joined(separator: " "),
             sessionCacheCoverageDetail: codexSessionCacheCoverageDetail(
@@ -321,8 +356,9 @@ package struct AgentProviderUsageSnapshot: Equatable {
             codexPresentation
         case let .unsupported(providerName):
             .init(
-                title: "\(providerName) usage",
-                readoutText: "CH — · Est. —",
+                accessibilityLabel: "\(providerName) usage",
+                cacheHitRatioValue: Presentation.unavailableValue,
+                costEstimateValue: Presentation.unavailableValue,
                 detailText: "Cache hit (CH) share and cost are unavailable for \(providerName).",
                 noteText: "Usage accounting is unavailable for \(providerName)."
             )
@@ -542,17 +578,32 @@ package struct AgentProviderUsageSnapshot: Equatable {
             )
         }
         reasons = uniqueDetails(reasons)
+        // Completely priced intervals carry a diagnostic only for a stated pricing assumption
+        // (for example an unstated long-context qualifier); it never lowers coverage.
+        let assumptions = uniqueDetails(intervals.compactMap { interval in
+            interval.estimatedCostLowerUSD != nil && interval.coverage == .complete ? interval.diagnostic : nil
+        })
+        var assumptionText = assumptions.isEmpty ? "" : " Pricing assumption: \(assumptions.joined(separator: "; "))."
+        let legacyRangeCount = intervals.count { interval in
+            guard let lower = interval.estimatedCostLowerUSD, let upper = interval.estimatedCostUpperUSD else {
+                return false
+            }
+            return lower != upper
+        }
+        if legacyRangeCount > 0 {
+            assumptionText += " \(legacyRangeCount) earlier interval(s) were priced as a range by an older build; the lower bound is shown."
+        }
         guard let estimate else {
             return reasons.isEmpty
                 ? "Unavailable: no owned interval has a priceable token delta."
                 : "Unavailable: \(reasons.joined(separator: " "))"
         }
         guard estimate.coverage == .partial else {
-            return "Complete: every owned interval has a complete frozen-pricing estimate."
+            return "Complete: every owned interval has a complete frozen-pricing estimate.\(assumptionText)"
         }
         return reasons.isEmpty
-            ? "Partial: the persisted estimate is marked partial, but its historical cause was not recorded."
-            : "Partial: \(reasons.joined(separator: " "))"
+            ? "Partial: the persisted estimate is marked partial, but its historical cause was not recorded.\(assumptionText)"
+            : "Partial: \(reasons.joined(separator: " "))\(assumptionText)"
     }
 
     private static func uniqueDetails(_ details: [String]) -> [String] {
@@ -598,11 +649,6 @@ package struct AgentProviderUsageSnapshot: Equatable {
                 ? nil
                 : Self.usdAmount($0.amount)
         }
-        let latestInline = latestReadout.map { "CH \($0)" } ?? "CH —"
-        let costInline = costReadout.map {
-            "Est. \($0)\(Self.partialSuffix(costEstimate?.coverage))"
-        } ?? "Est. —"
-
         let latestDetail = latestRequestCacheHit.map {
             "Latest-request CH: \(latestReadout ?? "unavailable"). \($0.detail)"
         } ?? "Latest-request CH: unavailable. It is live-only and is not restored from turn/result aggregates or another process."
@@ -620,8 +666,9 @@ package struct AgentProviderUsageSnapshot: Equatable {
             .compactMap(\.self)
             .joined(separator: "\n\n")
         return .init(
-            title: "Claude latest request CH · session cost",
-            readoutText: "\(latestInline) · \(costInline)",
+            accessibilityLabel: "Claude usage",
+            cacheHitRatioValue: latestReadout ?? Presentation.unavailableValue,
+            costEstimateValue: costReadout ?? Presentation.unavailableValue,
             detailText: expanded.replacingOccurrences(of: "\n", with: " "),
             expandedDetailText: expanded,
             noteText: nil
@@ -632,16 +679,8 @@ package struct AgentProviderUsageSnapshot: Equatable {
         let latestReadout = latestRequestCacheHit?.share.map { Self.cachePercentage($0.ratio) }
         let costReadout: String? = costEstimate.flatMap { estimate in
             guard estimate.coverage != .unavailable, estimate.currency == CodexUsagePricing.currency else { return nil }
-            if let upper = costUpperBound, upper != estimate.amount {
-                // Endpoints round outward so the displayed range never excludes a permitted value.
-                return "\(Self.usdLowerBound(estimate.amount))–\(Self.usdUpperBound(upper))"
-            }
             return Self.usdAmount(estimate.amount)
         }
-        let latestInline = latestReadout.map { "CH \($0)" } ?? "CH —"
-        let costInline = costReadout.map {
-            "Est. \($0)\(Self.partialSuffix(costEstimate?.coverage))"
-        } ?? "Est. —"
 
         let latestDetail = latestRequestCacheHit.map {
             "Latest-request CH: \(latestReadout ?? "unavailable"). \($0.detail)"
@@ -653,15 +692,16 @@ package struct AgentProviderUsageSnapshot: Equatable {
             "Tracking period: since \($0.formatted(date: .abbreviated, time: .shortened))."
         } ?? "Tracking period: unavailable."
         let costDetail = costReadout.map {
-            "Accumulated session cost: \($0) (\(Self.coverageText(costEstimate?.coverage)) coverage). It is an API-equivalent estimate calculated from frozen OpenAI Standard/global list prices\(pricingProvenance.map { " (\($0))" } ?? "") at each dispatch, not billed spend or a plan charge. A range bounds the stated token-price assumptions where a context band could not be attributed. \(sessionCostCoverageDetail ?? "")"
+            "Accumulated session cost: \($0) (\(Self.coverageText(costEstimate?.coverage)) coverage). It is an API-equivalent estimate calculated from frozen OpenAI Standard/global list prices\(pricingProvenance.map { " (\($0))" } ?? "") at each dispatch, not billed spend or a plan charge. Uncached input is priced at the input rate (an absent cache-write count is the provider's schema default of zero), and the context band follows the model's context window or the latest request's input size, never dropping within a turn. \(sessionCostCoverageDetail ?? "")"
         } ?? "Accumulated session cost: unavailable. It would be an API-equivalent estimate, not billed spend or a plan charge. \(sessionCostCoverageDetail ?? "No owned interval could be priced.")"
 
         let expanded = [latestDetail, sessionCacheDetail, trackingDetail, costDetail, unavailableReason]
             .compactMap(\.self)
             .joined(separator: "\n\n")
         return .init(
-            title: "Codex latest request CH · session cost",
-            readoutText: "\(latestInline) · \(costInline)",
+            accessibilityLabel: "Codex usage",
+            cacheHitRatioValue: latestReadout ?? Presentation.unavailableValue,
+            costEstimateValue: costReadout ?? Presentation.unavailableValue,
             detailText: expanded.replacingOccurrences(of: "\n", with: " "),
             expandedDetailText: expanded,
             noteText: nil
@@ -675,26 +715,14 @@ package struct AgentProviderUsageSnapshot: Equatable {
         return "\(formatted(ratio * 100, fractionDigits: 1))%"
     }
 
-    private static func usdAmount(_ amount: Decimal) -> String {
-        if amount > 0, amount < Decimal(string: "0.001")! {
-            return "$\(NSDecimalNumber(decimal: amount).stringValue)"
-        }
-        return "$\(formatted(amount, fractionDigits: 3))"
-    }
-
-    /// Lower range endpoint rounded down; a tiny positive value keeps its exact digits so it
-    /// never masquerades as zero.
-    static func usdLowerBound(_ amount: Decimal) -> String {
-        let rounded = roundedDecimal(amount, scale: 3, mode: .down)
+    /// USD to two decimals, half-up. A positive amount that would round to zero shows `<$0.01`
+    /// so it never masquerades as free.
+    static func usdAmount(_ amount: Decimal) -> String {
+        let rounded = roundedDecimal(amount, scale: 2, mode: .plain)
         if amount > 0, rounded <= 0 {
-            return "$\(NSDecimalNumber(decimal: amount).stringValue)"
+            return "<$0.01"
         }
-        return "$\(formatted(rounded, fractionDigits: 3))"
-    }
-
-    /// Upper range endpoint rounded up.
-    static func usdUpperBound(_ amount: Decimal) -> String {
-        "$\(formatted(roundedDecimal(amount, scale: 3, mode: .up), fractionDigits: 3))"
+        return "$\(formatted(rounded, fractionDigits: 2))"
     }
 
     private static func roundedDecimal(_ value: Decimal, scale: Int16, mode: NSDecimalNumber.RoundingMode) -> Decimal {
@@ -718,10 +746,6 @@ package struct AgentProviderUsageSnapshot: Equatable {
         formatter.roundingMode = .halfUp
         return formatter.string(from: NSDecimalNumber(decimal: value))
             ?? NSDecimalNumber(decimal: value).stringValue
-    }
-
-    private static func partialSuffix(_ coverage: AgentProviderUsageRecord.Coverage?) -> String {
-        coverage == .partial ? " partial" : ""
     }
 
     private static func coverageText(_ coverage: AgentProviderUsageRecord.Coverage?) -> String {

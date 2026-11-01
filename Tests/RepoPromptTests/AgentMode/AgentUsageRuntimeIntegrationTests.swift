@@ -262,7 +262,7 @@ final class AgentUsageRuntimeIntegrationTests: XCTestCase {
         XCTAssertEqual(accounting.sessionCostEstimate, .init(amount: 2, currency: "USD", coverage: .complete))
         XCTAssertEqual(accounting.cacheHitShare, .init(ratio: Decimal(9) / Decimal(10), coverage: .complete))
         let projection = fixture.session.cachedProviderUsageProjection(selectedAgent: .claudeCode)
-        XCTAssertEqual(projection.presentation.readoutText, "CH — · Est. $2.000")
+        XCTAssertEqual(projection.presentation.readoutText, "Cache Hit Ratio: — · API Cost Estimates: $2.00")
         assertSessionAverage("90.0%", in: projection)
     }
 
@@ -495,7 +495,7 @@ final class AgentUsageRuntimeIntegrationTests: XCTestCase {
 
         // Restored and live figures combine as complete coverage (91 cached of 102 input tokens).
         let projection = fixture.session.cachedProviderUsageProjection(selectedAgent: .claudeCode)
-        XCTAssertEqual(projection.presentation.readoutText, "CH — · Est. $9.400")
+        XCTAssertEqual(projection.presentation.readoutText, "Cache Hit Ratio: — · API Cost Estimates: $9.40")
         assertSessionAverage("89.2%", in: projection)
         XCTAssertNil(projection.unavailableReason)
         XCTAssertNil(projection.coverageDetail)
@@ -535,7 +535,7 @@ final class AgentUsageRuntimeIntegrationTests: XCTestCase {
         }
         XCTAssertNil(fixture.session.usageAccounting?.persistedRepresentation)
         var projection = fixture.session.cachedProviderUsageProjection(selectedAgent: .claudeCode)
-        XCTAssertEqual(projection.presentation.readoutText, "CH — · Est. —")
+        XCTAssertEqual(projection.presentation.readoutText, "Cache Hit Ratio: — · API Cost Estimates: —")
         XCTAssertEqual(
             projection.unavailableReason,
             "No live figures: the runtime has not reported its version yet. This session's turns are not counted."
@@ -576,7 +576,7 @@ final class AgentUsageRuntimeIntegrationTests: XCTestCase {
 
         // UI projection readout (context pill / sidebar card) through the session cache.
         projection = fixture.session.cachedProviderUsageProjection(selectedAgent: .claudeCode)
-        XCTAssertEqual(projection.presentation.readoutText, "CH — · Est. $0.750")
+        XCTAssertEqual(projection.presentation.readoutText, "Cache Hit Ratio: — · API Cost Estimates: $0.75")
         assertSessionAverage("90.0%", in: projection)
         XCTAssertNil(projection.unavailableReason)
         XCTAssertNil(projection.coverageDetail)
@@ -745,7 +745,7 @@ final class AgentUsageRuntimeIntegrationTests: XCTestCase {
             XCTAssertNil(fixture.session.usageAccounting?.sessionCostEstimate)
             XCTAssertEqual(fixture.session.usageAccounting?.cacheHitShare, .init(ratio: Decimal(1) / Decimal(2), coverage: .complete))
             let projection = fixture.session.cachedProviderUsageProjection(selectedAgent: .claudeCode)
-            XCTAssertEqual(projection.presentation.readoutText, "CH — · Est. —")
+            XCTAssertEqual(projection.presentation.readoutText, "Cache Hit Ratio: — · API Cost Estimates: —")
             assertSessionAverage("50.0%", in: projection)
             XCTAssertNil(projection.unavailableReason)
             XCTAssertEqual(
@@ -809,7 +809,8 @@ final class AgentUsageRuntimeIntegrationTests: XCTestCase {
             XCTAssertEqual(record.claudeSegments.first?.latestCumulative, Decimal(string: "0.4"))
             XCTAssertEqual(record.turns.last?.acceptedResultID, nil)
             let projection = fixture.session.cachedProviderUsageProjection(selectedAgent: .claudeCode)
-            XCTAssertEqual(projection.presentation.readoutText, "CH — · Est. $0.400 partial")
+            XCTAssertEqual(projection.presentation.readoutText, "Cache Hit Ratio: — · API Cost Estimates: $0.40")
+            XCTAssertEqual(projection.costEstimate?.coverage, .partial)
             assertSessionAverage("90.0%", in: projection)
             XCTAssertEqual(
                 projection.coverageDetail,
@@ -840,7 +841,8 @@ final class AgentUsageRuntimeIntegrationTests: XCTestCase {
             XCTAssertEqual(reloadedRecord.claudeSegments.first?.latestCumulative, Decimal(string: "0.4"))
             XCTAssertEqual(fixture.session.usageAccounting?.sessionCostEstimate?.coverage, .partial)
             let afterEnd = fixture.session.cachedProviderUsageProjection(selectedAgent: .claudeCode)
-            XCTAssertEqual(afterEnd.presentation.readoutText, "CH — · Est. $0.400 partial")
+            XCTAssertEqual(afterEnd.presentation.readoutText, "Cache Hit Ratio: — · API Cost Estimates: $0.40")
+            XCTAssertEqual(afterEnd.costEstimate?.coverage, .partial)
             assertSessionAverage("90.0%", in: afterEnd)
         }
 
@@ -1466,7 +1468,7 @@ final class AgentUsageRuntimeIntegrationTests: XCTestCase {
         let aggregateOnlyProjection = session.cachedProviderUsageProjection(selectedAgent: .claudeCode)
         XCTAssertNil(aggregateOnlyProjection.latestRequestCacheHit?.requestID)
         XCTAssertNil(aggregateOnlyProjection.latestRequestCacheHit?.share)
-        XCTAssertEqual(aggregateOnlyProjection.presentation.readoutText, "CH — · Est. $2.000")
+        XCTAssertEqual(aggregateOnlyProjection.presentation.readoutText, "Cache Hit Ratio: — · API Cost Estimates: $2.00")
         assertSessionAverage("50.0%", in: aggregateOnlyProjection)
 
         let liveTurn = await controller.test_registerSyntheticDispatch()
@@ -1510,12 +1512,12 @@ final class AgentUsageRuntimeIntegrationTests: XCTestCase {
         await waitUntil("assistant latest request reached UI callback") {
             fixture.viewModel.test_syncRuntimeMetricsCallCount > syncCountBeforeLatest
                 && fixture.viewModel.ui.runtimeMetrics.runtimeVM.snapshot.providerUsage.presentation.readoutText
-                == "CH 90.0% · Est. $2.000"
+                == "Cache Hit Ratio: 90.0% · API Cost Estimates: $2.00"
         }
 
         var projection = fixture.viewModel.ui.runtimeMetrics.runtimeVM.snapshot.providerUsage
         XCTAssertEqual(projection.latestRequestCacheHit?.share?.ratio, Decimal(string: "0.9"))
-        XCTAssertEqual(projection.presentation.readoutText, "CH 90.0% · Est. $2.000")
+        XCTAssertEqual(projection.presentation.readoutText, "Cache Hit Ratio: 90.0% · API Cost Estimates: $2.00")
         assertSessionAverage("50.0%", in: projection)
         XCTAssertEqual(session.usageAccounting?.ownedRevision, ownedRevisionBeforeLatest)
         XCTAssertGreaterThan(
@@ -1546,11 +1548,11 @@ final class AgentUsageRuntimeIntegrationTests: XCTestCase {
         await waitUntil("missing assistant usage reached UI callback") {
             fixture.viewModel.test_syncRuntimeMetricsCallCount > syncCountBeforeMissing
                 && fixture.viewModel.ui.runtimeMetrics.runtimeVM.snapshot.providerUsage.presentation.readoutText
-                == "CH — · Est. $2.000"
+                == "Cache Hit Ratio: — · API Cost Estimates: $2.00"
         }
 
         projection = fixture.viewModel.ui.runtimeMetrics.runtimeVM.snapshot.providerUsage
-        XCTAssertEqual(projection.presentation.readoutText, "CH — · Est. $2.000")
+        XCTAssertEqual(projection.presentation.readoutText, "Cache Hit Ratio: — · API Cost Estimates: $2.00")
         XCTAssertTrue(projection.presentation.expandedDetailText?.contains("did not include a usage object") == true)
         assertSessionAverage("50.0%", in: projection)
         XCTAssertEqual(
@@ -1652,7 +1654,7 @@ final class AgentUsageRuntimeIntegrationTests: XCTestCase {
         }
 
         let projection = fixture.viewModel.ui.runtimeMetrics.runtimeVM.snapshot.providerUsage
-        XCTAssertTrue(projection.presentation.readoutText.hasPrefix("CH 80.0% · Est."))
+        XCTAssertTrue(projection.presentation.readoutText.hasPrefix("Cache Hit Ratio: 80.0% · API Cost Estimates: "))
         assertSessionAverage("20.0%", in: projection)
         XCTAssertEqual(session.usageAccounting?.record, recordBeforeLastOnly)
         XCTAssertEqual(session.usageAccounting?.codexSessionCostEstimate, costBeforeLastOnly)
@@ -1710,7 +1712,8 @@ final class AgentUsageRuntimeIntegrationTests: XCTestCase {
         )
         XCTAssertTrue(try XCTUnwrap(fixture.session.usageAccounting).hasAbandonedHydratedLifecycleState)
         let projection = fixture.session.cachedProviderUsageProjection(selectedAgent: .claudeCode)
-        XCTAssertEqual(projection.presentation.readoutText, "CH — · Est. $0.500 partial")
+        XCTAssertEqual(projection.presentation.readoutText, "Cache Hit Ratio: — · API Cost Estimates: $0.50")
+        XCTAssertEqual(projection.costEstimate?.coverage, .partial)
         assertSessionAverage("90.0%", in: projection)
         XCTAssertEqual(projection.coverageDetail, "The restored state includes unfinished work.")
         XCTAssertEqual(fixture.session.usageAccounting?.persistedRepresentation, .record(hydrated), "no owned mutation happened")
@@ -1756,7 +1759,7 @@ final class AgentUsageRuntimeIntegrationTests: XCTestCase {
             let reloaded = try await fixture.reloadPersistedSession()
             XCTAssertEqual(reloaded.providerUsage, persisted, seed.label)
             let projection = fixture.session.cachedProviderUsageProjection(selectedAgent: .claudeCode)
-            XCTAssertEqual(projection.presentation.readoutText, "CH — · Est. —", seed.label)
+            XCTAssertEqual(projection.presentation.readoutText, "Cache Hit Ratio: — · API Cost Estimates: —", seed.label)
         }
     }
 
@@ -1935,7 +1938,7 @@ final class AgentUsageRuntimeIntegrationTests: XCTestCase {
         XCTAssertEqual(accounting.sessionCostEstimate, .init(amount: expectedFreshCost, currency: "USD", coverage: .complete))
         XCTAssertEqual(accounting.cacheHitShare?.coverage, .complete)
         let projection = fixture.session.cachedProviderUsageProjection(selectedAgent: .claudeCode)
-        XCTAssertEqual(projection.presentation.readoutText, "CH — · Est. $0.013")
+        XCTAssertEqual(projection.presentation.readoutText, "Cache Hit Ratio: — · API Cost Estimates: $0.01")
         assertSessionAverage("86.4%", in: projection)
         XCTAssertNil(projection.unavailableReason)
         XCTAssertNil(projection.coverageDetail)
@@ -1972,7 +1975,7 @@ final class AgentUsageRuntimeIntegrationTests: XCTestCase {
         XCTAssertEqual(accounting.childActivityTurnCount, 1)
         XCTAssertFalse(accounting.hasUnchargedDispatchedWork)
         let projection = fixture.session.cachedProviderUsageProjection(selectedAgent: .claudeCode)
-        XCTAssertEqual(projection.presentation.readoutText, "CH — · Est. $0.048")
+        XCTAssertEqual(projection.presentation.readoutText, "Cache Hit Ratio: — · API Cost Estimates: $0.05")
         XCTAssertNil(projection.unavailableReason)
         XCTAssertTrue(try XCTUnwrap(projection.coverageDetail).contains("Native child (subagent) activity occurred in 1 turn"), projection.coverageDetail ?? "")
     }
@@ -2007,7 +2010,7 @@ final class AgentUsageRuntimeIntegrationTests: XCTestCase {
         XCTAssertEqual(accounting.cacheHitShare?.coverage, .complete)
         // 9698 cached of 10768 input-side tokens; the compaction result's zero triple adds nothing.
         let projection = fixture.session.cachedProviderUsageProjection(selectedAgent: .claudeCode)
-        XCTAssertEqual(projection.presentation.readoutText, "CH — · Est. $0.007")
+        XCTAssertEqual(projection.presentation.readoutText, "Cache Hit Ratio: — · API Cost Estimates: $0.01")
         assertSessionAverage("90.1%", in: projection)
     }
 
@@ -2059,7 +2062,7 @@ final class AgentUsageRuntimeIntegrationTests: XCTestCase {
         XCTAssertEqual(accounting.executionVerdict, nil, "execution ended")
         // 17003 cached of 17411 input-side tokens across the four non-empty triples.
         let projection = fixture.session.cachedProviderUsageProjection(selectedAgent: .claudeCode)
-        XCTAssertEqual(projection.presentation.readoutText, "CH — · Est. $0.024")
+        XCTAssertEqual(projection.presentation.readoutText, "Cache Hit Ratio: — · API Cost Estimates: $0.02")
         assertSessionAverage("97.7%", in: projection)
     }
 
