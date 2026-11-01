@@ -2,7 +2,7 @@
 
 Scope: read when the task touches the Telegram "Open session" link, paired-browser (PWA) control of UI-driven root sessions, the gateway's browser HTTPS origin or loopback companion listener, the gateway Host allowlist, or setup and recovery of a phone browser.
 Authority: Authoritative
-Last-verified: 2026-10-31
+Last-verified: 2026-11-01
 
 Implemented and accepted by the owner for the Dev build with Safari on iPhone, with the limits listed below. Telegram event rules (eligibility, lineage, question audience, terminal order) stay owned by the [Telegram attention notifications contract](plans/2026-10-10-telegram-attention-notifications-contract.md). Code and tests are the behavioral source of truth.
 
@@ -56,7 +56,7 @@ The [optional passkey-unlock spec](plans/2026-10-31-remote-passkey-unlock-spec.m
 - **Links fail after a build switch:** re-run that build's Serve command.
 - **Telegram rejects the URL button:** clear the browser HTTPS port. Alerts go back to text only, and the Serve setup stays in place.
 
-## Verification status (2026-10-31)
+## Verification status (2026-11-01)
 - **Live, owner-confirmed on Dev with iPhone Safari:**
   - an unpaired page shows no session content;
   - pairing with Mac approval, and pairing reuse in normal tabs;
@@ -69,7 +69,8 @@ The [optional passkey-unlock spec](plans/2026-10-31-remote-passkey-unlock-spec.m
   - recovery with Forget pairing and Mac re-approval;
   - the earlier literal-text transcript view (historical; replaced by the presentation above).
 - **Owner feedback (2026-10-31):** after the polished layout was deployed, the owner reported that the phone UI looks much better and that typing longer text works. This is not a full acceptance of the list below.
-- **Pending deployment and live checks (Markdown, Copy, Top / Latest):** the Markdown bodies, code-block Copy (including the Selected fallback), sideways code scrolling, and the sticky Top / Latest pill have JavaScriptCore coverage and synthetic Chromium layout checks; none has been deployed or used in iPhone Safari. Check Copy from list-indented fences and Latest with a tall multi-question form: Latest currently lands at the page bottom, so the question title can require scrolling up. The pill can overlap a Copy button at the viewport edge; scrolling slightly is the workaround.
+- **Deployed and owner-confirmed (2026-11-01, Dev + iPhone Safari):** after rebuilding and reloading, the owner reported that Markdown looks good, Top and Latest both work, and code-block Copy copied and pasted the exact sample text. Read-only HTTPS health/readiness checks passed and served HTML/JavaScript byte-matched the worktree. These are basic live checks, not complete browser acceptance.
+- **Remaining Markdown/navigation checks:** the Selected fallback, long-code sideways scrolling, list-indented code Copy and Latest with a tall multi-question form are still unverified live. Latest currently lands at the page bottom, so the question title can require scrolling up. The pill can overlap a Copy button at the viewport edge; scrolling slightly is the workaround.
 - **Pending live acceptance (2026-10-31 presentation):** the rest of the structured transcript view and layout are not yet fully checked on iPhone Safari. Still to check:
   - light and dark appearance, and Dynamic Type sizes;
   - the keyboard with the composer in normal flow;
@@ -80,7 +81,7 @@ The [optional passkey-unlock spec](plans/2026-10-31-remote-passkey-unlock-spec.m
   - collapsing and expanding the toolbar with a multi-line draft;
   - while reading inside the opened Raw transcript, new records push the raw text down (no anchor there; accepted for a debug view);
   - VoiceOver.
-- **Synthetic only:**
+- **Automated evidence (not a substitute for the live checks above):**
   - older-page transcript paging, segmentation, `buildSpartanLogXML` parity, primary-view rendering including Markdown structure and code-block Copy, Top / Latest scroll targets and paging, node reuse, and scroll anchoring with synthetic geometry (JavaScriptCore tests in `PWAResourceTests+Transcript.swift`). Live sessions were too short to page.
   - Headless desktop-browser screenshots at 320, 390 and 1280px, light and dark, and headless Chromium checks of first-page landing, question landing, prepend anchoring (including the final older page), a focused composer holding still during new output, and header wrapping with enlarged text at 320 and 390px, are layout evidence only, not iPhone acceptance. The same applies to a headless Chromium check of the Markdown view at 320 and 390px: 8px paragraph and list gaps, a code block scrolling sideways with no page overflow, the Top / Latest pill stuck at the screen bottom mid-transcript and settled above Raw transcript and the composer at the end, Top landing the first record under the header, and Send to the right of a multi-line draft.
 - **Inconclusive, not fixed:** after the gateway site's Safari website data was deleted and the page fully reloaded, Safari still had the revoked identity. Access stayed refused, so this is not a bypass, but website-data deletion as a recovery step is unverified. Use Forget pairing instead.
