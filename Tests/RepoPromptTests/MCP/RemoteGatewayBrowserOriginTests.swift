@@ -164,6 +164,34 @@ final class RemoteGatewayBrowserOriginTests: XCTestCase {
         }
     }
 
+    /// Remote passkey unlock, Step 2 item 4: the origin-change revision advances on every real
+    /// change to the effective origin — including an A→B→A sequence published within ONE activation
+    /// generation, which `currentGeneration` cannot distinguish. The passkey coordinator relies on
+    /// this to invalidate a ceremony whose origin changed and changed back during a verifier await.
+    func testOriginRevisionAdvancesOnEveryRealOriginChangeIncludingABA() throws {
+        let store = RemoteGatewayStatusStore()
+        let gatewayOrigin = try RemoteGatewayOrigin(tailscaleIPv4: "100.64.0.8", channel: .debug)
+        let originA = try RemoteGatewayOrigin(string: "https://a.example.ts.net:8443")
+        let originB = try RemoteGatewayOrigin(string: "https://b.example.ts.net:8443")
+        XCTAssertEqual(store.currentOriginRevision, 0)
+
+        // Every publication uses the SAME activation generation, so currentGeneration never moves.
+        store.publish(.discoverable(gatewayOrigin), browserOrigin: originA, generation: 1)
+        let afterA = store.currentOriginRevision
+        XCTAssertGreaterThan(afterA, 0)
+        store.publish(.discoverable(gatewayOrigin), browserOrigin: originB, generation: 1)
+        let afterB = store.currentOriginRevision
+        XCTAssertGreaterThan(afterB, afterA, "A→B advances the origin revision")
+        store.publish(.discoverable(gatewayOrigin), browserOrigin: originA, generation: 1)
+        XCTAssertGreaterThan(store.currentOriginRevision, afterB, "B→A advances again though the string returned to A")
+        XCTAssertEqual(store.currentGeneration, 1, "the activation generation did not change across A→B→A")
+
+        // A no-op republish of the same effective origin does not advance the revision.
+        let steady = store.currentOriginRevision
+        store.publish(.discoverable(gatewayOrigin), browserOrigin: originA, generation: 1)
+        XCTAssertEqual(store.currentOriginRevision, steady, "no effective change → no bump")
+    }
+
     /// Review S3-02: publications are fenced by activation-gate generation, and a stop withdraws
     /// the link without claiming Remote Control was turned off.
     func testPublicationIsGenerationFencedAndStopWithdrawsTheLink() throws {

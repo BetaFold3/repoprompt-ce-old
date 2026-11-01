@@ -101,7 +101,13 @@ var repoPromptAppDependencies: [Target.Dependency] = [
     .product(name: "Cuchardet", package: "UniversalCharsetDetection"),
     .product(name: "JSONSchema", package: "JSONSchema"),
     .product(name: "Ontology", package: "ontology"),
-    .product(name: "RepoPromptClaudeCompatibleProvider", package: "RepoPromptAgentProviders")
+    .product(name: "RepoPromptClaudeCompatibleProvider", package: "RepoPromptAgentProviders"),
+    // Remote passkey unlock (Step 2): the maintained-copy WebAuthn verifier is linked into the
+    // app target only. SwiftCBOR is pulled in transitively by WebAuthn but is never imported by
+    // production code. It is intentionally NOT added to RepoPromptGateway, RepoPromptRemoteWire,
+    // RepoPromptAgentCore or RepoPromptShared. Both are local path packages, so Package.resolved
+    // is unchanged.
+    .product(name: "WebAuthn", package: "SwiftWebAuthn")
 ]
 
 /// Shared by RepoPromptApp and the lower app-split library targets so compile conditions stay aligned.

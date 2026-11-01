@@ -1,6 +1,9 @@
 import Foundation
+import Logging
 import RepoPromptAgentCore
 import RepoPromptRemoteWire
+
+private let gatewayLaunchLog = Logger(label: "com.repoprompt.mcp.gateway.launch")
 
 struct RemoteGatewayLaunchConfiguration: Equatable {
     let bindHost: String
@@ -9,18 +12,52 @@ struct RemoteGatewayLaunchConfiguration: Equatable {
     /// The browser HTTPS origin served by the owner's `tailscale serve` listener, or nil. The
     /// gateway also accepts its authority as a request Host. A change relaunches the gateway.
     var browserOrigin: RemoteGatewayOrigin?
+    /// The passkey policy version the launched gateway MUST understand, or nil when no device
+    /// requires a passkey (remote passkey unlock, Step 2 — decision 8). When non-nil, the app
+    /// passes `--passkey-policy-version=<v>` to the gateway. A gateway that does not recognize the
+    /// flag refuses to start (fail-closed), so an incompatible gateway can never serve a registry
+    /// with a required policy. This is part of `Equatable`, so a change in required-ness retires a
+    /// running process before a replacement starts.
+    var requiredPasskeyPolicyVersion: Int?
+
+    /// CLI arguments passed to the gateway process. Empty unless a passkey policy is required.
+    var gatewayProcessArguments: [String] {
+        guard let version = requiredPasskeyPolicyVersion else { return [] }
+        return ["--passkey-policy-version=\(version)"]
+    }
 
     static func production(
         bindHost: String,
         browserOrigin: RemoteGatewayOrigin? = nil,
-        buildIdentity: RemoteControlBuildIdentity = .current
+        buildIdentity: RemoteControlBuildIdentity = .current,
+        requiredPasskeyPolicyVersion: Int? = nil
     ) -> Self {
         .init(
             bindHost: bindHost,
             port: buildIdentity.fixedPort,
             appSupportRoot: RemoteControlStorageNamespace.gatewayRuntimeRootURL().path,
-            browserOrigin: browserOrigin
+            browserOrigin: browserOrigin,
+            requiredPasskeyPolicyVersion: requiredPasskeyPolicyVersion
         )
+    }
+
+    /// Derive the required passkey policy version from the authoritative paired-device registry.
+    /// An unreadable or invalid registry MUST NOT be treated as "no policy": it fails closed to
+    /// version 1 so a corrupt or fenced registry cannot silently drop enforcement.
+    static func resolveRequiredPasskeyPolicyVersion(
+        store: RemotePairingIdentityStore = .shared
+    ) -> Int? {
+        do {
+            let registry = try store.registry()
+            return registry.devices.contains { $0.passkey.isRequired } ? 1 : nil
+        } catch {
+            // Fail closed: an unreadable/fenced/invalid registry may hold a required policy, so the
+            // gateway must still be launched with the policy flag. Log the source error so the
+            // fail-closed decision is diagnosable rather than silent (it is NOT proof that a policy
+            // is actually required).
+            gatewayLaunchLog.error("resolveRequiredPasskeyPolicyVersion: registry read failed, failing closed to version 1: \(String(describing: error))")
+            return 1
+        }
     }
 }
 

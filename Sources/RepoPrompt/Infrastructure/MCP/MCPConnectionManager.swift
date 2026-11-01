@@ -2080,6 +2080,12 @@ actor ServerNetworkManager {
         /// handshake and always nil for `.standard` connections. A `let` without a default, so every
         /// construction site must state it.
         let gatewayRemoteDeviceID: String?
+        /// Launch-credential generation under which this connection was admitted as `.gateway`
+        /// (0 for `.standard`). A later credential rotation advances the manager's generation, so a
+        /// live-principal query rejects a connection stamped at an older generation. A `let` without
+        /// a default, so every construction site must state it (copying the existing stamp on any
+        /// in-place identity update).
+        let gatewayCredentialGeneration: UInt64
     }
 
     /// Identity context per connection
@@ -2087,6 +2093,11 @@ actor ServerNetworkManager {
 
     /// Launch-scoped credential expected from the app-spawned gateway bootstrap client.
     private var gatewayLaunchCredential: String?
+
+    /// Monotonic generation advanced whenever `gatewayLaunchCredential` actually changes (a rotation
+    /// or clear). A gateway connection records the generation it was admitted under; a later change
+    /// makes `isGatewayPrincipalConnectionLive` reject that now-stale connection.
+    private var gatewayLaunchCredentialGeneration: UInt64 = 0
 
     /// Identity failure escalation tracking
     private var identityFailureWindowStart: Date?
@@ -2105,11 +2116,35 @@ actor ServerNetworkManager {
 
     func setGatewayLaunchCredential(_ credential: String?) {
         let trimmed = credential?.trimmingCharacters(in: .whitespacesAndNewlines)
-        gatewayLaunchCredential = trimmed?.isEmpty == false ? trimmed : nil
+        let normalized = trimmed?.isEmpty == false ? trimmed : nil
+        if normalized != gatewayLaunchCredential {
+            // A real credential change (rotation or clear) invalidates gateway identities admitted
+            // under the previous credential, so a live-principal query rejects the stale connection.
+            gatewayLaunchCredentialGeneration &+= 1
+        }
+        gatewayLaunchCredential = normalized
     }
 
     func isGatewayPrincipalConnection(_ connectionID: UUID) -> Bool {
         identityContextByConnection[connectionID]?.principal == .gateway
+    }
+
+    /// A stricter, lifetime-aware check than `isGatewayPrincipalConnection`: the connection must be
+    /// a `.gateway` principal that still exists, is not being removed, and was admitted under the
+    /// CURRENT launch credential. The passkey coordinator calls this AFTER a verifier await, keyed
+    /// by the OLD connection id it captured at ceremony begin, so a connection torn down (ordinary
+    /// removal, committed/watchdog removal, or a full server stop) or whose launch credential was
+    /// rotated during verification cannot yield a committed enrollment or a verified unlock.
+    func isGatewayPrincipalConnectionLive(_ connectionID: UUID) -> Bool {
+        guard let context = identityContextByConnection[connectionID],
+              context.principal == .gateway,
+              context.gatewayCredentialGeneration == gatewayLaunchCredentialGeneration,
+              connections[connectionID] != nil,
+              !connectionsBeingRemoved.contains(connectionID)
+        else {
+            return false
+        }
+        return true
     }
 
     /// The paired device behind a verified per-device gateway app link, or nil. Requires the
@@ -6438,7 +6473,8 @@ actor ServerNetworkManager {
             hasHandshake: false,
             principal: principal,
             lastUpdated: Date(),
-            gatewayRemoteDeviceID: Self.gatewayRemoteDeviceID(bootstrapClientName: clientName, principal: principal)
+            gatewayRemoteDeviceID: Self.gatewayRemoteDeviceID(bootstrapClientName: clientName, principal: principal),
+            gatewayCredentialGeneration: principal == .gateway ? gatewayLaunchCredentialGeneration : 0
         )
         identityContextByConnection[connectionID] = identityContext
 
@@ -10714,7 +10750,8 @@ actor ServerNetworkManager {
                     hasHandshake: true,
                     principal: principal,
                     lastUpdated: Date(),
-                    gatewayRemoteDeviceID: Self.gatewayRemoteDeviceID(bootstrapClientName: clientName, principal: principal)
+                    gatewayRemoteDeviceID: Self.gatewayRemoteDeviceID(bootstrapClientName: clientName, principal: principal),
+                    gatewayCredentialGeneration: principal == .gateway ? gatewayLaunchCredentialGeneration : 0
                 )
             }
 

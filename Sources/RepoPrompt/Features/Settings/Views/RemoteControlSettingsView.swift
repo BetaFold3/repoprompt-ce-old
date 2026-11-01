@@ -9,11 +9,13 @@ struct RemoteControlSettingsView: View {
     @ObservedObject private var globalSettings = GlobalSettingsStore.shared
     @ObservedObject private var gatewayStatus = RemoteGatewayStatusStore.shared
     @ObservedObject private var fontScale = FontScaleManager.shared
+    @ObservedObject private var passkeyCoordinator = RemotePasskeyCoordinator.shared
     @State private var hostFingerprint = ""
     @State private var pairedDevices: [PairedDeviceRecord] = []
     @State private var storeError: String?
     @State private var browserPortDraft = ""
     @State private var browserPortError: String?
+    @State private var pendingPasskeyDisable: PairedDeviceRecord?
 
     private let buildIdentity = RemoteControlBuildIdentity.current
     private var fontPreset: FontScalePreset {
@@ -41,6 +43,16 @@ struct RemoteControlSettingsView: View {
             devicesSection
         }
         .onAppear(perform: refreshAll)
+        .confirmationDialog(
+            "Turn off the passkey requirement?",
+            isPresented: Binding(get: { pendingPasskeyDisable != nil }, set: { if !$0 { pendingPasskeyDisable = nil } }),
+            presenting: pendingPasskeyDisable
+        ) { device in
+            Button("Turn Off Passkey", role: .destructive) { disablePasskey(device) }
+            Button("Cancel", role: .cancel) { pendingPasskeyDisable = nil }
+        } message: { device in
+            Text("Browser access for \(device.displayName) will no longer require a passkey. Any enrolled credential is cleared. You can require a passkey again later.")
+        }
     }
 
     private var gatewaySection: some View {
@@ -217,12 +229,120 @@ struct RemoteControlSettingsView: View {
                 Text(device.id).font(.system(size: 11, design: .monospaced)).foregroundColor(.secondary)
                 Text(device.scopes.sorted().map(\.rawValue).joined(separator: ", "))
                     .font(fontPreset.captionFont).foregroundColor(.secondary)
+                passkeyBlock(device)
             }
             Spacer()
             Button("Revoke") { revoke(device) }.buttonStyle(CustomButtonStyle()).disabled(device.isRevoked)
         }
         .padding(10)
         .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    @ViewBuilder
+    private func passkeyBlock(_ device: PairedDeviceRecord) -> some View {
+        // Recomputed whenever the coordinator's `revision` OR the gateway status (origin/lifecycle)
+        // changes — both are observed objects. The saved policy state and the observed enforcement
+        // state are shown as separate lines. A failed read (malformed/fenced store) is surfaced as
+        // "unavailable" with actions disabled — never silently presented as "off".
+        let result = Result { try passkeyCoordinator.status(for: device.id) }
+        VStack(alignment: .leading, spacing: 4) {
+            Divider().padding(.vertical, 2)
+            switch result {
+            case let .success(status):
+                HStack(spacing: 6) {
+                    Image(systemName: "key.horizontal").foregroundColor(.secondary).frame(width: 14)
+                    Text("Passkey: \(passkeyPersistedLabel(status.persisted))").font(fontPreset.captionFont)
+                }
+                // A policy-off device keeps ordinary browser access, so it has no passkey
+                // enforcement requirement and shows no enforcement line.
+                if showsEnforcementLine(status.persisted) {
+                    Text(passkeyEnforcementLabel(status.enforcement))
+                        .font(fontPreset.captionFont).foregroundColor(.secondary)
+                }
+                if let reason = status.enableBlockedReason {
+                    Text(reason).font(fontPreset.captionFont).foregroundColor(.secondary)
+                }
+                if let openUntil = status.enrollmentOpenUntil {
+                    Text("Enrollment open until \(openUntil, style: .time)")
+                        .font(fontPreset.captionFont).foregroundColor(.secondary)
+                }
+                passkeyControls(device, status: status)
+            case .failure:
+                HStack(spacing: 6) {
+                    Image(systemName: "key.horizontal").foregroundColor(.secondary).frame(width: 14)
+                    Text("Passkey: status unavailable").font(fontPreset.captionFont)
+                }
+                Text("The passkey policy could not be read. Reload or restart RepoPrompt to manage it.")
+                    .font(fontPreset.captionFont).foregroundColor(.secondary)
+                passkeyControls(device, status: nil)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func passkeyControls(_ device: PairedDeviceRecord, status: RemotePasskeyDeviceStatus?) -> some View {
+        // A nil status means the read failed: disable every action, since each one needs a store read.
+        let unavailable = status == nil
+        let blocked = unavailable || status?.enableBlockedReason != nil
+        HStack(spacing: 8) {
+            switch status?.persisted {
+            case .off, .none:
+                Button("Require Passkey") { runPasskeyAction(device, "Passkey required for") { try await passkeyCoordinator.enable(deviceID: device.id) } }
+                    .buttonStyle(CustomButtonStyle()).disabled(blocked || device.isRevoked)
+            case .requiredNotEnrolled:
+                Button("Open Enrollment") { runPasskeyAction(device, "Enrollment opened for") { try await passkeyCoordinator.openEnrollment(deviceID: device.id) } }
+                    .buttonStyle(CustomButtonStyle()).disabled(blocked || device.isRevoked)
+                // Trusted local recovery: available even when the origin is unavailable, but not when
+                // the policy itself could not be read.
+                Button("Turn Off") { pendingPasskeyDisable = device }.buttonStyle(CustomButtonStyle()).disabled(unavailable)
+            case .requiredEnrolled, .requiredNeedsReenrollment:
+                Button("Reset") { runPasskeyAction(device, "Passkey reset for") { try passkeyCoordinator.reset(deviceID: device.id) } }
+                    .buttonStyle(CustomButtonStyle()).disabled(unavailable)
+                Button("Turn Off") { pendingPasskeyDisable = device }.buttonStyle(CustomButtonStyle()).disabled(unavailable)
+            }
+        }
+    }
+
+    private func passkeyPersistedLabel(_ persisted: RemotePasskeyDeviceStatus.Persisted?) -> String {
+        switch persisted {
+        case .off, .none: "Not required"
+        case .requiredNotEnrolled: "Required · not enrolled"
+        case .requiredEnrolled: "Required · enrolled"
+        case .requiredNeedsReenrollment: "Required · re-enrollment needed"
+        }
+    }
+
+    /// A policy-off device has no passkey enforcement requirement; only a device that requires a
+    /// passkey shows an enforcement line.
+    private func showsEnforcementLine(_ persisted: RemotePasskeyDeviceStatus.Persisted) -> Bool {
+        if case .off = persisted { return false }
+        return true
+    }
+
+    private func passkeyEnforcementLabel(_ enforcement: RemotePasskeyDeviceStatus.Enforcement?) -> String {
+        switch enforcement {
+        case .gatewayUnavailable, .none: "Enforcement: Remote Control not active"
+        case .gatewayLacksSupport: "Enforcement: gateway update required"
+        case .pending: "Enforcement: pending gateway acknowledgment"
+        case .applied: "Enforcement: active"
+        }
+    }
+
+    private func runPasskeyAction(_ device: PairedDeviceRecord, _ success: String, _ action: @escaping () async throws -> Void) {
+        // enable/openEnrollment are async (they live-check the gateway principal before activating
+        // policy); reset/disable are synchronous but satisfy the async closure trivially. The view
+        // is @MainActor, so the Task runs on the main actor and UI updates stay ordered.
+        Task { @MainActor in
+            do {
+                try await action()
+                refreshDevices()
+                showFeedback("\(success) \(device.displayName)", false)
+            } catch let failure as RemotePasskeyFailure {
+                showFeedback("Passkey action failed: \(failure.code)", true)
+            } catch {
+                showFeedback("Passkey action failed: \(error.localizedDescription)", true)
+            }
+        }
     }
 
     private func labeledValue(_ label: String, _ value: String) -> some View {
@@ -263,6 +383,11 @@ struct RemoteControlSettingsView: View {
             pairedDevices = []
             storeError = "Remote pairing store unavailable: \(error.localizedDescription)"
         }
+    }
+
+    private func disablePasskey(_ device: PairedDeviceRecord) {
+        pendingPasskeyDisable = nil
+        runPasskeyAction(device, "Passkey requirement turned off for") { try passkeyCoordinator.disable(deviceID: device.id) }
     }
 
     private func revoke(_ device: PairedDeviceRecord) {

@@ -71,6 +71,27 @@ final class RemoteGatewayStatusStore: ObservableObject {
     /// The newest activation-gate generation published so far.
     private var publishedGeneration: UInt64 = 0
 
+    /// Monotonic count of real changes to the EFFECTIVE browser origin (`activeBrowserOrigin`).
+    /// Unlike `publishedGeneration`, it is owned here and advances on every actual origin change —
+    /// including an A→B→A change published within one activation generation, which the activation
+    /// generation would not distinguish.
+    private var originChangeRevision: UInt64 = 0
+
+    /// The newest activation-gate generation published so far. This is the activation generation,
+    /// NOT an origin-change counter: two different origins published at the same activation
+    /// generation share this value, so it must not be used to detect an A→B→A origin change.
+    var currentGeneration: UInt64 {
+        publishedGeneration
+    }
+
+    /// Read hook for the passkey coordinator (remote passkey unlock, Step 2): the origin-change
+    /// revision. The coordinator captures this at ceremony begin and re-checks it at completion so a
+    /// ceremony is invalidated across any real origin change, including an A→B→A change within one
+    /// activation generation that a bare origin-string comparison (and `currentGeneration`) miss.
+    var currentOriginRevision: UInt64 {
+        originChangeRevision
+    }
+
     /// Publishes `status` for an activation-gate `generation`. A publication from an older
     /// generation than one already published is stale (it lost a race with a newer apply,
     /// stop, or exit) and is ignored, so it cannot re-advertise a stopped gateway's link.
@@ -86,6 +107,9 @@ final class RemoteGatewayStatusStore: ObservableObject {
         }
         if activeBrowserOrigin != active {
             activeBrowserOrigin = active
+            // A real change to the effective origin (including A→nil→A and A→B→A) advances the
+            // origin-change revision even when the activation generation does not.
+            originChangeRevision &+= 1
         }
         return true
     }

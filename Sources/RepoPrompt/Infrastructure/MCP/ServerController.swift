@@ -507,7 +507,10 @@ final actor ServerController: ObservableObject {
             let launchConfiguration = RemoteGatewayLaunchConfiguration.production(
                 bindHost: bindHost,
                 browserOrigin: browserOrigin,
-                buildIdentity: buildIdentity
+                buildIdentity: buildIdentity,
+                // Fail-closed: when any paired device requires a passkey (or the registry can't be
+                // read), pass the policy-version flag so an incompatible gateway refuses to start.
+                requiredPasskeyPolicyVersion: RemoteGatewayLaunchConfiguration.resolveRequiredPasskeyPolicyVersion()
             )
             await publishRemoteGatewayStatus(.starting(origin), browserOrigin: browserOrigin, generation: generation)
             try await ensureRemoteGatewayGeneration(generation)
@@ -703,6 +706,10 @@ final actor ServerController: ObservableObject {
                 // Always set (empty when unset) so an inherited value never widens the Host allowlist.
                 environment["REPOPROMPT_GATEWAY_BROWSER_ORIGIN"] = configuration.browserOrigin?.string ?? ""
                 process.environment = environment
+                // Non-empty only when a passkey policy is required. The current gateway rejects an
+                // unknown flag at config parse (before the listener), so an incompatible binary
+                // fails closed instead of serving a required policy it cannot enforce.
+                process.arguments = configuration.gatewayProcessArguments
                 let diagnostics = RemoteGatewayProcessDiagnosticsCapture(
                     runtimeRootURL: URL(fileURLWithPath: configuration.appSupportRoot),
                     generation: token

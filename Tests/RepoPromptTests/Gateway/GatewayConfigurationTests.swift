@@ -149,6 +149,20 @@ final class GatewayConfigurationTests: XCTestCase {
         XCTAssertTrue(viaEnvironment.allowStaticTokenAuth)
     }
 
+    func testLegacyGatewayRejectsPasskeyPolicyVersionFlag() throws {
+        // Remote passkey unlock, Step 2 (decision 8): the current gateway has no passkey policy
+        // support, so it MUST reject `--passkey-policy-version` at config parse — before any
+        // listener binds. That rejection is what makes the app's fail-closed launch guard work: an
+        // incompatible gateway cannot serve a registry whose policy it can't enforce. A future
+        // (Step 3) gateway will recognize and validate the flag instead.
+        XCTAssertThrowsError(try GatewayConfiguration.parse(
+            arguments: ["--passkey-policy-version=1"],
+            environment: [:]
+        )) { error in
+            XCTAssertEqual(error as? GatewayConfigurationError, .unknownArgument("--passkey-policy-version"))
+        }
+    }
+
     func testBrowserOriginIsOptionalHTTPSWithExplicitPortAndBecomesTheExtraHostAuthority() throws {
         XCTAssertNil(try GatewayConfiguration.parse(arguments: [], environment: [:]).browserOriginAuthority)
         XCTAssertNil(

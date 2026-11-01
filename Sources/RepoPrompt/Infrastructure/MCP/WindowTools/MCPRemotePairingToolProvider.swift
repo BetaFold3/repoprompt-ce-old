@@ -18,6 +18,11 @@ enum RemotePairingOperation: String, Codable, CaseIterable {
     case mintTicket = "mint_ticket"
     case revokeDevice = "revoke_device"
     case listDevices = "list_devices"
+    case passkeyRegisterBegin = "passkey_register_begin"
+    case passkeyRegisterComplete = "passkey_register_complete"
+    case passkeyUnlockBegin = "passkey_unlock_begin"
+    case passkeyUnlockComplete = "passkey_unlock_complete"
+    case acknowledgeTrust = "acknowledge_trust"
 }
 
 private enum MCPRemotePairingToolDefinition {
@@ -32,15 +37,25 @@ private enum MCPRemotePairingToolDefinition {
     - `complete_pairing`: verify device proof, show consent UI, persist after approval.
     - `mint_ticket`: mint a one-time ≤60s host-signed ticket for a paired non-revoked device. Scopes are clamped to the device record.
     - `revoke_device`: mark a device revoked and clear push metadata.
-    - `list_devices`: list paired devices and host fingerprint.
+    - `list_devices`: list paired devices and host fingerprint. Set `passkey_policy_capability` to 1 to receive the full passkey-policy projection, the authoritative origin, the current trust revision, and the exact issuance identity to acknowledge.
+    - `passkey_register_begin` / `passkey_register_complete`: run the app-owned WebAuthn registration ceremony for a required device inside an open enrollment window. Registration never grants access.
+    - `passkey_unlock_begin` / `passkey_unlock_complete`: run the assertion ceremony for an enrolled device. The app returns the verified fact; the gateway issues the grant.
+    - `acknowledge_trust`: acknowledge the exact trust snapshot (`trust_launch`, `trust_revision`, `trust_issuance`) most recently issued to this capable principal.
     """
 
     static let inputSchema: JSONSchema = .object(
         properties: [
             "op": .string(
                 description: "Remote pairing operation.",
-                enum: ["discover_host", "begin_pairing", "complete_pairing", "mint_ticket", "revoke_device", "list_devices"]
+                enum: ["discover_host", "begin_pairing", "complete_pairing", "mint_ticket", "revoke_device", "list_devices", "passkey_register_begin", "passkey_register_complete", "passkey_unlock_begin", "passkey_unlock_complete", "acknowledge_trust"]
             ),
+            "ceremony_id": .string(description: "Passkey ceremony ID minted by the host at a begin op and echoed back at the matching complete op."),
+            "connection_generation": .integer(description: "The gateway sink's connection generation, supplied from the authenticated connection."),
+            "credential": .string(description: "Raw navigator.credentials create/get response JSON for a passkey complete op. Rejected over 64 KiB."),
+            "passkey_policy_capability": .integer(description: "Set to 1 by a passkey-capable gateway on list_devices to receive the full policy projection."),
+            "trust_launch": .string(description: "Host launch nonce echoed on acknowledge_trust."),
+            "trust_revision": .string(description: "Store save-revision the gateway is acknowledging on acknowledge_trust, echoed exactly as the decimal string issued in list_devices (a JSON number is also accepted)."),
+            "trust_issuance": .string(description: "Unguessable issuance ID from the acknowledged list_devices trust_revision; must be echoed exactly on acknowledge_trust."),
             "nonce": .string(description: "Discovery nonce from the native client."),
             "channel": .string(description: "Expected build channel: release or debug."),
             "approval_context": .string(description: "Fresh signed discovery approval context required by begin_pairing."),
@@ -106,8 +121,12 @@ final class MCPRemotePairingToolProvider: MCPWindowToolProviding {
         let approvalRouter: any RemotePairingApprovalRouting
         let discoveryAuthority: RemotePairingDiscoveryAuthority
         let challengeStore: RemotePairingChallengeStore
+        let passkeyCoordinator: RemotePasskeyCoordinator
         let now: @Sendable () -> Date
 
+        /// @MainActor so the `RemotePasskeyCoordinator.shared` default (a main-actor singleton) can
+        /// be evaluated; every construction site is already on the main actor.
+        @MainActor
         init(
             captureRequestMetadata: @escaping MCPWindowToolDependencies.CaptureRequestMetadata,
             isGatewayPrincipalConnection: @escaping MCPWindowToolDependencies.IsGatewayPrincipalConnection,
@@ -115,6 +134,7 @@ final class MCPRemotePairingToolProvider: MCPWindowToolProviding {
             approvalRouter: any RemotePairingApprovalRouting,
             discoveryAuthority: RemotePairingDiscoveryAuthority = .shared,
             challengeStore: RemotePairingChallengeStore = .shared,
+            passkeyCoordinator: RemotePasskeyCoordinator = .shared,
             now: @escaping @Sendable () -> Date = { Date() }
         ) {
             self.captureRequestMetadata = captureRequestMetadata
@@ -123,6 +143,7 @@ final class MCPRemotePairingToolProvider: MCPWindowToolProviding {
             self.approvalRouter = approvalRouter
             self.discoveryAuthority = discoveryAuthority
             self.challengeStore = challengeStore
+            self.passkeyCoordinator = passkeyCoordinator
             self.now = now
         }
 
@@ -213,7 +234,29 @@ final class MCPRemotePairingToolProvider: MCPWindowToolProviding {
         case .revokeDevice:
             return try executeRevokeDevice(args: args, dependencies: dependencies)
         case .listDevices:
-            return try executeListDevices(args: args, dependencies: dependencies)
+            return try await executeExpectedFailureBoundary {
+                try await executeListDevices(args: args, dependencies: dependencies)
+            }
+        case .passkeyRegisterBegin:
+            return try await executeExpectedFailureBoundary {
+                try await executePasskeyRegisterBegin(args: args, dependencies: dependencies)
+            }
+        case .passkeyRegisterComplete:
+            return try await executeExpectedFailureBoundary {
+                try await executePasskeyRegisterComplete(args: args, dependencies: dependencies)
+            }
+        case .passkeyUnlockBegin:
+            return try await executeExpectedFailureBoundary {
+                try await executePasskeyUnlockBegin(args: args, dependencies: dependencies)
+            }
+        case .passkeyUnlockComplete:
+            return try await executeExpectedFailureBoundary {
+                try await executePasskeyUnlockComplete(args: args, dependencies: dependencies)
+            }
+        case .acknowledgeTrust:
+            return try await executeExpectedFailureBoundary {
+                try await executeAcknowledgeTrust(args: args, dependencies: dependencies)
+            }
         }
     }
 
@@ -263,7 +306,27 @@ final class MCPRemotePairingToolProvider: MCPWindowToolProviding {
             }
             if let failure { return expectedFailureValue(failure) }
             throw error
+        } catch let failure as RemotePasskeyFailure {
+            return expectedFailureValue(passkeyFailureValue(failure))
         }
+    }
+
+    /// Map a typed coordinator failure to the shared expected-failure envelope. The generic
+    /// `challenge_invalid` code is preserved so a response never reveals which guard rejected.
+    private static func passkeyFailureValue(_ failure: RemotePasskeyFailure) -> RemotePairingExpectedFailure {
+        let status = switch failure {
+        case .unknownDevice:
+            404
+        case .deviceRevoked, .gatewayUnsupported:
+            403
+        case .verificationFailed, .challengeInvalid, .staleAcknowledgment:
+            401
+        case .originUnavailable, .gatewayUnavailable, .storageFailed:
+            503
+        default:
+            409
+        }
+        return RemotePairingExpectedFailure(code: failure.code, message: "Passkey operation rejected: \(failure.code).", status: status)
     }
 
     private static func expectedFailureValue(_ failure: RemotePairingExpectedFailure) -> Value {
@@ -449,16 +512,271 @@ final class MCPRemotePairingToolProvider: MCPWindowToolProviding {
     private static func executeListDevices(
         args: [String: Value],
         dependencies: ExecutionDependencies
-    ) throws -> Value {
+    ) async throws -> Value {
         let includeRevoked = args["include_revoked"]?.boolValue ?? true
+        let capable = (args["passkey_policy_capability"]?.intValue ?? 0) == 1
+        let principalConnectionID = try await requirePrincipalConnectionID(dependencies)
         let host = try dependencies.identityStore.hostPublicKeyInfo()
-        let devices = try dependencies.identityStore.listDevices(includeRevoked: includeRevoked)
+
+        // A single lock-scope read so the device view and the revision it is acknowledged at
+        // cannot tear. A registry fault is an authoritative "unavailable", never a silent empty.
+        let snapshot: (registry: PairedDeviceRegistry, revision: UInt64)
+        do {
+            snapshot = try dependencies.identityStore.trustSnapshot()
+        } catch {
+            throw RemotePairingExpectedFailure(
+                code: "registry_unavailable",
+                message: "The paired-device registry could not be read.",
+                status: 503
+            )
+        }
+        let devices = snapshot.registry.devices
+            .sorted { $0.createdAt < $1.createdAt }
+            .filter { includeRevoked ? true : !$0.isRevoked }
+
+        if capable {
+            // A capable gateway receives the full policy projection, the current trust revision, the
+            // authoritative origin, and the exact issued snapshot it may acknowledge.
+            dependencies.passkeyCoordinator.recordTrustCall(capable: true, principalConnectionID: principalConnectionID)
+            let projection = dependencies.passkeyCoordinator.trustProjection()
+            var deviceEpochs: [String: UInt64] = [:]
+            for device in devices where device.passkey.isRequired {
+                deviceEpochs[device.id] = device.passkey.epoch
+            }
+            let issuanceID = dependencies.passkeyCoordinator.recordIssuedTrustSnapshot(
+                principalConnectionID: principalConnectionID,
+                revision: snapshot.revision,
+                originRevision: projection.originRevision,
+                deviceEpochs: deviceEpochs
+            )
+            let deviceValues = devices.map { device -> Value in
+                let enrollment = dependencies.passkeyCoordinator.enrollmentProjection(for: device.id)
+                return deviceValue(device, policyView: .full, policyExtras: [
+                    "enrollment_open": .bool(enrollment.enrollmentOpen),
+                    "needs_reenrollment": .bool(enrollment.needsReenrollment)
+                ])
+            }
+            return .object([
+                "ok": .bool(true),
+                "passkey_policy_version": .int(1),
+                "trust_revision": .object([
+                    "launch": .string(dependencies.identityStore.launchNonce),
+                    // Decimal string: lossless for a UInt64 revision on the JSON wire.
+                    "revision": .string(String(snapshot.revision)),
+                    // Unguessable per-issuance identity; acknowledge_trust must echo it exactly so an
+                    // acknowledgment for a superseded issuance (same revision, different origin)
+                    // cannot be accepted for the current one.
+                    "issuance": issuanceID.map(Value.string) ?? .null
+                ]),
+                // Authoritative, app-published origin for Step 3 reconciliation (never a header).
+                "origin": projection.originSerialized.map(Value.string) ?? .null,
+                "origin_revision": .string(String(projection.originRevision)),
+                "host_public_key": .string(host.rawRepresentation.base64EncodedString()),
+                "host_fingerprint": .string(host.fingerprint),
+                "devices": .array(deviceValues)
+            ])
+        }
+
+        // Mixed-version safety: an old gateway that cannot enforce the passkey policy is told every
+        // required device is revoked, so its existing revocation handling closes those connections.
+        // This is a RESPONSE projection only — it does NOT durably revoke the device.
+        dependencies.passkeyCoordinator.recordTrustCall(capable: false, principalConnectionID: principalConnectionID)
         return .object([
             "ok": .bool(true),
             "host_public_key": .string(host.rawRepresentation.base64EncodedString()),
             "host_fingerprint": .string(host.fingerprint),
-            "devices": .array(devices.map(deviceValue))
+            "devices": .array(devices.map { deviceValue($0, policyView: .maskedForLegacyGateway) })
         ])
+    }
+
+    // MARK: - Passkey ceremony operations (Step 2)
+
+    private static func executePasskeyRegisterBegin(
+        args: [String: Value],
+        dependencies: ExecutionDependencies
+    ) async throws -> Value {
+        let context = try await passkeyBeginContext(args: args, dependencies: dependencies)
+        let options = try dependencies.passkeyCoordinator.registerBegin(context)
+        return .object([
+            "ok": .bool(true),
+            "device_id": .string(context.deviceID),
+            "ceremony_id": .string(options.ceremonyID),
+            "challenge": .string(options.challengeBase64URL),
+            "rp": .object(["id": .string(options.relyingPartyID), "name": .string(options.relyingPartyName)]),
+            "user": .object([
+                "id": .string(options.userHandleBase64URL),
+                "name": .string(options.userName),
+                "display_name": .string(options.userDisplayName)
+            ]),
+            "pub_key_cred_params": .array([.object(["type": .string("public-key"), "alg": .int(-7)])]),
+            "authenticator_selection": .object([
+                "resident_key": .string("preferred"),
+                "user_verification": .string("required")
+            ]),
+            "attestation": .string("none"),
+            "timeout": .int(options.timeoutMilliseconds)
+        ])
+    }
+
+    private static func executePasskeyRegisterComplete(
+        args: [String: Value],
+        dependencies: ExecutionDependencies
+    ) async throws -> Value {
+        let context = try await passkeyCeremonyContext(args: args, dependencies: dependencies)
+        let json = try requiredCredentialJSON(args)
+        let outcome = try await dependencies.passkeyCoordinator.registerComplete(context, credentialJSON: json)
+        return .object([
+            "ok": .bool(true),
+            "enrolled": .bool(true),
+            "device_id": .string(outcome.deviceID),
+            "epoch": .string(String(outcome.epoch)),
+            "ceremony_id": .string(outcome.ceremonyID),
+            "connection_generation": .int(Int(outcome.connectionGeneration))
+        ])
+    }
+
+    private static func executePasskeyUnlockBegin(
+        args: [String: Value],
+        dependencies: ExecutionDependencies
+    ) async throws -> Value {
+        let context = try await passkeyBeginContext(args: args, dependencies: dependencies)
+        let options = try dependencies.passkeyCoordinator.unlockBegin(context)
+        return .object([
+            "ok": .bool(true),
+            "device_id": .string(context.deviceID),
+            "ceremony_id": .string(options.ceremonyID),
+            "challenge": .string(options.challengeBase64URL),
+            "rp_id": .string(options.relyingPartyID),
+            "allow_credentials": .array([.object([
+                "type": .string("public-key"),
+                "id": .string(options.allowedCredentialBase64URL)
+            ])]),
+            "user_verification": .string("required"),
+            "timeout": .int(options.timeoutMilliseconds)
+        ])
+    }
+
+    private static func executePasskeyUnlockComplete(
+        args: [String: Value],
+        dependencies: ExecutionDependencies
+    ) async throws -> Value {
+        let context = try await passkeyCeremonyContext(args: args, dependencies: dependencies)
+        let json = try requiredCredentialJSON(args)
+        let outcome = try await dependencies.passkeyCoordinator.unlockComplete(context, credentialJSON: json)
+        return .object([
+            "ok": .bool(true),
+            "verified": .bool(true),
+            "device_id": .string(outcome.deviceID),
+            "epoch": .string(String(outcome.epoch)),
+            "ceremony_id": .string(outcome.ceremonyID),
+            "connection_generation": .int(Int(outcome.connectionGeneration))
+        ])
+    }
+
+    private static func executeAcknowledgeTrust(
+        args: [String: Value],
+        dependencies: ExecutionDependencies
+    ) async throws -> Value {
+        let principalConnectionID = try await requirePrincipalConnectionID(dependencies)
+        let launch = try requiredTrimmedString(args["trust_launch"], name: "trust_launch")
+        // The revision is issued as a decimal string (lossless UInt64 on the JSON wire); accept the
+        // echoed string as well as a JSON number so a conformant client round-trips it exactly.
+        let revision = try requiredUInt64StringOrInt(args["trust_revision"], name: "trust_revision")
+        let issuanceID = try requiredTrimmedString(args["trust_issuance"], name: "trust_issuance")
+        try dependencies.passkeyCoordinator.acknowledgeTrust(
+            principalConnectionID: principalConnectionID,
+            launch: launch,
+            revision: revision,
+            issuanceID: issuanceID
+        )
+        return .object(["ok": .bool(true)])
+    }
+
+    // MARK: Passkey argument helpers
+
+    private static func requirePrincipalConnectionID(_ dependencies: ExecutionDependencies) async throws -> String {
+        let metadata = await dependencies.captureRequestMetadata()
+        guard let connectionID = metadata.connectionID else {
+            throw MCPError.invalidRequest("remote_pairing requires a verified gateway principal connection.")
+        }
+        return connectionID.uuidString
+    }
+
+    private static func passkeyBeginContext(
+        args: [String: Value],
+        dependencies: ExecutionDependencies
+    ) async throws -> RemotePasskeyBeginContext {
+        let deviceID = try requiredPasskeyDeviceID(args)
+        let connectionGeneration = try requiredUInt64(args["connection_generation"], name: "connection_generation")
+        let principalConnectionID = try await requirePrincipalConnectionID(dependencies)
+        return RemotePasskeyBeginContext(
+            deviceID: deviceID,
+            connectionGeneration: connectionGeneration,
+            principalConnectionID: principalConnectionID
+        )
+    }
+
+    private static func passkeyCeremonyContext(
+        args: [String: Value],
+        dependencies: ExecutionDependencies
+    ) async throws -> RemotePasskeyCeremonyContext {
+        let deviceID = try requiredPasskeyDeviceID(args)
+        let ceremonyID = try requiredTrimmedString(args["ceremony_id"], name: "ceremony_id")
+        guard (16 ... 64).contains(ceremonyID.count) else {
+            throw MCPError.invalidParams("ceremony_id must be 16...64 characters.")
+        }
+        let connectionGeneration = try requiredUInt64(args["connection_generation"], name: "connection_generation")
+        let principalConnectionID = try await requirePrincipalConnectionID(dependencies)
+        return RemotePasskeyCeremonyContext(
+            deviceID: deviceID,
+            ceremonyID: ceremonyID,
+            connectionGeneration: connectionGeneration,
+            principalConnectionID: principalConnectionID
+        )
+    }
+
+    private static func requiredPasskeyDeviceID(_ args: [String: Value]) throws -> String {
+        let deviceID = try requiredTrimmedString(args["device_id"], name: "device_id")
+        guard RemotePairingCrypto.isValidDeviceID(deviceID) else {
+            throw MCPError.invalidParams("device_id must match remote:<lowercase-hex>.")
+        }
+        return deviceID
+    }
+
+    private static func requiredCredentialJSON(_ args: [String: Value]) throws -> Data {
+        guard let raw = args["credential"]?.stringValue, !raw.isEmpty else {
+            throw MCPError.invalidParams("credential is required.")
+        }
+        let data = Data(raw.utf8)
+        guard data.count <= 64 * 1024 else {
+            throw MCPError.invalidParams("credential exceeds the 64 KiB limit.")
+        }
+        return data
+    }
+
+    private static func requiredUInt64(_ value: Value?, name: String) throws -> UInt64 {
+        guard let intValue = value?.intValue, intValue >= 0 else {
+            throw MCPError.invalidParams("\(name) must be a non-negative integer.")
+        }
+        return UInt64(intValue)
+    }
+
+    /// Accept a non-negative UInt64 supplied either as a JSON number or as a decimal string. The
+    /// trust revision is issued to the client as a decimal string (lossless for the full UInt64
+    /// range), so a conformant acknowledgment echoes that string; a plain JSON number is tolerated.
+    private static func requiredUInt64StringOrInt(_ value: Value?, name: String) throws -> UInt64 {
+        if let string = value?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !string.isEmpty
+        {
+            guard let parsed = UInt64(string) else {
+                throw MCPError.invalidParams("\(name) must be a non-negative integer.")
+            }
+            return parsed
+        }
+        if let intValue = value?.intValue, intValue >= 0 {
+            return UInt64(intValue)
+        }
+        throw MCPError.invalidParams("\(name) must be a non-negative integer.")
     }
 
     private static func discoveryValue(_ response: RemoteDiscoveryResponse) -> Value {
@@ -568,7 +886,18 @@ final class MCPRemotePairingToolProvider: MCPWindowToolProviding {
         ])
     }
 
-    private static func deviceValue(_ device: PairedDeviceRecord) -> Value {
+    /// How a device's passkey policy is projected into a `deviceValue` response.
+    enum PolicyView {
+        /// No policy fields (complete-pairing and revoke responses).
+        case none
+        /// Full policy projection for a passkey-capable gateway.
+        case full
+        /// Legacy gateway: a required device is reported `revoked` so the old gateway's revocation
+        /// handling closes it; no policy fields are added. Response-only, not a durable revocation.
+        case maskedForLegacyGateway
+    }
+
+    private static func deviceValue(_ device: PairedDeviceRecord, policyView: PolicyView = .none, policyExtras: [String: Value]? = nil) -> Value {
         var object: [String: Value] = [
             "schema_version": .int(device.schemaVersion),
             "id": .string(device.id),
@@ -591,6 +920,27 @@ final class MCPRemotePairingToolProvider: MCPWindowToolProviding {
             object["revoked_at"] = .null
         }
         object["has_push_subscription"] = .bool(device.pushSubscription != nil)
+
+        switch policyView {
+        case .none:
+            break
+        case .maskedForLegacyGateway:
+            if device.passkey.isRequired {
+                object["revoked"] = .bool(true)
+            }
+        case .full:
+            var policy: [String: Value] = [
+                "version": .int(1),
+                "state": .string(device.passkey.state.rawValue),
+                "enrolled": .bool(device.passkey.isEnrolled),
+                // Decimal string: lossless for a UInt64 epoch on the JSON wire.
+                "epoch": .string(String(device.passkey.epoch))
+            ]
+            if let policyExtras {
+                policy.merge(policyExtras) { _, extra in extra }
+            }
+            object["passkey_policy"] = .object(policy)
+        }
         return .object(object)
     }
 

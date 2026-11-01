@@ -1,7 +1,15 @@
 # Vendor/SwiftWebAuthn (+ Vendor/SwiftCBOR) — local modification notes
 
-Bounded passkey verifier experiment (2026-11-01). Linked **only** into the root test target;
-not part of the production runtime graph. No upstream fork published; no network publication.
+Bounded passkey verifier experiment (2026-11-01). Originally linked **only** into the root test
+target. As of Step 2 of the remote passkey-unlock work (2026-11-01) `WebAuthn` is additionally
+linked into the **app target** (`RepoPromptApp`) through its ordinary public ceremony API (no
+`@testable`). `SwiftCBOR` is pulled in transitively by `WebAuthn` but is never imported by
+production code, and neither package is linked into `RepoPromptGateway`, `RepoPromptRemoteWire`,
+`RepoPromptAgentCore` or `RepoPromptShared`. No upstream fork published; no network publication.
+Both remain local path packages, so `Package.resolved` is unchanged. Bundled third-party notices
+for both packages live at `ThirdPartyLicenses/swift-webauthn/` (Apache-2.0 `LICENSE.txt` +
+`NOTICE.txt`) and `ThirdPartyLicenses/swiftcbor/` (`UNLICENSE`), picked up by the existing
+`Scripts/package_app.sh` legal-copy step.
 
 ## Provenance (frozen pins)
 - `Vendor/SwiftWebAuthn/Sources/WebAuthn/**` — brokenhandsio/swift-webauthn @
@@ -16,8 +24,8 @@ not part of the production runtime graph. No upstream fork published; no network
 ## Package layout (two packages, mirroring upstream)
 SwiftCBOR is kept as its **own** package (`Vendor/SwiftCBOR`, `swift-tools-version:5.5`) that
 `Vendor/SwiftWebAuthn` (`swift-tools-version:6.0`) depends on via `.package(path: "../SwiftCBOR")`;
-the root `Package.swift` references both path packages and links `WebAuthn` + `SwiftCBOR` into the
-root test target only. This reproduces upstream's per-package compile boundary: SwiftCBOR's
+the root `Package.swift` references both path packages, links `WebAuthn` into the app target
+(`RepoPromptApp`) and links `WebAuthn` + `SwiftCBOR` into the root test target. This reproduces upstream's per-package compile boundary: SwiftCBOR's
 `public` `CBOR.Tag` gets no implicit `Sendable`, so its `static let` tag constants are hard
 concurrency errors under the Swift 6 language mode — upstream never hit that because SwiftCBOR
 ships its own tools-5.5 manifest and compiles in the Swift 5 language mode. Keeping two packages
@@ -111,7 +119,13 @@ attestation formats than `none` likewise remain in the source but are rejected b
   extensions block must decode as exactly one complete CBOR map (valid unknown entries allowed)
   with no trailing bytes (`invalidExtensions` for a decode failure / non-map;
   `leftOverBytesInAuthenticatorData` for trailing bytes). Embedded per-item `decodeItem` for the
-  public key is unchanged (not globally full-consumption).
+  public key is unchanged (not globally full-consumption). Additionally (Step 2 production
+  adoption), every TOP-LEVEL extension-map key must be a CBOR text string (WebAuthn Level 3 §9 /
+  the IANA WebAuthn Extension Identifier registry); a non-text top-level key throws
+  `invalidExtensions`. This closes the floating/compound top-level duplicate-key gap (a non-text
+  key — the only kind the retained decoder's value-equality duplicate check cannot reliably
+  reject — can no longer appear at the top level) without recursing into extension values, whose
+  CBOR is extension-defined and never consumed in this profile.
 - `Ceremonies/Authentication/AuthenticatorAssertionResponse.swift` — assertion verify rejects the
   AT flag (`attestedCredentialDataFlagSetInAssertion`), enforces BS⇒BE (`invalidBackupFlags`),
   and, when a stored backup-eligible value is supplied, enforces cross-ceremony immutability
@@ -143,6 +157,29 @@ attestation formats than `none` likewise remain in the source but are rejected b
   unchanged; if any future adoption routes attacker-controlled CBOR through `CodableCBORDecoder`, the
   uniqueness guard must be mirrored there (or that path documented out-of-profile) at that time.
 - No cryptographic routines, no replacement parser, no dependency upgrades.
+
+## Step 2 production-adoption review (2026-11-01)
+Reviewed as part of promoting the verifier into the app target. Findings that required **no code
+change** (recorded so a later reviewer need not re-derive them):
+- **Bounded decode depth is already universal on the reachable path.** Every CBOR decode reachable
+  from the ES256 / `none` registration and assertion ceremonies already passes
+  `CBOROptions(maximumDepth: 16)`: the attestation object
+  (`Ceremonies/Registration/AuthenticatorAttestationResponse.swift`), the authenticator-data
+  extensions block and the embedded COSE-key length probe (`Ceremonies/Shared/AuthenticatorData.swift`),
+  and the COSE key itself (`Ceremonies/Shared/CredentialPublicKey.swift`). The only unbounded
+  (`maximumDepth: .max`) decodes are in SwiftCBOR's `Decoder/` Codable path, which this profile
+  never uses (see "Codable CBOR path" above). A depth-bomb regression test guards the reachable
+  path.
+- **`none`-only attestation is already enforced by the library.** `AttestationObject.verify`
+  accepts `case .none` (empty statement required) and its `default` throws
+  `attestationVerificationNotSupported`; the `packed`/`tpm` branches are commented out. Any non-`none`
+  format is therefore rejected without an adapter-level fmt check.
+- **Nested float/NaN/compound duplicate keys inside extension values remain a documented,
+  non-blocking profile limitation** (P2-01/P2-03 above). It is not reachable as an authorization
+  differential here: extension outputs are validated structurally and never interpreted for any
+  policy decision, and the new top-level text-key check removes the top-level case. Closing the
+  nested case would require a canonical CBOR key-identity function (a broad key-equality
+  subsystem), which is deliberately out of scope.
 
 ## External/upstream positive fixture — limitation (recorded, not worked around)
 The bounded copy vendors only `Sources/WebAuthn` (and `Vendor/SwiftCBOR/Sources/SwiftCBOR`); the

@@ -82,7 +82,18 @@ extension AuthenticatorData {
             } catch {
                 throw .invalidExtensions
             }
-            guard case .map = decodedExtensions else { throw .invalidExtensions }
+            guard case let .map(extensionMap) = decodedExtensions else { throw .invalidExtensions }
+            // RPCE local modification: WebAuthn authenticator-data extension identifiers are text
+            // strings (WebAuthn Level 3 §9 and the IANA WebAuthn Extension Identifier registry).
+            // Require every TOP-LEVEL extension-map key to be a CBOR text string. This rejects a
+            // non-text top-level key — including the floating/compound keys whose duplicate the
+            // retained decoder's value-equality check cannot reliably reject — so a malformed
+            // top-level identifier cannot slip through. It deliberately does NOT recurse into
+            // extension values, whose CBOR is extension-defined and is never consumed in this
+            // profile. See Vendor/SwiftWebAuthn/PATCHES.md.
+            for extensionKey in extensionMap.keys {
+                guard case .utf8String = extensionKey else { throw .invalidExtensions }
+            }
             guard extensionStream.remainingBytes == 0 else { throw .leftOverBytesInAuthenticatorData }
             extensionData = extensionBytes
             remainingCount -= extensionBytes.count
