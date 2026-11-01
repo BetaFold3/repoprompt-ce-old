@@ -134,6 +134,131 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
         #endif
     }
 
+    func testGatewayAdmissionAuthenticatedBeforeCredentialRotationIsNeverPublished() async throws {
+        #if DEBUG
+            try await Self.withIsolatedManagerSocket(prefix: "gateway-rotation") { manager, socketURL in
+                await manager.setConnectionApprovalHandler { _, _ in true }
+                await manager.debugSetGatewayLaunchCredentialForTesting("old-launch-secret")
+                await manager.start()
+                let listenerReady = await Self.waitForCurrentBootstrapListener(manager, at: socketURL)
+                XCTAssertTrue(listenerReady)
+
+                // A gateway connection fully registered through real credential authentication
+                // under the old launch credential.
+                let registeredToken = "gateway-bootstrap:remote:aaaa0001"
+                let registeredFD = try Self.connectRawUnixClient(to: socketURL)
+                defer { Self.closeIfOpen(registeredFD) }
+                try Self.writeBootstrapRequest(
+                    to: registeredFD,
+                    sessionToken: registeredToken,
+                    clientName: "remote:aaaa0001",
+                    gatewayCredential: "old-launch-secret"
+                )
+                let registeredResponse = try Self.readBootstrapResponse(from: registeredFD)
+                XCTAssertEqual(registeredResponse.type, "accepted")
+                let registeredID = try await Self.waitForSessionBinding(manager, token: registeredToken)
+                let registeredLiveBeforeRotation = await manager.isGatewayPrincipalConnectionLive(registeredID)
+                XCTAssertTrue(registeredLiveBeforeRotation)
+
+                // Pause one old-credential gateway admission and one standard admission after
+                // real authentication, inside the production policy-readiness await.
+                let staleGatewayToken = "gateway-bootstrap:remote:aaaa0002"
+                let standardToken = "gateway-rotation-standard-\(UUID().uuidString)"
+                let staleGatewayGate = SuspendedAdmissionGate()
+                let standardGate = SuspendedAdmissionGate()
+                await manager.debugSetAfterBootstrapPolicyReadinessForTesting { token in
+                    if token == staleGatewayToken {
+                        await staleGatewayGate.suspendUntilReleased()
+                    } else if token == standardToken {
+                        await standardGate.suspendUntilReleased()
+                    }
+                }
+                let staleGatewayFD = try Self.connectRawUnixClient(to: socketURL)
+                defer { Self.closeIfOpen(staleGatewayFD) }
+                let standardFD = try Self.connectRawUnixClient(to: socketURL)
+                defer { Self.closeIfOpen(standardFD) }
+
+                do {
+                    try Self.writeBootstrapRequest(
+                        to: staleGatewayFD,
+                        sessionToken: staleGatewayToken,
+                        clientName: "remote:aaaa0002",
+                        gatewayCredential: "old-launch-secret"
+                    )
+                    try Self.writeBootstrapRequest(
+                        to: standardFD,
+                        sessionToken: standardToken,
+                        clientName: "gateway-rotation-standard"
+                    )
+                    let staleGatewaySuspended = await Self.waitUntil { await staleGatewayGate.hasEntered }
+                    let standardSuspended = await Self.waitUntil { await standardGate.hasEntered }
+                    XCTAssertTrue(staleGatewaySuspended)
+                    XCTAssertTrue(standardSuspended)
+
+                    await manager.debugSetGatewayLaunchCredentialForTesting("new-launch-secret")
+                    let registeredLiveAfterRotation = await manager.isGatewayPrincipalConnectionLive(registeredID)
+                    XCTAssertFalse(
+                        registeredLiveAfterRotation,
+                        "A gateway connection registered under the old credential must stop being live after rotation"
+                    )
+
+                    await staleGatewayGate.release()
+                    await standardGate.release()
+
+                    let staleGatewayResponse = try Self.readBootstrapResponse(from: staleGatewayFD)
+                    XCTAssertEqual(staleGatewayResponse.type, "rejected")
+                    XCTAssertEqual(staleGatewayResponse.errorCode, MCPBootstrapErrorCode.approvalDenied.rawValue)
+                    let standardResponse = try Self.readBootstrapResponse(from: standardFD)
+                    XCTAssertEqual(standardResponse.type, "accepted", "Standard principals carry no credential generation")
+                    let standardID = try await Self.waitForSessionBinding(manager, token: standardToken)
+                    let standardPrincipal = await manager.debugConnectionPrincipalForTesting(standardID)
+                    XCTAssertEqual(standardPrincipal, .standard)
+                } catch {
+                    await staleGatewayGate.release()
+                    await standardGate.release()
+                    throw error
+                }
+                await manager.debugSetAfterBootstrapPolicyReadinessForTesting(nil)
+
+                let staleGatewayBinding = await manager.debugConnectionIDForSessionTokenForTesting(staleGatewayToken)
+                XCTAssertNil(staleGatewayBinding, "An admission authenticated before rotation must never be published")
+                let admissionsDrained = await Self.waitUntil {
+                    let reservations = await manager.debugBootstrapReservationCount()
+                    let transferred = await manager.debugTransferredBootstrapSocketCountForShutdownTest()
+                    return reservations == 0 && transferred == 0
+                }
+                XCTAssertTrue(admissionsDrained, "Stale-generation rejection must not leak reservations or descriptors")
+
+                // A fresh bootstrap with the new credential authenticates under the new generation.
+                let freshToken = "gateway-bootstrap:remote:aaaa0003"
+                let freshFD = try Self.connectRawUnixClient(to: socketURL)
+                defer { Self.closeIfOpen(freshFD) }
+                try Self.writeBootstrapRequest(
+                    to: freshFD,
+                    sessionToken: freshToken,
+                    clientName: "remote:aaaa0003",
+                    gatewayCredential: "new-launch-secret"
+                )
+                let freshResponse = try Self.readBootstrapResponse(from: freshFD)
+                XCTAssertEqual(freshResponse.type, "accepted")
+                let freshID = try await Self.waitForSessionBinding(manager, token: freshToken)
+                let freshLive = await manager.isGatewayPrincipalConnectionLive(freshID)
+                let registeredStillStale = await manager.isGatewayPrincipalConnectionLive(registeredID)
+                XCTAssertTrue(freshLive)
+                XCTAssertFalse(registeredStillStale)
+
+                for token in [registeredToken, standardToken, freshToken] {
+                    if let connectionID = await manager.debugConnectionIDForSessionTokenForTesting(token) {
+                        await manager.debugRemoveConnection(connectionID)
+                    }
+                }
+                await manager.debugSetGatewayLaunchCredentialForTesting(nil)
+            }
+        #else
+            throw XCTSkip("Bootstrap admission credential seam is DEBUG-only")
+        #endif
+    }
+
     func testSuccessiveSameSessionBootstrapAdmissionsDoNotDoubleDiscountReplacement() async throws {
         #if DEBUG
             try await Self.withIsolatedManagerSocket(prefix: "same-token-reservation") { manager, socketURL in

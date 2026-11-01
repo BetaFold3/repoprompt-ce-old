@@ -104,6 +104,22 @@ private final class GatewayTerminationGate: @unchecked Sendable {
     }
 }
 
+/// Logs a non-applied strict trust refresh. Fixed wording only: no payload, device, or error text.
+private func logTrustRefreshReceiptIfNotApplied(
+    _ receipt: GatewayCapabilityTrustRefreshReceipt,
+    trigger: String,
+    logger: Logger
+) {
+    switch receipt {
+    case .applied:
+        return
+    case .invalid:
+        logger.warning("\(trigger) gateway trust refresh: authoritative trust invalid; access invalidated")
+    case .transportFailure:
+        logger.warning("\(trigger) gateway trust refresh: principal link unavailable; last authority preserved")
+    }
+}
+
 LoggingSystem.bootstrap { label in
     StreamLogHandler.standardError(label: label)
 }
@@ -136,7 +152,10 @@ do {
         .appendingPathComponent("auth", isDirectory: true)
         .appendingPathComponent("used-tickets-v1.jsonl")
     let usedTicketStore = try UsedTicketStore(fileURL: usedTicketStoreURL)
-    let authenticator = DeviceAuthenticator(usedTicketStore: usedTicketStore)
+    // One monotonic access clock shared by the access authority and every connection sink, so grant
+    // deadlines and sink-side deadline checks compare instants from the same source.
+    let accessClock = GatewayContinuousAccessClock()
+    let authenticator = DeviceAuthenticator(usedTicketStore: usedTicketStore, accessClock: accessClock)
 
     // Web Push (M5): gateway-owned VAPID keypair and per-device subscriptions.
     let pushDirectoryURL = configuration.appSupportRootURL
@@ -195,6 +214,9 @@ do {
     )
 
     let pairingRelay = GatewayPairingRelay(appLink: appLink, auditLog: auditLog, logger: logger)
+    // The passkey relay rides the SAME original gateway-principal app link: strict trust fetch, ACK,
+    // and ceremonies all share one authenticated principal leg.
+    let passkeyRelay = GatewayPasskeyRelay(appLink: appLink)
 
     let httpServer = GatewayHTTPServer(
         configuration: configuration,
@@ -204,15 +226,16 @@ do {
         auditLog: auditLog,
         pairingRelay: pairingRelay,
         vapidPublicKeyBase64URL: VAPIDKeyStore.publicKeyBase64URL(for: vapidPrivateKey),
+        accessClock: accessClock,
+        passkeyRelay: passkeyRelay,
         logger: logger
     )
 
     let revokedTransitionState = GatewayRevokedDeviceTransitionState()
-    let trustRefreshCoordinator = GatewayTrustRefreshCoordinator(
-        fetchSnapshot: {
-            try await GatewayTrustSynchronizer.fetchSnapshot(appLink: appLink)
-        },
-        applySnapshot: { snapshot in
+    let trustRefreshOperations = GatewayTrustRefreshOperations.production(
+        relay: passkeyRelay,
+        authenticator: authenticator,
+        applyLegacySnapshot: { snapshot in
             let revokedDeviceIDs = await authenticator.updateTrust(snapshot)
             let tornDown = await appLinkPool.applyTrustSnapshot(snapshot)
             let teardownDeviceIDs = await revokedTransitionState.devicesRequiringTeardown(
@@ -250,11 +273,21 @@ do {
                     }
                 }
             }
+        },
+        closeAccessDeniedConnections: {
+            await httpServer.closeAccessDeniedConnections()
         }
     )
+    let trustRefreshCoordinator = GatewayTrustRefreshCoordinator(operations: trustRefreshOperations)
+    // Passkey ceremonies refresh through the same serialized strict coordinator; wired before the
+    // listener starts so no connection can observe an unwired refresh path.
+    httpServer.setPasskeyTrustRefreshAction {
+        try await trustRefreshCoordinator.refresh()
+    }
     await pairingRelay.setPostCompletePairingAction {
         do {
-            try await trustRefreshCoordinator.refresh()
+            let receipt = try await trustRefreshCoordinator.refresh()
+            logTrustRefreshReceiptIfNotApplied(receipt, trigger: "Post-pairing", logger: logger)
         } catch is CancellationError {
             // Gateway shutdown owns cancellation; pairing HTTP work will be
             // closed by server teardown.
@@ -281,7 +314,8 @@ do {
     let trustSyncTask = Task {
         while !Task.isCancelled {
             do {
-                try await trustRefreshCoordinator.refresh()
+                let receipt = try await trustRefreshCoordinator.refresh()
+                logTrustRefreshReceiptIfNotApplied(receipt, trigger: "Periodic", logger: logger)
             } catch {
                 if !Task.isCancelled {
                     logger.warning("Gateway trust sync failed: \(String(describing: error))")

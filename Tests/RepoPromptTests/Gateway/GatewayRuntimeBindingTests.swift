@@ -847,6 +847,58 @@ final class GatewayRuntimeBindingTests: XCTestCase {
         XCTAssertEqual(polledSessionIDs, Set([sessionID, otherSessionID]))
     }
 
+    /// S3-A-09: when a subscribe's correlated response is WITHHELD (e.g. the connection locked or its
+    /// binding changed at settlement), the handler calls `discardQueuedResponse` instead of
+    /// `didQueueResponse`. The discard must drop EXACTLY that request's deferred validation — so its
+    /// catch-up poll never runs and no `session_update` is emitted — without cancelling an unrelated
+    /// subscription that shares the same request id on a different connection.
+    func testWithheldSubscriptionDiscardsOnlyItsOwnDeferredValidation() async throws {
+        let withheldSessionID = sessionID
+        let survivingSessionID = "22222222-2222-2222-2222-222222222222"
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(
+                json: GatewayTestHelpers.snapshot(sessionID: survivingSessionID, status: "running")
+            ))
+        ])
+        let runtime = try await makeRuntime(connection: connection, bindingState: .bound)
+        let withheldSink = RecordingFrameSink()
+        let survivingSink = RecordingFrameSink()
+        let withheldSinkID = UUID()
+        let survivingSinkID = UUID()
+        // Same request id ("dup") on two different connections — distinct FIFO validation keys.
+        let withheldRequest = RemoteClientFrame(type: "subscribe", requestID: "dup", sessionID: withheldSessionID)
+        let survivingRequest = RemoteClientFrame(type: "subscribe", requestID: "dup", sessionID: survivingSessionID)
+
+        let withheldMaybe = await runtime.handle(withheldRequest, deviceID: "device", sinkID: withheldSinkID, sink: withheldSink)
+        _ = try XCTUnwrap(withheldMaybe)
+        let survivingMaybe = await runtime.handle(survivingRequest, deviceID: "device", sinkID: survivingSinkID, sink: survivingSink)
+        let survivingHandled = try XCTUnwrap(survivingMaybe)
+
+        // The withheld connection's response is never delivered; its deferred validation is discarded.
+        await runtime.discardQueuedResponse(for: withheldRequest, deviceID: "device", sinkID: withheldSinkID)
+        // The unrelated duplicate-id subscription is delivered and its deferred validation activates.
+        await survivingSink.send(survivingHandled)
+        await runtime.didQueueResponse(for: survivingRequest, response: survivingHandled, deviceID: "device", sinkID: survivingSinkID)
+
+        for _ in 0 ..< 50 {
+            let frames = await survivingSink.frames
+            if frames.contains(where: { $0.type == "session_update" }) { break }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+
+        // The surviving duplicate-requestID subscription's deferred validation was NOT discarded by
+        // the withheld one's discard (the FIFO validation key includes sinkID + sessionIDs, so a shared
+        // client requestID does not collide). It therefore activates: it emits a correlated
+        // session_update and runs its catch-up poll against its own session.
+        let survivingFrames = await survivingSink.frames
+        XCTAssertTrue(survivingFrames.contains { $0.type == "session_update" }, "The surviving duplicate-id subscription still validates and emits.")
+        let polledSessions = await Set(connection.calls.compactMap { $0.arguments["session_id"]?.stringValue })
+        XCTAssertTrue(polledSessions.contains(survivingSessionID), "The surviving subscription polls its own session during catch-up validation.")
+        // The withheld subscription's deferred validation entry was popped by its own discard (keyed by
+        // sinkID + requestID + sessionIDs), so it was never handed to `validateSubscription`: the discard
+        // controls the deferred VALIDATION, not the already-registered observation intent.
+    }
+
     func testSubscribeOnUnboundConnectionReturnsBindingRequiredWithWindows() async throws {
         let connection = RecordingAppLinkConnection(responses: [
             .result(windowListResponse())
@@ -1873,6 +1925,34 @@ final class GatewayRuntimeBindingTests: XCTestCase {
         XCTAssertEqual(response?.payload?.objectValue?["code"]?.stringValue, "in_doubt")
         let steerCalls = await connection.calls.filter { $0.name == "agent_run" && $0.arguments["op"] == .string("steer") }
         XCTAssertEqual(steerCalls.count, 1)
+    }
+
+    /// An uncertain tool failure (indistinguishable provenance) must be IN DOUBT exactly like a lost
+    /// link — never a definite failure and never a safe-retry signal — and the action that executed
+    /// before the throw is not retried. `.failure` surfaces a non-MCP throw that `AppLinkSession`
+    /// normalizes to `.uncertainToolFailure(.unclassified)`, which shares the ledger mapping line with
+    /// `.authoritativeToolFailure`. (Step 3 Oracle plan §3.)
+    func testUncertainToolFailureDoesNotRetryAndReturnsInDoubt() async throws {
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(windowListResponse()),
+            .result(sessionListResponse([sessionID])),
+            .result(sessionListResponse([])),
+            .failure("indistinguishable SDK failure")
+        ])
+        let runtime = try await makeRuntime(connection: connection, bindingState: .bindingRequired("bind first"))
+        let sink = RecordingFrameSink()
+
+        let response = await runtime.handle(
+            RemoteClientFrame(type: "steer", requestID: "r1", sessionID: sessionID, payload: .object(["message": .string("next")])),
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: sink
+        )
+
+        XCTAssertEqual(response?.type, "command_error")
+        XCTAssertEqual(response?.payload?.objectValue?["code"]?.stringValue, "in_doubt")
+        let steerCalls = await connection.calls.filter { $0.name == "agent_run" && $0.arguments["op"] == .string("steer") }
+        XCTAssertEqual(steerCalls.count, 1, "The in-doubt action must not be retried.")
     }
 
     func testBoundStartWithUniqueWorkspaceNameAutoRoutesAndAuditsMatchCount() async throws {

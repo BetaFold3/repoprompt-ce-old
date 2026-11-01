@@ -26,6 +26,18 @@ struct AppChannelClosingNotification: MCP.Notification {
     static let name: String = RepoPromptControlMethod.channelClosing
 }
 
+/// Sanitized category of a tool-call failure whose provenance the pinned MCP SDK does not
+/// preserve. The first three are SDK `MCPError` cases that both local client/transport paths and
+/// wire-decoded server responses (codes -32603/-32000/-32001) produce; `unclassified` is any other
+/// non-`AppLinkError`, non-`MCPError` throw (for example the SDK's response-decoding failure).
+/// The case names are not provenance: none proves an outage or an authoritative app statement.
+enum AppLinkUncertainFailureKind: String, Equatable, CaseIterable {
+    case internalError
+    case connectionClosed
+    case transportError
+    case unclassified
+}
+
 enum AppLinkError: Error, Equatable, CustomStringConvertible {
     case notConnected
     case socketCreationFailed(errno: Int32)
@@ -38,6 +50,15 @@ enum AppLinkError: Error, Equatable, CustomStringConvertible {
     case invalidHandshakeResponse(String)
     case toolCallTimedOut(TimeInterval)
     case appLinkLost(String)
+    /// The app answered the tool call with a JSON-RPC error response whose code no local
+    /// client or transport path produces. It proves a response was received, not that the link
+    /// stays healthy afterward, and not whether the call executed. Carries only the JSON-RPC
+    /// code; the app's error message is deliberately not retained.
+    case authoritativeToolFailure(code: Int)
+    /// The SDK threw an error whose provenance cannot be distinguished between a local
+    /// client/transport failure and an authoritative (rejected or malformed) app response.
+    /// Carries only the sanitized kind; no SDK message, response body, or underlying error.
+    case uncertainToolFailure(kind: AppLinkUncertainFailureKind)
 
     var description: String {
         switch self {
@@ -63,6 +84,38 @@ enum AppLinkError: Error, Equatable, CustomStringConvertible {
             "MCP tool call timed out after \(timeout)s"
         case let .appLinkLost(reason):
             "App link was lost during tool call: \(reason)"
+        case let .authoritativeToolFailure(code):
+            "App rejected the tool call (JSON-RPC error \(code))"
+        case let .uncertainToolFailure(kind):
+            "App link tool call failed with indistinguishable provenance (\(kind.rawValue))"
+        }
+    }
+
+    /// Classifies an error thrown by the MCP client for one tool call. Grounded in the pinned
+    /// swift-sdk: a server JSON-RPC error response resumes the request with the wire-decoded
+    /// `MCPError` (`Client.handleResponse`), while local client/transport failures surface as
+    /// `.connectionClosed`, `.transportError`, or `.internalError("Client connection not
+    /// initialized")`. Wire codes -32000/-32001/-32603 decode to those same cases, so only the
+    /// remaining cases are provably server-originated; the overlapping ones are uncertain.
+    static func authoritativeResponseCode(for error: Error) -> Int? {
+        guard let mcpError = error as? MCPError else { return nil }
+        switch mcpError {
+        case .parseError, .invalidRequest, .methodNotFound, .invalidParams,
+             .serverError, .urlElicitationRequired:
+            return mcpError.code
+        case .internalError, .connectionClosed, .transportError:
+            return nil
+        }
+    }
+
+    /// Sanitized uncertainty for a non-cancellation, non-`AppLinkError` throw that
+    /// `authoritativeResponseCode(for:)` did not classify.
+    static func uncertainFailureKind(for error: Error) -> AppLinkUncertainFailureKind {
+        switch error as? MCPError {
+        case .internalError: .internalError
+        case .connectionClosed: .connectionClosed
+        case .transportError: .transportError
+        default: .unclassified
         }
     }
 }
@@ -132,7 +185,16 @@ actor AppLinkSession {
     private let maximumReconnectAttempts: Int?
     private nonisolated let eventHub = AppLinkStateEventHub()
 
+    /// Fixed `.appLinkLost` reason for a call that completed on a connection that had since been
+    /// replaced or shut down: its result or failure is stale transport (in doubt) and is never
+    /// published.
+    static let supersededConnectionReason = "connection superseded"
+
     private var connection: (any AppLinkConnection)?
+    /// Advanced whenever `connection` is installed, cleared, or shut down. A tool call captures
+    /// it with the connection so a late completion from a superseded incarnation is rejected
+    /// and can never clear or report against a newer healthy connection.
+    private var connectionGeneration: UInt64 = 0
     private var reconnectTask: Task<Void, Never>?
     private var hasConnectedOnce = false
     private var shutdownRequested = false
@@ -182,8 +244,16 @@ actor AppLinkSession {
                 await self?.handleChannelClosing(params)
             }
         )
-        await connection?.disconnect()
+        guard !shutdownRequested else {
+            await newConnection.disconnect()
+            throw CancellationError()
+        }
+        // Supersede the predecessor before awaiting its teardown, so its in-flight calls
+        // failing during disconnect observe a stale generation.
+        let predecessor = connection
+        connectionGeneration &+= 1
         connection = newConnection
+        await predecessor?.disconnect()
         if hasConnectedOnce {
             emit(.reconnected)
         } else {
@@ -218,31 +288,60 @@ actor AppLinkSession {
         if arguments["_rawJSON"] == nil {
             arguments["_rawJSON"] = .bool(true)
         }
+        let callGeneration = connectionGeneration
+        let result: MCPToolResult
         do {
-            return try await connection.callTool(
+            result = try await connection.callTool(
                 name: name,
                 arguments: arguments,
                 timeout: timeout
             )
         } catch is CancellationError {
             throw CancellationError()
-        } catch let error as AppLinkError {
-            if case .toolCallTimedOut = error {
-                throw error
-            }
-            self.connection = nil
-            guard !shutdownRequested else { throw error }
-            emit(.disconnected(reason: String(describing: error)))
-            start()
-            throw error
         } catch {
-            self.connection = nil
-            guard !shutdownRequested else { throw error }
-            let reason = String(describing: error)
-            emit(.disconnected(reason: reason))
-            start()
-            throw AppLinkError.appLinkLost(reason)
+            guard callGeneration == connectionGeneration else {
+                throw AppLinkError.appLinkLost(Self.supersededConnectionReason)
+            }
+            if let code = AppLinkError.authoritativeResponseCode(for: error) {
+                // A JSON-RPC response arrived; do not clear or reconnect solely because of it.
+                throw AppLinkError.authoritativeToolFailure(code: code)
+            }
+            if let error = error as? AppLinkError {
+                switch error {
+                case .toolCallTimedOut, .authoritativeToolFailure:
+                    throw error
+                case .uncertainToolFailure, .notConnected, .socketCreationFailed,
+                     .descriptorConfigurationFailed, .pathTooLong, .connectFailed,
+                     .handshakeEncodingFailed, .handshakeTimeout, .handshakeRejected,
+                     .invalidHandshakeResponse, .appLinkLost:
+                    throw recoverFromCurrentConnectionFailure(error)
+                }
+            }
+            // Overlapping SDK cases and unknown throws (including response-decoding failures)
+            // are uncertain, never a known outage; the captured connection still recovers.
+            throw recoverFromCurrentConnectionFailure(
+                .uncertainToolFailure(kind: AppLinkError.uncertainFailureKind(for: error))
+            )
         }
+        guard callGeneration == connectionGeneration else {
+            throw AppLinkError.appLinkLost(Self.supersededConnectionReason)
+        }
+        return result
+    }
+
+    private func clearConnection() {
+        connection = nil
+        connectionGeneration &+= 1
+    }
+
+    /// Existing current-connection recovery: clear the captured connection and, unless shutting
+    /// down, report the disconnect with the sanitized description and restart the reconnect loop.
+    private func recoverFromCurrentConnectionFailure(_ error: AppLinkError) -> AppLinkError {
+        clearConnection()
+        guard !shutdownRequested else { return error }
+        emit(.disconnected(reason: String(describing: error)))
+        start()
+        return error
     }
 
     func shutdown() async {
@@ -250,8 +349,8 @@ actor AppLinkSession {
         reconnectTask?.cancel()
         reconnectTask = nil
         if let connection {
+            clearConnection()
             await connection.disconnect()
-            self.connection = nil
         }
         emit(.disconnected(reason: "shutdown"))
     }
@@ -264,6 +363,7 @@ actor AppLinkSession {
                 reconnectTask = nil
                 return
             } catch {
+                if shutdownRequested { break }
                 attempt += 1
                 let reason = String(describing: error)
                 logger.warning("App link connect attempt \(attempt) failed: \(reason)")
@@ -350,7 +450,8 @@ struct GatewayBootstrapMCPConnector: AppLinkConnecting {
     }
 }
 
-private actor GatewayMCPAppConnection: AppLinkConnection {
+/// Internal (not private) only so a socketpair fixture can drive the pinned SDK decode path.
+actor GatewayMCPAppConnection: AppLinkConnection {
     private let client: Client
     private let transport: BootstrapSocketMCPTransport
 

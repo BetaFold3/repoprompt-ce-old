@@ -24,59 +24,6 @@ struct GatewayTrustSnapshot: Equatable {
     let hostPublicKeyRawRepresentation: Data
     let hostFingerprint: String
     let devices: [String: GatewayTrustedDevice]
-
-    static func parse(from payload: JSONValue) throws -> GatewayTrustSnapshot {
-        guard let object = payload.objectValue,
-              let hostKeyRaw = object["host_public_key"]?.stringValue,
-              let hostPublicKey = Data(base64Encoded: hostKeyRaw),
-              let hostFingerprint = object["host_fingerprint"]?.stringValue,
-              let deviceValues = object["devices"]?.arrayValue
-        else {
-            throw DeviceAuthenticationError.invalidTrustSnapshot("Missing host key, fingerprint, or devices.")
-        }
-        var devices: [String: GatewayTrustedDevice] = [:]
-        for deviceValue in deviceValues {
-            guard let deviceObject = deviceValue.objectValue,
-                  let deviceID = deviceObject["id"]?.stringValue,
-                  let publicKeyRaw = deviceObject["public_key"]?.stringValue,
-                  let publicKey = Data(base64Encoded: publicKeyRaw)
-            else {
-                throw DeviceAuthenticationError.invalidTrustSnapshot("Malformed paired-device record.")
-            }
-            let counterFloor = deviceObject["counter_floor"]?.intValue ?? 0
-            devices[deviceID] = GatewayTrustedDevice(
-                deviceID: deviceID,
-                displayName: deviceObject["display_name"]?.stringValue ?? deviceID,
-                publicKeyRawRepresentation: publicKey,
-                isRevoked: deviceObject["revoked"]?.boolValue ?? false,
-                counterFloor: UInt64(max(0, counterFloor))
-            )
-        }
-        return GatewayTrustSnapshot(
-            hostPublicKeyRawRepresentation: hostPublicKey,
-            hostFingerprint: hostFingerprint,
-            devices: devices
-        )
-    }
-}
-
-/// Fetches the trust snapshot from the app through the gateway-principal app leg.
-enum GatewayTrustSynchronizer {
-    static func fetchSnapshot(appLink: AppLinkSession) async throws -> GatewayTrustSnapshot {
-        let result = try await appLink.callTool(
-            name: "remote_pairing",
-            arguments: [
-                "op": .string("list_devices"),
-                "include_revoked": .bool(true)
-            ],
-            timeout: 15
-        )
-        let payload = try RemoteMCPToolResultCodec.jsonValue(from: result)
-        if result.isError == true {
-            throw DeviceAuthenticationError.invalidTrustSnapshot("remote_pairing list_devices failed.")
-        }
-        return try GatewayTrustSnapshot.parse(from: payload)
-    }
 }
 
 // MARK: - Errors
@@ -190,14 +137,27 @@ actor DeviceAuthenticator {
     private var trust: GatewayTrustSnapshot?
     private var connections: [UUID: ConnectionAuthState] = [:]
 
+    // MARK: Step 3 access-authority state (remote passkey unlock)
+
+    // These extend the one gateway authority (no second actor/store). The Step 3 handler wires the
+    // closed-by-default sink, lock/expiry/renewal, and principal-link ceremonies over this state. See
+    // `GatewayDeviceAccessAuthority.swift` for the operations over it.
+    let accessClock: GatewayAccessClock
+    var publicationRevision: GatewayPublicationRevision = .initial
+    var capabilityTrust: GatewayCapabilityTrustAvailability = .unavailable
+    var deviceAccess: [String: GatewayDeviceAccessRecord] = [:]
+    var handles: [UUID: GatewayConnectionHandle] = [:]
+
     init(
         usedTicketStore: UsedTicketStore,
         trust: GatewayTrustSnapshot? = nil,
-        now: @escaping @Sendable () -> Date = { Date() }
+        now: @escaping @Sendable () -> Date = { Date() },
+        accessClock: GatewayAccessClock = GatewayContinuousAccessClock()
     ) {
         self.usedTicketStore = usedTicketStore
         self.trust = trust
         self.now = now
+        self.accessClock = accessClock
     }
 
     /// Replaces the trust snapshot. Returns device IDs that must be disconnected:

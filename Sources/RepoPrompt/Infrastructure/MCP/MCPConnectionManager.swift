@@ -2192,6 +2192,27 @@ actor ServerNetworkManager {
         return Self.constantTimeEquals(trimmed, expected) ? .gateway : .invalid
     }
 
+    /// A bootstrap admission authenticates its principal against the launch credential once, before
+    /// any suspension, and captures that credential generation. `.standard` carries no credential;
+    /// a `.gateway` admission stays publishable only while that exact generation is still current,
+    /// so a rotation during policy, capacity, or accepted-delivery awaits fails it closed.
+    private func isAuthenticatedGatewayCredentialCurrent(
+        principal: MCPConnectionPrincipal,
+        gatewayCredentialGeneration: UInt64
+    ) -> Bool {
+        principal != .gateway || gatewayCredentialGeneration == gatewayLaunchCredentialGeneration
+    }
+
+    private func rejectBootstrapAdmissionBecauseGatewayCredentialRotated(
+        connectionID: UUID
+    ) -> BootstrapSocketServer.Admission {
+        log.warning("Rejecting bootstrap connection \(connectionID) - gateway credential rotated during admission")
+        return .reject(.rejected(
+            reason: "Gateway credential rotated during admission",
+            errorCode: MCPBootstrapErrorCode.approvalDenied.rawValue
+        ))
+    }
+
     private nonisolated static func constantTimeEquals(_ lhs: String, _ rhs: String) -> Bool {
         let lhsBytes = Array(lhs.utf8)
         let rhsBytes = Array(rhs.utf8)
@@ -5859,6 +5880,11 @@ actor ServerNetworkManager {
             break
         }
         let principal = principalDecision.principal
+        // Captured synchronously with the principal decision, before the first suspension: the
+        // admission carries the generation it authenticated under, never a later current one.
+        let authenticatedGatewayCredentialGeneration: UInt64 = principal == .gateway
+            ? gatewayLaunchCredentialGeneration
+            : 0
 
         guard isCurrentBootstrapListener(sourceListener, lifecycleGeneration: admissionLifecycleGeneration) else {
             return rejectBootstrapAdmissionBecauseStopped(connectionID: connectionID)
@@ -5910,6 +5936,12 @@ actor ServerNetworkManager {
                 return rejectBootstrapAdmissionBecauseStopped(connectionID: connectionID)
             }
         #endif
+        guard isAuthenticatedGatewayCredentialCurrent(
+            principal: principal,
+            gatewayCredentialGeneration: authenticatedGatewayCredentialGeneration
+        ) else {
+            return rejectBootstrapAdmissionBecauseGatewayCredentialRotated(connectionID: connectionID)
+        }
 
         guard claimBootstrapAdmission(
             sessionToken: sessionToken,
@@ -5957,13 +5989,25 @@ actor ServerNetworkManager {
             )
             return rejectBootstrapAdmissionBecauseStopped(connectionID: connectionID)
         }
+        guard isAuthenticatedGatewayCredentialCurrent(
+            principal: principal,
+            gatewayCredentialGeneration: authenticatedGatewayCredentialGeneration
+        ) else {
+            releaseBootstrapAdmissionClaim(
+                sessionToken: sessionToken,
+                connectionID: connectionID,
+                lifecycleGeneration: admissionLifecycleGeneration
+            )
+            return rejectBootstrapAdmissionBecauseGatewayCredentialRotated(connectionID: connectionID)
+        }
         return makeAcceptedBootstrapAdmission(
             connectionID: connectionID,
             lifecycleGeneration: admissionLifecycleGeneration,
             sessionToken: sessionToken,
             clientPid: clientPid,
             clientName: clientName,
-            principal: principal
+            principal: principal,
+            gatewayCredentialGeneration: authenticatedGatewayCredentialGeneration
         )
     }
 
@@ -6035,7 +6079,8 @@ actor ServerNetworkManager {
         sessionToken: String,
         clientPid: Int,
         clientName: String?,
-        principal: MCPConnectionPrincipal
+        principal: MCPConnectionPrincipal,
+        gatewayCredentialGeneration: UInt64
     ) -> BootstrapSocketServer.Admission {
         guard reserveBootstrapSlot(
             connectionID: connectionID,
@@ -6069,7 +6114,8 @@ actor ServerNetworkManager {
                     sessionToken: sessionToken,
                     clientPid: clientPid,
                     clientName: clientName,
-                    principal: principal
+                    principal: principal,
+                    gatewayCredentialGeneration: gatewayCredentialGeneration
                 )
             },
             onAcceptAborted: { [self] in
@@ -6088,7 +6134,8 @@ actor ServerNetworkManager {
         sessionToken: String,
         clientPid: Int,
         clientName: String?,
-        principal: MCPConnectionPrincipal
+        principal: MCPConnectionPrincipal,
+        gatewayCredentialGeneration: UInt64
     ) async {
         guard let reservation = bootstrapReservations[connectionID],
               reservation.lifecycleGeneration == admissionLifecycleGeneration,
@@ -6183,6 +6230,19 @@ actor ServerNetworkManager {
             )
             return
         }
+        // Accepted delivery and postAccept scheduling suspend after admission returned, so a
+        // gateway credential rotation may land here. Fail closed before any predecessor removal.
+        guard isAuthenticatedGatewayCredentialCurrent(
+            principal: principal,
+            gatewayCredentialGeneration: gatewayCredentialGeneration
+        ) else {
+            await abandonPendingBootstrapCommit(
+                connectionID: connectionID,
+                lifecycleGeneration: admissionLifecycleGeneration,
+                reason: "gateway credential rotated before publication"
+            )
+            return
+        }
 
         let committedPredecessorRemoval: CommittedConnectionRemoval?
         if let replacementCredit = committingReservation.replacementCredit {
@@ -6227,6 +6287,7 @@ actor ServerNetworkManager {
             clientPid: clientPid,
             clientName: clientName,
             principal: principal,
+            gatewayCredentialGeneration: gatewayCredentialGeneration,
             manager: preparedConnection
         ) else {
             if let committedPredecessorRemoval {
@@ -6383,7 +6444,8 @@ actor ServerNetworkManager {
                 sessionToken: sessionToken,
                 clientPid: clientPid,
                 clientName: clientName,
-                principal: .standard
+                principal: .standard,
+                gatewayCredentialGeneration: 0
             )
             guard admission.publishTransferredFD?(clientFD) == true else {
                 await rollbackBootstrapReservation(
@@ -6459,9 +6521,15 @@ actor ServerNetworkManager {
         clientPid: Int,
         clientName: String?,
         principal: MCPConnectionPrincipal,
+        gatewayCredentialGeneration: UInt64,
         manager: BootstrapSocketConnectionManager
     ) -> Bool {
-        guard isRunningState, self.lifecycleGeneration == lifecycleGeneration else {
+        guard isRunningState, self.lifecycleGeneration == lifecycleGeneration,
+              isAuthenticatedGatewayCredentialCurrent(
+                  principal: principal,
+                  gatewayCredentialGeneration: gatewayCredentialGeneration
+              )
+        else {
             return false
         }
 
@@ -6474,7 +6542,7 @@ actor ServerNetworkManager {
             principal: principal,
             lastUpdated: Date(),
             gatewayRemoteDeviceID: Self.gatewayRemoteDeviceID(bootstrapClientName: clientName, principal: principal),
-            gatewayCredentialGeneration: principal == .gateway ? gatewayLaunchCredentialGeneration : 0
+            gatewayCredentialGeneration: principal == .gateway ? gatewayCredentialGeneration : 0
         )
         identityContextByConnection[connectionID] = identityContext
 

@@ -119,7 +119,7 @@ Step 2 — done | rounds 1/2 | open: none; see evidence step2-review-disposition
 Change: versioned trust policy, monotonic absolute grants, epoch/generation reconciliation, safe hello/sink ordering, signed control relay, inbound and loop-local outgoing gates, generic settlement of withheld results, and static-token closure. Scope remains gateway/browser only.
 Validation: extend `GatewayAuthDeviceAuthenticatorTests` and `GatewayAuthE2EContractTests` using injected time and software assertions. Cover protected commands/results/errors, watch broadcasts/terminal catch-up, locked new sink before hello, expiry at queue boundary, Lock during verification, reset/invalid snapshot, transport outage, reconnect/other tab, cross-device/build binding and existing static-token connections. Preserve existing ticket/counter/revocation tests. No sleeps for expiration tests.
 Done when: every content path is denied while locked, delayed grants cannot revive a lock, and the exact enqueue/in-flight boundary is demonstrated.
-Step 3 — todo | rounds 0/2 | open: enforcement and signed-activity renewal implementation; see evidence 2026-11-01-timeout-decision.md | downgraded: none | assumed: shared per browser; foreground user activity only | deferred: watch polling optimization
+Step 3 — done | rounds 2/2 | open: none; both lanes cleared; see evidence step3-review-disposition.md | downgraded: none | assumed: 30-minute idle shared per browser; foreground activity only; uncertain-error invalidation closes all | deferred: relay-begin ordering, retained watch intent, nonblocking test/UX limits in evidence; watch polling optimization
 
 ### Step 4 — Native passkey phone flow
 Change: unlock/enrollment/needs-Mac states, user-gesture-safe ceremonies, Lock, content clearing, draft retention and stale-response fences; preserve deep link and channel identity. No account system or new framework.
@@ -144,6 +144,7 @@ No public exposure or app-managed Tailscale; no passwords/OTP/recovery codes; no
 - Owner authorized the bounded maintained-copy patch-and-test experiment, including positive registration/assertion fixtures and malformed-input regressions through the coordinated test workflow (2026-11-01).
 - Owner requested re-signing the experiment commit now and continuing implementation through Steps 2–5; deployment/relaunch and manual credential actions retain their action-boundary approvals (2026-11-01).
 - Unlock timeout: 30 minutes idle, superseding the earlier one-hour duration and the main-agent absolute-timeout assumption (owner answer 2026-11-01).
+- Owner authorized fixing known Step 3 defects and one additional fresh scoped OracleB review after its incomplete initial response and failed recovery retry; both required reviewers remain in use (2026-11-01).
 
 ## Open owner choices and implementation gates
 - Recommended timeout is 15 minutes absolute; alternatives are a shorter window or 30 minutes.

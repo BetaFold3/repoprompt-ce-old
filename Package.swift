@@ -134,6 +134,11 @@ var repoPromptTestDependencies: [Target.Dependency] = [
     "RepoPromptWorkspace",
     "RepoPromptGateway",
     "RepoPromptRemoteWire",
+    // Gateway WebSocket frame-sink tests drive the actual production NIO sink against an embedded
+    // channel (remote passkey unlock, Step 3). Test-only; not added to any production target.
+    .product(name: "NIOCore", package: "swift-nio"),
+    .product(name: "NIOEmbedded", package: "swift-nio"),
+    .product(name: "NIOWebSocket", package: "swift-nio"),
     .product(name: "RepoPromptShared", package: "RepoPromptCore"),
     .product(name: "RepoPromptMCPClientKit", package: "RepoPromptCore"),
     .product(name: "RepoPromptMCPCore", package: "RepoPromptCore"),

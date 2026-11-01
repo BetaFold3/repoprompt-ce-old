@@ -191,18 +191,23 @@ final class RemotePasskeyCoordinator: ObservableObject {
     /// Step 3 can light it up.
     func enable(deviceID: String) async throws {
         prune()
+        // Early existence/storage check for a clean error, then the live/capability gate (which
+        // awaits). The authoritative branch decision and CAS epoch are taken from a FRESH read AFTER
+        // the await, so a concurrent enrollment, disable, or epoch bump during the await cannot be
+        // acted on with a stale snapshot (e.g. opening a window on a device that just enrolled, or a
+        // CAS against a superseded epoch).
+        _ = try requireDevice(deviceID)
+        try await requireEnrollableLive()
         let device = try requireDevice(deviceID)
         guard !device.isRevoked else { throw RemotePasskeyFailure.deviceRevoked }
         switch (device.passkey.state, device.passkey.credential) {
         case (.off, _):
-            try await requireEnrollableLive()
             try casPolicy(deviceID, expectedEpoch: device.passkey.epoch) { policy in
                 policy.state = .required
                 policy.credential = nil
             }
             try openWindow(deviceID)
         case (.required, .none):
-            try await requireEnrollableLive()
             try openWindow(deviceID)
         case (.required, .some):
             throw RemotePasskeyFailure.passkeyAlreadyEnrolled
@@ -214,11 +219,14 @@ final class RemotePasskeyCoordinator: ObservableObject {
     /// Reopen the enrollment window for a device that is required-without-credential.
     func openEnrollment(deviceID: String) async throws {
         prune()
+        _ = try requireDevice(deviceID)
+        try await requireEnrollableLive()
+        // Re-read AFTER the await: the required/not-enrolled preconditions must reflect current
+        // enrollment, not the pre-await snapshot.
         let device = try requireDevice(deviceID)
         guard !device.isRevoked else { throw RemotePasskeyFailure.deviceRevoked }
         guard device.passkey.state == .required else { throw RemotePasskeyFailure.passkeyNotRequired }
         guard device.passkey.credential == nil else { throw RemotePasskeyFailure.passkeyAlreadyEnrolled }
-        try await requireEnrollableLive()
         try openWindow(deviceID)
         invalidateCeremonies(forDevice: deviceID)
         bump()

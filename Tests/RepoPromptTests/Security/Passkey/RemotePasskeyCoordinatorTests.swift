@@ -240,6 +240,52 @@ final class RemotePasskeyCoordinatorTests: XCTestCase {
         XCTAssertNil(try store.device(id: deviceID)?.passkey.credential)
     }
 
+    /// Step3 item (deferred Step2): `enable` must re-read enrollment state AFTER the async liveness
+    /// query, so a concurrent enrollment during the await is observed rather than acted on stale.
+    /// Without the re-read, the pre-await `.off` branch would CAS against a superseded epoch; with
+    /// it, `enable` observes the committed credential and refuses with `passkeyAlreadyEnrolled`.
+    func testEnableRereadsEnrollmentStateAfterLivenessAwait() async throws {
+        let store = try makeStore()
+        let origin = OriginBox(exampleOrigin())
+        let gate = VerifierGate()
+        let coordinator = RemotePasskeyCoordinator(
+            identityStore: store, verifier: GatedFakeVerifier(),
+            now: { ContinuousClock.now }, originSnapshot: { origin.state },
+            isPrincipalLive: { _ in
+                await gate.enter()
+                return true
+            }
+        )
+        coordinator.recordTrustCall(capable: true, principalConnectionID: principal)
+        let task = Task { @MainActor in try await coordinator.enable(deviceID: self.deviceID) }
+        await gate.waitUntilEntered()
+        // Out-of-band, a concurrent ceremony commits a credential (device becomes required+enrolled,
+        // epoch advances) while `enable` is parked in the liveness await.
+        let credential = RemotePasskeyCredentialRecord(
+            credentialID: Data([1, 2, 3]),
+            publicKeyCOSE: Data([0xA5, 0x01]),
+            rpID: "example.com",
+            userHandle: Data([7]),
+            signCountAtRegistration: 0,
+            backupEligible: true,
+            backedUpAtRegistration: true,
+            createdAt: Date()
+        )
+        try store.updatePasskeyPolicy(deviceID: deviceID, expectedEpoch: 0) { policy in
+            policy.state = .required
+            policy.credential = credential
+        }
+        await gate.release()
+        do {
+            try await task.value
+            XCTFail("Expected passkeyAlreadyEnrolled after re-read")
+        } catch let error as RemotePasskeyFailure {
+            XCTAssertEqual(error, .passkeyAlreadyEnrolled)
+        }
+        // The fresh read refused, so no enrollment window was opened for the already-enrolled device.
+        XCTAssertNil(try coordinator.status(for: deviceID).enrollmentOpenUntil)
+    }
+
     // MARK: - Registration / unlock binding
 
     private func enrollWithFakeVerifier(

@@ -149,17 +149,39 @@ final class GatewayConfigurationTests: XCTestCase {
         XCTAssertTrue(viaEnvironment.allowStaticTokenAuth)
     }
 
-    func testLegacyGatewayRejectsPasskeyPolicyVersionFlag() throws {
-        // Remote passkey unlock, Step 2 (decision 8): the current gateway has no passkey policy
-        // support, so it MUST reject `--passkey-policy-version` at config parse — before any
-        // listener binds. That rejection is what makes the app's fail-closed launch guard work: an
-        // incompatible gateway cannot serve a registry whose policy it can't enforce. A future
-        // (Step 3) gateway will recognize and validate the flag instead.
-        XCTAssertThrowsError(try GatewayConfiguration.parse(
+    func testPasskeyPolicyVersionFlagAcceptsOnlyTheSupportedVersion() throws {
+        // Remote passkey unlock, Step 3 (decision 4): this gateway understands the passkey policy
+        // wire. The flag is a COMPATIBILITY GUARD, not an opt-in — the gateway defaults to the
+        // supported version when it is absent, accepts an explicit `=1`, and fails fast on any other
+        // value (string or environment), before any listener binds.
+        let withoutFlag = try GatewayConfiguration.parse(arguments: [], environment: [:])
+        XCTAssertEqual(withoutFlag.passkeyPolicyVersion, GatewayConfiguration.supportedPasskeyPolicyVersion)
+
+        let viaArgument = try GatewayConfiguration.parse(
             arguments: ["--passkey-policy-version=1"],
             environment: [:]
-        )) { error in
-            XCTAssertEqual(error as? GatewayConfigurationError, .unknownArgument("--passkey-policy-version"))
+        )
+        XCTAssertEqual(viaArgument.passkeyPolicyVersion, 1)
+
+        let viaSeparateValue = try GatewayConfiguration.parse(
+            arguments: ["--passkey-policy-version", "1"],
+            environment: [:]
+        )
+        XCTAssertEqual(viaSeparateValue.passkeyPolicyVersion, 1)
+
+        let viaEnvironment = try GatewayConfiguration.parse(
+            arguments: [],
+            environment: [GatewayConfiguration.EnvironmentKey.passkeyPolicyVersion: "1"]
+        )
+        XCTAssertEqual(viaEnvironment.passkeyPolicyVersion, 1)
+
+        for invalid in ["2", "0", "abc", "-1"] {
+            XCTAssertThrowsError(try GatewayConfiguration.parse(
+                arguments: ["--passkey-policy-version=\(invalid)"],
+                environment: [:]
+            ), invalid) { error in
+                XCTAssertEqual(error as? GatewayConfigurationError, .unsupportedPasskeyPolicyVersion(invalid), invalid)
+            }
         }
     }
 

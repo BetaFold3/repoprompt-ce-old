@@ -24,7 +24,18 @@ public enum RemoteWireProtocol {
         // M5: gateway-owned Web Push subscription registration for the connected
         // (authenticated) device; never translated to an app tool call.
         "push_subscribe",
-        "push_unsubscribe"
+        "push_unsubscribe",
+        // Remote passkey unlock, Step 3: gateway-owned WebAuthn ceremony + lock control frames for
+        // the connected device. Never translated to an app tool call; dispatched to the principal
+        // passkey relay and the device-access authority instead.
+        "passkey_register_begin",
+        "passkey_register_complete",
+        "passkey_unlock_begin",
+        "passkey_unlock_complete",
+        // Explicit signed foreground activity: renews the idle grant deadline (never ordinary
+        // traffic). The phone-initiated lock drops the shared grant immediately.
+        "passkey_activity",
+        "lock"
     ]
 
     public static let serverFrameTypes: Set<String> = [
@@ -39,7 +50,12 @@ public enum RemoteWireProtocol {
         // another device, a CLI client, or the local user).
         "interaction_resolved",
         "channel_closing",
-        "pong"
+        "pong",
+        // Remote passkey unlock, Step 3 safe-control frames (content-free; emitted by the gateway's
+        // unforgeable safe-control path even while a connection is locked).
+        "lock_state",
+        "passkey_challenge",
+        "passkey_ceremony_complete"
     ]
 
     public static let mutatingClientFrameTypes: Set<String> = [
@@ -48,25 +64,37 @@ public enum RemoteWireProtocol {
         "respond",
         "cancel",
         "open_workspace",
-        "fork_session"
+        "fork_session",
+        // The passkey ceremony frames carry a request_id so the gateway can correlate the challenge
+        // it returns and the completion the browser sends back.
+        "passkey_register_begin",
+        "passkey_register_complete",
+        "passkey_unlock_begin",
+        "passkey_unlock_complete"
     ]
 
-    public static func decodeClientFrame(from data: Data) throws -> RemoteClientFrame {
+    /// Decode a client frame. With `allowUnknownTypes: false` (the default, used by non-gateway
+    /// callers) an unknown frame type is rejected. The gateway WebSocket handler passes
+    /// `allowUnknownTypes: true` so a syntactically valid frame carrying an UNKNOWN type is still
+    /// decoded: on a signed paired connection it is then signature/counter verified and routed to the
+    /// generic locked-deny / unsupported path, rather than being rejected pre-verification with a raw
+    /// decoder description. Malformed bytes (invalid JSON, wrong version) are still rejected here.
+    public static func decodeClientFrame(from data: Data, allowUnknownTypes: Bool = false) throws -> RemoteClientFrame {
         let frame: RemoteClientFrame
         do {
             frame = try JSONDecoder().decode(RemoteClientFrame.self, from: data)
         } catch {
             throw RemoteWireProtocolError.invalidJSON
         }
-        try validateClientFrame(frame)
+        try validateClientFrame(frame, allowUnknownTypes: allowUnknownTypes)
         return frame
     }
 
-    public static func validateClientFrame(_ frame: RemoteClientFrame) throws {
+    public static func validateClientFrame(_ frame: RemoteClientFrame, allowUnknownTypes: Bool = false) throws {
         guard frame.v == version else {
             throw RemoteWireProtocolError.unsupportedVersion(frame.v)
         }
-        guard clientFrameTypes.contains(frame.type) else {
+        if !allowUnknownTypes, !clientFrameTypes.contains(frame.type) {
             throw RemoteWireProtocolError.unsupportedFrameType(frame.type)
         }
         if mutatingClientFrameTypes.contains(frame.type), frame.requestID?.isEmptyOrWhitespace != false {

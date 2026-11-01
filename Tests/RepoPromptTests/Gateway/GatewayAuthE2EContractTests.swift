@@ -48,7 +48,7 @@ final class GatewayAuthE2EContractTests: XCTestCase {
 
     /// Builds, but does not start, the gateway under test. `extraArguments` follow the defaults,
     /// so a later `--port` or `--bind-host` wins.
-    private func makeServer(extraArguments: [String] = []) async throws {
+    private func makeServer(extraArguments: [String] = [], requiredDevices: [GatewayAuthTestSupport.TestDeviceIdentity] = []) async throws {
         configuration = try GatewayConfiguration.parse(
             arguments: [
                 "--app-support-root", root.path,
@@ -65,6 +65,22 @@ final class GatewayAuthE2EContractTests: XCTestCase {
         )
         let usedTicketStore = try GatewayAuthTestSupport.makeUsedTicketStore(root: root)
         let authenticator = DeviceAuthenticator(usedTicketStore: usedTicketStore, trust: trust)
+        // Step 3 flip: paired connections now bind through the access authority and lock unless a
+        // valid capability-1 snapshot authorizes them. Most M4 contract assertions predate passkey
+        // policy, so default to an all-off snapshot (paired `.unprotected`, static allowed) to
+        // preserve their exact pre-Step-3 behavior; a required-policy test opts specific devices in.
+        let capability: GatewayCapabilityTrustSnapshot = if requiredDevices.isEmpty {
+            GatewayAuthTestSupport.capabilityOffSnapshot(hostSigner: hostSigner, devices: [device, capacityDevice])
+        } else {
+            GatewayAuthTestSupport.capabilityRequiredSnapshot(
+                hostSigner: hostSigner,
+                required: requiredDevices,
+                off: [device, capacityDevice].filter { candidate in
+                    !requiredDevices.contains { $0.deviceID == candidate.deviceID }
+                }
+            )
+        }
+        _ = await authenticator.applyCapabilityTrust(capability)
 
         connector = E2EPoolConnector(capacityRejectedClientName: capacityDevice.deviceID)
         let pool = AppLinkPool(
@@ -410,6 +426,60 @@ final class GatewayAuthE2EContractTests: XCTestCase {
             "capacity_exceeded"
         )
         try await assertAuditContains(code: "capacity_exceeded", deviceID: capacityDevice.deviceID)
+    }
+
+    // MARK: - Required passkey policy (Step 3)
+
+    /// Under a required (enrolled) policy the paired device binds LOCKED: hello_ack reports it, an
+    /// ordinary runtime frame is WITHHELD as a content-free `passkey_locked` settlement rather than
+    /// executed, and a passkey ceremony with no principal relay fails closed with a sanitized
+    /// `authentication_failed`. (The full ceremony→grant→unlock state machine is covered
+    /// deterministically by the authority and relay unit suites.)
+    func testRequiredPolicyBindsLockedWithholdsRuntimeAndFailsClosedCeremony() async throws {
+        await disposeServer()
+        try await makeServer(requiredDevices: [device])
+        try await server.start()
+        port = try XCTUnwrap(server.localAddress?.port)
+
+        let ticket = try GatewayAuthTestSupport.mintTicket(
+            hostSigner: hostSigner,
+            deviceID: device.deviceID,
+            scopes: [GatewayRemoteScope.sessionsObserve]
+        )
+        let socket = openSocket()
+        defer { socket.cancel(with: .normalClosure, reason: nil) }
+
+        // 1. Hello admits but binds LOCKED; the ack says so and the connection stays open to unlock.
+        let helloAck = try await performTicketHello(socket, ticket: ticket, deviceKey: device.signer)
+        XCTAssertEqual(helloAck.type, "hello_ack")
+        XCTAssertEqual(helloAck.payload?.objectValue?["device_id"]?.stringValue, device.deviceID)
+        XCTAssertEqual(helloAck.payload?.objectValue?["locked"]?.boolValue, true)
+
+        // 2. An ordinary runtime frame is withheld with a content-free lock settlement, not executed.
+        let listFrame = try GatewayAuthTestSupport.signedFrameData(
+            object: GatewayAuthTestSupport.frameObject(type: "list_sessions"),
+            ticketID: ticket.ticketID,
+            deviceID: device.deviceID,
+            counter: 2,
+            deviceKey: device.signer
+        )
+        try await send(listFrame, over: socket)
+        let listResult = try await receiveFrame(socket)
+        XCTAssertEqual(listResult.type, "command_error")
+        XCTAssertEqual(listResult.payload?.objectValue?["code"]?.stringValue, "passkey_locked")
+
+        // 3. A passkey ceremony with no configured relay fails closed (no crash, sanitized failure).
+        let beginFrame = try GatewayAuthTestSupport.signedFrameData(
+            object: GatewayAuthTestSupport.frameObject(type: "passkey_unlock_begin", requestID: "req-unlock-1"),
+            ticketID: ticket.ticketID,
+            deviceID: device.deviceID,
+            counter: 3,
+            deviceKey: device.signer
+        )
+        try await send(beginFrame, over: socket)
+        let beginResult = try await receiveFrame(socket)
+        XCTAssertEqual(beginResult.type, "command_error")
+        XCTAssertEqual(beginResult.payload?.objectValue?["code"]?.stringValue, "authentication_failed")
     }
 
     // MARK: - Loopback companion (Step 4)
