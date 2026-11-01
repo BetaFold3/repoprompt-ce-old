@@ -119,7 +119,7 @@ Step 2 — todo | rounds 0/2 | open: none | downgraded: none | assumed: opt-in p
 Change: versioned trust policy, monotonic absolute grants, epoch/generation reconciliation, safe hello/sink ordering, signed control relay, inbound and loop-local outgoing gates, generic settlement of withheld results, and static-token closure. Scope remains gateway/browser only.
 Validation: extend `GatewayAuthDeviceAuthenticatorTests` and `GatewayAuthE2EContractTests` using injected time and software assertions. Cover protected commands/results/errors, watch broadcasts/terminal catch-up, locked new sink before hello, expiry at queue boundary, Lock during verification, reset/invalid snapshot, transport outage, reconnect/other tab, cross-device/build binding and existing static-token connections. Preserve existing ticket/counter/revocation tests. No sleeps for expiration tests.
 Done when: every content path is denied while locked, delayed grants cannot revive a lock, and the exact enqueue/in-flight boundary is demonstrated.
-Step 3 — todo | rounds 0/2 | open: none | downgraded: none | assumed: 15-minute absolute per-browser grant | deferred: watch polling optimization
+Step 3 — todo | rounds 0/2 | open: inactivity-renewal contract; see evidence 2026-11-01-timeout-decision.md | downgraded: none | assumed: one hour means inactivity, shared per browser | deferred: watch polling optimization
 
 ### Step 4 — Native passkey phone flow
 Change: unlock/enrollment/needs-Mac states, user-gesture-safe ceremonies, Lock, content clearing, draft retention and stale-response fences; preserve deep link and channel identity. No account system or new framework.
@@ -139,6 +139,7 @@ No public exposure or app-managed Tailscale; no passwords/OTP/recovery codes; no
 ## Decisions
 - Owner requested a separate passkey spec for the existing remote and identified 1Password as their preferred credential manager (2026-10-31).
 - Owner deferred relaunch approval; this specification task does not authorize deployment or implementation (2026-10-31).
+- Unlock timeout: one hour, superseding the earlier 15-minute duration proposal throughout this spec (owner answer 2026-11-01).
 
 ## Open owner choices and implementation gates
 - Recommended timeout is 15 minutes absolute; alternatives are a shorter window or 30 minutes.
