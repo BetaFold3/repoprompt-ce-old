@@ -21,6 +21,9 @@ extension AgentModeViewModel {
         case mcpControlled
         /// A remote-controllable attention root (`remoteAttentionRootSession(sessionID:)`).
         case remoteAttentionRoot
+        /// A steering target in a workspace granted to `sourceWorkspaceID`
+        /// (`workspaceSteeringGrantedTarget(sessionID:sourceWorkspaceID:)`, `workspace_steer`).
+        case workspaceGrant(sourceWorkspaceID: UUID)
     }
 
     func instructionTargetSession(sessionID: UUID, target: SessionInstructionTarget) -> AgentTabSession? {
@@ -29,6 +32,8 @@ extension AgentModeViewModel {
             mcpControlledSession(sessionID: sessionID)
         case .remoteAttentionRoot:
             remoteAttentionRootSession(sessionID: sessionID)
+        case let .workspaceGrant(sourceWorkspaceID):
+            workspaceSteeringGrantedTarget(sessionID: sessionID, sourceWorkspaceID: sourceWorkspaceID)
         }
     }
 
@@ -64,7 +69,9 @@ extension AgentModeViewModel {
     }
 
     /// The final submission predicate of a session-targeted send: the same live object still
-    /// resolves through `target`, and a remote root send is still dispatch-ready for `text`.
+    /// resolves through `target`, and a remote root or workspace-steering send is still
+    /// dispatch-ready for `text` (for workspace steering, the unattributed message, and a pending
+    /// question or approval also refuses, since only the owner may answer it).
     func sessionInstructionTargetIsReady(
         session: AgentTabSession,
         sessionID: UUID,
@@ -77,6 +84,8 @@ extension AgentModeViewModel {
             return true
         case .remoteAttentionRoot:
             return remoteRootDispatchRefusal(session: session, text: text) == nil
+        case .workspaceGrant:
+            return workspaceSteeringDispatchRefusal(session: session, message: text) == nil
         }
     }
 

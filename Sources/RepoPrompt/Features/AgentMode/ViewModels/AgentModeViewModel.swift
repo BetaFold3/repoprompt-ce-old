@@ -724,6 +724,8 @@ final class AgentModeViewModel: ObservableObject {
     #if DEBUG
         /// Test-only workspace used for session persistence when no workspace manager exists.
         var test_persistenceWorkspaceOverride: WorkspaceModel?
+        /// Test-only grant store for the workspace-steering final fence (`workspaceSteeringGrantStore`).
+        var test_workspaceSteeringGrantStoreOverride: WorkspaceSteeringGrantStore?
         /// Test seam: awaited inside `handleComposeTabsWillClose` after runtime teardown and
         /// immediately before the final save, so a peer reset and a local mutation can be
         /// interleaved between the preflight and that save.
@@ -9855,6 +9857,8 @@ final class AgentModeViewModel: ObservableObject {
     /// the normal non-composer send path (durable admission, waiting continuation, provider
     /// steering, follow-up, or a new run). `target` names the authority that resolved `session`;
     /// every post-await submission fence re-resolves it and requires the same live object.
+    /// `readinessText` is the text the final readiness check evaluates when it differs from the
+    /// submitted text (workspace steering submits an attributed message but checks the original).
     func dispatchSessionInstruction(
         session: AgentTabSession,
         sessionID: UUID,
@@ -9862,7 +9866,8 @@ final class AgentModeViewModel: ObservableObject {
         allowStartingRun: Bool,
         workflow: AgentWorkflowDefinition?,
         nativePreparedTurn: NativeSlashPreparedUserTurn?,
-        target: SessionInstructionTarget
+        target: SessionInstructionTarget,
+        readinessText: String? = nil
     ) async throws -> MCPInstructionDispatch {
         guard instructionTargetSession(sessionID: sessionID, target: target) === session else {
             throw MCPError.invalidParams("The requested agent run is no longer active.")
@@ -9875,6 +9880,7 @@ final class AgentModeViewModel: ObservableObject {
         guard !trimmedText.isEmpty else {
             throw MCPError.invalidParams("message is required.")
         }
+        let readinessText = readinessText ?? trimmedText
         if let interaction = mcpPendingInteraction(for: session),
            interaction.kind != .instruction
         {
@@ -9913,7 +9919,8 @@ final class AgentModeViewModel: ObservableObject {
                 workflow: workflow,
                 nativePreparedTurn: nativePreparedTurn,
                 childLinkFence: childLinkFence,
-                target: target
+                target: target,
+                readinessText: readinessText
             )
         }
 
@@ -9939,7 +9946,7 @@ final class AgentModeViewModel: ObservableObject {
                           session: session,
                           sessionID: sessionID,
                           target: target,
-                          text: trimmedText
+                          text: readinessText
                       )
                 else {
                     return false
@@ -9992,7 +9999,8 @@ final class AgentModeViewModel: ObservableObject {
         workflow: AgentWorkflowDefinition?,
         nativePreparedTurn: NativeSlashPreparedUserTurn?,
         childLinkFence: MCPDelegatedChildLinkAdmission?,
-        target: SessionInstructionTarget
+        target: SessionInstructionTarget,
+        readinessText: String
     ) async throws -> MCPInstructionDispatch {
         let tracker = session.codexSteerAckTracker
         let activeDispatchWakeIdentity = mcpActiveDispatchWakeIdentity(for: session, sessionID: sessionID)
@@ -10009,7 +10017,8 @@ final class AgentModeViewModel: ObservableObject {
                 nativePreparedTurn: nativePreparedTurn,
                 refusal: refusal,
                 childLinkFence: childLinkFence,
-                target: target
+                target: target,
+                readinessText: readinessText
             )
             self?.codexMCPSubmissionDrivers[attemptID] = nil
         }
@@ -10085,7 +10094,8 @@ final class AgentModeViewModel: ObservableObject {
         nativePreparedTurn: NativeSlashPreparedUserTurn?,
         refusal: CodexMCPDispatchRefusal,
         childLinkFence: MCPDelegatedChildLinkAdmission?,
-        target: SessionInstructionTarget
+        target: SessionInstructionTarget,
+        readinessText: String
     ) async {
         let tracker = session.codexSteerAckTracker
         guard tracker.markOperationStarted(attemptID: attemptID) else { return }
@@ -10109,7 +10119,7 @@ final class AgentModeViewModel: ObservableObject {
                           session: session,
                           sessionID: sessionID,
                           target: target,
-                          text: text
+                          text: readinessText
                       )
                 else {
                     return false

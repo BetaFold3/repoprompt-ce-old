@@ -2,8 +2,8 @@ import Foundation
 import MCP
 import RepoPromptAgentCore
 
-/// `workspace_steer`: list and (later) steer top-level sessions in workspaces the owner granted to
-/// the caller's workspace (docs/context/specs/2026-11-01-assistant-workspace-steering-spec.md).
+/// `workspace_steer`: list and steer top-level sessions in workspaces the owner granted to the
+/// caller's workspace (docs/context/specs/2026-11-01-assistant-workspace-steering-spec.md).
 ///
 /// The source workspace comes only from the request's actor-owned run route
 /// (`RequestMetadata.actorRoutedRunTab`), and that run's window must still show it. Tool
@@ -59,7 +59,9 @@ struct WorkspaceSteeringMCPToolService {
         switch op {
         case "list":
             return try list(args: args, caller: caller)
-        case "send", "request_grant":
+        case "send":
+            return try await send(args: args, caller: caller)
+        case "request_grant":
             throw MCPError.invalidParams(Self.notImplementedMessage(op: op))
         default:
             throw MCPError.invalidParams(
@@ -100,6 +102,22 @@ struct WorkspaceSteeringMCPToolService {
             sourceWorkspaceName: workspace.name,
             sourceSessionID: window.agentModeViewModel.sessions[route.tabID]?.activeAgentSessionID
         )
+    }
+
+    /// The durable session of the calling run, frozen at entry for attribution: the session live in
+    /// the route-owned tab, uniquely bound there (`authoritativeLiveSession`), and still running the
+    /// routed run (its process run ID is the route's), so a replaced session or a later run in the
+    /// tab is never credited. Any local session qualifies (roots, workers, explore and Knowledge).
+    func frozenSourceSessionID(caller: Caller) throws -> UUID {
+        guard let viewModel = windows().first(where: { $0.windowID == caller.windowID })?.agentModeViewModel,
+              let session = viewModel.sessions[caller.tabID],
+              let sessionID = session.activeAgentSessionID,
+              ((try? viewModel.authoritativeLiveSession(for: sessionID)) ?? nil) === session,
+              session.runID == caller.runID
+        else {
+            throw MCPError.invalidParams(Self.sourceSessionUnavailableMessage)
+        }
+        return sessionID
     }
 
     // MARK: - Target resolution
@@ -187,6 +205,80 @@ struct WorkspaceSteeringMCPToolService {
                 return order == .orderedSame ? lhs.workspaceID < rhs.workspaceID : order == .orderedAscending
             }
         return try Value(ListReply(workspaces: workspaces))
+    }
+
+    // MARK: - send
+
+    /// Entry checks run in order and refuse before anything is admitted: arguments, the frozen
+    /// source session, one fresh grant read, then the target, resolved across every window showing
+    /// the target workspace and pinned (window, view model, session) for the rest of the request.
+    /// The pinned view model's final predicate re-checks the grant for its current workspace and
+    /// the same session object; no other window is rescanned.
+    private func send(args: [String: Value], caller: Caller) async throws -> Value {
+        let targetID = try uuidArgument(args["target_workspace_id"], name: "target_workspace_id", kind: "workspace")
+        let sessionID = try uuidArgument(args["session_id"], name: "session_id", kind: "session")
+        let message = args["message"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !message.isEmpty else {
+            throw MCPError.invalidParams(AgentModeViewModel.workspaceSteeringEmptyMessageMessage)
+        }
+        let sourceSessionID = try frozenSourceSessionID(caller: caller)
+        guard let granted = grantStore().grantedTargets(source: caller.sourceWorkspaceID) else {
+            throw MCPError.invalidParams(Self.grantsUnreadableForSendMessage)
+        }
+        guard granted.contains(targetID) else {
+            throw MCPError.invalidParams(
+                Self.notGrantedMessage(
+                    target: workspaceName(targetID, caller: caller) ?? targetID.uuidString,
+                    source: caller.sourceWorkspaceName
+                ) + Self.nothingSentSuffix
+            )
+        }
+        let scan = scanTarget(workspaceID: targetID)
+        guard scan.isOpen else {
+            let knownName = workspaceName(targetID, caller: caller)
+            let refusal = knownName == nil && !isKnownWorkspace(targetID)
+                ? Self.deletedWorkspaceMessage(workspaceID: targetID.uuidString)
+                : Self.notOpenMessage(workspaceName: knownName ?? Self.unknownWorkspaceName)
+            throw MCPError.invalidParams(refusal + Self.nothingSentSuffix)
+        }
+        if scan.ambiguous.contains(sessionID) {
+            throw MCPError.invalidParams(
+                Self.ambiguousSessionMessage(sessionID: sessionID.uuidString) + Self.nothingSentSuffix
+            )
+        }
+        guard let match = scan.eligible[sessionID] else {
+            throw MCPError.invalidParams(Self.targetUnavailableMessage(sessionID: sessionID.uuidString))
+        }
+        let delivery = try await match.viewModel.workspaceSteeringDispatchInstruction(
+            session: match.session,
+            sessionID: sessionID,
+            sourceWorkspaceID: caller.sourceWorkspaceID,
+            message: message,
+            attribution: Self.attribution(
+                sourceWorkspaceName: caller.sourceWorkspaceName,
+                sourceWorkspaceID: caller.sourceWorkspaceID,
+                sourceSessionID: sourceSessionID
+            )
+        )
+        return try Value(SendReply(
+            workspaceID: targetID.uuidString,
+            sessionID: sessionID.uuidString,
+            delivery: delivery.rawValue
+        ))
+    }
+
+    private func uuidArgument(_ value: Value?, name: String, kind: String) throws -> UUID {
+        guard let text = value?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+              let id = UUID(uuidString: text)
+        else {
+            throw MCPError.invalidParams("workspace_steer \(name) must be a \(kind) UUID. Nothing was sent.")
+        }
+        return id
+    }
+
+    /// The line that precedes every steering message in the target transcript.
+    static func attribution(sourceWorkspaceName: String, sourceWorkspaceID: UUID, sourceSessionID: UUID) -> String {
+        "[Steer from workspace \"\(sourceWorkspaceName)\" (\(sourceWorkspaceID.uuidString)), session \(sourceSessionID.uuidString)]"
     }
 
     private func describe(targetID: UUID, caller: Caller) -> ListReply.Workspace {
@@ -291,6 +383,19 @@ struct WorkspaceSteeringMCPToolService {
         let workspaces: [Workspace]
     }
 
+    struct SendReply: Codable, Equatable {
+        let workspaceID: String
+        let sessionID: String
+        /// `MCPInstructionDispatch` raw value, as `agent_run` reports it.
+        let delivery: String
+
+        enum CodingKeys: String, CodingKey {
+            case workspaceID = "workspace_id"
+            case sessionID = "session_id"
+            case delivery
+        }
+    }
+
     // MARK: - Messages
 
     static let unknownWorkspaceName = "unknown workspace"
@@ -309,6 +414,18 @@ struct WorkspaceSteeringMCPToolService {
 
     static let grantsUnreadableMessage =
         "Workspace steering grants could not be read from settings, so nothing was listed."
+
+    static let grantsUnreadableForSendMessage =
+        "Workspace steering grants could not be read from settings. Nothing was sent."
+
+    static let sourceSessionUnavailableMessage =
+        "The session making this call is not the current run of its tab on this Mac, so workspace_steer cannot attribute the message. Nothing was sent."
+
+    static let nothingSentSuffix = " Nothing was sent."
+
+    static func targetUnavailableMessage(sessionID: String) -> String {
+        "Session \(sessionID) is not a top-level session that can be steered in that workspace on this Mac (it may be a worker, controlled by another agent, a Knowledge session, or no longer open). Call list for current sessions. Nothing was sent."
+    }
 
     static func notGrantedMessage(target: String, source: String) -> String {
         "Workspace '\(target)' is not granted to '\(source)'. The owner can add a grant in Settings → Manage Workspaces → Workspace Steering."

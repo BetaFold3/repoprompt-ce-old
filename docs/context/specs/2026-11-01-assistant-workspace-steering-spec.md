@@ -5,7 +5,7 @@ Authority: Reference
 Last-verified: 2026-11-01
 
 ## Status and goal
-Implementation in progress: Step 1 is committed; later steps and live acceptance remain pending. Steps follow the [review policy](../review-policy.md).
+Implementation in progress: Steps 1–3 are implemented; grant requests and live acceptance remain pending. Steps follow the [review policy](../review-policy.md).
 
 An owner-designated "Assistant" workspace runs Agent Mode sessions that periodically read other workspaces' saved transcripts (existing `history` tool), check a long-horizon plan, tell the owner about deviations, and sometimes send a steer or follow-up into a session of another workspace. This spec adds the missing parts: an owner-approved, persistent, one-way workspace→workspace grant, and a tool to list and message sessions in granted workspaces.
 
@@ -63,7 +63,7 @@ Step 2 — done | rounds 1/2 | open: none | downgraded: none | assumed: shared r
   - no `mcpControlContext` after a send, and the target still an attention root.
 - Done when: every refusal sends nothing, and accepted sends reach the target without changing its control, approvals or alerts.
 
-Step 3 — todo | rounds 0/2 | open: none | downgraded: none | assumed: none | deferred: none
+Step 3 — done | rounds 1/2 | open: none | downgraded: none | assumed: source process identity verified (step3-remediation.md) | deferred: nonblocking coverage and wording; live acceptance (step3-dispositions.md)
 
 ### Step 4 — `request_grant` and approval prompt
 - Change: the new approval operation kind without auto-approve or Always Allow, fixed wording, revalidation, and persistence through Step 1.

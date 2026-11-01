@@ -150,6 +150,86 @@ import XCTest
             }
         }
 
+        /// An explore leaf steers through its production route: the lease's run ID is the session's
+        /// process run ID (as `makeLease(runID)` builds it from `AgentModeProcessRunIdentity`), the
+        /// installed policy grants `workspace_steer`, and a send under that connection's real request
+        /// context is attributed to the explore session. Once the session's process run is replaced,
+        /// the old connection's route no longer matches and is refused without sending.
+        func testExploreLeafSourceSendsThroughItsProductionRouteAndAReplacedRunIsRefused() async throws {
+            let window = try await makeWindow(name: "Explore Source")
+            let sourceWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+            try await registerCatalog(for: window)
+            let target = try await makeWindow(name: "Explore Target")
+            let targetWorkspace = try XCTUnwrap(target.workspaceManager.activeWorkspace)
+            let targetVM = target.agentModeViewModel
+            let targetSettings = target.apiSettingsViewModel
+            let previousOpenCode = targetSettings.isOpenCodeConnected
+            addTeardownBlock { @MainActor in
+                targetSettings.isOpenCodeConnected = previousOpenCode
+                targetVM.test_workspaceSteeringGrantStoreOverride = nil
+            }
+            targetVM.test_workspaceSteeringGrantStoreOverride = grantStore
+            targetSettings.isOpenCodeConnected = true
+            let targetRoot = try makeSession(in: target, name: "Target root")
+            targetRoot.session.selectedAgent = .openCode
+            targetRoot.session.runID = UUID()
+            targetRoot.session.runState = .running
+            targetRoot.session.beginRunAttempt(source: "test.workspaceSteering.exploreTarget")
+            targetRoot.session.appendItem(.user("first", sequenceIndex: targetRoot.session.nextSequenceIndex))
+            XCTAssertEqual(grantStore.add(source: sourceWorkspace.id, target: targetWorkspace.id), .added)
+
+            let parent = try makeSession(in: window, name: "Explore parent")
+            let explore = try makeSession(in: window, name: "Explore child", parent: parent.sessionID)
+            let processRunID = AgentModeProcessRunIdentity.startFreshProcessRun(for: explore.session)
+            explore.session.runState = .running
+            explore.session.beginRunAttempt(source: "test.workspaceSteering.explore")
+            let decision = AgentDelegationPolicy.decision(taskLabelKind: .explore, lineage: .resolved(depth: 1))
+            XCTAssertEqual(decision, .exploreLeaf)
+            let run = try await routeRun(
+                window: window,
+                tabID: explore.tabID,
+                role: .explore,
+                profile: .standard,
+                policy: AgentDelegationPolicy.runToolPolicy(decision: decision, taskLabelKind: .explore, sessionProfile: .standard),
+                runID: processRunID
+            )
+            let tools = try await ServerNetworkManager.shared.debugListToolNames(for: run.connectionID)
+            XCTAssertTrue(tools.contains(MCPWindowToolName.workspaceSteer), "Tools: \(tools)")
+            let args: [String: Value] = [
+                "op": .string("send"),
+                "target_workspace_id": .string(targetWorkspace.id.uuidString),
+                "session_id": .string(targetRoot.sessionID.uuidString),
+                "message": .string("From the explore leaf")
+            ]
+
+            let value = try await ServerNetworkManager.withConnectionID(run.connectionID) {
+                try await self.callSteer(window, args)
+            }
+            let reply = try JSONDecoder().decode(Service.SendReply.self, from: JSONEncoder().encode(value))
+            XCTAssertEqual(reply.delivery, "queued_follow_up")
+            let expected = "[Steer from workspace \"\(sourceWorkspace.name)\" (\(sourceWorkspace.id.uuidString)), "
+                + "session \(explore.sessionID.uuidString)]\n\nFrom the explore leaf"
+            XCTAssertEqual(targetRoot.session.pendingInstructions.map(\.text), [expected])
+
+            // A new process run for the explore session: the old connection's route names the
+            // previous run and is never credited to the new one.
+            _ = AgentModeProcessRunIdentity.startFreshProcessRun(for: explore.session)
+            do {
+                let refused = try await ServerNetworkManager.withConnectionID(run.connectionID) {
+                    try await self.callSteer(window, args)
+                }
+                XCTFail("A replaced run must be refused; got \(refused)")
+            } catch {
+                XCTAssertTrue(
+                    String(describing: error).contains(Service.sourceSessionUnavailableMessage),
+                    "\(error)"
+                )
+            }
+            XCTAssertEqual(targetRoot.session.pendingInstructions.map(\.text), [expected], "Nothing more was sent")
+            XCTAssertNil(targetRoot.session.mcpControlContext)
+            XCTAssertTrue(targetVM.isAttentionNotificationRoot(targetRoot.session))
+        }
+
         /// A connection with no Agent Mode lease (an external client) and a gateway-principal
         /// connection neither see the tool in `tools/list` nor have an additional-tool grant in
         /// their configured policy state. A call that reaches the tool under either connection's real
@@ -690,9 +770,10 @@ import XCTest
             XCTAssertEqual(workspace.warnings, [])
         }
 
-        /// `send` and `request_grant` are reserved until their steps and refuse without touching
-        /// the target.
-        func testReservedOperationsRefuseWithoutSending() async throws {
+        /// `request_grant` is reserved until Step 4 and refuses without touching the target, and an
+        /// unknown op is refused. `send` (Step 3, `WorkspaceSteeringSendTests`) refuses here too:
+        /// this route's tab holds no live session to attribute the message to.
+        func testRequestGrantIsReservedAndSendWithoutALiveSourceSessionRefuses() async throws {
             let source = try await makeWindow(name: "Assistant")
             let sourceWorkspace = try XCTUnwrap(source.workspaceManager.activeWorkspace)
             let target = try await makeWindow(name: "Target")
@@ -707,7 +788,7 @@ import XCTest
                 "target_workspace_id": .string(targetWorkspace.id.uuidString),
                 "session_id": .string(root.sessionID.uuidString),
                 "message": .string("hello")
-            ], message: Service.notImplementedMessage(op: "send"))
+            ], message: Service.sourceSessionUnavailableMessage)
             await assertRefused(source, [
                 "op": .string("request_grant"),
                 "target_workspace_id": .string(targetWorkspace.id.uuidString)
@@ -879,10 +960,10 @@ import XCTest
             tabID: UUID,
             role: AgentModelCatalog.TaskLabelKind,
             profile: AgentSessionProfile,
-            policy: AgentDelegationPolicy.RunToolPolicy
+            policy: AgentDelegationPolicy.RunToolPolicy,
+            runID: UUID = UUID()
         ) async throws -> RoutedRun {
             let manager = ServerNetworkManager.shared
-            let runID = UUID()
             let connectionID = UUID()
             let spec = MCPBootstrapLeaseSpec.agentMode(
                 tabID: tabID,
