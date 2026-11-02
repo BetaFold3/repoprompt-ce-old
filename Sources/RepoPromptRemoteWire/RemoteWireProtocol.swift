@@ -16,6 +16,9 @@ public enum RemoteWireProtocol {
         "unsubscribe",
         "list_agents",
         "list_sessions",
+        // Read-only, gateway-owned discovery of open windows' active workspaces (fresh app read;
+        // no workspace mutation). Not mutating, so no request_id requirement beyond correlation.
+        "list_workspaces",
         "open_workspace",
         "get_log",
         "fork_session",

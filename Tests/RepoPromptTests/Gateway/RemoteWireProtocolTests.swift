@@ -49,6 +49,15 @@ final class RemoteWireProtocolTests: XCTestCase {
         XCTAssertEqual(try RemoteWireProtocol.decodeClientFrame(from: data).type, "open_workspace")
     }
 
+    func testListWorkspacesIsARecognizedReadOnlyFrame() throws {
+        XCTAssertTrue(RemoteWireProtocol.clientFrameTypes.contains("list_workspaces"))
+        XCTAssertFalse(RemoteWireProtocol.mutatingClientFrameTypes.contains("list_workspaces"))
+        let data = #"{"v":1,"type":"list_workspaces","payload":{},"sig":null}"#.data(using: .utf8)!
+        let frame = try RemoteWireProtocol.decodeClientFrame(from: data)
+        XCTAssertEqual(frame.type, "list_workspaces")
+        XCTAssertNil(frame.requestID)
+    }
+
     func testHandoffFramesHaveExpectedMutationAndFeatureMembership() throws {
         XCTAssertTrue(RemoteWireProtocol.clientFrameTypes.contains("fork_session"))
         XCTAssertTrue(RemoteWireProtocol.mutatingClientFrameTypes.contains("fork_session"))

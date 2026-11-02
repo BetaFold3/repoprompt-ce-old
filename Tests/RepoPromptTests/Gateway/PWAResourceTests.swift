@@ -69,9 +69,10 @@ final class PWAResourceTests: XCTestCase {
         XCTAssertTrue(text.contains("./app.js"), "index.html must load the ES module client")
         XCTAssertTrue(text.contains("manifest.webmanifest"), "index.html must link the manifest")
         XCTAssertTrue(
-            text.contains("bound window"),
-            "The UI must surface that sessions are scoped to the bound window's active workspace"
+            text.contains("workspace chosen on this page") && text.contains(">Switch workspace</button>"),
+            "The UI must surface that sessions are scoped to the chosen workspace and offer Switch workspace"
         )
+        XCTAssertFalse(text.contains("Leave a single window open"), "Closing Mac windows is no longer required")
         XCTAssertTrue(text.contains("<details id=\"activity-panel\" class=\"panel\">"), "Activity starts collapsed")
         XCTAssertTrue(text.contains("<details id=\"transcript-raw\" class=\"disclosure\">"), "Raw transcript starts collapsed")
         XCTAssertFalse(text.contains("aria-live"), "the refreshed transcript is not a live region")

@@ -25,7 +25,7 @@ struct ScopeEnforcementError: Error, Equatable, CustomStringConvertible {
 ///
 /// | Frame | Required scope |
 /// |---|---|
-/// | subscribe, unsubscribe, poll, list_agents, list_sessions, get_log, extract_handoff | sessions:observe |
+/// | subscribe, unsubscribe, poll, list_agents, list_sessions, list_workspaces, get_log, extract_handoff | sessions:observe |
 /// | start, steer, cancel, open_workspace, fork_session | sessions:operate |
 /// | respond | interactions:respond |
 /// | future workspace browsing/read-only context | workspace:read (reserved) |
@@ -42,6 +42,10 @@ enum ScopeEnforcer {
     static func requiredScope(forFrameType type: String) -> String? {
         switch type {
         case "subscribe", "unsubscribe", "poll", "list_agents", "list_sessions", "get_log", "extract_handoff":
+            GatewayRemoteScope.sessionsObserve
+        case "list_workspaces":
+            // Read-only discovery of the open Mac windows' active workspaces, used only to choose
+            // which workspace's sessions to observe. It never opens, focuses, or binds anything.
             GatewayRemoteScope.sessionsObserve
         case "push_subscribe", "push_unsubscribe":
             // Push wake registration is observation-adjacent: it only lets the

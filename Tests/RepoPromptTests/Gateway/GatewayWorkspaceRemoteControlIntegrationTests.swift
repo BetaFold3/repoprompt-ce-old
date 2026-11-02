@@ -978,6 +978,182 @@ final class GatewayWorkspaceRemoteControlIntegrationTests: XCTestCase {
         XCTAssertEqual(calls[3].arguments["_windowID"], .int(7))
     }
 
+    /// Owner-requested chooser: a BOUND single-window connection whose owner then opens a second Mac
+    /// window can rediscover workspaces fresh, list the second workspace by ID only, and steer its
+    /// session on the second window through catalog affinity — with no binding change and no
+    /// window-closing workaround.
+    func testBoundConnectionDiscoversSecondWindowThenChosenWorkspaceListsAndSteersByIDOnly() async throws {
+        let workspaceAID = "77777777-7777-7777-7777-777777777777"
+        let workspaceBID = "99999999-9999-9999-9999-999999999999"
+        let windowA: JSONValue = .object([
+            "window_id": .int(1),
+            "workspace": .object(["id": .string(workspaceAID), "name": .string("Workspace A")])
+        ])
+        let windowB: JSONValue = .object([
+            "window_id": .int(2),
+            "workspace": .object(["id": .string(workspaceBID), "name": .string("Workspace B")])
+        ])
+        let singleWindow = GatewayTestHelpers.toolResult(json: .object(["windows": .array([windowA])]))
+        let twoWindows = GatewayTestHelpers.toolResult(json: .object(["windows": .array([windowA, windowB])]))
+        let workspaceBSessions = GatewayTestHelpers.toolResult(json: .object([
+            "sessions": .array([
+                .object([
+                    "session_id": .string(windowTwoNewestID),
+                    "name": .string("Window Two Session"),
+                    "last_modified": .string("2026-07-12T04:00:00.000Z"),
+                    "state": .string("running")
+                ])
+            ]),
+            "workspace": .object(["id": .string(workspaceBID), "name": .string("Workspace B")])
+        ]))
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(singleWindow),
+            .result(twoWindows),
+            .result(twoWindows),
+            .result(workspaceBSessions),
+            .result(steerResult(sessionID: windowTwoNewestID))
+        ])
+        let runtime = try await makeRuntime(connection: connection, bindingState: .bound)
+
+        func handle(_ frame: RemoteClientFrame) async -> RemoteServerFrame? {
+            await runtime.handle(frame, deviceID: "device", sinkID: UUID(), sink: RecordingFrameSink())
+        }
+
+        let before = await handle(RemoteClientFrame(type: "list_workspaces", requestID: "chooser-before"))
+        XCTAssertEqual(before?.payload?.objectValue?["windows"]?.arrayValue?.count, 1)
+
+        let after = await handle(RemoteClientFrame(type: "list_workspaces", requestID: "chooser-after"))
+        let afterWindows = try XCTUnwrap(after?.payload?.objectValue?["windows"]?.arrayValue)
+        XCTAssertEqual(
+            afterWindows.map { $0.objectValue?["workspace_id"]?.stringValue },
+            [workspaceAID, workspaceBID]
+        )
+
+        let list = await handle(RemoteClientFrame(
+            type: "list_sessions",
+            requestID: "chooser-list-b",
+            payload: .object(["workspace_id": .string(workspaceBID), "limit": .int(50)])
+        ))
+        XCTAssertEqual(list?.type, "command_result")
+        XCTAssertEqual(list?.payload?.objectValue?["workspace"]?.objectValue?["id"], .string(workspaceBID))
+        XCTAssertEqual(
+            list?.payload?.objectValue?["sessions"]?.arrayValue?.map { $0.objectValue?["session_id"]?.stringValue },
+            [windowTwoNewestID]
+        )
+
+        let steer = await handle(RemoteClientFrame(
+            type: "steer",
+            requestID: "chooser-steer-b",
+            sessionID: windowTwoNewestID,
+            payload: .object(["message": .string("continue on the second window")])
+        ))
+        XCTAssertEqual(steer?.type, "command_result")
+
+        let calls = await connection.calls
+        XCTAssertEqual(calls.map(\.name), ["bind_context", "bind_context", "bind_context", "agent_manage", "agent_run"])
+        XCTAssertEqual(calls[3].arguments["_windowID"], .int(2))
+        XCTAssertEqual(calls[3].arguments["workspace_id"], .string(workspaceBID))
+        XCTAssertNil(calls[3].arguments["workspace_name"])
+        XCTAssertEqual(calls[4].arguments["op"], .string("steer"))
+        XCTAssertEqual(calls[4].arguments["_windowID"], .int(2), "Catalog affinity must route the steer to window 2")
+        XCTAssertFalse(calls.contains { $0.name == "manage_workspaces" }, "The chooser never opens or focuses a workspace")
+    }
+
+    /// The owner's main case: the phone connects while several Mac windows are open, so its link is
+    /// UNBOUND (`binding_required`). Discovery, an ID-only list of the second window's workspace, a
+    /// subscribe and a steer all succeed through catalog affinity, with no binding, open or focus.
+    func testUnboundMultiWindowConnectionDiscoversListsSubscribesAndSteersChosenWorkspace() async throws {
+        let workspaceAID = "77777777-7777-7777-7777-777777777777"
+        let workspaceBID = "99999999-9999-9999-9999-999999999999"
+        let twoWindows = GatewayTestHelpers.toolResult(json: .object([
+            "windows": .array([
+                .object([
+                    "window_id": .int(1),
+                    "workspace": .object(["id": .string(workspaceAID), "name": .string("Workspace A")])
+                ]),
+                .object([
+                    "window_id": .int(2),
+                    "workspace": .object(["id": .string(workspaceBID), "name": .string("Workspace B")])
+                ])
+            ]),
+            "binding": .object(["state": .string("unbound")])
+        ]))
+        let workspaceBSessions = GatewayTestHelpers.toolResult(json: .object([
+            "sessions": .array([
+                .object([
+                    "session_id": .string(windowTwoNewestID),
+                    "name": .string("Window Two Session"),
+                    "last_modified": .string("2026-07-12T04:00:00.000Z"),
+                    "state": .string("running")
+                ])
+            ]),
+            "workspace": .object(["id": .string(workspaceBID), "name": .string("Workspace B")])
+        ]))
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(twoWindows),
+            .result(twoWindows),
+            .result(workspaceBSessions)
+        ])
+        let runtime = try await makeRuntime(
+            connection: connection,
+            bindingState: .bindingRequired("Multiple RepoPrompt windows are open; bind this connection to a window before remote operations.")
+        )
+
+        func handle(_ frame: RemoteClientFrame) async -> RemoteServerFrame? {
+            await runtime.handle(frame, deviceID: "device", sinkID: UUID(), sink: RecordingFrameSink())
+        }
+
+        let discovered = await handle(RemoteClientFrame(type: "list_workspaces", requestID: "unbound-discover"))
+        XCTAssertEqual(
+            discovered?.payload?.objectValue?["windows"]?.arrayValue?.map { $0.objectValue?["workspace_id"]?.stringValue },
+            [workspaceAID, workspaceBID]
+        )
+
+        let list = await handle(RemoteClientFrame(
+            type: "list_sessions",
+            requestID: "unbound-list-b",
+            payload: .object(["workspace_id": .string(workspaceBID), "limit": .int(50)])
+        ))
+        XCTAssertEqual(list?.type, "command_result")
+        XCTAssertEqual(
+            list?.payload?.objectValue?["sessions"]?.arrayValue?.map { $0.objectValue?["session_id"]?.stringValue },
+            [windowTwoNewestID]
+        )
+
+        let subscribe = await handle(RemoteClientFrame(
+            type: "subscribe",
+            requestID: "unbound-subscribe",
+            payload: .object(["session_ids": .array([.string(windowTwoNewestID)])])
+        ))
+        XCTAssertEqual(subscribe?.type, "command_result", "Affinity from the scoped list resolves the unbound watch")
+        XCTAssertEqual(
+            subscribe?.payload?.objectValue?["subscribed_session_ids"]?.arrayValue,
+            [.string(windowTwoNewestID)]
+        )
+
+        await connection.enqueue(.result(steerResult(sessionID: windowTwoNewestID)))
+        let steer = await handle(RemoteClientFrame(
+            type: "steer",
+            requestID: "unbound-steer",
+            sessionID: windowTwoNewestID,
+            payload: .object(["message": .string("continue from the phone")])
+        ))
+        XCTAssertEqual(steer?.type, "command_result")
+
+        let calls = await connection.calls
+        let listCall = try XCTUnwrap(calls.first { $0.name == "agent_manage" })
+        XCTAssertEqual(listCall.arguments["_windowID"], .int(2))
+        XCTAssertEqual(listCall.arguments["workspace_id"], .string(workspaceBID))
+        XCTAssertNil(listCall.arguments["workspace_name"])
+        let steerCall = try XCTUnwrap(calls.last { $0.name == "agent_run" && $0.arguments["op"] == .string("steer") })
+        XCTAssertEqual(steerCall.arguments["_windowID"], .int(2))
+        XCTAssertTrue(
+            calls.filter { $0.name == "bind_context" }.allSatisfy { $0.arguments["op"] == .string("list") },
+            "Only read-only window listing; the connection is never bound to a window"
+        )
+        XCTAssertFalse(calls.contains { $0.name == "manage_workspaces" }, "Nothing is opened or focused on the Mac")
+    }
+
     private func waitForSessionUpdate(
         sink: RecordingFrameSink,
         sessionID: String

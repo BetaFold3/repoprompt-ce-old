@@ -347,10 +347,13 @@ details#activity-panel > summary {
   <!-- Sessions -->
   <section id="sessions-panel" class="panel hidden">
     <h2>Sessions</h2>
-    <p class="scope-note">Showing sessions for the bound window&rsquo;s active workspace only. Sessions in other windows or workspaces are not listed here.</p>
+    <p id="workspace-label" class="scope-note"></p>
+    <p class="scope-note">Showing sessions for the workspace chosen on this page only. Use Switch workspace to list another workspace open in a window on your Mac.</p>
     <ul id="sessions-list" class="sessions"></ul>
+    <p id="sessions-status" class="hint" role="status"></p>
     <div class="row">
       <button id="refresh-sessions" class="secondary">Refresh</button>
+      <button id="switch-workspace" class="secondary" type="button">Switch workspace</button>
     </div>
   </section>
 
@@ -402,15 +405,16 @@ details#activity-panel > summary {
   </details>
 </main>
 
-<!-- binding_required window/workspace picker -->
-<div id="binding-overlay" class="overlay hidden">
+<!-- Workspace chooser: open workspaces read fresh from the Mac; choosing changes only this page's list -->
+<div id="binding-overlay" class="overlay hidden" role="dialog" aria-modal="true" aria-labelledby="workspace-chooser-title">
   <div class="panel">
-    <h2>Window binding required</h2>
-    <p class="hint" id="binding-message">The gateway link is not bound to a RepoPrompt window.</p>
-    <p class="hint">RepoPrompt has multiple windows open. Leave a single window open on your Mac, then retry. The sessions list is scoped to the bound window&rsquo;s active workspace; a session opened from a notification link does not need it.</p>
+    <h2 id="workspace-chooser-title">Choose a workspace</h2>
+    <p class="hint">These workspaces are open in windows on your Mac. Choosing one changes only which sessions this page lists; nothing changes on your Mac. A session opened from a notification link does not need a choice.</p>
+    <ul id="workspace-choices" class="sessions"></ul>
+    <p id="workspace-chooser-status" class="hint" role="status"></p>
     <div class="row">
-      <button id="binding-retry">Retry</button>
-      <button id="binding-dismiss" class="secondary">Dismiss</button>
+      <button id="workspace-retry" class="hidden" type="button">Retry</button>
+      <button id="binding-dismiss" class="secondary" type="button">Dismiss</button>
     </div>
   </div>
 </div>

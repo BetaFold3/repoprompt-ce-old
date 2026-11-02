@@ -347,8 +347,10 @@ extension PWAResourceTests {
         XCTAssertEqual(harness.string("$('interaction-box').dataset.interactionId"), "I1")
         harness.editDrafts()
 
-        // Work still in flight when the lock happens.
+        // Work still in flight when the lock happens. A chosen workspace makes the list
+        // request a real `list_sessions`.
         harness.run("""
+        state.selectedWorkspaceId = 'W1';
         refreshSessions();
         pollSession('S1');
         refreshTranscript();
@@ -1184,7 +1186,7 @@ extension PWAResourceTests {
     }
 }
 
-private final class PWAPasskeyHarness {
+final class PWAPasskeyHarness {
     static let untouchedForm: NSArray = [
         ["selected": [] as NSArray, "custom": "", "skipped": false, "disabled": [false, false]],
         ["selected": [] as NSArray, "custom": "", "skipped": false, "disabled": [false, false, false]],

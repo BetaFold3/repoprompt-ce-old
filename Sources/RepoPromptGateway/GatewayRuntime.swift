@@ -247,6 +247,8 @@ actor RemoteGatewayRuntime {
             await handlePushSubscribe(frame, deviceID: deviceID)
         case "push_unsubscribe":
             await handlePushUnsubscribe(frame, deviceID: deviceID)
+        case "list_workspaces":
+            await handleListWorkspaces(frame, deviceID: deviceID)
         default:
             await handleToolMappedCommand(frame, deviceID: deviceID)
         }
@@ -427,6 +429,45 @@ actor RemoteGatewayRuntime {
             requestID: frame.requestID,
             payload: .object(["status": .string(removed ? "unsubscribed" : "not_subscribed")])
         )
+    }
+
+    /// Read-only discovery of the open Mac windows' active workspaces for the browser workspace
+    /// chooser. Always a FRESH `bind_context list` read through the existing eligible-window helper:
+    /// no cached window details are ever returned, and no workspace is opened, focused, or bound.
+    /// Failures use one fixed, sanitized error so no raw app or transport text reaches the browser.
+    private func handleListWorkspaces(_ frame: RemoteClientFrame, deviceID: String) async -> RemoteServerFrame {
+        let payloadIsEmpty: Bool = switch frame.payload {
+        case nil, .null: true
+        case let .object(object): object.isEmpty
+        default: false
+        }
+        guard payloadIsEmpty else {
+            audit(frame: frame, deviceID: deviceID, outcome: "failure", code: "invalid_payload")
+            return .commandError(
+                requestID: frame.requestID,
+                sessionID: frame.sessionID,
+                code: "invalid_payload",
+                message: "list_workspaces takes no arguments."
+            )
+        }
+        switch await eligibleStartTargetWindowInfoLookup(deviceID: deviceID) {
+        case let .available(info):
+            let payload = JSONValue.object(["windows": info.details])
+            audit(frame: frame, deviceID: deviceID, outcome: "success")
+            return .commandResult(requestID: frame.requestID, payload: payload)
+        case .unavailable(.emptyWindowList):
+            // The app answered authoritatively with no open windows: an honest empty inventory.
+            audit(frame: frame, deviceID: deviceID, outcome: "success")
+            return .commandResult(requestID: frame.requestID, payload: .object(["windows": .array([])]))
+        case .unavailable:
+            audit(frame: frame, deviceID: deviceID, outcome: "failure", code: "workspace_discovery_unavailable")
+            return .commandError(
+                requestID: frame.requestID,
+                sessionID: frame.sessionID,
+                code: "workspace_discovery_unavailable",
+                message: "Open workspaces are unavailable. Retry."
+            )
+        }
     }
 
     private func handleToolMappedCommand(_ frame: RemoteClientFrame, deviceID: String) async -> RemoteServerFrame {

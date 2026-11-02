@@ -284,6 +284,8 @@ final class GatewayPasskeyE2EContractTests: XCTestCase {
         // to the client's own request id and leaking no decoder/raw text. The connection stays open and
         // locked, so the get_log below still settles on the same socket.
         try await assertLockedSettlement(socket, type: "frobnicate_unknown", requestID: "req-unknown")
+        // The chooser's read-only workspace discovery is protected like any list: withheld while locked.
+        try await assertLockedSettlement(socket, type: "list_workspaces", requestID: "req-list-workspaces", payload: .object([:]))
         try await assertLockedSettlement(
             socket,
             type: "get_log",
@@ -471,6 +473,82 @@ final class GatewayPasskeyE2EContractTests: XCTestCase {
         clock.advance(by: .seconds(25 * 60))
         let listed = try await socket.request(type: "list_sessions", requestID: "req-list-after-renewal")
         XCTAssertEqual(listed.type, "command_result", "Delivery continues past the original deadline after renewal")
+    }
+
+    /// Workspace chooser: a `list_workspaces` admitted while unlocked whose app read is HELD while the
+    /// phone locks must settle as the content-free `passkey_locked` error — the late window inventory
+    /// (workspace names) never reaches the locked browser. A re-unlock then gets a fresh read.
+    func testLockDuringHeldWorkspaceDiscoveryWithholdsInventoryAndReunlockReadsFresh() async throws {
+        let windows: JSONValue = .object(["windows": .array([
+            .object([
+                "window_id": .int(1),
+                "workspace": .object(["id": .string("workspace-held"), "name": .string("Held Secret Name")])
+            ])
+        ])])
+        try await runLockDuringHeldWorkspaceDiscovery(heldResult: GatewayTestHelpers.toolResult(json: windows))
+    }
+
+    /// The same lock race when the held app read FAILS: the delayed discovery error is also withheld
+    /// as `passkey_locked` (never the fixed discovery error or raw app text), and re-unlock reads fresh.
+    func testLockDuringHeldWorkspaceDiscoveryFailureSettlesLockedAndReunlockReadsFresh() async throws {
+        let failure = GatewayTestHelpers.toolResult(
+            json: .object(["error": .string("Held Secret Name /Users/owner/private failure")]),
+            isError: true
+        )
+        try await runLockDuringHeldWorkspaceDiscovery(heldResult: failure)
+    }
+
+    private func runLockDuringHeldWorkspaceDiscovery(heldResult: MCPToolResult) async throws {
+        let socket = try await openPairedSocket()
+        defer { socket.close() }
+        _ = try await socket.hello()
+        let key = SoftwareAuthenticator()
+        try await register(socket, using: key, requestID: "req-register")
+        try await unlock(socket, using: key, requestID: "req-unlock")
+        _ = try await socket.receiveUnlockedNotice()
+
+        let gate = RecordingAppLinkResponseGate()
+        await poolConnector.enqueue(.gated(heldResult, gate), for: device.deviceID)
+        try await socket.send(type: "list_workspaces", requestID: "req-held-workspaces", payload: .object([:]))
+        await gate.waitUntilEntered()
+
+        try await socket.send(type: "lock")
+        var lockedReason: String?
+        for _ in 0 ..< 8 {
+            let frame = try await socket.receive()
+            XCTAssertEqual(frame.type, "lock_state", "Nothing but access notices before the held read settles")
+            if frame.payload?.objectValue?["locked"]?.boolValue == true {
+                lockedReason = frame.payload?.objectValue?["reason"]?.stringValue
+                break
+            }
+        }
+        XCTAssertEqual(lockedReason, "passkey_locked")
+
+        await gate.release()
+        let settled = try await socket.receiveCorrelated()
+        XCTAssertEqual(settled.type, "command_error")
+        XCTAssertEqual(settled.requestID, "req-held-workspaces")
+        XCTAssertEqual(settled.payload?.objectValue?["code"]?.stringValue, "passkey_locked")
+        let encoded = try String(decoding: RemoteWireProtocol.encodeServerFrame(settled), as: UTF8.self)
+        XCTAssertFalse(encoded.contains("Held Secret Name"), "The withheld inventory never reaches a locked browser")
+        XCTAssertFalse(encoded.contains("workspace_discovery_unavailable"), "A withheld failure is a lock settlement too")
+
+        try await unlock(socket, using: key, requestID: "req-reunlock")
+        let freshWindows: JSONValue = .object(["windows": .array([
+            .object([
+                "window_id": .int(2),
+                "workspace": .object(["id": .string("workspace-fresh"), "name": .string("Fresh Name")])
+            ])
+        ])])
+        await poolConnector.enqueue(.result(GatewayTestHelpers.toolResult(json: freshWindows)), for: device.deviceID)
+        let fresh = try await socket.request(type: "list_workspaces", requestID: "req-fresh-workspaces", payload: .object([:]))
+        XCTAssertEqual(fresh.type, "command_result")
+        XCTAssertEqual(
+            fresh.payload?.objectValue?["windows"]?.arrayValue?.first?.objectValue?["workspace_id"]?.stringValue,
+            "workspace-fresh"
+        )
+        let calls = await poolConnector.toolNames(for: device.deviceID)
+        XCTAssertEqual(calls, ["bind_context", "bind_context"], "Each discovery is one fresh app read")
     }
 
     private static func deadlineRemaining(_ access: [String: JSONValue]) -> Double? {
@@ -806,16 +884,29 @@ private struct ProviderBackedPrincipalConnector: AppLinkConnecting {
 private final class PasskeyE2EPoolConnector: AppLinkConnecting, @unchecked Sendable {
     private let lock = NSLock()
     private var connections: [String: RecordingAppLinkConnection] = [:]
+    private var seededResponses: [String: [RecordingAppLinkConnection.Response]] = [:]
 
     func toolNames(for clientName: String) async -> [String] {
         guard let connection = lock.withLock({ connections[clientName] }) else { return [] }
         return await connection.calls.map(\.name)
     }
 
+    /// Queue a scripted app response for the device link, whether or not it has connected yet.
+    func enqueue(_ response: RecordingAppLinkConnection.Response, for clientName: String) async {
+        let existing: RecordingAppLinkConnection? = lock.withLock {
+            if let connection = connections[clientName] { return connection }
+            seededResponses[clientName, default: []].append(response)
+            return nil
+        }
+        await existing?.enqueue(response)
+    }
+
     func connect(configuration _: GatewayConfiguration, clientName: String, logger _: Logger) async throws -> any AppLinkConnection {
-        let connection = RecordingAppLinkConnection()
-        lock.withLock { connections[clientName] = connection }
-        return connection
+        lock.withLock {
+            let connection = RecordingAppLinkConnection(responses: seededResponses.removeValue(forKey: clientName) ?? [])
+            connections[clientName] = connection
+            return connection
+        }
     }
 }
 

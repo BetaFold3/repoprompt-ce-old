@@ -4,7 +4,7 @@
 // - pairing bootstrap via the gateway pairing relay (discovery, /api/pair/*, /api/ticket),
 // - one-time app-minted ticket + per-frame P256 device signatures (DPoP-lite),
 // - direct session subscribe / poll / transcript catch-up / respond / steer / cancel,
-// - binding_required surface for the sessions list,
+// - a page-local workspace chooser for the sessions list (list_workspaces, ID-only list_sessions),
 // - Web Push wake registration (push_subscribe) with identifier-only payloads,
 // - optional passkey unlock: lock presentation, native WebAuthn ceremonies started
 //   directly from the user's tap, Lock, and foreground activity reports.
@@ -267,6 +267,21 @@ const state = {
   // The session whose composer and question form are still in the (possibly hidden)
   // detail view, including after Sessions cleared currentSessionId.
   detailSessionId: null,
+  // Workspace chooser, page memory only (never stored or put in the URL). The ID is
+  // the only selector sent; the name is protected display text cleared on lock.
+  selectedWorkspaceId: null,
+  selectedWorkspaceName: null,
+  workspaceSelectedOnce: false, // a sole workspace is auto-selected only before any choice
+  workspaceChoices: [],
+  workspaceRetryReason: 'entry', // what the chooser's Retry repeats
+  // Bumped by each discovery and choice: an older discovery reply does nothing.
+  workspaceGeneration: 0,
+  // Bumped by each list request: only the newest list reply is applied.
+  listGeneration: 0,
+  // The sessions list shows exactly these IDs, from the last accepted list reply.
+  listedSessionIds: [],
+  listLoaded: false, // true once a list reply for the current choice was accepted
+  selectedWorkspaceShared: false, // the chosen name matched another choice when last known
 };
 
 function viewIsCurrent(generation) {
@@ -433,6 +448,8 @@ function resetIdentityState() {
   state.detailSessionId = null;
   clearCopyTimers();
   setActionStatus('');
+  // Another build's or a forgotten pairing's workspace is not carried over.
+  resetWorkspaceView(true);
   $('sessions-panel').classList.add('hidden');
   $('detail-panel').classList.add('hidden');
   hideDetailChrome();
@@ -725,9 +742,8 @@ function handleServerFrame(raw) {
       const isError = frame.type === 'command_error';
       const code = frame.payload && frame.payload.code;
       if (isError && LOCK_CODES.includes(code)) handleLockError();
-      if (state.contentOpen && isError && (code === 'binding_required' || code === 'ambiguous_start_target')) {
-        showBindingOverlay(frame.payload.message);
-      }
+      // Only the sessions-list flow opens the workspace chooser; an error from any other
+      // command never navigates there.
       if (pending) {
         if (isError) {
           pending.reject(commandError(frame.payload));
@@ -744,7 +760,7 @@ function handleServerFrame(raw) {
     case 'session_update':
     case 'session_terminal': {
       if (!state.contentOpen) break;
-      if (frame.session_id) {
+      if (frame.session_id && admitsSessionFrame(frame.session_id)) {
         detectSeqGap(frame);
         bumpRevision(frame.session_id);
         state.sessions.set(frame.session_id, frame.payload || {});
@@ -761,7 +777,7 @@ function handleServerFrame(raw) {
     }
     case 'interaction_resolved': {
       if (!state.contentOpen) break;
-      if (frame.session_id) {
+      if (frame.session_id && admitsSessionFrame(frame.session_id)) {
         // interaction_resolved consumes the same per-session seq stream as
         // updates/terminal frames; track it so the next snapshot does not look
         // like a missed update and trigger a spurious get_log catch-up.
@@ -772,9 +788,10 @@ function handleServerFrame(raw) {
     }
     case 'session_expired': {
       if (!state.contentOpen) break;
-      if (frame.session_id) {
+      if (frame.session_id && admitsSessionFrame(frame.session_id)) {
         bumpRevision(frame.session_id);
         state.sessions.delete(frame.session_id);
+        state.listedSessionIds = state.listedSessionIds.filter((id) => id !== frame.session_id);
         renderSessions();
         if (frame.session_id === state.currentSessionId) {
           state.sessions.set(frame.session_id, { status: 'expired' });
@@ -798,6 +815,13 @@ function handleServerFrame(raw) {
   }
 }
 
+// Watch frames still arrive for sessions observed earlier (another workspace, another
+// tab of this device). Only the listed sessions and the open session take them; they
+// never add a session to the list.
+function admitsSessionFrame(sessionId) {
+  return sessionId === state.currentSessionId || state.listedSessionIds.includes(sessionId);
+}
+
 function detectSeqGap(frame) {
   if (typeof frame.seq !== 'number' || !frame.session_id) return;
   const last = state.lastSeqBySession.get(frame.session_id) || 0;
@@ -809,7 +833,7 @@ function detectSeqGap(frame) {
 }
 
 // ---------------------------------------------------------------------------
-// Sessions list (scoped to the bound window's active workspace)
+// Sessions list (scoped to the workspace chosen on this page)
 
 function shortID(sessionId) {
   return String(sessionId).slice(0, 8);
@@ -831,46 +855,304 @@ function hideDetailChrome() {
 }
 
 function showSessionsList() {
+  // Text typed in the session being left comes back when it is reopened, as across a lock.
+  if (state.contentOpen) snapshotDrafts();
   state.viewGeneration += 1;
   state.currentSessionId = null;
   state.deepLinkSessionId = null;
   $('detail-panel').classList.add('hidden');
   hideDetailChrome();
   $('sessions-panel').classList.remove('hidden');
+  renderWorkspaceLabel();
+  renderSessions();
+  // Entry always rereads the open workspaces; a remembered choice still open is kept.
+  discoverWorkspaces('entry');
+}
+
+// Errors meaning the chosen workspace is no longer open (or no longer routable):
+// the choice is cleared and the open workspaces are read again once.
+const WORKSPACE_GONE_CODES = ['workspace_not_open', 'workspace_mismatch', 'binding_required'];
+const DISCOVERY_ERROR_TEXT = 'Open workspaces are unavailable. Retry.';
+const NO_WORKSPACE_TEXT = 'No open workspace is available. Open one on your Mac, then retry.';
+// A gateway build without workspace discovery answers with unsupported_frame_type.
+const OUTDATED_TEXT = 'This page and the gateway are different versions. Reload this page, or update and restart the gateway.';
+const LIST_ERROR_TEXT = 'Sessions are unavailable. Retry.';
+
+function compareText(a, b) {
+  if (a < b) return -1;
+  return a > b ? 1 : 0;
+}
+
+// One choice per workspace ID from a fresh `windows` reply. Rows without an ID are not
+// choices. The first name in window order wins; a missing or repeated name gets a
+// short ID suffix, while the full ID stays the value.
+function normalizeWorkspaceChoices(windows) {
+  const order = (row) => (Number.isFinite(row.window_id) ? row.window_id : Number.MAX_SAFE_INTEGER);
+  const rows = (Array.isArray(windows) ? windows : [])
+    .filter((row) => row && typeof row === 'object')
+    .sort((a, b) => order(a) - order(b));
+  const byId = new Map();
+  for (const row of rows) {
+    const id = typeof row.workspace_id === 'string' ? row.workspace_id.trim() : '';
+    if (!id) continue;
+    const name = typeof row.workspace_name === 'string' ? row.workspace_name.trim() : '';
+    const existing = byId.get(id);
+    if (!existing) byId.set(id, { id, name });
+    else if (!existing.name && name) existing.name = name;
+  }
+  const choices = [...byId.values()];
+  const nameCounts = new Map();
+  for (const choice of choices) nameCounts.set(choice.name, (nameCounts.get(choice.name) || 0) + 1);
+  for (const choice of choices) {
+    choice.label = choice.name && nameCounts.get(choice.name) === 1
+      ? choice.name
+      : `${choice.name || 'Workspace'} (${shortID(choice.id)})`;
+  }
+  return choices.sort((a, b) => compareText(a.name, b.name) || compareText(a.id, b.id));
+}
+
+// `reason`: 'entry' (sessions list shown), 'switch' (Switch workspace: always show the
+// choices) or 'recover' (the chosen workspace closed: show the choices, never auto-pick).
+async function discoverWorkspaces(reason) {
+  if (!state.contentOpen) return;
+  state.workspaceGeneration += 1;
+  const generation = state.workspaceGeneration;
+  const accessGeneration = state.accessGeneration;
+  // Opening a session (or any view change) makes this discovery stale: it must never put
+  // the chooser over the session detail.
+  const viewGeneration = state.viewGeneration;
+  const ws = state.ws;
+  const current = () => state.contentOpen && state.ws === ws && viewIsCurrent(viewGeneration)
+    && state.workspaceGeneration === generation && state.accessGeneration === accessGeneration;
+  if (reason !== 'entry') {
+    // Earlier choices may be stale (recover: one just closed); none is offered until
+    // the fresh read answers.
+    state.workspaceChoices = [];
+    showWorkspaceChooser('Looking for open workspaces…', false);
+  }
+  let result;
+  try {
+    result = await sendCommand({ type: 'list_workspaces', payload: {} });
+  } catch (error) {
+    if (!current()) {
+      // The socket closed under this still-newest discovery (no lock cleanup, as with
+      // protection off): its "Looking…" chooser must not stay up. A newer discovery
+      // owns the chooser and is left alone.
+      if (state.workspaceGeneration === generation && state.ws !== ws) hideWorkspaceChooser();
+      return;
+    }
+    // A failed Switch keeps the current choice and list; entry stays without a list.
+    state.workspaceChoices = [];
+    state.workspaceRetryReason = reason === 'switch' ? 'switch' : 'entry';
+    const text = error.code === 'unsupported_frame_type' ? OUTDATED_TEXT : DISCOVERY_ERROR_TEXT;
+    if (reason !== 'switch') {
+      state.listedSessionIds = [];
+      state.listLoaded = false;
+      state.listGeneration += 1;
+      renderSessions();
+      setSessionsStatus(text, 'err');
+    }
+    showWorkspaceChooser(text, true);
+    logLine(`list_workspaces failed: ${error.code || 'error'}`);
+    return;
+  }
+  if (!current()) return;
+  const choices = normalizeWorkspaceChoices(result && result.windows);
+  state.workspaceChoices = choices;
+  state.workspaceRetryReason = reason === 'switch' ? 'switch' : 'entry';
+  const remembered = choices.find((choice) => choice.id === state.selectedWorkspaceId);
+  if (reason === 'entry' && remembered) {
+    state.selectedWorkspaceName = remembered.name;
+    hideWorkspaceChooser();
+    renderWorkspaceLabel();
+    refreshSessions();
+    return;
+  }
+  if (reason === 'entry' && state.selectedWorkspaceId && !remembered) {
+    // The remembered workspace closed: never silently list a different one.
+    clearWorkspaceSelection();
+  }
+  if (reason === 'entry' && !state.workspaceSelectedOnce && choices.length === 1) {
+    chooseWorkspace(choices[0]);
+    return;
+  }
+  showWorkspaceChooser(choices.length ? '' : NO_WORKSPACE_TEXT, !choices.length);
+}
+
+function clearWorkspaceSelection() {
+  state.selectedWorkspaceId = null;
+  state.selectedWorkspaceName = null;
+  state.selectedWorkspaceShared = false;
+  state.listedSessionIds = [];
+  state.listLoaded = false;
+  state.listGeneration += 1;
+  renderWorkspaceLabel();
+  renderSessions();
+}
+
+// Choosing only changes what this page lists: nothing is opened, focused or bound on
+// the Mac, and no session is unsubscribed.
+function chooseWorkspace(choice) {
+  if (!state.contentOpen) return;
+  state.workspaceGeneration += 1;
+  state.selectedWorkspaceId = choice.id;
+  state.selectedWorkspaceName = choice.name;
+  state.workspaceSelectedOnce = true;
+  state.listedSessionIds = [];
+  state.listLoaded = false;
+  hideWorkspaceChooser();
+  renderWorkspaceLabel();
+  renderSessions();
   refreshSessions();
 }
 
+function showWorkspaceChooser(status, retry) {
+  const list = $('workspace-choices');
+  list.replaceChildren();
+  const generation = state.workspaceGeneration;
+  for (const choice of state.workspaceChoices) {
+    const item = element('li');
+    const row = element('button', 'session-row');
+    row.type = 'button';
+    row.dataset.workspaceId = choice.id;
+    const name = element('span', 'name', choice.label);
+    const badge = element('span', 'badge', choice.id === state.selectedWorkspaceId ? 'current' : '');
+    const chevron = element('span', 'chevron', '›');
+    chevron.setAttribute('aria-hidden', 'true');
+    row.append(name, badge, chevron);
+    row.onclick = () => {
+      if (state.workspaceGeneration === generation) chooseWorkspace(choice);
+    };
+    item.appendChild(row);
+    list.appendChild(item);
+  }
+  $('workspace-chooser-status').textContent = status || '';
+  $('workspace-retry').classList.toggle('hidden', !retry);
+  $('binding-overlay').classList.remove('hidden');
+}
+
+function hideWorkspaceChooser() {
+  $('binding-overlay').classList.add('hidden');
+}
+
+// The chosen workspace's name, with a short ID when it is missing or another open
+// workspace has the same name, as in the chooser. While a Switch has cleared the
+// choices, the answer from the last known choices is kept.
+function workspaceDisplayName(id, name) {
+  if (state.workspaceChoices.length) {
+    state.selectedWorkspaceShared = state.workspaceChoices.some((choice) => choice.id !== id && choice.name === name);
+  }
+  return name && !state.selectedWorkspaceShared ? name : `${name || 'Workspace'} (${shortID(id)})`;
+}
+
+function renderWorkspaceLabel() {
+  const id = state.selectedWorkspaceId;
+  $('workspace-label').textContent = id && state.contentOpen
+    ? `Workspace: ${workspaceDisplayName(id, state.selectedWorkspaceName)}`
+    : '';
+}
+
+// Clears the chooser and list from the page. Lock keeps the opaque chosen ID for a
+// fresh check after unlock; a reset identity (Forget pairing, another build) drops it.
+function resetWorkspaceView(forgetChoice) {
+  state.workspaceGeneration += 1;
+  state.listGeneration += 1;
+  state.selectedWorkspaceName = null;
+  state.selectedWorkspaceShared = false;
+  state.workspaceChoices = [];
+  state.listedSessionIds = [];
+  state.listLoaded = false;
+  if (forgetChoice) {
+    state.selectedWorkspaceId = null;
+    state.workspaceSelectedOnce = false;
+  }
+  $('workspace-choices').replaceChildren();
+  for (const id of ['workspace-label', 'workspace-chooser-status', 'sessions-status']) $(id).textContent = '';
+  hideWorkspaceChooser();
+}
+
+function setSessionsStatus(text, kind) {
+  const status = $('sessions-status');
+  status.textContent = text || '';
+  status.classList.toggle('err', kind === 'err');
+}
+
 async function refreshSessions() {
+  if (!state.contentOpen) return;
+  const workspaceId = state.selectedWorkspaceId;
+  if (!workspaceId) {
+    discoverWorkspaces('entry');
+    return;
+  }
+  state.listGeneration += 1;
+  const generation = state.listGeneration;
   const accessGeneration = state.accessGeneration;
+  // A list answered after the owner opened a session neither renders nor starts recovery;
+  // returning to Sessions lists again.
+  const viewGeneration = state.viewGeneration;
+  const ws = state.ws;
+  // A watch update or expiry during the request is newer than this list's snapshot.
+  const revisions = new Map(state.revisionBySession);
+  const current = () => state.ws === ws && state.listGeneration === generation && viewIsCurrent(viewGeneration)
+    && state.accessGeneration === accessGeneration && state.selectedWorkspaceId === workspaceId;
+  setSessionsStatus('');
+  let result;
   try {
-    const result = await sendCommand({ type: 'list_sessions', payload: { limit: 50 } });
-    // A list answered after a lock is dropped, not cached or rendered.
-    if (state.accessGeneration !== accessGeneration) return;
-    const items = result.sessions || result.items || (Array.isArray(result) ? result : []);
-    for (const item of items) {
-      const sessionId = item.session_id || item.id;
-      if (sessionId) state.sessions.set(sessionId, item);
-    }
-    renderSessions();
-    const ids = [...state.sessions.keys()];
-    if (ids.length) {
-      await sendCommand({ type: 'subscribe', payload: { session_ids: ids } }).catch(() => {});
-    }
+    result = await sendCommand({ type: 'list_sessions', payload: { workspace_id: workspaceId, limit: 50 } });
   } catch (error) {
-    if (state.accessGeneration === accessGeneration) logLine(`list_sessions failed: ${error.message}`);
+    // A list answered after a lock, a newer list or another choice changes nothing.
+    if (!current()) return;
+    logLine(`list_sessions failed: ${error.code || 'error'}`);
+    if (WORKSPACE_GONE_CODES.includes(error.code)) {
+      clearWorkspaceSelection();
+      discoverWorkspaces('recover');
+      return;
+    }
+    setSessionsStatus(LIST_ERROR_TEXT, 'err');
+    return;
+  }
+  if (!current()) return;
+  const items = result.sessions || result.items || (Array.isArray(result) ? result : []);
+  const ids = [];
+  for (const item of items) {
+    const sessionId = item && (item.session_id || item.id);
+    if (typeof sessionId !== 'string' || !sessionId || ids.includes(sessionId)) continue;
+    if ((state.revisionBySession.get(sessionId) || 0) !== (revisions.get(sessionId) || 0)) {
+      // Expired while the list was in flight: not listed again.
+      if (!state.sessions.has(sessionId)) continue;
+    } else {
+      state.sessions.set(sessionId, item);
+    }
+    ids.push(sessionId);
+  }
+  // The accepted reply replaces the list; it never adds to an earlier one.
+  state.listedSessionIds = ids;
+  state.listLoaded = true;
+  const workspace = result.workspace;
+  if (workspace && workspace.id === workspaceId && typeof workspace.name === 'string' && workspace.name.trim()) {
+    state.selectedWorkspaceName = workspace.name.trim();
+  }
+  renderWorkspaceLabel();
+  renderSessions();
+  if (ids.length) {
+    await sendCommand({ type: 'subscribe', payload: { session_ids: ids } }).catch(() => {});
   }
 }
 
 function renderSessions() {
   const list = $('sessions-list');
   list.replaceChildren();
-  const entries = [...state.sessions.entries()];
-  if (!entries.length) {
-    const empty = element('li', 'empty', 'No sessions in the bound workspace.');
-    list.appendChild(empty);
+  if (!state.contentOpen) return;
+  const ids = state.listedSessionIds;
+  if (!ids.length) {
+    // Empty only after an accepted reply; before one (loading or failed) nothing is claimed.
+    let text = 'Choose a workspace to list its sessions.';
+    if (state.selectedWorkspaceId) text = state.listLoaded ? 'No sessions in this workspace.' : 'Sessions not loaded yet.';
+    list.appendChild(element('li', 'empty', text));
     return;
   }
-  for (const [sessionId, payload] of entries) {
+  for (const sessionId of ids) {
+    const payload = state.sessions.get(sessionId);
     const item = element('li');
     const row = element('button', 'session-row');
     row.type = 'button';
@@ -911,7 +1193,7 @@ async function openSession(sessionId) {
   }
   renderSessionDetail();
   try {
-    // Subscribe to this session directly; it does not need to be in the bound
+    // Subscribe to this session directly; it does not need to be in the chosen
     // workspace's sessions list.
     await sendCommand({ type: 'subscribe', session_id: sessionId });
   } catch (error) {
@@ -1972,7 +2254,7 @@ function respond() {
 function sendComposer() {
   const button = $('composer-send');
   const verb = button.textContent;
-  return runAction(button, `${verb}…`, async (sessionId, generation) => {
+  return runAction(button, `${verb}…`, async (sessionId) => {
     const input = $('composer-input');
     const draft = input.value;
     const message = draft.trim();
@@ -1980,10 +2262,11 @@ function sendComposer() {
     await sendCommand({ type: 'steer', session_id: sessionId, payload: { message } });
     // Text known to be sent is never put back from a draft kept across a lock.
     if (state.composerDrafts.get(sessionId) === draft) state.composerDrafts.delete(sessionId);
-    // Clear only the draft that was sent, and only in the view it was sent from, also
-    // while that view is kept behind the sessions list; newer text stays.
-    const sameView = viewIsCurrent(generation) || (!state.currentSessionId && state.detailSessionId === sessionId);
-    if (sameView && input.value === draft) {
+    // Clear only the text that was sent, and only while this session's composer is in
+    // the page: shown, kept behind the sessions list, or reopened (with its kept draft
+    // restored) before the reply. Newer text stays; after a lock clears content
+    // detailSessionId is null and nothing is touched.
+    if (state.detailSessionId === sessionId && input.value === draft) {
       input.value = '';
       sizeComposer();
     }
@@ -2206,13 +2489,15 @@ function closeProtectedView() {
   for (const id of ['interaction-title', 'interaction-text', 'interaction-context']) $(id).textContent = '';
   $('question-form').replaceChildren();
   $('sessions-list').replaceChildren();
+  // Workspace names and choices are protected; only the opaque chosen ID stays in
+  // memory, to be checked against a fresh read after unlock.
+  resetWorkspaceView(false);
   for (const id of ['detail-name', 'detail-status', 'detail-session-id']) $(id).textContent = '';
   $('composer-input').value = '';
   $('composer').classList.add('hidden');
   setActionStatus('');
   $('sessions-panel').classList.add('hidden');
   $('detail-panel').classList.add('hidden');
-  $('binding-overlay').classList.add('hidden');
   hideDetailChrome();
   // The activity log names sessions and actions.
   if (wasOpen) $('log').textContent = '';
@@ -2730,14 +3015,6 @@ function resumeForeground() {
 }
 
 // ---------------------------------------------------------------------------
-// binding_required surface (sessions list only)
-
-function showBindingOverlay(message) {
-  $('binding-message').textContent = message || 'The gateway link is not bound to a RepoPrompt window.';
-  $('binding-overlay').classList.remove('hidden');
-}
-
-// ---------------------------------------------------------------------------
 // Web Push wake registration
 
 async function registerServiceWorker() {
@@ -2819,11 +3096,13 @@ async function main() {
   $('stop-button').onclick = () => stopSession();
   $('composer-input').addEventListener('input', () => sizeComposer());
   window.addEventListener('resize', () => sizeComposer());
-  $('binding-retry').onclick = () => {
-    $('binding-overlay').classList.add('hidden');
-    refreshSessions();
+  $('switch-workspace').onclick = () => discoverWorkspaces('switch');
+  $('workspace-retry').onclick = () => discoverWorkspaces(state.workspaceRetryReason);
+  // Dismiss keeps the current choice and list; a discovery still in flight is dropped.
+  $('binding-dismiss').onclick = () => {
+    state.workspaceGeneration += 1;
+    hideWorkspaceChooser();
   };
-  $('binding-dismiss').onclick = () => $('binding-overlay').classList.add('hidden');
   // Returning to the tab reconnects, after re-reading which build the gateway is.
   // Protected content is hidden on leaving and stays hidden until a fresh hello.
   document.addEventListener('visibilitychange', () => {
