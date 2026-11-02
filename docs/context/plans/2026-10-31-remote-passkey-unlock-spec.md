@@ -131,7 +131,7 @@ Step 4 — done | rounds 1/2 | open: none; both lanes cleared; see evidence step
 Change: none unless live acceptance exposes an in-scope defect. Ask immediately before deployment/relaunch and every required manual or credential action. First target is Dev + normal iPhone Safari + current 1Password; other build/browser combinations are not prerequisites without separate owner approval.
 Validation: enroll with Mac authorization, perform the separate unlock, open a Telegram session link, answer/steer/follow up/Stop, copy/read normally, reconnect/background/second-tab reuse within the window, fixed expiry without traffic extension, Lock across tabs, reset/reenroll, revoke, and plain-HTTP refusal. Confirm no prompt per action, no lost draft, no pre-unlock content flash on foreground, and clear recovery after cancel/provider failure. Use a throwaway credential if capturing a reusable public fixture; never export private credential material or grant secrets. Cross-build/hostname/port cases get deterministic tests first and separate live approval when available.
 Done when: the owner accepts the actual Safari/1Password workflow and stated limits. Distill implemented facts into the owning context document, archive the original plan intact with an outcome summary, and handle any unsigned commits at the approved signing boundary.
-Step 5 — todo | rounds 0/2 | open: owner deployment and live approvals | downgraded: none | assumed: Dev and Safari first | deferred: release/Brave live coverage unless requested
+Step 5 — doing | rounds 0/2 | open: two native enrollment failures; fixed-code diagnostics reviewed; deployment/retry and final signing pending; see evidence step5-live-acceptance.md | downgraded: none | assumed: Dev and Safari first | deferred: release/Brave live coverage unless requested
 
 ## Cuts
 No public exposure or app-managed Tailscale; no passwords/OTP/recovery codes; no passkey replacing browser pairing; no multiple-credential manager; no grant persistence, sliding timeout, attempt-lockout framework or notification redesign; no attestation service, homemade verifier fallback, blanket header-hardening project or watch-poll optimization. Already-running work is not cancelled on lock. Library failure is a stop/defer decision, not permission to expand scope.
@@ -145,6 +145,12 @@ No public exposure or app-managed Tailscale; no passwords/OTP/recovery codes; no
 - Owner requested re-signing the experiment commit now and continuing implementation through Steps 2–5; deployment/relaunch and manual credential actions retain their action-boundary approvals (2026-11-01).
 - Unlock timeout: 30 minutes idle, superseding the earlier one-hour duration and the main-agent absolute-timeout assumption (owner answer 2026-11-01).
 - Owner authorized fixing known Step 3 defects and one additional fresh scoped OracleB review after its incomplete initial response and failed recovery retry; both required reviewers remain in use (2026-11-01).
+
+- Owner approved Dev deployment and relaunch now following the recommendation to deploy committed snapshot 5e020ec1 without unrelated uncommitted edits (2026-11-02).
+
+- Owner chose to pause and keep the current session after the new build installed but the old displaced Dev process survived; normal quit and launch retry remain pending (2026-11-02).
+
+- Owner reported relaunch completed and requested continuing live acceptance (2026-11-02).
 
 ## Open owner choices and implementation gates
 - Recommended timeout is 15 minutes absolute; alternatives are a shorter window or 30 minutes.

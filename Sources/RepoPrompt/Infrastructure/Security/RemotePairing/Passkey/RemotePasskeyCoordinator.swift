@@ -54,6 +54,8 @@ final class RemotePasskeyCoordinator: ObservableObject {
     /// unlock. Keyed by the OLD id captured at begin, so a late answer can never affect a
     /// replacement principal.
     private let isPrincipalLive: (String) async -> Bool
+    /// Mac-local fixed-code rejection diagnostics; never changes a thrown failure.
+    private let diagnostics: RemotePasskeyDiagnostics
 
     // MARK: In-memory ceremony state
 
@@ -103,6 +105,9 @@ final class RemotePasskeyCoordinator: ObservableObject {
         let publicKeyCOSE: [UInt8]?
         let storedUserHandle: Data?
         let backupEligible: Bool?
+        /// Registration-only diagnostic fact: the challenge deadline was capped at the enrollment
+        /// window's end (shorter than `challengeLifetime`). Used only to label an expiry.
+        var windowCapped = false
     }
 
     private var windows: [String: EnrollmentWindowRecord] = [:]
@@ -155,10 +160,12 @@ final class RemotePasskeyCoordinator: ObservableObject {
         originSnapshot: (() -> OriginState)? = nil,
         randomBytes: @escaping (Int) -> [UInt8] = RemotePasskeyCoordinator.secureRandomBytes,
         buildLabel: String = RemotePasskeyCoordinator.defaultBuildLabel(),
-        isPrincipalLive: (@Sendable (String) async -> Bool)? = nil
+        isPrincipalLive: (@Sendable (String) async -> Bool)? = nil,
+        diagnostics: RemotePasskeyDiagnostics = .unifiedLog
     ) {
         self.identityStore = identityStore
         self.verifier = verifier
+        self.diagnostics = diagnostics
         self.now = now
         self.randomBytes = randomBytes
         self.buildLabel = buildLabel
@@ -315,7 +322,8 @@ final class RemotePasskeyCoordinator: ObservableObject {
         let ceremonyID = makeCeremonyID()
         let challengeBytes = randomBytes(32)
         let userHandle = Data(randomBytes(16))
-        let expiresAt = min(now().advanced(by: Self.challengeLifetime), window.expiresAt)
+        let uncappedExpiry = now().advanced(by: Self.challengeLifetime)
+        let expiresAt = min(uncappedExpiry, window.expiresAt)
         challenges[key] = PendingChallenge(
             kind: .registration,
             deviceID: context.deviceID,
@@ -334,7 +342,8 @@ final class RemotePasskeyCoordinator: ObservableObject {
             credentialID: nil,
             publicKeyCOSE: nil,
             storedUserHandle: nil,
-            backupEligible: nil
+            backupEligible: nil,
+            windowCapped: window.expiresAt < uncappedExpiry
         )
         bump()
         return RemotePasskeyRegistrationOptions(
@@ -350,22 +359,33 @@ final class RemotePasskeyCoordinator: ObservableObject {
     }
 
     func registerComplete(_ context: RemotePasskeyCeremonyContext, credentialJSON: Data) async throws -> RemotePasskeyRegistrationOutcome {
+        diagnostics.record(.received(.registration))
         let key = ChallengeKey(deviceID: context.deviceID, kind: .registration)
         // One-use: consume the challenge up front so a replay cannot reuse it.
-        guard let pending = challenges[key], pending.ceremonyID == context.ceremonyID else {
+        guard let pending = challenges[key] else {
+            recordDiagnostic(.registration, .preBinding, .challengeSlotEmpty)
+            throw RemotePasskeyFailure.challengeInvalid
+        }
+        guard pending.ceremonyID == context.ceremonyID else {
+            recordDiagnostic(.registration, .preBinding, .ceremonyIDMismatch)
             throw RemotePasskeyFailure.challengeInvalid
         }
         challenges[key] = nil
         bump()
-        try validateBinding(pending, context: context)
+        try validateBinding(pending, context: context, stage: .preBinding)
 
         let input = RemotePasskeyRegistrationInput(
             challenge: pending.challenge,
             origin: pending.origin,
             relyingPartyName: buildLabel,
             credentialJSON: credentialJSON,
-            isCredentialIDUnused: { [identityStore] idBytes in
-                guard let registry = try? identityStore.registry() else { return false }
+            isCredentialIDUnused: { [identityStore, diagnostics] idBytes in
+                guard let registry = try? identityStore.registry() else {
+                    // Fail closed as before; label the read failure so the library's resulting
+                    // duplicate-ID rejection is not mistaken for a real duplicate.
+                    diagnostics.record(.init(ceremony: .registration, stage: .verifier, reason: .storeFailed))
+                    return false
+                }
                 let data = Data(idBytes)
                 return !registry.devices.contains { $0.passkey.credential?.credentialID == data }
             }
@@ -384,11 +404,12 @@ final class RemotePasskeyCoordinator: ObservableObject {
         // once more after that suspension. A principal removed or whose credential rotated during
         // verification yields no committed enrollment.
         do {
-            try validateBinding(pending, context: context)
+            try validateBinding(pending, context: context, stage: .postBinding)
             guard await isPrincipalLive(pending.principalConnectionID) else {
+                recordDiagnostic(.registration, .principalLiveness, .principalNotLive)
                 throw RemotePasskeyFailure.challengeInvalid
             }
-            try validateBinding(pending, context: context)
+            try validateBinding(pending, context: context, stage: .postBinding)
         } catch {
             clearCeremonyArtifacts(pending)
             bump()
@@ -415,9 +436,17 @@ final class RemotePasskeyCoordinator: ObservableObject {
             clearCeremonyArtifacts(pending)
             bump()
             switch storeError {
-            case .policyConflict, .duplicateCredentialID, .deviceNotFound:
+            case .policyConflict:
+                recordDiagnostic(.registration, .store, .storePolicyConflict)
+                throw RemotePasskeyFailure.challengeInvalid
+            case .duplicateCredentialID:
+                recordDiagnostic(.registration, .store, .storeDuplicateCredentialID)
+                throw RemotePasskeyFailure.challengeInvalid
+            case .deviceNotFound:
+                recordDiagnostic(.registration, .store, .storeDeviceNotFound)
                 throw RemotePasskeyFailure.challengeInvalid
             default:
+                recordDiagnostic(.registration, .store, .storeFailed)
                 throw RemotePasskeyFailure.storageFailed
             }
         }
@@ -480,15 +509,22 @@ final class RemotePasskeyCoordinator: ObservableObject {
     }
 
     func unlockComplete(_ context: RemotePasskeyCeremonyContext, credentialJSON: Data) async throws -> RemotePasskeyUnlockOutcome {
+        diagnostics.record(.received(.assertion))
         let key = ChallengeKey(deviceID: context.deviceID, kind: .assertion)
-        guard let pending = challenges[key], pending.ceremonyID == context.ceremonyID else {
+        guard let pending = challenges[key] else {
+            recordDiagnostic(.assertion, .preBinding, .challengeSlotEmpty)
+            throw RemotePasskeyFailure.challengeInvalid
+        }
+        guard pending.ceremonyID == context.ceremonyID else {
+            recordDiagnostic(.assertion, .preBinding, .ceremonyIDMismatch)
             throw RemotePasskeyFailure.challengeInvalid
         }
         challenges[key] = nil
         bump()
-        try validateBinding(pending, context: context)
+        try validateBinding(pending, context: context, stage: .preBinding)
 
         guard let credentialID = pending.credentialID, let publicKeyCOSE = pending.publicKeyCOSE else {
+            recordDiagnostic(.assertion, .preBinding, .assertionMaterialMissing)
             throw RemotePasskeyFailure.challengeInvalid
         }
         let input = RemotePasskeyAssertionInput(
@@ -508,11 +544,12 @@ final class RemotePasskeyCoordinator: ObservableObject {
         // Re-check after the await, re-query the ACTUAL live gateway principal by its captured id,
         // then re-check once more. No disk write and no sign-count update: the gateway issues the
         // grant from this verified fact in Step 3.
-        try validateBinding(pending, context: context)
+        try validateBinding(pending, context: context, stage: .postBinding)
         guard await isPrincipalLive(pending.principalConnectionID) else {
+            recordDiagnostic(.assertion, .principalLiveness, .principalNotLive)
             throw RemotePasskeyFailure.challengeInvalid
         }
-        try validateBinding(pending, context: context)
+        try validateBinding(pending, context: context, stage: .postBinding)
         return RemotePasskeyUnlockOutcome(
             deviceID: context.deviceID,
             epoch: pending.epoch,
@@ -807,69 +844,91 @@ final class RemotePasskeyCoordinator: ObservableObject {
     }
 
     /// Generic binding re-check. Every mismatch collapses to `challengeInvalid` so a caller cannot
-    /// learn which specific guard rejected the ceremony.
-    private func validateBinding(_ pending: PendingChallenge, context: RemotePasskeyCeremonyContext) throws {
-        guard pending.principalConnectionID == context.principalConnectionID,
-              pending.connectionGeneration == context.connectionGeneration
-        else {
+    /// learn which specific guard rejected the ceremony; the fixed reason is recorded Mac-locally
+    /// (unified log only) before the generic throw.
+    private func validateBinding(
+        _ pending: PendingChallenge,
+        context: RemotePasskeyCeremonyContext,
+        stage: RemotePasskeyDiagnosticEvent.Stage
+    ) throws {
+        if let reason = bindingFailure(pending, context: context) {
+            recordDiagnostic(pending.kind == .registration ? .registration : .assertion, stage, reason)
             throw RemotePasskeyFailure.challengeInvalid
         }
+    }
+
+    /// The first failing binding guard, in the original check order, or nil when every guard holds.
+    private func bindingFailure(_ pending: PendingChallenge, context: RemotePasskeyCeremonyContext) -> RemotePasskeyDiagnosticReason? {
+        guard pending.principalConnectionID == context.principalConnectionID else { return .principalMismatch }
+        guard pending.connectionGeneration == context.connectionGeneration else { return .connectionGenerationMismatch }
         // Per-key in-flight validity token: a replace/cancel/reset/disable/enable on THIS
         // (device, kind) since the ceremony began invalidates it here, without any unrelated
         // device/kind ceremony being able to.
         let key = ChallengeKey(deviceID: pending.deviceID, kind: pending.kind)
-        guard token(for: key) == pending.ceremonyToken else { throw RemotePasskeyFailure.challengeInvalid }
+        guard token(for: key) == pending.ceremonyToken else { return .ceremonyTokenSuperseded }
         // Per-principal invalidation generation: `invalidate(principal)` (disconnect/Lock) for THIS
         // principal rejects it, but an invalidation for a different (old) principal does not.
         guard principalGen(for: pending.principalConnectionID) == pending.principalGen else {
-            throw RemotePasskeyFailure.challengeInvalid
+            return .principalInvalidated
         }
-        guard now() < pending.expiresAt else { throw RemotePasskeyFailure.challengeInvalid }
+        guard now() < pending.expiresAt else {
+            return pending.windowCapped ? .challengeExpiredWindowCapped : .challengeExpired
+        }
         let snapshot = originSnapshot()
-        guard let origin = snapshot.origin,
-              origin == pending.origin,
-              snapshot.generation == pending.originGeneration
-        else {
-            throw RemotePasskeyFailure.challengeInvalid
-        }
+        guard let origin = snapshot.origin else { return .originUnavailable }
+        guard origin == pending.origin else { return .originChanged }
+        guard snapshot.generation == pending.originGeneration else { return .originRevisionChanged }
         guard let device = (try? identityStore.device(id: pending.deviceID)) ?? nil else {
-            throw RemotePasskeyFailure.challengeInvalid
+            return .deviceUnavailable
         }
-        guard !device.isRevoked,
-              device.passkey.epoch == pending.epoch,
-              device.passkey.state == .required
-        else {
-            throw RemotePasskeyFailure.challengeInvalid
-        }
+        guard !device.isRevoked else { return .deviceRevoked }
+        guard device.passkey.epoch == pending.epoch else { return .epochChanged }
+        guard device.passkey.state == .required else { return .policyNotRequired }
         switch pending.kind {
         case .registration:
-            guard device.passkey.credential == nil else { throw RemotePasskeyFailure.challengeInvalid }
+            guard device.passkey.credential == nil else { return .alreadyEnrolled }
             // Re-check the EXACT authorization window that minted this challenge — not just policy
             // and origin. A cancelled/replaced/expired window (or one at a different epoch/origin)
             // rejects the completion even though the policy still reads required.
-            guard let windowID = pending.windowID,
-                  let window = windows[pending.deviceID],
-                  window.id == windowID,
-                  now() < window.expiresAt,
-                  window.epoch == pending.epoch,
+            guard let windowID = pending.windowID, let window = windows[pending.deviceID] else { return .windowMissing }
+            guard window.id == windowID else { return .windowReplaced }
+            guard now() < window.expiresAt else { return .windowExpired }
+            guard window.epoch == pending.epoch,
                   window.origin == pending.origin,
                   window.originGeneration == pending.originGeneration
             else {
-                throw RemotePasskeyFailure.challengeInvalid
+                return .windowBindingChanged
             }
         case .assertion:
             guard let credential = device.passkey.credential,
                   let boundID = pending.credentialID,
                   credential.credentialID == Data(boundID)
             else {
-                throw RemotePasskeyFailure.challengeInvalid
+                return .credentialChanged
             }
         }
+        return nil
+    }
+
+    private func recordDiagnostic(
+        _ ceremony: RemotePasskeyDiagnosticEvent.Ceremony,
+        _ stage: RemotePasskeyDiagnosticEvent.Stage,
+        _ reason: RemotePasskeyDiagnosticReason
+    ) {
+        diagnostics.record(.init(ceremony: ceremony, stage: stage, reason: reason))
     }
 
     private func prune() {
         let instant = now()
         windows = windows.filter { $0.value.expiresAt > instant }
+        // Diagnostic only: label each expired challenge dropped here (no retained state), so a
+        // later completion's `challenge_slot_empty` can be attributed to expiry.
+        for pending in challenges.values where pending.expiresAt <= instant {
+            diagnostics.record(.pruned(
+                pending.kind == .registration ? .registration : .assertion,
+                reason: pending.windowCapped ? .challengeExpiredWindowCapped : .challengeExpired
+            ))
+        }
         challenges = challenges.filter { $0.value.expiresAt > instant }
     }
 

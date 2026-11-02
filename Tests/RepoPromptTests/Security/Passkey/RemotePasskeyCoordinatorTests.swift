@@ -736,6 +736,161 @@ final class RemotePasskeyCoordinatorTests: XCTestCase {
         XCTAssertNil(try store.device(id: deviceID)?.passkey.credential)
     }
 
+    // MARK: - Diagnostics (fixed reason codes; the thrown failure is unchanged)
+
+    private func instrumentedCoordinator(
+        store: RemotePairingIdentityStore,
+        origin: OriginBox,
+        clock: FakeClock,
+        recorder: RecordingPasskeyDiagnostics,
+        verifier: any RemotePasskeyVerifying = GatedFakeVerifier(),
+        live: LiveBox = LiveBox(true)
+    ) -> RemotePasskeyCoordinator {
+        RemotePasskeyCoordinator(
+            identityStore: store, verifier: verifier,
+            now: { clock.now() }, originSnapshot: { origin.state },
+            isPrincipalLive: { _ in live.value },
+            diagnostics: recorder.diagnostics
+        )
+    }
+
+    private func registrationEvent(
+        _ stage: RemotePasskeyDiagnosticEvent.Stage,
+        _ reason: RemotePasskeyDiagnosticReason
+    ) -> RemotePasskeyDiagnosticEvent {
+        .init(ceremony: .registration, stage: stage, reason: reason)
+    }
+
+    func testDiagnosticsLabelChallengeExpiryAndWindowCappedExpiry() async throws {
+        // Plain 60 s challenge expiry inside an open window.
+        let plainRecorder = RecordingPasskeyDiagnostics()
+        let plainClock = FakeClock()
+        let plain = try instrumentedCoordinator(store: makeStore(), origin: OriginBox(exampleOrigin()), clock: plainClock, recorder: plainRecorder)
+        plain.recordTrustCall(capable: true, principalConnectionID: principal)
+        try await plain.enable(deviceID: deviceID)
+        let plainOptions = try plain.registerBegin(beginContext())
+        plainClock.advance(by: .seconds(61))
+        await assertFailure(.challengeInvalid) {
+            _ = try await plain.registerComplete(self.completeContext(ceremonyID: plainOptions.ceremonyID), credentialJSON: Data("{}".utf8))
+        }
+        XCTAssertEqual(plainRecorder.events, [.received(.registration), registrationEvent(.preBinding, .challengeExpired)])
+
+        // Begin late in the 120 s window: the challenge deadline is capped at the window's end.
+        let cappedRecorder = RecordingPasskeyDiagnostics()
+        let cappedClock = FakeClock()
+        let capped = try instrumentedCoordinator(store: makeStore(), origin: OriginBox(exampleOrigin()), clock: cappedClock, recorder: cappedRecorder)
+        capped.recordTrustCall(capable: true, principalConnectionID: principal)
+        try await capped.enable(deviceID: deviceID)
+        cappedClock.advance(by: .seconds(100))
+        let cappedOptions = try capped.registerBegin(beginContext())
+        cappedClock.advance(by: .seconds(21))
+        await assertFailure(.challengeInvalid) {
+            _ = try await capped.registerComplete(self.completeContext(ceremonyID: cappedOptions.ceremonyID), credentialJSON: Data("{}".utf8))
+        }
+        XCTAssertEqual(cappedRecorder.events, [.received(.registration), registrationEvent(.preBinding, .challengeExpiredWindowCapped)])
+    }
+
+    /// A status read prunes the expired challenge before the completion arrives: the prune is
+    /// labelled with the expiry, and the completion is then a distinct receipt plus slot-empty.
+    func testDiagnosticsLabelExpiryPrunedByStatusBeforeCompletion() async throws {
+        let recorder = RecordingPasskeyDiagnostics()
+        let clock = FakeClock()
+        let coordinator = try instrumentedCoordinator(store: makeStore(), origin: OriginBox(exampleOrigin()), clock: clock, recorder: recorder)
+        coordinator.recordTrustCall(capable: true, principalConnectionID: principal)
+        try await coordinator.enable(deviceID: deviceID)
+        let options = try coordinator.registerBegin(beginContext())
+        clock.advance(by: .seconds(61))
+        _ = try coordinator.status(for: deviceID)
+        XCTAssertEqual(recorder.events, [.pruned(.registration, reason: .challengeExpired)])
+        await assertFailure(.challengeInvalid) {
+            _ = try await coordinator.registerComplete(self.completeContext(ceremonyID: options.ceremonyID), credentialJSON: Data("{}".utf8))
+        }
+        XCTAssertEqual(recorder.events, [
+            .pruned(.registration, reason: .challengeExpired),
+            .received(.registration),
+            registrationEvent(.preBinding, .challengeSlotEmpty)
+        ])
+    }
+
+    func testDiagnosticsLabelPreBindingGuardsAndStaySilentOnSuccess() async throws {
+        let recorder = RecordingPasskeyDiagnostics()
+        let coordinator = try instrumentedCoordinator(store: makeStore(), origin: OriginBox(exampleOrigin()), clock: FakeClock(), recorder: recorder)
+        coordinator.recordTrustCall(capable: true, principalConnectionID: principal)
+        try await coordinator.enable(deviceID: deviceID)
+
+        let generationOptions = try coordinator.registerBegin(beginContext(connectionGeneration: 5))
+        await assertFailure(.challengeInvalid) {
+            _ = try await coordinator.registerComplete(self.completeContext(ceremonyID: generationOptions.ceremonyID, connectionGeneration: 6), credentialJSON: Data("{}".utf8))
+        }
+        try await coordinator.openEnrollment(deviceID: deviceID)
+        let principalOptions = try coordinator.registerBegin(beginContext())
+        let otherPrincipal = RemotePasskeyCeremonyContext(deviceID: deviceID, ceremonyID: principalOptions.ceremonyID, connectionGeneration: 5, principalConnectionID: "gateway-connection-9")
+        await assertFailure(.challengeInvalid) {
+            _ = try await coordinator.registerComplete(otherPrincipal, credentialJSON: Data("{}".utf8))
+        }
+        try await coordinator.openEnrollment(deviceID: deviceID)
+        let replaced = try coordinator.registerBegin(beginContext())
+        _ = try coordinator.registerBegin(beginContext()) // replaces the pending challenge
+        await assertFailure(.challengeInvalid) {
+            _ = try await coordinator.registerComplete(self.completeContext(ceremonyID: replaced.ceremonyID), credentialJSON: Data("{}".utf8))
+        }
+        XCTAssertEqual(recorder.events, [
+            .received(.registration), registrationEvent(.preBinding, .connectionGenerationMismatch),
+            .received(.registration), registrationEvent(.preBinding, .principalMismatch),
+            .received(.registration), registrationEvent(.preBinding, .ceremonyIDMismatch)
+        ])
+
+        try await coordinator.openEnrollment(deviceID: deviceID)
+        let options = try coordinator.registerBegin(beginContext())
+        _ = try await coordinator.registerComplete(completeContext(ceremonyID: options.ceremonyID), credentialJSON: Data("{}".utf8))
+        XCTAssertEqual(recorder.events.count, 7, "a committed registration records only its receipt")
+        XCTAssertEqual(recorder.events.last, .received(.registration))
+        await assertFailure(.challengeInvalid) {
+            _ = try await coordinator.registerComplete(self.completeContext(ceremonyID: options.ceremonyID), credentialJSON: Data("{}".utf8))
+        }
+        XCTAssertEqual(Array(recorder.events.suffix(2)), [.received(.registration), registrationEvent(.preBinding, .challengeSlotEmpty)])
+    }
+
+    func testDiagnosticsLabelPostBindingAndPrincipalLiveness() async throws {
+        // Each case parks the verifier, mutates one binding, and expects one fixed post-binding label.
+        let cases: [(RemotePasskeyDiagnosticReason, @MainActor (RemotePasskeyCoordinator, OriginBox) async throws -> Void)] = [
+            (.ceremonyTokenSuperseded, { coordinator, _ in coordinator.cancelEnrollment(deviceID: self.deviceID) }),
+            (.originRevisionChanged, { _, origin in origin.state = self.exampleOrigin(generation: 2) }),
+            (.principalInvalidated, { coordinator, _ in coordinator.invalidate(principalConnectionID: self.principal) })
+        ]
+        for (expected, mutate) in cases {
+            let recorder = RecordingPasskeyDiagnostics()
+            let origin = OriginBox(exampleOrigin(generation: 1))
+            let gate = VerifierGate()
+            let coordinator = try instrumentedCoordinator(
+                store: makeStore(), origin: origin, clock: FakeClock(), recorder: recorder, verifier: GatedFakeVerifier(gate: gate)
+            )
+            coordinator.recordTrustCall(capable: true, principalConnectionID: principal)
+            try await coordinator.enable(deviceID: deviceID)
+            let options = try coordinator.registerBegin(beginContext())
+            let task = Task { @MainActor in
+                try await coordinator.registerComplete(self.completeContext(ceremonyID: options.ceremonyID), credentialJSON: Data("{}".utf8))
+            }
+            await gate.waitUntilEntered()
+            try await mutate(coordinator, origin)
+            await gate.release()
+            await assertTaskFailure(.challengeInvalid, task)
+            XCTAssertEqual(recorder.events, [.received(.registration), registrationEvent(.postBinding, expected)], "case \(expected.rawValue)")
+        }
+
+        let recorder = RecordingPasskeyDiagnostics()
+        let live = LiveBox(true)
+        let coordinator = try instrumentedCoordinator(store: makeStore(), origin: OriginBox(exampleOrigin()), clock: FakeClock(), recorder: recorder, live: live)
+        coordinator.recordTrustCall(capable: true, principalConnectionID: principal)
+        try await coordinator.enable(deviceID: deviceID)
+        let options = try coordinator.registerBegin(beginContext())
+        live.value = false
+        await assertFailure(.challengeInvalid) {
+            _ = try await coordinator.registerComplete(self.completeContext(ceremonyID: options.ceremonyID), credentialJSON: Data("{}".utf8))
+        }
+        XCTAssertEqual(recorder.events, [.received(.registration), registrationEvent(.principalLiveness, .principalNotLive)])
+    }
+
     // MARK: - Live gateway principal re-query after verification
 
     func testRegisterRejectedWhenPrincipalNotLiveAfterVerification() async throws {
@@ -769,16 +924,23 @@ final class RemotePasskeyCoordinatorTests: XCTestCase {
         )
         try await enrollWithFakeVerifier(store: store, origin: origin, coordinator: enroller)
         // A second coordinator sees the principal as not live at unlock time.
+        let recorder = RecordingPasskeyDiagnostics()
         let unlocker = RemotePasskeyCoordinator(
             identityStore: store, verifier: GatedFakeVerifier(),
             now: { ContinuousClock.now }, originSnapshot: { origin.state },
-            isPrincipalLive: { _ in false }
+            isPrincipalLive: { _ in false },
+            diagnostics: recorder.diagnostics
         )
         unlocker.recordTrustCall(capable: true, principalConnectionID: principal)
         let options = try unlocker.unlockBegin(beginContext())
         await assertFailure(.challengeInvalid) {
             _ = try await unlocker.unlockComplete(self.completeContext(ceremonyID: options.ceremonyID), credentialJSON: Data("{}".utf8))
         }
+        // Assertion-path labelling: the coordinator maps `pending.kind` to the assertion ceremony.
+        XCTAssertEqual(recorder.events, [
+            .received(.assertion),
+            .init(ceremony: .assertion, stage: .principalLiveness, reason: .principalNotLive)
+        ])
     }
 
     // MARK: - Acknowledgment must name the exact issued snapshot

@@ -82,14 +82,23 @@ struct WebAuthnRemotePasskeyVerifier: RemotePasskeyVerifying {
     /// cannot drive the decoder.
     static let maxWireBytes = 64 * 1024
 
+    /// Mac-local fixed-code rejection diagnostics (never affects acceptance or the thrown error).
+    private let diagnostics: RemotePasskeyDiagnostics
+
+    init(diagnostics: RemotePasskeyDiagnostics = .unifiedLog) {
+        self.diagnostics = diagnostics
+    }
+
     func verifyRegistration(_ input: RemotePasskeyRegistrationInput) async throws -> RemotePasskeyVerifiedRegistration {
         guard input.credentialJSON.count <= Self.maxWireBytes else {
+            record(.registration, .oversizedInput)
             throw RemotePasskeyVerificationError.oversizedInput
         }
         let registration: RegistrationCredential
         do {
             registration = try JSONDecoder().decode(RegistrationCredential.self, from: input.credentialJSON)
         } catch {
+            diagnostics.record(.init(ceremony: .registration, stage: .verifier, reason: .malformedEnvelope, decodingFailure: .init(error)))
             throw RemotePasskeyVerificationError.malformedResponse
         }
 
@@ -106,6 +115,14 @@ struct WebAuthnRemotePasskeyVerifier: RemotePasskeyVerifying {
                 confirmCredentialIDNotRegisteredYet: { _ in input.isCredentialIDUnused(registration.rawID) }
             )
         } catch {
+            recordLibraryFailure(
+                .registration,
+                error,
+                clientDataJSON: registration.attestationResponse.clientDataJSON,
+                expectedType: .create,
+                challenge: input.challenge,
+                origin: input.origin
+            )
             throw Self.mapVerificationError(error)
         }
 
@@ -120,12 +137,14 @@ struct WebAuthnRemotePasskeyVerifier: RemotePasskeyVerifying {
 
     func verifyAssertion(_ input: RemotePasskeyAssertionInput) async throws {
         guard input.credentialJSON.count <= Self.maxWireBytes else {
+            record(.assertion, .oversizedInput)
             throw RemotePasskeyVerificationError.oversizedInput
         }
         let assertion: AuthenticationCredential
         do {
             assertion = try JSONDecoder().decode(AuthenticationCredential.self, from: input.credentialJSON)
         } catch {
+            diagnostics.record(.init(ceremony: .assertion, stage: .verifier, reason: .malformedEnvelope, decodingFailure: .init(error)))
             throw RemotePasskeyVerificationError.malformedResponse
         }
 
@@ -133,14 +152,17 @@ struct WebAuthnRemotePasskeyVerifier: RemotePasskeyVerifying {
         // The outer base64url `id` must decode to the same bytes as `rawId`, and `rawId` must equal
         // the stored credential ID the ceremony is bound to.
         guard let decodedID = assertion.id.decodedBytes, decodedID == assertion.rawID else {
+            record(.assertion, .credentialIDWireMismatch)
             throw RemotePasskeyVerificationError.credentialIdentityMismatch
         }
         guard assertion.rawID == input.credentialID else {
+            record(.assertion, .credentialIDNotBound)
             throw RemotePasskeyVerificationError.credentialIdentityMismatch
         }
         // Absent response user handle is accepted; a present one must equal the stored handle.
         if let responseHandle = assertion.response.userHandle {
             guard let stored = input.userHandle, Array(stored) == responseHandle else {
+                record(.assertion, .userHandleMismatch)
                 throw RemotePasskeyVerificationError.userHandleMismatch
             }
         }
@@ -158,11 +180,65 @@ struct WebAuthnRemotePasskeyVerifier: RemotePasskeyVerifying {
                 credentialBackupEligible: input.backupEligible
             )
         } catch {
+            recordLibraryFailure(
+                .assertion,
+                error,
+                clientDataJSON: assertion.response.clientDataJSON,
+                expectedType: .assert,
+                challenge: input.challenge,
+                origin: input.origin
+            )
             throw Self.mapVerificationError(error)
         }
     }
 
     // MARK: Helpers
+
+    private func record(_ ceremony: RemotePasskeyDiagnosticEvent.Ceremony, _ reason: RemotePasskeyDiagnosticReason) {
+        diagnostics.record(.init(ceremony: ceremony, stage: .verifier, reason: reason))
+    }
+
+    private func recordLibraryFailure(
+        _ ceremony: RemotePasskeyDiagnosticEvent.Ceremony,
+        _ error: Error,
+        clientDataJSON: [UInt8],
+        expectedType: CollectedClientData.CeremonyType,
+        challenge: [UInt8],
+        origin: RemotePasskeyOrigin
+    ) {
+        diagnostics.record(Self.libraryFailureEvent(
+            ceremony, error,
+            clientDataJSON: clientDataJSON, expectedType: expectedType, challenge: challenge, origin: origin
+        ))
+    }
+
+    /// Fixed-code classification of a library rejection: a MAPPED public `WebAuthnError` constant
+    /// maps by equality; a Foundation `DecodingError` here can only come from the library's
+    /// client-data decode (the envelope was already decoded) and carries only its case token;
+    /// anything else — including an unmapped `WebAuthnError` — is `libraryUnknown` plus a value-free
+    /// client-data consistency token. No error text, coding context or reflection is used.
+    static func libraryFailureEvent(
+        _ ceremony: RemotePasskeyDiagnosticEvent.Ceremony,
+        _ error: Error,
+        clientDataJSON: [UInt8],
+        expectedType: CollectedClientData.CeremonyType,
+        challenge: [UInt8],
+        origin: RemotePasskeyOrigin
+    ) -> RemotePasskeyDiagnosticEvent {
+        if let webAuthn = error as? WebAuthnError, let known = RemotePasskeyDiagnosticReason.knownLibraryReason(webAuthn) {
+            return .init(ceremony: ceremony, stage: .verifier, reason: known)
+        }
+        if error is DecodingError {
+            return .init(ceremony: ceremony, stage: .verifier, reason: .clientDataUndecodable, decodingFailure: .init(error))
+        }
+        let check = RemotePasskeyDiagnostics.clientDataCheck(
+            clientDataJSON: clientDataJSON,
+            expectedType: expectedType,
+            expectedChallenge: challenge,
+            expectedOrigin: origin.serialized
+        )
+        return .init(ceremony: ceremony, stage: .verifier, reason: .libraryUnknown, clientDataCheck: check)
+    }
 
     /// Relying-party display name used for the assertion manager. The RP name is not part of
     /// assertion verification (only RP ID / origin are), so a fixed non-empty value is sufficient.
