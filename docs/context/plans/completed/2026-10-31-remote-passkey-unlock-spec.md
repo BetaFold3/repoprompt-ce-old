@@ -1,3 +1,15 @@
+# Completion outcome — 2026-11-02
+
+All five steps are complete. The owner accepted the deployed Dev build with normal iPhone Safari and 1Password, including registration, separate unlock, session actions, recovery, idle locking, and the follow-up chooser for multiple already-open Mac workspaces. The selected timeout is **30 minutes idle**, shared by the paired browser across tabs and reconnects; that owner decision supersedes the original absolute-time proposals below. The owner authorized a bounded maintained-copy verifier after the initial dependency feasibility stop; pinned sources, local patches and licenses are retained in Vendor. No new service or handwritten verifier was introduced.
+
+Independent OracleA/OracleB implementation reviews cleared blocking findings. Focused coordinated tests, lint and guardrails passed; live checks are owner-reported and their limits are explicit in the [owning remote contract](../../telegram-paired-browser-remote.md). The full root suite, Release/other-browser passkey acceptance, distinct unavailable-provider behavior, same-identity HTTP refusal, exact-cutoff live timing and extra chooser window-edge live checks are not claimed. Local evidence remains in `docs/investigations/2026-10-31-remote-passkey-unlock/`.
+
+All passkey commits are signed after owner-approved re-signing, with unchanged trees/messages and unrelated work preserved. Final implementation commits: Step 1 `56f21bc6`, Step 2 `ed285dfe`, Step 3 `171ae4a0`, Step 4 `5288c212`; Step 5 repairs `7752d004` and `703cb7f9`; workspace chooser `b0c95c4b`. Full old-to-new hashes are recorded in the evidence directory's `unsigned-commits.md`. Nothing was pushed. The running package's pre-rewrite provenance remains valid; signing did not change product content or require another relaunch.
+
+The original specification follows intact except for status lines and owner Decisions. Historical proposals and pending statements below are preserved, not current guidance; use the owning remote contract for implemented behavior.
+
+---
+
 # Optional passkey unlock for the paired-browser remote — spec
 
 Scope: read when the task touches passkey enrollment, unlock, relock or recovery for an already paired remote browser.
@@ -131,7 +143,7 @@ Step 4 — done | rounds 1/2 | open: none; both lanes cleared; see evidence step
 Change: none unless live acceptance exposes an in-scope defect. Ask immediately before deployment/relaunch and every required manual or credential action. First target is Dev + normal iPhone Safari + current 1Password; other build/browser combinations are not prerequisites without separate owner approval.
 Validation: enroll with Mac authorization, perform the separate unlock, open a Telegram session link, answer/steer/follow up/Stop, copy/read normally, reconnect/background/second-tab reuse within the window, fixed expiry without traffic extension, Lock across tabs, reset/reenroll, revoke, and plain-HTTP refusal. Confirm no prompt per action, no lost draft, no pre-unlock content flash on foreground, and clear recovery after cancel/provider failure. Use a throwaway credential if capturing a reusable public fixture; never export private credential material or grant secrets. Cross-build/hostname/port cases get deterministic tests first and separate live approval when available.
 Done when: the owner accepts the actual Safari/1Password workflow and stated limits. Distill implemented facts into the owning context document, archive the original plan intact with an outcome summary, and handle any unsigned commits at the approved signing boundary.
-Step 5 — doing | rounds 1/2 | open: core live flow and recovery accepted; HTTP smoke only; workspace chooser reviewed with no open P0/P1, deployment/live acceptance and final signing pending; see evidence step5-normalizer-outcome.md and workspace-chooser-review-status.md | downgraded: none | assumed: Dev and Safari first; chooser for already-open workspaces only | deferred: zero-window Refresh recovery (use Switch); distinct provider-unavailable and same-identity HTTP live checks; full MCP handler seam; release/Brave live coverage unless requested
+Step 5 — done | rounds 1/2 | open: none; owner accepted live workflow and stated limits; all passkey commits signed; see evidence step5-normalizer-outcome.md, workspace-chooser-steps.md and unsigned-commits.md | downgraded: none | assumed: Dev and Safari first; chooser for already-open workspaces only | deferred: zero-window Refresh recovery (use Switch); distinct provider-unavailable and same-identity HTTP live checks; exact-cutoff live timing; extra chooser window-edge live checks; full MCP handler seam; release/Brave live coverage unless requested
 
 ## Cuts
 No public exposure or app-managed Tailscale; no passwords/OTP/recovery codes; no passkey replacing browser pairing; no multiple-credential manager; no grant persistence, sliding timeout, attempt-lockout framework or notification redesign; no attestation service, homemade verifier fallback, blanket header-hardening project or watch-poll optimization. Already-running work is not cancelled on lock. Library failure is a stop/defer decision, not permission to expand scope.
@@ -151,6 +163,8 @@ No public exposure or app-managed Tailscale; no passwords/OTP/recovery codes; no
 - Owner chose to pause and keep the current session after the new build installed but the old displaced Dev process survived; normal quit and launch retry remain pending (2026-11-02).
 
 - Owner reported relaunch completed and requested continuing live acceptance (2026-11-02).
+- Owner accepted the deployed Dev + Safari + 1Password workflow and multi-workspace chooser, with the stated live-test limits, and requested closeout (2026-11-02).
+- Owner approved re-signing the 15-commit local descendant range while preserving all contents and unrelated work, then explicitly approved retry after the signing-agent failure; all replacement signatures verified (2026-11-02).
 
 ## Open owner choices and implementation gates
 - Recommended timeout is 15 minutes absolute; alternatives are a shorter window or 30 minutes.
