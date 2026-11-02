@@ -54,8 +54,10 @@ The later-turn retention fix doesn't repair a run whose in-memory workspace a bu
   - Settings list, Add and Remove;
   - Revoke refusing the next send.
 
+- Claude later-turn regression verified live after the owner's rebuild/relaunch on 2026-11-02: a fresh Claude Code Agent Mode worker completed `list` on turn one, then `request_grant` on turn two with the same process run ID. The real approval overlay appeared; a guarded native UI click selected Deny, the tool returned `denied`, and a subsequent `list` remained empty. No grant was created. This validates source-workspace retention across turns, not a full Claude target-send matrix.
+
 ## Known limits
-- Not run live: the full cross-provider matrix (Claude, ACP and headless callers depend on run-route seeding and are refused when the workspace identity is missing; the Claude later-turn retention fix has automated coverage only), queued-prompt visibility, Return not approving, and the 30 s watchdog dismissal in the UI. Telegram notification delivery wasn't run either.
+- Not run live: the full cross-provider matrix (Claude, ACP and headless callers depend on run-route seeding and are refused when the workspace identity is missing), queued-prompt visibility, Return not approving, and the 30 s watchdog dismissal in the UI. Telegram notification delivery wasn't run either.
 - The `delivery` value is the inherited one chosen before admission.
 - An already-open Settings page can show stale rows from another process until it reappears, but authorization always reads the file.
 - Saved history can lag, so a missing attributed message doesn't prove the send failed.
