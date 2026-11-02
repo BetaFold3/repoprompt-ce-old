@@ -5,7 +5,7 @@ Authority: Reference
 Last-verified: 2026-11-01
 
 ## Status and goal
-Implementation in progress: Steps 1–4 are implemented; owner-run live acceptance remains pending. Steps follow the [review policy](../review-policy.md).
+Complete: Steps 1–5 are implemented and the owner accepted live Dev-app checks on 2026-11-02. Durable guidance is in [Assistant workspace steering](../assistant-workspace-steering.md). Steps follow the [review policy](../review-policy.md).
 
 An owner-designated "Assistant" workspace runs Agent Mode sessions that periodically read other workspaces' saved transcripts (existing `history` tool), check a long-horizon plan, tell the owner about deviations, and sometimes send a steer or follow-up into a session of another workspace. This spec adds the missing parts: an owner-approved, persistent, one-way workspace→workspace grant, and a tool to list and message sessions in granted workspaces.
 
@@ -84,9 +84,10 @@ Step 4 — done | rounds 0/2 | open: none | downgraded: none | assumed: existing
   - the prefix visible in the target transcript.
 - Done when: the owner accepts the checks.
 
-Step 5 — todo | rounds 0/2 | open: owner approval for app launch | downgraded: none | assumed: none | deferred: none
+Step 5 — done | rounds 0/2 | open: none | downgraded: none | assumed: owner delegated remaining UI execution (step5-live-2026-11-02.md) | deferred: optional cross-provider, queued-prompt, watchdog and timer checks (step5-live-2026-11-02.md)
 
 ## Decisions
+- On 2026-11-02, the owner delegated remaining live UI checks to the agent and accepted the reported Step 5 outcomes.
 - Accept unrelated lint formatting errors for now and continue implementation.
 - Access is a persistent, one-way workspace→workspace grant covering every current and future session on both sides, with no per-session or per-steer approval and no chaining.
 - The Assistant schedules its own periodic checks; the app adds no live monitoring.
