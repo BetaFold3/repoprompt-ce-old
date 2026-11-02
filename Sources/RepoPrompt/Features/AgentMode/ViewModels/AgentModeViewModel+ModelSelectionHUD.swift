@@ -72,6 +72,12 @@ extension AgentModeViewModel {
                 unavailableMessage: index.leaves.isEmpty
                     ? "No cached remote models are available for this session."
                     : nil,
+                onSuccessfulModelSelection: { [weak self] in
+                    self?.requestComposerFocusAfterModelSelection(
+                        sourceTabID: sourceTabID,
+                        sourceIdentity: sourceIdentity
+                    )
+                },
                 commit: { [weak self] leaf in
                     guard let self else {
                         throw AgentModelSelectionCommitError.sourceUnavailable
@@ -114,6 +120,12 @@ extension AgentModeViewModel {
             unavailableMessage: index.leaves.isEmpty
                 ? "No selectable models are available for this session."
                 : nil,
+            onSuccessfulModelSelection: { [weak self] in
+                self?.requestComposerFocusAfterModelSelection(
+                    sourceTabID: sourceTabID,
+                    sourceIdentity: sourceIdentity
+                )
+            },
             commit: { [weak self] leaf in
                 guard let self,
                       let liveSession = sessions[sourceTabID],
@@ -132,6 +144,23 @@ extension AgentModeViewModel {
                 )
             }
         )
+    }
+
+    @MainActor
+    private func requestComposerFocusAfterModelSelection(
+        sourceTabID: UUID,
+        sourceIdentity: ObjectIdentifier
+    ) {
+        guard !isShutdownFrozen,
+              currentTabID == sourceTabID,
+              let session = sessions[sourceTabID],
+              ObjectIdentifier(session) == sourceIdentity
+        else { return }
+        ui.composer.requestFocus(AgentComposerFocusRequest(
+            id: UUID(),
+            tabID: sourceTabID,
+            reason: .modelSelectionCommitted
+        ))
     }
 
     @MainActor

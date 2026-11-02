@@ -1,6 +1,9 @@
 import Combine
 import Foundation
 import RepoPromptAgentCore
+#if DEBUG
+    import OSLog
+#endif
 
 @MainActor
 final class AgentComposerUIStore: ObservableObject {
@@ -13,6 +16,11 @@ final class AgentComposerUIStore: ObservableObject {
     }
 
     func requestFocus(_ request: AgentComposerFocusRequest) {
+        #if DEBUG
+            Logger(subsystem: "com.repoprompt.app", category: "composer-focus").debug(
+                "request token=\(request.id.uuidString, privacy: .public) reason=\(String(describing: request.reason), privacy: .public)"
+            )
+        #endif
         #if DEBUG || EDIT_FLOW_PERF
             AgentInteractionLatencyProbe.composerFocusRequested(requestID: request.id, tabID: request.tabID)
         #endif

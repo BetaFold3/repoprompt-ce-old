@@ -5,6 +5,9 @@ import RepoPromptUI
 import RepoPromptWorkspace
 import SwiftUI
 import UniformTypeIdentifiers
+#if DEBUG
+    import OSLog
+#endif
 
 enum ImagePasteboardTypes {
     static let legacyApplePNG = NSPasteboard.PasteboardType("Apple PNG pasteboard type")
@@ -683,6 +686,16 @@ struct CustomTextField: NSViewRepresentable {
                 lastAppliedToken: lastAppliedComposerFocusToken,
                 pendingToken: pendingComposerFocusToken
             )
+            #if DEBUG
+                // Read actual AppKit state after applying; no text, tab IDs, or model names.
+                defer {
+                    if let token, action != .none {
+                        Logger(subsystem: "com.repoprompt.app", category: "composer-focus").debug(
+                            "delivery token=\(token.uuidString, privacy: .public) action=\(String(describing: action), privacy: .public) window=\(textView.window?.windowNumber ?? -1, privacy: .public) key=\(textView.window?.isKeyWindow == true, privacy: .public) firstResponder=\(textView.window?.firstResponder === textView, privacy: .public)"
+                        )
+                    }
+                }
+            #endif
 
             switch action {
             case .clearPending, .none, .waitForWindow:

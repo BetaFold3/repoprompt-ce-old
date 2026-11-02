@@ -7,6 +7,7 @@ struct AgentComposerFocusRequest: Equatable {
         case newSession
         case newKnowledgeSession
         case reusedPlaceholder
+        case modelSelectionCommitted
     }
 
     let id: UUID

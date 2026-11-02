@@ -13,6 +13,9 @@ import RepoPromptUI
 import RepoPromptWorkspace
 import SwiftUI
 import UniformTypeIdentifiers
+#if DEBUG
+    import OSLog
+#endif
 
 struct AgentComposerActions {
     let storeDraft: (_ tabID: UUID, _ text: String) -> Void
@@ -194,7 +197,11 @@ struct AgentInputBar: View {
     }
 
     private func applyComposerFocusRequest(discardMismatch: Bool) {
-        switch composerFocusObservationCue.requestAction(discardMismatch: discardMismatch) {
+        let action = composerFocusObservationCue.requestAction(discardMismatch: discardMismatch)
+        #if DEBUG
+            Self.traceComposerFocusRequestAction(action, pendingRequestID: composerFocusObservationCue.requestID)
+        #endif
+        switch action {
         case .none, .leavePending:
             return
         case let .discard(requestID):
@@ -209,6 +216,34 @@ struct AgentInputBar: View {
             composerUI.consumeFocusRequest(id: requestID)
         }
     }
+
+    #if DEBUG
+        /// Content-free: action name and request token only, to locate where a requested focus stopped.
+        private static func traceComposerFocusRequestAction(
+            _ action: AgentComposerFocusObservationCue.RequestAction,
+            pendingRequestID: UUID?
+        ) {
+            let actionName: String
+            let requestToken: String
+            switch action {
+            case .none:
+                actionName = "none"
+                requestToken = "none"
+            case .leavePending:
+                actionName = "leavePending"
+                requestToken = pendingRequestID?.uuidString ?? "none"
+            case let .discard(requestID):
+                actionName = "discard"
+                requestToken = requestID.uuidString
+            case let .applyAndConsume(requestID):
+                actionName = "applyAndConsume"
+                requestToken = requestID.uuidString
+            }
+            Logger(subsystem: "com.repoprompt.app", category: "composer-focus").debug(
+                "cue action=\(actionName, privacy: .public) token=\(requestToken, privacy: .public)"
+            )
+        }
+    #endif
 
     private var composerActions: AgentComposerActions {
         AgentComposerActions(

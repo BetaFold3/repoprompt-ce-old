@@ -733,12 +733,58 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
                 CodexReasoningEffort.parse(effortRaw)?.rawValue
             )
 
+            XCTAssertNotEqual(
+                fixture.viewModel.ui.composer.focusRequest?.reason,
+                .modelSelectionCommitted,
+                "Calling the commit closure alone must not request composer focus."
+            )
+
+            // Through the HUD: success restores focus to the source composer.
+            clearComposerFocusRequest(fixture)
+            let hud = AgentModelSelectionHUDViewModel()
+            hud.present(mode: .switchModel) {
+                fixture.viewModel.makeModelSelectionHUDPresentation(
+                    mode: .switchModel,
+                    sourceTabID: fixture.tabAID,
+                    windowID: fixture.window.windowID
+                )
+            }
+            let hudLeaf = try XCTUnwrap(
+                localCodexLeaf(in: hud.filteredLeaves, excludingModelRaw: fixture.sessionA.selectedModelRaw)
+            )
+            await hud.commit(hudLeaf)
+            XCTAssertNil(hud.errorMessage)
+            XCTAssertFalse(hud.isPresented)
+            guard case let .local(_, hudModelRaw, _) = hudLeaf.commitPayload else {
+                return XCTFail("Expected a local model selection")
+            }
+            XCTAssertEqual(fixture.sessionA.selectedModelRaw, hudModelRaw)
+            let focusRequest = try XCTUnwrap(fixture.viewModel.ui.composer.focusRequest)
+            XCTAssertEqual(focusRequest.tabID, fixture.tabAID)
+            XCTAssertEqual(focusRequest.reason, .modelSelectionCommitted)
+
+            // Through the HUD: a tab switch under an open picker rejects the commit without focus.
             let stalePresentation = fixture.viewModel.makeModelSelectionHUDPresentation(
                 mode: .switchModel,
                 sourceTabID: fixture.tabAID,
                 windowID: fixture.window.windowID
             )
+            XCTAssertNotNil(stalePresentation.onSuccessfulModelSelection)
+            hud.present(mode: .switchModel) { stalePresentation }
+            XCTAssertTrue(hud.isPresented)
+            let staleLeaf = try XCTUnwrap(
+                localCodexLeaf(in: hud.filteredLeaves, excludingModelRaw: fixture.sessionA.selectedModelRaw)
+            )
             await fixture.window.promptManager.switchComposeTab(fixture.tabBID)
+            clearComposerFocusRequest(fixture)
+            await hud.commit(staleLeaf)
+            XCTAssertTrue(hud.isPresented, "A rejected commit keeps the HUD open with its error.")
+            XCTAssertEqual(
+                hud.errorMessage,
+                AgentModelSelectionCommitError.sourceUnavailable.localizedDescription
+            )
+            XCTAssertEqual(fixture.sessionA.selectedModelRaw, hudModelRaw)
+            XCTAssertNil(fixture.viewModel.ui.composer.focusRequest)
             do {
                 try await stalePresentation.commit(leaf)
                 XCTFail("Expected a source-pinned presentation to reject tab drift")
@@ -748,6 +794,164 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
                     AgentModelSelectionCommitError.sourceUnavailable.localizedDescription
                 )
             }
+            hud.activeTabDidChange()
+            XCTAssertFalse(hud.isPresented)
+            XCTAssertNil(fixture.viewModel.ui.composer.focusRequest)
+        }
+    }
+
+    func testModelSelectionFocusCallbackRejectsSourceTabDriftAndShutdownFreeze() async throws {
+        try await withFixture { fixture in
+            fixture.sessionA.hasSentFirstMessage = false
+            fixture.sessionA.replaceItems([])
+            fixture.viewModel.refreshDerivedTranscriptState(for: fixture.sessionA)
+            configureHUDCodexProvider(fixture)
+            fixture.sessionA.selectedAgent = .codexExec
+
+            let presentation = fixture.viewModel.makeModelSelectionHUDPresentation(
+                mode: .switchModel,
+                sourceTabID: fixture.tabAID,
+                windowID: fixture.window.windowID
+            )
+            let focusCallback = try XCTUnwrap(presentation.onSuccessfulModelSelection)
+
+            await fixture.window.promptManager.switchComposeTab(fixture.tabBID)
+            XCTAssertEqual(fixture.viewModel.currentTabID, fixture.tabBID)
+            clearComposerFocusRequest(fixture)
+            focusCallback()
+            XCTAssertNil(
+                fixture.viewModel.ui.composer.focusRequest,
+                "A source-pinned callback must not focus another tab's composer."
+            )
+
+            await fixture.window.promptManager.switchComposeTab(fixture.tabAID)
+            XCTAssertEqual(fixture.viewModel.currentTabID, fixture.tabAID)
+            clearComposerFocusRequest(fixture)
+            let freezeID = UUID()
+            fixture.viewModel.beginShutdownFreeze(requestID: freezeID, ownsRecoveryFreeze: false)
+            XCTAssertTrue(fixture.viewModel.isShutdownFrozen)
+            focusCallback()
+            XCTAssertNil(
+                fixture.viewModel.ui.composer.focusRequest,
+                "A shutdown-frozen view model must not publish composer focus."
+            )
+            fixture.viewModel.endShutdownFreeze(requestID: freezeID)
+
+            focusCallback()
+            XCTAssertEqual(fixture.viewModel.ui.composer.focusRequest?.tabID, fixture.tabAID)
+            XCTAssertEqual(fixture.viewModel.ui.composer.focusRequest?.reason, .modelSelectionCommitted)
+        }
+    }
+
+    /// Lowest faithful layer for the shell receiver: the production `.activeComposeTabChanged`
+    /// post drives `AgentHUDActiveTabChangeGate.handle`, the same handler the shell calls.
+    /// The shell's SwiftUI `onReceive` subscription and the redraw-driven regression it replaced
+    /// (the removed nested `onChange`) remain live-only; this test cannot detect either.
+    func testActiveTabChangeSignalIsWindowScopedSynchronousAndAllowsFirstPressAfterSwitch() async throws {
+        try await withFixture { fixture in
+            configureHUDCodexProvider(fixture)
+            for session in [fixture.sessionA, fixture.sessionB] {
+                session.hasSentFirstMessage = false
+                session.replaceItems([])
+                fixture.viewModel.refreshDerivedTranscriptState(for: session)
+                session.selectedAgent = .codexExec
+                session.selectedModelRaw = AgentModel.defaultModel.rawValue
+                session.selectedReasoningEffortRaw = nil
+            }
+
+            let windowID = fixture.window.windowID
+            let promptManager = fixture.window.promptManager
+            let navigationHUD = AgentNavigationHUDViewModel()
+            let modelHUD = AgentModelSelectionHUDViewModel()
+            let recorder = HUDActiveTabChangeRecorder()
+            let observer = NotificationCenter.default.addObserver(
+                forName: .activeComposeTabChanged,
+                object: nil,
+                queue: nil
+            ) { note in
+                let requestWindowID = note.userInfo?["windowID"] as? Int
+                MainActor.assumeIsolated {
+                    let matched = AgentHUDActiveTabChangeGate.handle(
+                        requestWindowID: requestWindowID,
+                        currentWindowID: windowID,
+                        navigationHUD: navigationHUD,
+                        modelSelectionHUD: modelHUD
+                    )
+                    recorder.deliveries.append(HUDActiveTabChangeRecorder.Delivery(
+                        matched: matched,
+                        storedActiveTabID: promptManager.activeComposeTabID,
+                        navigationPresentedAfterDelivery: navigationHUD.isPresented,
+                        modelPresentedAfterDelivery: modelHUD.isPresented
+                    ))
+                }
+            }
+            defer { NotificationCenter.default.removeObserver(observer) }
+
+            XCTAssertFalse(AgentHUDActiveTabChangeGate.matches(requestWindowID: nil, currentWindowID: windowID))
+            XCTAssertFalse(AgentHUDActiveTabChangeGate.matches(requestWindowID: windowID + 1, currentWindowID: windowID))
+            XCTAssertTrue(AgentHUDActiveTabChangeGate.matches(requestWindowID: windowID, currentWindowID: windowID))
+
+            navigationHUD.present(mode: .currentWindow, currentWindow: fixture.window)
+            modelHUD.present(mode: .switchModel) {
+                fixture.viewModel.makeModelSelectionHUDPresentation(
+                    mode: .switchModel,
+                    sourceTabID: fixture.tabAID,
+                    windowID: windowID
+                )
+            }
+            XCTAssertTrue(navigationHUD.isPresented)
+            XCTAssertTrue(modelHUD.isPresented)
+
+            // Foreign and unscoped events name the current tab so no production sink retargets.
+            // No await separates these posts from the assertion, so no other fixture can interleave.
+            NotificationCenter.default.post(
+                name: .activeComposeTabChanged,
+                object: nil,
+                userInfo: ["tabID": fixture.tabAID, "windowID": windowID + 10000]
+            )
+            NotificationCenter.default.post(
+                name: .activeComposeTabChanged,
+                object: nil,
+                userInfo: ["tabID": fixture.tabAID]
+            )
+            XCTAssertEqual(recorder.deliveries.map(\.matched), [false, false])
+            XCTAssertTrue(navigationHUD.isPresented, "Another window's (or an unscoped) tab change must not dismiss.")
+            XCTAssertTrue(modelHUD.isPresented, "Another window's (or an unscoped) tab change must not dismiss.")
+
+            recorder.deliveries.removeAll()
+            await promptManager.switchComposeTab(fixture.tabBID)
+            // Other windows may post across the await; only this window's events count.
+            XCTAssertEqual(
+                recorder.deliveries.filter(\.matched),
+                [HUDActiveTabChangeRecorder.Delivery(
+                    matched: true,
+                    storedActiveTabID: fixture.tabBID,
+                    navigationPresentedAfterDelivery: false,
+                    modelPresentedAfterDelivery: false
+                )],
+                "One window-scoped event, delivered after storage, dismisses both HUDs synchronously."
+            )
+            XCTAssertEqual(fixture.viewModel.currentTabID, fixture.tabBID)
+
+            // The first press after the switch presents for the new tab and commits with focus.
+            clearComposerFocusRequest(fixture)
+            modelHUD.present(mode: .switchModel) {
+                fixture.viewModel.makeModelSelectionHUDPresentation(
+                    mode: .switchModel,
+                    sourceTabID: fixture.tabBID,
+                    windowID: windowID
+                )
+            }
+            XCTAssertTrue(modelHUD.isPresented, "One press after a session switch must open the picker.")
+            XCTAssertNil(modelHUD.unavailableMessage)
+            let leaf = try XCTUnwrap(
+                localCodexLeaf(in: modelHUD.filteredLeaves, excludingModelRaw: fixture.sessionB.selectedModelRaw)
+            )
+            await modelHUD.commit(leaf)
+            XCTAssertNil(modelHUD.errorMessage)
+            XCTAssertFalse(modelHUD.isPresented)
+            XCTAssertEqual(fixture.viewModel.ui.composer.focusRequest?.tabID, fixture.tabBID)
+            XCTAssertEqual(fixture.viewModel.ui.composer.focusRequest?.reason, .modelSelectionCommitted)
         }
     }
 
@@ -763,8 +967,20 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
 
             XCTAssertNil(presentation.unavailableMessage)
             XCTAssertTrue(presentation.noticeText?.contains("Target reply:") == true)
-            let leaf = try XCTUnwrap(presentation.index.leaves.first)
-            try await presentation.commit(leaf)
+            XCTAssertNil(presentation.onSuccessfulModelSelection, "Handoff never restores source focus.")
+            let hud = AgentModelSelectionHUDViewModel()
+            hud.present(mode: .handoffLastReply) { presentation }
+            let leafID = try XCTUnwrap(presentation.index.leaves.first?.id)
+            let leaf = try XCTUnwrap(hud.filteredLeaves.first { $0.id == leafID })
+            clearComposerFocusRequest(fixture)
+            await hud.commit(leaf)
+            XCTAssertNil(hud.errorMessage)
+            XCTAssertFalse(hud.isPresented)
+            XCTAssertNotEqual(
+                fixture.viewModel.ui.composer.focusRequest?.reason,
+                .modelSelectionCommitted,
+                "Handoff must not publish a model-selection focus request."
+            )
 
             let destinationTabID = try XCTUnwrap(fixture.viewModel.currentTabID)
             XCTAssertNotEqual(destinationTabID, fixture.tabAID)
@@ -3461,6 +3677,29 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
         }
     #endif
 
+    private func clearComposerFocusRequest(
+        _ fixture: Fixture,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        if let requestID = fixture.viewModel.ui.composer.focusRequest?.id {
+            fixture.viewModel.ui.composer.consumeFocusRequest(id: requestID)
+        }
+        XCTAssertNil(fixture.viewModel.ui.composer.focusRequest, file: file, line: line)
+    }
+
+    private func localCodexLeaf(
+        in leaves: [AgentModelSelectionLeaf],
+        excludingModelRaw: String?
+    ) -> AgentModelSelectionLeaf? {
+        leaves.first {
+            if case let .local(agent: .codexExec, modelRaw, _) = $0.commitPayload {
+                return modelRaw != excludingModelRaw
+            }
+            return false
+        }
+    }
+
     private func configureHUDCodexProvider(_ fixture: Fixture) {
         fixture.window.apiSettingsViewModel.isCodexConnected = true
         fixture.viewModel.test_setAvailableAgents([.codexExec])
@@ -3646,4 +3885,16 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
         let tabATexts: [String]
         let tabBTexts: [String]
     }
+}
+
+@MainActor
+private final class HUDActiveTabChangeRecorder {
+    struct Delivery: Equatable {
+        let matched: Bool
+        let storedActiveTabID: UUID?
+        let navigationPresentedAfterDelivery: Bool
+        let modelPresentedAfterDelivery: Bool
+    }
+
+    var deliveries: [Delivery] = []
 }
