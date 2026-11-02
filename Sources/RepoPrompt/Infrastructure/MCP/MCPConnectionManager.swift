@@ -3745,6 +3745,11 @@ actor ServerNetworkManager {
         return token
     }
 
+    /// Replaces the run's cached policy state with a newer one (an equal or older `updatedAt` changes
+    /// nothing). A policy-only writer (`preservingWorkspaceForPolicyRefresh`) supplies no workspace:
+    /// its `nil` means "not asserted", so the source workspace that exact-tab admission established
+    /// is kept when the run's window, nonnil tab, and purpose are unchanged. Every other field comes
+    /// from the new state, and any other writer's `nil` replaces (clears) the workspace.
     private func seedRunPolicyState(
         runID: UUID,
         windowID: Int,
@@ -3757,14 +3762,27 @@ actor ServerNetworkManager {
         purpose: MCPRunPurpose,
         taskLabelKind: AgentModelCatalog.TaskLabelKind? = nil,
         allowsAgentExternalControlTools: Bool = false,
+        preservingWorkspaceForPolicyRefresh: Bool = false,
         updatedAt: Date
     ) {
-        if let existing = runPolicyStateByRunID[runID], existing.updatedAt >= updatedAt {
+        let existing = runPolicyStateByRunID[runID]
+        if let existing, existing.updatedAt >= updatedAt {
             return
+        }
+        var resolvedWorkspaceID = workspaceID
+        if preservingWorkspaceForPolicyRefresh,
+           workspaceID == nil,
+           let existing,
+           let tabID,
+           existing.tabID == tabID,
+           existing.windowID == windowID,
+           existing.purpose == purpose
+        {
+            resolvedWorkspaceID = existing.workspaceID
         }
         runPolicyStateByRunID[runID] = RunConnectionPolicyState(
             windowID: windowID,
-            workspaceID: workspaceID,
+            workspaceID: resolvedWorkspaceID,
             tabID: tabID,
             restrictedTools: restrictedTools,
             additionalTools: additionalTools,
@@ -3792,6 +3810,7 @@ actor ServerNetworkManager {
             purpose: policy.purpose,
             taskLabelKind: policy.taskLabelKind,
             allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools,
+            preservingWorkspaceForPolicyRefresh: true,
             updatedAt: policy.createdAt
         )
     }
@@ -8917,6 +8936,7 @@ actor ServerNetworkManager {
                 purpose: purpose,
                 taskLabelKind: taskLabelKind,
                 allowsAgentExternalControlTools: allowsAgentExternalControlTools,
+                preservingWorkspaceForPolicyRefresh: true,
                 updatedAt: policy.createdAt
             )
         }

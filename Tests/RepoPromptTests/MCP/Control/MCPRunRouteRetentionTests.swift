@@ -1898,12 +1898,229 @@ import XCTest
             XCTAssertNil(window.mcpServer.connectionIDToRunID[connectionIDB], "B is never registered window-side")
             XCTAssertEqual(window.mcpServer.boundTabID(forConnection: connectionIDA), tabID)
             XCTAssertNil(window.mcpServer.boundTabID(forConnection: connectionIDB), "the refresh binds no run tab for B")
+            // The later turn's policy-only install keeps the source workspace the run tab's admission
+            // established, for the bound helper (A) and the one routed only actor-side (B).
+            let expectedRunTab = ServerNetworkManager.RunPolicyTab(
+                runID: runID, windowID: window.windowID, workspaceID: workspaceID, tabID: tabID
+            )
+            for (label, connectionID) in [("A", connectionIDA), ("B", connectionIDB)] {
+                let runTab = await manager.actorRoutedRunPolicyTab(for: connectionID)
+                XCTAssertEqual(runTab, expectedRunTab, "\(label) keeps the run tab's workspace after the later turn")
+            }
 
             await manager.clearClientConnectionPolicy(for: clientName, windowID: window.windowID, runID: runID)
             await manager.cleanupRunRoutingState(for: runID, windowID: window.windowID)
             for connectionID in [connectionIDA, connectionIDB] {
                 await manager.removeConnection(connectionID)
             }
+        }
+
+        /// A later turn whose policy leaves the tool projection unchanged (the retained refresh has
+        /// nothing to announce) keeps the run tab's workspace on the helper's actor-side route:
+        /// nothing rebinds the tab to rediscover it, so the policy install must not erase it.
+        @MainActor
+        func testAnUnchangedLaterTurnPolicyKeepsTheRunTabsWorkspace() async throws {
+            let window = makeWindow()
+            defer { WindowStatesManager.shared.unregisterWindowState(window) }
+            let (tabID, workspaceID) = try await addRunTab(to: window)
+            let manager = await makeManager(table: makeTable())
+            let runID = UUID()
+            await manager.debugSeedRunPolicyState(
+                runID: runID,
+                windowID: window.windowID,
+                workspaceID: workspaceID,
+                tabID: tabID,
+                restrictedTools: AgentModeMCPToolPolicy.restrictedTools,
+                additionalTools: nil,
+                purpose: .agentModeRun
+            )
+            await manager.registerExpectedAgentPID(agentPID, for: clientName, runID: runID)
+            let connectionID = await routedHelper(on: manager, runID: runID, helperPID: helperPID)
+            try window.mcpServer.bindTabForConnection(
+                connectionID: connectionID,
+                clientName: clientName,
+                tabID: tabID,
+                workspaceID: workspaceID,
+                windowID: window.windowID,
+                runID: runID,
+                explicitlyBound: false
+            )
+            let expectedRunTab = ServerNetworkManager.RunPolicyTab(
+                runID: runID, windowID: window.windowID, workspaceID: workspaceID, tabID: tabID
+            )
+            let seededRunTab = await manager.actorRoutedRunPolicyTab(for: connectionID)
+            try require(seededRunTab == expectedRunTab, "fixture: the route names the run tab's workspace")
+
+            await manager.installClientConnectionPolicy(
+                for: clientName,
+                windowID: window.windowID,
+                restrictedTools: AgentModeMCPToolPolicy.restrictedTools,
+                oneShot: true,
+                reason: "later turn",
+                ttl: 10,
+                tabID: tabID,
+                runID: runID,
+                purpose: .agentModeRun,
+                requiresExpectedAgentPID: true
+            )
+            await manager.refreshRetainedRunPolicyForTurnStart(for: clientName, runID: runID)
+
+            let runTab = await manager.actorRoutedRunPolicyTab(for: connectionID)
+            XCTAssertEqual(runTab, expectedRunTab, "the unchanged later turn keeps the run tab's workspace")
+            let cachedWorkspaceID = await manager.debugRunPolicyState(for: runID)?.workspaceID
+            XCTAssertEqual(cachedWorkspaceID, workspaceID)
+            XCTAssertEqual(window.mcpServer.boundTabID(forConnection: connectionID), tabID)
+            // `workspace_steer` resolves its caller from the same request routing context: the later
+            // turn's call is not refused for a missing source workspace. (`grantStore` is never read
+            // by caller resolution.)
+            let routing = await manager.requestRoutingContext(for: connectionID)
+            let metadata = MCPServerViewModel.RequestMetadata(
+                connectionID: connectionID,
+                clientName: clientName,
+                windowID: window.windowID,
+                runPurpose: routing.runPurpose,
+                actorRoutedRunTab: routing.actorRoutedRunTab,
+                gatewayRemoteDeviceID: routing.gatewayRemoteDeviceID
+            )
+            let steering = WorkspaceSteeringMCPToolService(
+                captureRequestMetadata: { metadata },
+                isGatewayPrincipalConnection: { await manager.isGatewayPrincipalConnection($0) },
+                windows: { [window] },
+                grantStore: { .shared }
+            )
+            let caller = try await steering.resolveCaller(metadata: metadata)
+            XCTAssertEqual(caller.sourceWorkspaceID, workspaceID, "the later turn's steering caller keeps its source workspace")
+            XCTAssertEqual(caller.runID, runID)
+            XCTAssertEqual(caller.windowID, window.windowID)
+            XCTAssertEqual(caller.tabID, tabID)
+
+            await manager.clearClientConnectionPolicy(for: clientName, windowID: window.windowID, runID: runID)
+            await manager.cleanupRunRoutingState(for: runID, windowID: window.windowID)
+            await manager.removeConnection(connectionID)
+        }
+
+        /// A policy-only install keeps a known workspace only for the same run, window, nonnil tab,
+        /// and purpose; any other identity, a replacement seed, or a cleaned-up run stays unknown, and
+        /// the accepted policy's tools always replace the old ones.
+        func testAPolicyOnlyInstallKeepsTheWorkspaceOnlyForTheSameRunTabIdentity() async {
+            let manager = await makeManager(table: makeTable())
+            let knownWorkspaceID = UUID()
+            let tabID = UUID()
+            var changed = AgentModeMCPToolPolicy.restrictedTools
+            changed.insert("route_retention_workspace_identity_tool")
+
+            struct Case {
+                let label: String
+                var seededTabID: UUID?
+                var installedWindowOffset = 0
+                var installedTabID: UUID?
+                var installedPurpose: MCPRunPurpose = .agentModeRun
+                var cleansUpFirst = false
+                let expectsWorkspace: Bool
+            }
+            let cases = [
+                Case(label: "same identity", seededTabID: tabID, installedTabID: tabID, expectsWorkspace: true),
+                Case(label: "changed window", seededTabID: tabID, installedWindowOffset: 1, installedTabID: tabID, expectsWorkspace: false),
+                Case(label: "changed tab", seededTabID: tabID, installedTabID: UUID(), expectsWorkspace: false),
+                Case(label: "changed purpose", seededTabID: tabID, installedTabID: tabID, installedPurpose: .discoverRun, expectsWorkspace: false),
+                Case(label: "no incoming tab", seededTabID: tabID, installedTabID: nil, expectsWorkspace: false),
+                Case(label: "no existing tab", seededTabID: nil, installedTabID: tabID, expectsWorkspace: false),
+                Case(label: "no tab on either side", seededTabID: nil, installedTabID: nil, expectsWorkspace: false),
+                Case(label: "cleaned-up run", seededTabID: tabID, installedTabID: tabID, cleansUpFirst: true, expectsWorkspace: false)
+            ]
+            for testCase in cases {
+                let runID = UUID()
+                let installedWindowID = windowID + testCase.installedWindowOffset
+                await manager.debugSeedRunPolicyState(
+                    runID: runID,
+                    windowID: windowID,
+                    workspaceID: knownWorkspaceID,
+                    tabID: testCase.seededTabID,
+                    restrictedTools: AgentModeMCPToolPolicy.restrictedTools,
+                    additionalTools: nil,
+                    purpose: .agentModeRun,
+                    updatedAt: Date(timeIntervalSinceNow: -60)
+                )
+                if testCase.cleansUpFirst {
+                    await manager.cleanupRunRoutingState(for: runID, windowID: windowID)
+                }
+                await manager.installClientConnectionPolicy(
+                    for: clientName,
+                    windowID: installedWindowID,
+                    restrictedTools: changed,
+                    oneShot: true,
+                    reason: "later turn",
+                    ttl: 10,
+                    tabID: testCase.installedTabID,
+                    runID: runID,
+                    purpose: testCase.installedPurpose
+                )
+                let state = await manager.debugRunPolicyState(for: runID)
+                XCTAssertEqual(
+                    state?.workspaceID,
+                    testCase.expectsWorkspace ? knownWorkspaceID : nil,
+                    "\(testCase.label): workspace"
+                )
+                XCTAssertEqual(state?.restrictedTools, changed, "\(testCase.label): the accepted policy's tools replace the old ones")
+                XCTAssertEqual(state?.windowID, installedWindowID, "\(testCase.label): window")
+                XCTAssertEqual(state?.purpose, testCase.installedPurpose, "\(testCase.label): purpose")
+                await manager.clearClientConnectionPolicy(for: clientName, windowID: installedWindowID, runID: runID)
+                await manager.cleanupRunRoutingState(for: runID, windowID: installedWindowID)
+            }
+
+            // A replacement seed (preservation off) with no workspace still clears a known one.
+            let replacedRunID = UUID()
+            await manager.debugSeedRunPolicyState(
+                runID: replacedRunID,
+                windowID: windowID,
+                workspaceID: knownWorkspaceID,
+                tabID: tabID,
+                restrictedTools: AgentModeMCPToolPolicy.restrictedTools,
+                additionalTools: nil,
+                purpose: .agentModeRun,
+                updatedAt: Date(timeIntervalSinceNow: -60)
+            )
+            await manager.debugSeedRunPolicyState(
+                runID: replacedRunID,
+                windowID: windowID,
+                workspaceID: nil,
+                tabID: tabID,
+                restrictedTools: changed,
+                additionalTools: nil,
+                purpose: .agentModeRun
+            )
+            let replaced = await manager.debugRunPolicyState(for: replacedRunID)
+            XCTAssertNil(replaced?.workspaceID, "a replacement seed keeps its clearing semantics")
+            await manager.cleanupRunRoutingState(for: replacedRunID, windowID: windowID)
+
+            // A stale install (older than the cached state) changes nothing.
+            let staleRunID = UUID()
+            await manager.debugSeedRunPolicyState(
+                runID: staleRunID,
+                windowID: windowID,
+                workspaceID: knownWorkspaceID,
+                tabID: tabID,
+                restrictedTools: AgentModeMCPToolPolicy.restrictedTools,
+                additionalTools: nil,
+                purpose: .agentModeRun,
+                updatedAt: Date(timeIntervalSinceNow: 3600)
+            )
+            await manager.installClientConnectionPolicy(
+                for: clientName,
+                windowID: windowID,
+                restrictedTools: changed,
+                oneShot: true,
+                reason: "stale turn",
+                ttl: 10,
+                tabID: UUID(),
+                runID: staleRunID,
+                purpose: .agentModeRun
+            )
+            let stale = await manager.debugRunPolicyState(for: staleRunID)
+            XCTAssertEqual(stale?.workspaceID, knownWorkspaceID, "a stale install leaves the cached state")
+            XCTAssertEqual(stale?.restrictedTools, AgentModeMCPToolPolicy.restrictedTools)
+            await manager.clearClientConnectionPolicy(for: clientName, windowID: windowID, runID: staleRunID)
+            await manager.cleanupRunRoutingState(for: staleRunID, windowID: windowID)
         }
 
         // MARK: - Request-originated window-route mutations (window-route holder)
