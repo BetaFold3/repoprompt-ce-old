@@ -2016,6 +2016,58 @@ final class TabContextRoutingTests: XCTestCase {
         XCTAssertEqual(fileActions.payload["operation_id"]?.stringValue, "create-123")
     }
 
+    /// The gateway relays the browser's WebAuthn credential to `remote_pairing` as exact JSON text.
+    /// Production normalization must hand the provider that same string (surrounding whitespace
+    /// included), never a parsed object, for both registration and assertion completion.
+    func testRemotePairingCredentialJSONStringSurvivesNormalizationExactly() {
+        let credential = "  \n{\"id\":\"AQID\",\"rawId\":\"AQID\",\"response\":{\"clientDataJSON\":\"e30\"},\"type\":\"public-key\"}\n "
+        let completionOps: [RemotePairingOperation] = [.passkeyRegisterComplete, .passkeyUnlockComplete]
+        for op in completionOps {
+            let params: [String: Value] = [
+                "op": .string(op.rawValue),
+                "device_id": .string("remote:1234abcd"),
+                "ceremony_id": .string("0123456789abcdef0123"),
+                "connection_generation": .int(9),
+                "credential": .string(credential)
+            ]
+            let normalized = MCPToolArgsNormalizer.normalize(
+                params: params,
+                originalToolName: MCPWindowToolName.remotePairing,
+                canonicalToolName: MCPWindowToolName.remotePairing
+            )
+            XCTAssertEqual(normalized.payload["credential"], .string(credential), op.rawValue)
+            XCTAssertEqual(normalized.payload, params, op.rawValue)
+            XCTAssertTrue(normalized.warnings.isEmpty, op.rawValue)
+        }
+    }
+
+    /// The `remote_pairing` credential exemption is field- and tool-scoped: other `remote_pairing`
+    /// fields and other tools' JSON-string subfields (even one named `credential`) still normalize.
+    func testJSONStringSubfieldsStillNormalizeOutsideRemotePairingCredential() {
+        let otherField = MCPToolArgsNormalizer.normalize(
+            params: [
+                "op": .string(RemotePairingOperation.mintTicket.rawValue),
+                "device_id": .string("remote:1234abcd"),
+                "scopes": .string("[\"read\"]")
+            ],
+            originalToolName: MCPWindowToolName.remotePairing,
+            canonicalToolName: MCPWindowToolName.remotePairing
+        )
+        XCTAssertEqual(otherField.payload["scopes"], .array([.string("read")]))
+
+        let unrelatedTool = MCPToolArgsNormalizer.normalize(
+            params: [
+                "op": .string("add"),
+                "credential": .string("{\"a\":1}"),
+                "paths": .string("[\"Sources/App.swift\"]")
+            ],
+            originalToolName: "manage_selection",
+            canonicalToolName: "manage_selection"
+        )
+        XCTAssertEqual(unrelatedTool.payload["credential"], .object(["a": .int(1)]))
+        XCTAssertEqual(unrelatedTool.payload["paths"], .array([.string("Sources/App.swift")]))
+    }
+
     #if DEBUG
         @MainActor
         func testGatewayPrincipalExplicitWindowIDRoutesWithoutPersistingDefaultMapping() async throws {

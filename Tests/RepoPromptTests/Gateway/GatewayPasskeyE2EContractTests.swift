@@ -689,7 +689,13 @@ private final class PasskeyE2EApp {
         )
         let context = MCPWindowToolContext(toolName: MCPWindowToolName.remotePairing, windowID: 1)
         execute = { arguments in
-            try await MCPRemotePairingToolProvider.execute(args: arguments, context: context, dependencies: dependencies)
+            // The app's MCP CallTool handler normalizes arguments before dispatching the provider.
+            let normalized = MCPToolArgsNormalizer.normalize(
+                params: arguments,
+                originalToolName: MCPWindowToolName.remotePairing,
+                canonicalToolName: MCPWindowToolName.remotePairing
+            )
+            return try await MCPRemotePairingToolProvider.execute(args: normalized.payload, context: context, dependencies: dependencies)
         }
     }
 }

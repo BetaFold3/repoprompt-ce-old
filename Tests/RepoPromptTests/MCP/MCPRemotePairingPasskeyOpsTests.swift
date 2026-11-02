@@ -73,8 +73,15 @@ final class MCPRemotePairingPasskeyOpsTests: XCTestCase {
         return Harness(store: store, coordinator: coordinator, deps: deps, connectionID: connectionID)
     }
 
+    /// Runs the production CallTool argument normalizer before the provider, as the app's MCP
+    /// handler does, so the credential JSON string contract is exercised end to end.
     private func execute(_ args: [String: Value], _ deps: MCPRemotePairingToolProvider.ExecutionDependencies) async throws -> Value {
-        try await MCPRemotePairingToolProvider.execute(args: args, context: context, dependencies: deps)
+        let normalized = MCPToolArgsNormalizer.normalize(
+            params: args,
+            originalToolName: MCPWindowToolName.remotePairing,
+            canonicalToolName: MCPWindowToolName.remotePairing
+        )
+        return try await MCPRemotePairingToolProvider.execute(args: normalized.payload, context: context, dependencies: deps)
     }
 
     private func b64urlDecode(_ string: String) -> [UInt8] {
