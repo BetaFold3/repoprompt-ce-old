@@ -48,6 +48,20 @@ final class AgentRunningStatusPresentationTests: XCTestCase {
         }
     }
 
+    func testRecognizedExternalMCPToolsUseCompactActionAndServerLabel() {
+        let cases = [
+            ("mcp__busycal__delete_event", "Delete Event · BusyCal"),
+            ("functions.mcp__github__list_prs", "List PRs · GitHub"),
+            ("mcp__docs.rs__search_crates", "Search Crates · Docs.rs")
+        ]
+        for (raw, expected) in cases {
+            XCTAssertEqual(AgentRunningStatusPresentation.displayText(for: raw), expected, raw)
+        }
+        for raw in ["Running mcp__busycal__delete_event", "ns.mcp__busycal__delete_event", "mcp__busycal__", "mcp__RepoPromptCE__unknown_tool"] {
+            XCTAssertEqual(AgentRunningStatusPresentation.displayText(for: raw), raw, raw)
+        }
+    }
+
     func testExplicitServerPrefixesStripInFirstMatchOrderAndMatchLegacyResolution() {
         let pinned: [(raw: String, normalized: String, canonical: String?, explicit: Bool)] = [
             ("mcp__RepoPromptCE__read_file", "read_file", "read_file", true),

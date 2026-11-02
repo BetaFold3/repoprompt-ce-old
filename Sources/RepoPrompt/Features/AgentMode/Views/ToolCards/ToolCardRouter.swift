@@ -133,10 +133,12 @@ enum ToolCardRouter {
             toolIsError: item.toolIsError,
             agentControlContext: agentControlContext
         )
+        let header = genericHeader(for: item, normalizedToolName: normalized, explicitTitle: presentation?.title)
         return AnyView(
             ToolCallCard(
                 item: item,
-                title: presentation?.title ?? toolDisplayName(for: normalized ?? item.toolName),
+                title: header.title,
+                sourceLabel: header.sourceLabel,
                 subtitle: subtitle,
                 oracleOpenContext: oracleOpenContext,
                 showRunScopedToolCancel: showRunScopedToolCancel,
@@ -229,8 +231,26 @@ enum ToolCardRouter {
             if NativeToolCardPresentationBuilder.build(item: item, normalizedToolName: key) != nil {
                 return AnyView(NativeToolResultCard(item: item, normalizedToolName: key))
             }
-            return AnyView(UnknownToolResultCard(item: item, title: toolDisplayName(for: normalized ?? item.toolName)))
+            let header = genericHeader(for: item, normalizedToolName: normalized, explicitTitle: nil)
+            return AnyView(UnknownToolResultCard(item: item, title: header.title, sourceLabel: header.sourceLabel))
         }
+    }
+
+    /// Generic call/result header. An explicit specialized title (for example a web action) wins and
+    /// carries no source label; otherwise external MCP tools split into action title + server label,
+    /// parsed from the raw tool name before lossy dotted-suffix normalization.
+    static func genericHeader(
+        for item: AgentChatItem,
+        normalizedToolName: String?,
+        explicitTitle: String?
+    ) -> ToolCardHeaderPresentation {
+        if let explicitTitle {
+            return ToolCardHeaderPresentation(title: explicitTitle, sourceLabel: nil)
+        }
+        return ToolCardHeaderPresentation.generic(
+            rawToolName: item.toolName,
+            normalizedToolName: normalizedToolName
+        )
     }
 
     struct ToolCallPresentation: Equatable {
@@ -1012,6 +1032,7 @@ enum ToolCallCardStateResolver {
 struct ToolCallCard: View {
     let item: AgentChatItem
     let title: String
+    let sourceLabel: String?
     let subtitle: String?
     let oracleOpenContext: AgentOracleOpenContext?
     let showRunScopedToolCancel: Bool
@@ -1020,6 +1041,7 @@ struct ToolCallCard: View {
     init(
         item: AgentChatItem,
         title: String,
+        sourceLabel: String? = nil,
         subtitle: String?,
         oracleOpenContext: AgentOracleOpenContext?,
         showRunScopedToolCancel: Bool = false,
@@ -1027,6 +1049,7 @@ struct ToolCallCard: View {
     ) {
         self.item = item
         self.title = title
+        self.sourceLabel = sourceLabel
         self.subtitle = subtitle
         self.oracleOpenContext = oracleOpenContext
         self.showRunScopedToolCancel = showRunScopedToolCancel
@@ -1064,6 +1087,7 @@ struct ToolCallCard: View {
             iconName: toolIcon(for: item.toolName),
             iconColor: ToolCardAccentResolver.color(for: item.toolName),
             title: title,
+            sourceLabel: sourceLabel,
             subtitle: subtitle,
             status: status,
             timestamp: item.timestamp,
