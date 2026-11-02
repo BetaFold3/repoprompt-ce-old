@@ -431,7 +431,7 @@ allowed_tracked_docs=(
   "docs/context/plans/completed/2026-10-10-app-module-split-contract.md"
   "docs/context/plans/2026-10-10-telegram-attention-notifications-contract.md"
   "docs/context/plans/completed/2026-10-30-telegram-remote-link-specs.md"
-  "docs/context/plans/2026-10-31-remote-passkey-unlock-spec.md"
+  "docs/context/plans/completed/2026-10-31-remote-passkey-unlock-spec.md"
   "docs/context/specs/2026-11-01-assistant-workspace-steering-spec.md"
   "docs/context/assistant-workspace-steering.md"
   "docs/context/telegram-paired-browser-remote.md"
