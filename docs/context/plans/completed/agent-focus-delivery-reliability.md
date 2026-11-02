@@ -1,9 +1,27 @@
+# Completion outcome — 2026-11-02
+
+The plan is closed by owner decision after daily-use acceptance on a rebuilt and relaunched Dev build. The owner reported that, after switching sidebar sessions, one press now opens both the quick model picker (⌥⌘K) and quick handoff (⇧⌥⌘K), and that typing goes straight into the composer after selecting a model, without clicking it. The remaining live-checklist items below were not individually exercised and are not claimed.
+
+What landed:
+- August hardening, commit `20479a32`: D1 composer focus token, D2 HUD presentation epoch and deferred false→true focus edge, and D4 DEBUG `hud-routing` instrumentation. These remain in place.
+- November follow-up, commit `d1f59003`: the root cause of the two-press failure was the shell's redraw-driven active-tab dismissal, which read `PromptViewModel`'s active tab without observing it, so the next redraw (the shortcut's own presentation) could deliver a stale tab change and close the fresh HUD. It was replaced by a synchronous, window-scoped `.activeComposeTabChanged` receiver shared by the navigation, model-selection and handoff HUDs. Successful model selections now request composer focus through the existing token path (`.modelSelectionCommitted`). Lifecycle and focus tracing was extended. Commit `9e6cfa42` separately repaired a guardrails allowlist entry.
+- Reviews: OracleA and OracleB reviewed the November change independently, with one policy-aware re-review round. No P0/P1 remained open. Findings and dispositions are kept locally in `.agent-artifacts/agent-focus-delivery-reliability/evidence/` (not committed).
+
+Decisions at closure:
+- D3: the navigation HUD's mirrored focus fix was not implemented. Its gate is now satisfied (the five source conditions were confirmed and the model HUD was live-validated), so it may land later without re-adjudication if a navigation-HUD focus failure is observed. The navigation HUD already shares the November dismissal repair.
+- D4: no wrong-window routing was reported after the dismissal repair, so no routing fix was made. The pre-specified fallback-only re-resolve remains the response if `hud-routing` logs ever show the race.
+- Still deferred: same-tab session replacement and cross-family identity coverage, and low-level dropped-token tracing (B-R1-P2a).
+
+Durable invariants now live in the [quick model/handoff HUD contract](../../quick-model-picker-and-handoff-hud.md). The original plan follows intact except for its status lines and owner decision; its historical pending statements are not current guidance.
+
+---
+
 # Agent Mode focus delivery reliability: new-session composer and quick model/handoff HUD
 
 Scope: read when the task touches new-session composer focus delivery, the quick model picker / quick handoff HUD keyboard-focus acquisition, `ResizableTextFieldFeatures` focus plumbing, or HUD shortcut routing instrumentation.
 Authority: Authoritative
 Last-verified: 2026-11-02
-Status: active implementation plan. The D1 composer-token contingency, D2 model-selection/handoff HUD focus edge, and D4 DEBUG routing instrumentation are implemented in source, activating the pre-authorized D3 contingency of the Agent Mode QoL plan. The November follow-up now replaces shell redraw-driven tab dismissal with synchronous window-scoped tab events, adds success-only model-switch composer restoration, and extends lifecycle/focus tracing. Runtime attribution and daily-use acceptance remain unresolved. The D3 source spike confirms all five navigation-HUD conditions, but the mirrored navigation-HUD implementation has not landed and remains gated on live model-HUD validation. Supersedes nothing.
+Status: completed 2026-11-02 by owner decision on daily-use acceptance (see the completion outcome above). Original status: active implementation plan. The D1 composer-token contingency, D2 model-selection/handoff HUD focus edge, and D4 DEBUG routing instrumentation are implemented in source, activating the pre-authorized D3 contingency of the Agent Mode QoL plan. The November follow-up now replaces shell redraw-driven tab dismissal with synchronous window-scoped tab events, adds success-only model-switch composer restoration, and extends lifecycle/focus tracing. Runtime attribution and daily-use acceptance remain unresolved. The D3 source spike confirms all five navigation-HUD conditions, but the mirrored navigation-HUD implementation has not landed and remains gated on live model-HUD validation. Supersedes nothing.
 
 ## How this plan was settled
 
@@ -97,9 +115,10 @@ F1–F6 below record the August baseline, not the current implementation. The D1
 
 The owner authorized a focused fix and tracing after independent OracleA/OracleB guidance, with daily-work acceptance to follow. This does not reset the earlier rounds or adjudicated D1–D4 decisions.
 
-Step 6 — done | rounds 1/2 | open: none (local implementation and validation; daily acceptance deferred) | downgraded: none | assumed: repair shared navigation dismissal without changing its focus gate; retain evidence locally | deferred: daily-use UI acceptance; same-tab/cross-family identity coverage; B-R1-P2a low-level dropped-token tracing (see evidence)
+Step 6 — done | rounds 1/2 | open: none (local implementation and validation; owner daily-use acceptance passed 2026-11-02) | downgraded: none | assumed: repair shared navigation dismissal without changing its focus gate; retain evidence locally | deferred: same-tab/cross-family identity coverage; B-R1-P2a low-level dropped-token tracing (see evidence)
 
 Owner decision (2026-11-02): fix the completed remote-passkey plan allowlist separately, then commit the reviewed HUD fixes locally.
+Owner decision (2026-11-02): close the plan on daily-use acceptance of first press after a session switch (both shortcuts) and immediate typing after a model selection.
 
 Evidence directory (local, not committed): `.agent-artifacts/agent-focus-delivery-reliability/evidence/`. Initial findings: `2026-11-02-initial-oraclea.md`, `2026-11-02-initial-oracleb.md`; dispositions and validation: `2026-11-02-step6-evidence.md`. Round counts apply to this November step only; August rounds and owner decisions above are unchanged.
 
@@ -109,7 +128,7 @@ Evidence directory (local, not committed): `.agent-artifacts/agent-focus-deliver
 - **Shared receiver body:** `AgentHUDActiveTabChangeGate.handle` (next to the gate in `ContentRootShellView.swift`) performs the strict window match, navigation dismissal, and `activeTabDidChange()`. The shell wraps it in one HUD animation; tests call the same function.
 - **Tracing:** `hud-routing` now includes active-tab receipt, reasoned dismissal attempts, commit/suspension outcomes (`commit-success-invoke-focus-callback` records only that the callback was invoked; it may still reject or the delivery may fail), epochs, and query lifecycle/focus-binding events. Shell receive, VM, and view records carry a DEBUG-only per-HUD-instance trace ID (`hud=`); shell receive records pair it with the owning window ID. Query records include the hosting window's first-responder class name (not contents), and the deferred true leg logs `assert-edge-ran` or `assert-edge-bailed`. `composer-focus` correlates request, input-bar cue action (`applyAndConsume`, `leavePending`, `discard`, `none`), and delivery by token UUID; delivery reports AppKit first-responder state at attempt time, not afterwards. No user content or session IDs are logged.
 - **Limits:** logical reset and a deferred token do not prove physical teardown or focus handover. No speculative teardown acknowledgement, retries, delay, new key-window policy, or closure-bearing features were added. Rapid newer-HUD/overlay focus competition remains a live acceptance case, not a guarantee inferred from unit tests.
-- **Durable contract:** see [quick model/handoff HUD](../quick-model-picker-and-handoff-hud.md). Keep this plan active until its outstanding live checks and navigation gate are resolved.
+- **Durable contract:** see [quick model/handoff HUD](../../quick-model-picker-and-handoff-hud.md). Keep this plan active until its outstanding live checks and navigation gate are resolved.
 
 ## Tests
 

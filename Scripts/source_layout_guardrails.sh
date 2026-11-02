@@ -782,7 +782,7 @@ allowed_tracked_docs=(
   "docs/context/plans/completed/2026-10-08-swift-compile-follow-ups-plan.md"
   "docs/context/oracle-failure-inspection.md"
   "docs/context/plans/completed/2026-10-18-codemap-automatic-convergence-plan.md"
-  "docs/context/plans/agent-focus-delivery-reliability.md"
+  "docs/context/plans/completed/agent-focus-delivery-reliability.md"
   "docs/context/plans/agent-mode-qol-shortcut-focus-toolbar-motion.md"
   "docs/context/plans/omp-provider-integration.md"
   "docs/context/plans/pi-provider-integration.md"
