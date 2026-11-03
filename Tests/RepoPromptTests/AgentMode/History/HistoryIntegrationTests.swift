@@ -2,6 +2,7 @@ import Foundation
 @testable import RepoPromptAgentCore
 @testable import RepoPromptApp
 @testable import RepoPromptPlatform
+import RepoPromptShared
 @testable import RepoPromptUI
 @testable import RepoPromptWorkspace
 import XCTest
@@ -338,6 +339,102 @@ final class HistoryIntegrationTests: XCTestCase {
 
     // MARK: - Helpers
 
+    // MARK: - get_session miss / cancellation
+
+    func testGetSession_unknownSessionID_runsOneInventoryScan() async throws {
+        let workspace = try fixture.createWorkspace(name: "Project")
+        try fixture.install([HistoryTestFixture.textSearchSession(name: "Known", activityText: "hello")], in: workspace)
+        // TTL 0: every inventory request is a full scan, so a refresh-by-rescan on miss
+        // would show up as a second scan.
+        let uncachedScanner = HistorySessionScanner(workspacesRoot: fixture.workspacesRoot, scanCacheTTL: 0)
+
+        let result = try await HistoryMCPToolService.execute(
+            args: ["op": "get_session", "session_id": .string(UUID().uuidString)],
+            scanner: uncachedScanner
+        )
+
+        guard case .error = result else {
+            return XCTFail("expected not-found error reply, got \(result)")
+        }
+        let inventoryScans = await uncachedScanner.inventoryScanCountForTesting
+        XCTAssertEqual(inventoryScans, 1, "A session_id miss must not trigger a second full inventory scan")
+    }
+
+    func testGetSession_sessionSavedAfterInventoryCached_resolvesWithoutFullRescan() async throws {
+        let workspace = try fixture.createWorkspace(name: "Project")
+        let existing = HistoryTestFixture.textSearchSession(name: "Existing", activityText: "hello")
+        try fixture.install([existing], in: workspace)
+        let cachedScanner = HistorySessionScanner(workspacesRoot: fixture.workspacesRoot, scanCacheTTL: 3600)
+        _ = try await HistoryMCPToolService.execute(args: ["op": "list_sessions"], scanner: cachedScanner)
+
+        let fresh = HistoryTestFixture.textSearchSession(name: "Fresh", activityText: "new work")
+        try fixture.install([existing, fresh], in: workspace)
+        let result = try await HistoryMCPToolService.execute(
+            args: ["op": "get_session", "session_id": .string(fresh.id.uuidString), "around_turn": 0],
+            scanner: cachedScanner
+        )
+
+        guard case let .getSession(dto) = result else {
+            return XCTFail("expected get_session reply, got \(result)")
+        }
+        XCTAssertEqual(dto.sessionID, fresh.id.uuidString)
+        let inventoryScans = await cachedScanner.inventoryScanCountForTesting
+        XCTAssertEqual(inventoryScans, 1, "Fresh-session resolution must not rescan every workspace")
+        let listed = try await listReply(HistoryMCPToolService.execute(args: ["op": "list_sessions"], scanner: cachedScanner))
+        XCTAssertEqual(listed.totalSessions, 2, "The refreshed workspace is visible to later cached calls")
+    }
+
+    func testSearchUnderExecutionWatchdog_deadlineDuringTranscriptLoad_settlesAsCancellation() async throws {
+        let workspace = try fixture.createWorkspace(name: "Project")
+        try fixture.install([
+            HistoryTestFixture.textSearchSession(name: "A", activityText: "needle one"),
+            HistoryTestFixture.textSearchSession(name: "B", activityText: "needle two")
+        ], in: workspace)
+        let gated = FirstTranscriptLoadGatedScanner(base: scanner)
+        let clock = ExecutionWatchdogManualClock()
+        let recorder = await MCPToolExecutionHandlerPhaseRecorder(origin: clock.currentTime(), now: { await clock.environment.now() })
+        let diagnostics = MCPHistoryToolProvider.makeDiagnostics(recorder: recorder)
+        let cancellationRequested = HistoryWorkGate()
+
+        let task = Task<HistoryToolReply, Error> {
+            try await MCPToolExecutionWatchdog.execute(
+                deadline: MCPTimeoutPolicy.boundedToolExecutionDeadline,
+                cancellationGrace: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace,
+                environment: clock.environment,
+                onEvent: { event in
+                    if event == .cancellationRequested {
+                        await cancellationRequested.enterAndWait()
+                    }
+                }
+            ) {
+                try await HistoryMCPToolService.execute(
+                    args: ["op": "search", "query": "needle"],
+                    scanner: gated,
+                    diagnostics: diagnostics
+                )
+            }
+        }
+
+        try await clock.waitForSleeperCount(1)
+        await gated.gate.waitUntilEntered()
+        XCTAssertEqual(recorder.snapshot()?.phase, .historyTranscriptLoad, "Watchdog sees the history handler phase")
+        XCTAssertEqual(recorder.snapshot()?.transition, .started)
+
+        try await clock.advanceNext(expected: MCPTimeoutPolicy.boundedToolExecutionDeadline)
+        // `.cancellationRequested` is emitted after the watchdog cancelled the operation.
+        await cancellationRequested.waitUntilEntered()
+        await cancellationRequested.release()
+        await gated.gate.release()
+
+        do {
+            let reply = try await task.value
+            XCTFail("Expected execution timeout, got \(reply)")
+        } catch let error as MCPToolExecutionWatchdogError {
+            XCTAssertEqual(error, .executionTimedOut(settlement: .cancellation), "Must settle cooperatively, not via cleanupUnresponsive")
+        }
+        XCTAssertEqual(gated.transcriptLoadCount, 1, "No further transcript loads after cancellation")
+    }
+
     private func listReply(_ reply: HistoryToolReply) throws -> HistoryListSessionsReply {
         if case let .listSessions(dto) = reply { return dto }
         return try XCTUnwrap(nil as HistoryListSessionsReply?, "expected .listSessions reply, got \(reply)")
@@ -370,5 +467,103 @@ final class HistoryIntegrationTests: XCTestCase {
     private func localDate(year: Int, month: Int, day: Int, hour: Int) throws -> Date {
         let date = Calendar.current.date(from: DateComponents(year: year, month: month, day: day, hour: hour))
         return try XCTUnwrap(date)
+    }
+}
+
+/// Real-scanner wrapper whose first transcript load parks on an uncancellable gate, so a
+/// test can fire the watchdog deadline while the handler is provably inside work.
+private final class FirstTranscriptLoadGatedScanner: HistorySessionScanning, @unchecked Sendable {
+    let gate = HistoryWorkGate()
+    private let base: HistorySessionScanner
+    private let lock = NSLock()
+    private var loads = 0
+
+    init(base: HistorySessionScanner) {
+        self.base = base
+    }
+
+    var transcriptLoadCount: Int {
+        lock.withLock { loads }
+    }
+
+    func scanAllWorkspaces(diagnostics: HistoryExecutionDiagnostics?) async throws -> [HistoryWorkspaceScanResult] {
+        try await base.scanAllWorkspaces(diagnostics: diagnostics)
+    }
+
+    func refreshWorkspacesContainingSession(
+        _ sessionID: UUID,
+        diagnostics: HistoryExecutionDiagnostics?
+    ) async throws -> [HistoryWorkspaceScanResult] {
+        try await base.refreshWorkspacesContainingSession(sessionID, diagnostics: diagnostics)
+    }
+
+    func sessionsMatchingFilters(
+        _ records: [HistoryWorkspaceScanResult],
+        workspace: String?,
+        agentKind: String?,
+        model: String?,
+        filePath: String?,
+        from: Date?,
+        to: Date?
+    ) throws -> [HistoryFilteredSessionRecord] {
+        try base.sessionsMatchingFilters(
+            records,
+            workspace: workspace,
+            agentKind: agentKind,
+            model: model,
+            filePath: filePath,
+            from: from,
+            to: to
+        )
+    }
+
+    func loadTranscriptForSearch(
+        sessionID: UUID,
+        workspaceDir: URL,
+        diagnostics: HistoryExecutionDiagnostics?
+    ) async throws -> AgentTranscript {
+        let isFirst = lock.withLock {
+            loads += 1
+            return loads == 1
+        }
+        if isFirst {
+            await gate.enterAndWait()
+        }
+        return try await base.loadTranscriptForSearch(sessionID: sessionID, workspaceDir: workspaceDir, diagnostics: diagnostics)
+    }
+
+    func transcriptDerivedFieldsAreStale(
+        for record: AgentSessionMetadataRecord,
+        sessionID: UUID,
+        workspaceDir: URL
+    ) async -> Bool {
+        await base.transcriptDerivedFieldsAreStale(for: record, sessionID: sessionID, workspaceDir: workspaceDir)
+    }
+}
+
+/// Entry-signalling gate that ignores cancellation until released.
+private actor HistoryWorkGate {
+    private var entered = false
+    private var released = false
+    private var enteredWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func enterAndWait() async {
+        entered = true
+        enteredWaiters.forEach { $0.resume() }
+        enteredWaiters.removeAll()
+        guard !released else { return }
+        await withCheckedContinuation { releaseWaiters.append($0) }
+    }
+
+    func waitUntilEntered() async {
+        guard !entered else { return }
+        await withCheckedContinuation { enteredWaiters.append($0) }
+    }
+
+    func release() {
+        released = true
+        releaseWaiters.forEach { $0.resume() }
+        releaseWaiters.removeAll()
     }
 }

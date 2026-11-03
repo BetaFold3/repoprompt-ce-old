@@ -1230,6 +1230,321 @@ final class CodemapBindingEngineProjectionTests: CodemapBindingEngineTestCase {
         XCTAssertEqual(finalBuildCount, 5)
     }
 
+    #if DEBUG
+        func testProjectionBatchSharesOneSourceAuthorityCaptureWindow() async throws {
+            let repository = try makeRepositoryFixture(name: #function)
+            let paths = (0 ..< 20).map { "Sources/Feature\($0).swift" }
+            let root = try repository.makeRepository(
+                named: "repository",
+                files: Dictionary(uniqueKeysWithValues: paths.map {
+                    ($0, SwiftFixtureSource.emptyStruct("Feature\(paths.firstIndex(of: $0)!)"))
+                })
+            )
+            let runtime = try CodeMapArtifactRuntime(
+                rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts"),
+                builder: CodeMapArtifactBuilderClient(build: { _, _, _ in .readyNoSymbols })
+            )
+            let recorder = EngineProjectionRecorder()
+            let fixture = try await makeEngineFixture(
+                root: root,
+                runtime: runtime,
+                projectionCatalogFactory: { rootEpoch, fileIDs in
+                    let candidates = paths.map { path in
+                        WorkspaceCodemapProjectionCatalogCandidate(
+                            identity: WorkspaceCodemapArtifactBindingIdentity(
+                                rootID: rootEpoch.rootID,
+                                rootLifetimeID: rootEpoch.rootLifetimeID,
+                                fileID: fileIDs.id(for: path),
+                                standardizedRootPath: root.path,
+                                standardizedRelativePath: path,
+                                standardizedFullPath: root.appendingPathComponent(path).path
+                            )!,
+                            language: .swift,
+                            requestGeneration: 1,
+                            pathGeneration: 1
+                        )
+                    }
+                    return EngineProjectionCatalogStub(
+                        rootEpoch: rootEpoch,
+                        entries: candidates,
+                        recorder: recorder
+                    ).client
+                }
+            )
+            _ = await fixture.engine.registerRoot(fixture.registration)
+            _ = try await eligible(fixture.capabilityService.state(for: fixture.rootEpoch))
+
+            let capturesBefore = await fixture.capabilityService.authorityCaptureCountForTesting()
+            let schedule = await fixture.engine.scheduleProjectionPreload(rootEpoch: fixture.rootEpoch)
+            XCTAssertEqual(schedule, .handedOff)
+            let completed = await waitForEngineCondition {
+                await fixture.engine.accounting().projectionRoots.first?.phase == .complete
+            }
+            XCTAssertTrue(completed)
+            let capturesAfter = await fixture.capabilityService.authorityCaptureCountForTesting()
+
+            XCTAssertEqual(
+                capturesAfter - capturesBefore,
+                2,
+                "One projection batch must share one bracketed repository capture window."
+            )
+            let accounting = await fixture.engine.accounting()
+            let counts = try XCTUnwrap(accounting.projectionRoots.first?.progress.counts)
+            XCTAssertEqual(counts.supportedCandidateCount, UInt64(paths.count))
+            XCTAssertEqual(counts.processedCandidateCount, UInt64(paths.count))
+            XCTAssertEqual(counts.transientCount, 0)
+            let snapshots = await recorder.snapshots
+            let projectedEntryCount = snapshots.reduce(into: 0) { count, snapshot in
+                if case let .segment(segment) = snapshot { count += segment.entries.count }
+            }
+            XCTAssertEqual(projectedEntryCount, paths.count)
+            await fixture.engine.unloadRoot(rootEpoch: fixture.rootEpoch)
+            await fixture.engine.shutdown()
+        }
+    #endif
+
+    #if DEBUG
+        func testProjectionWindowScopedPrefetchFailureFallsBackToSingleIssuanceWithoutRetry() async throws {
+            let repository = try makeRepositoryFixture(name: #function)
+            let paths = (0 ..< 20).map { "Sources/Feature\($0).swift" }
+            let root = try repository.makeRepository(
+                named: "repository",
+                files: Dictionary(uniqueKeysWithValues: paths.enumerated().map { index, path in
+                    (path, SwiftFixtureSource.emptyStruct("Feature\(index)"))
+                })
+            )
+            let includedDirectory = repository.sandbox.appendingPathComponent("included-config", isDirectory: true)
+            try FileManager.default.createDirectory(at: includedDirectory, withIntermediateDirectories: true)
+            let includedConfig = includedDirectory.appendingPathComponent("extra.config")
+            let originalConfig = "# included\n"
+            try originalConfig.write(to: includedConfig, atomically: true, encoding: .utf8)
+            _ = try repository.runGit(["config", "include.path", includedConfig.path], at: root)
+            // The prefetch window sees an effective-config change between its captures, so every
+            // candidate's prefetched issuance is `.unstableWindow(.repository)`. The change is reverted
+            // before the next issuance's captures, so a fresh single issuance succeeds.
+            let churn = IncludedConfigWindowChurn(configURL: includedConfig, original: originalConfig)
+            let runtime = try CodeMapArtifactRuntime(
+                rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts"),
+                builder: CodeMapArtifactBuilderClient(build: { _, _, _ in .readyNoSymbols })
+            )
+            let recorder = EngineProjectionRecorder()
+            let fixture = try await makeEngineFixture(
+                root: root,
+                runtime: runtime,
+                capabilityHooks: WorkspaceCodemapGitCapabilityServiceHooks(
+                    afterSourcePathFingerprintCapture: { await churn.revertAfterMutation() },
+                    beforeSourceAuthorityPostRepositoryCapture: { await churn.mutateOnce() }
+                ),
+                projectionCatalogFactory: { rootEpoch, fileIDs in
+                    let candidates = paths.map { path in
+                        WorkspaceCodemapProjectionCatalogCandidate(
+                            identity: WorkspaceCodemapArtifactBindingIdentity(
+                                rootID: rootEpoch.rootID,
+                                rootLifetimeID: rootEpoch.rootLifetimeID,
+                                fileID: fileIDs.id(for: path),
+                                standardizedRootPath: root.path,
+                                standardizedRelativePath: path,
+                                standardizedFullPath: root.appendingPathComponent(path).path
+                            )!,
+                            language: .swift,
+                            requestGeneration: 1,
+                            pathGeneration: 1
+                        )
+                    }
+                    return EngineProjectionCatalogStub(
+                        rootEpoch: rootEpoch,
+                        entries: candidates,
+                        recorder: recorder
+                    ).client
+                }
+            )
+            _ = await fixture.engine.registerRoot(fixture.registration)
+            _ = try await eligible(fixture.capabilityService.state(for: fixture.rootEpoch))
+
+            let capturesBefore = await fixture.capabilityService.authorityCaptureCountForTesting()
+            let schedule = await fixture.engine.scheduleProjectionPreload(rootEpoch: fixture.rootEpoch)
+            XCTAssertEqual(schedule, .handedOff)
+            let completed = await waitForEngineCondition {
+                await fixture.engine.accounting().projectionRoots.first?.phase == .complete
+            }
+            XCTAssertTrue(completed)
+            let capturesAfter = await fixture.capabilityService.authorityCaptureCountForTesting()
+            let churnState = await churn.state
+
+            XCTAssertEqual(churnState, .init(mutated: true, reverted: true))
+            XCTAssertEqual(
+                capturesAfter - capturesBefore,
+                2 + 2 * paths.count,
+                "Window-scoped prefetch failures must fall back to one fresh single issuance each."
+            )
+            let accounting = await fixture.engine.accounting()
+            XCTAssertEqual(accounting.counters.projectionRetries, 0)
+            XCTAssertEqual(accounting.counters.repositoryAuthorityChanges, 0)
+            let counts = try XCTUnwrap(accounting.projectionRoots.first?.progress.counts)
+            XCTAssertEqual(counts.supportedCandidateCount, UInt64(paths.count))
+            XCTAssertEqual(counts.processedCandidateCount, UInt64(paths.count))
+            XCTAssertEqual(counts.transientCount, 0)
+            await fixture.engine.unloadRoot(rootEpoch: fixture.rootEpoch)
+            await fixture.engine.shutdown()
+        }
+    #endif
+
+    #if DEBUG
+        func testProjectionRootWidePrefetchFailureLatchesOnceWithoutFallback() async throws {
+            let repository = try makeRepositoryFixture(name: #function)
+            let paths = (0 ..< 20).map { "Sources/Feature\($0).swift" }
+            let root = try repository.makeRepository(
+                named: "repository",
+                files: Dictionary(uniqueKeysWithValues: paths.enumerated().map { index, path in
+                    (path, SwiftFixtureSource.emptyStruct("Feature\(index)"))
+                })
+            )
+            let runtime = try CodeMapArtifactRuntime(
+                rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts"),
+                builder: CodeMapArtifactBuilderClient(build: { _, _, _ in .readyNoSymbols })
+            )
+            let recorder = EngineProjectionRecorder()
+            let fixture = try await makeEngineFixture(
+                root: root,
+                runtime: runtime,
+                projectionCatalogFactory: { rootEpoch, fileIDs in
+                    let candidates = paths.map { path in
+                        WorkspaceCodemapProjectionCatalogCandidate(
+                            identity: WorkspaceCodemapArtifactBindingIdentity(
+                                rootID: rootEpoch.rootID,
+                                rootLifetimeID: rootEpoch.rootLifetimeID,
+                                fileID: fileIDs.id(for: path),
+                                standardizedRootPath: root.path,
+                                standardizedRelativePath: path,
+                                standardizedFullPath: root.appendingPathComponent(path).path
+                            )!,
+                            language: .swift,
+                            requestGeneration: 1,
+                            pathGeneration: 1
+                        )
+                    }
+                    return EngineProjectionCatalogStub(
+                        rootEpoch: rootEpoch,
+                        entries: candidates,
+                        recorder: recorder
+                    ).client
+                }
+            )
+            _ = await fixture.engine.registerRoot(fixture.registration)
+            _ = try await eligible(fixture.capabilityService.state(for: fixture.rootEpoch))
+            try repository.write("notes\n", to: "Notes.txt", at: root)
+            try repository.stage("Notes.txt", at: root)
+
+            let capturesBefore = await fixture.capabilityService.authorityCaptureCountForTesting()
+            let schedule = await fixture.engine.scheduleProjectionPreload(rootEpoch: fixture.rootEpoch)
+            XCTAssertEqual(schedule, .handedOff)
+            let cancelled = await waitForEngineCondition {
+                await fixture.engine.accounting().counters.projectionCoveragesCancelled == 1
+            }
+            XCTAssertTrue(cancelled)
+            let capturesAfter = await fixture.capabilityService.authorityCaptureCountForTesting()
+
+            // The opening capture sees the staged index: every prefetched issuance is the same
+            // root-wide failure, which is final, so the first candidate latches and ends the job.
+            XCTAssertEqual(capturesAfter - capturesBefore, 1)
+            let accounting = await fixture.engine.accounting()
+            XCTAssertEqual(accounting.counters.repositoryAuthorityChanges, 1)
+            XCTAssertEqual(accounting.counters.projectionRetries, 0)
+            XCTAssertEqual(accounting.counters.projectionCoveragesCompleted, 0)
+            let segmentCount = await recorder.snapshots.count { snapshot in
+                if case .segment = snapshot { return true }
+                return false
+            }
+            XCTAssertEqual(segmentCount, 0)
+            await fixture.engine.unloadRoot(rootEpoch: fixture.rootEpoch)
+            await fixture.engine.shutdown()
+        }
+    #endif
+
+    #if DEBUG
+        func testProjectionSharedAttributeEditInsidePrefetchWindowFallsBackAndLatchesOnce() async throws {
+            let repository = try makeRepositoryFixture(name: #function)
+            let paths = (0 ..< 20).map { "Sources/Feature\($0).swift" }
+            var files = Dictionary(uniqueKeysWithValues: paths.enumerated().map { index, path in
+                (path, SwiftFixtureSource.emptyStruct("Feature\(index)"))
+            })
+            files[".gitattributes"] = "*.txt -diff\n"
+            files["Sources/.gitattributes"] = "*.txt -diff\n"
+            let root = try repository.makeRepository(named: "repository", files: files)
+            // Each candidate's attribute evidence is the root and `Sources/` `.gitattributes`, in that
+            // order; the repository capture covers only the root file. Appending to the root file when
+            // the window's last pre-attribute read opens `Sources/.gitattributes` lands the shared edit
+            // between every candidate's pre and post attribute reads.
+            let attributeEdit = SharedAttributeWindowEdit(
+                rootAttributes: root.appendingPathComponent(".gitattributes"),
+                triggerOpenCount: paths.count
+            )
+            let runtime = try CodeMapArtifactRuntime(
+                rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts"),
+                builder: CodeMapArtifactBuilderClient(build: { _, _, _ in .readyNoSymbols })
+            )
+            let recorder = EngineProjectionRecorder()
+            let fixture = try await makeEngineFixture(
+                root: root,
+                runtime: runtime,
+                capabilityHooks: WorkspaceCodemapGitCapabilityServiceHooks(
+                    afterAuthorityEvidenceOpen: { attributeEdit.observeOpen($0) }
+                ),
+                projectionCatalogFactory: { rootEpoch, fileIDs in
+                    let candidates = paths.map { path in
+                        WorkspaceCodemapProjectionCatalogCandidate(
+                            identity: WorkspaceCodemapArtifactBindingIdentity(
+                                rootID: rootEpoch.rootID,
+                                rootLifetimeID: rootEpoch.rootLifetimeID,
+                                fileID: fileIDs.id(for: path),
+                                standardizedRootPath: root.path,
+                                standardizedRelativePath: path,
+                                standardizedFullPath: root.appendingPathComponent(path).path
+                            )!,
+                            language: .swift,
+                            requestGeneration: 1,
+                            pathGeneration: 1
+                        )
+                    }
+                    return EngineProjectionCatalogStub(
+                        rootEpoch: rootEpoch,
+                        entries: candidates,
+                        recorder: recorder
+                    ).client
+                }
+            )
+            _ = await fixture.engine.registerRoot(fixture.registration)
+            _ = try await eligible(fixture.capabilityService.state(for: fixture.rootEpoch))
+            attributeEdit.arm()
+
+            let capturesBefore = await fixture.capabilityService.authorityCaptureCountForTesting()
+            let schedule = await fixture.engine.scheduleProjectionPreload(rootEpoch: fixture.rootEpoch)
+            XCTAssertEqual(schedule, .handedOff)
+            let cancelled = await waitForEngineCondition {
+                await fixture.engine.accounting().counters.projectionCoveragesCancelled == 1
+            }
+            XCTAssertTrue(cancelled)
+            let capturesAfter = await fixture.capabilityService.authorityCaptureCountForTesting()
+
+            XCTAssertTrue(attributeEdit.didEdit)
+            // Every prefetched issuance is `.unstableWindow(.attributes)`. It is not final, so the first
+            // candidate falls back to one single issuance, whose opening capture sees the root
+            // attribute change and latches it: two window captures plus one opening capture.
+            XCTAssertEqual(capturesAfter - capturesBefore, 3)
+            let accounting = await fixture.engine.accounting()
+            XCTAssertEqual(accounting.counters.repositoryAuthorityChanges, 1)
+            XCTAssertEqual(accounting.counters.projectionRetries, 0)
+            XCTAssertEqual(accounting.counters.projectionCoveragesCompleted, 0)
+            let segmentCount = await recorder.snapshots.count { snapshot in
+                if case .segment = snapshot { return true }
+                return false
+            }
+            XCTAssertEqual(segmentCount, 0)
+            await fixture.engine.unloadRoot(rootEpoch: fixture.rootEpoch)
+            await fixture.engine.shutdown()
+        }
+    #endif
+
     func testProjectionPreloadMapsWorktreeAndTerminalGitClassificationsWithoutCleanReuse() async throws {
         let repository = try makeRepositoryFixture(name: #function)
         let submoduleSource = try repository.makeRepository(
@@ -1456,5 +1771,83 @@ final class CodemapBindingEngineProjectionTests: CodemapBindingEngineTestCase {
         XCTAssertEqual(accounting.counters.projectionCoveragesCancelled, 1)
         let snapshots = await recorder.snapshots
         XCTAssertEqual(snapshots.count, 0)
+    }
+}
+
+/// Appends to the root `.gitattributes` once, synchronously, on the armed N-th open of a
+/// `Sources/.gitattributes` evidence file.
+private final class SharedAttributeWindowEdit: @unchecked Sendable {
+    private let lock = NSLock()
+    private let rootAttributes: URL
+    private let triggerOpenCount: Int
+    private var armed = false
+    private var openCount = 0
+    private var edited = false
+
+    init(rootAttributes: URL, triggerOpenCount: Int) {
+        self.rootAttributes = rootAttributes
+        self.triggerOpenCount = triggerOpenCount
+    }
+
+    var didEdit: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return edited
+    }
+
+    func arm() {
+        lock.lock()
+        defer { lock.unlock() }
+        armed = true
+    }
+
+    func observeOpen(_ url: URL) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard armed, !edited,
+              url.lastPathComponent == ".gitattributes",
+              url.deletingLastPathComponent().lastPathComponent == "Sources"
+        else { return }
+        openCount += 1
+        guard openCount == triggerOpenCount,
+              let handle = try? FileHandle(forWritingTo: rootAttributes)
+        else { return }
+        defer { try? handle.close() }
+        handle.seekToEndOfFile()
+        handle.write(Data("*.md -diff\n".utf8))
+        edited = true
+    }
+}
+
+private actor IncludedConfigWindowChurn {
+    struct State: Equatable {
+        let mutated: Bool
+        let reverted: Bool
+    }
+
+    private let configURL: URL
+    private let original: String
+    private var mutated = false
+    private var reverted = false
+
+    init(configURL: URL, original: String) {
+        self.configURL = configURL
+        self.original = original
+    }
+
+    var state: State {
+        State(mutated: mutated, reverted: reverted)
+    }
+
+    func mutateOnce() {
+        guard !mutated else { return }
+        mutated = true
+        try? (original + "[core]\n\tautocrlf = true\n").write(to: configURL, atomically: false, encoding: .utf8)
+    }
+
+    func revertAfterMutation() {
+        guard mutated, !reverted else { return }
+        reverted = true
+        try? original.write(to: configURL, atomically: false, encoding: .utf8)
     }
 }

@@ -26,6 +26,34 @@ enum SnippetPaletteActivationGate {
     }
 }
 
+/// Tab changes are delivered after storage, not on an incidental shell redraw.
+enum AgentHUDActiveTabChangeGate {
+    static func matches(requestWindowID: Int?, currentWindowID: Int) -> Bool {
+        requestWindowID == currentWindowID
+    }
+
+    /// Shared body of the shell's `.activeComposeTabChanged` receiver; the caller supplies animation.
+    /// Returns whether the event targeted this window.
+    @MainActor
+    @discardableResult
+    static func handle(
+        requestWindowID: Int?,
+        currentWindowID: Int,
+        navigationHUD: AgentNavigationHUDViewModel,
+        modelSelectionHUD: AgentModelSelectionHUDViewModel
+    ) -> Bool {
+        guard matches(requestWindowID: requestWindowID, currentWindowID: currentWindowID) else {
+            return false
+        }
+        if navigationHUD.isPresented, !navigationHUD.isRouting {
+            navigationHUD.dismiss()
+        }
+        // Invalidate post-commit focus even when an in-flight operation cannot be dismissed.
+        modelSelectionHUD.activeTabDidChange()
+        return true
+    }
+}
+
 // MARK: - Content Root Shell
 
 struct ContentRootShellView: View {
@@ -111,6 +139,8 @@ struct ContentRootShellView: View {
                     approvalManager: workspaceApprovalManager,
                     request: request
                 )
+                // A promoted request gets a fresh overlay (visible card, Always Allow reset).
+                .id(request.id)
                 .transition(.opacity.combined(with: .scale(scale: 0.95)))
                 .zIndex(1001)
             }
@@ -173,7 +203,7 @@ struct ContentRootShellView: View {
                 #endif
                 animateHUD {
                     agentNavigationHUD.dismiss()
-                    agentModelSelectionHUD.dismiss()
+                    agentModelSelectionHUD.dismiss(reason: .blockingOverlay)
                 }
                 return
             }
@@ -193,7 +223,7 @@ struct ContentRootShellView: View {
                 return
             }
             animateHUD {
-                agentModelSelectionHUD.dismiss()
+                agentModelSelectionHUD.dismiss(reason: .navigation)
                 agentNavigationHUD.present(mode: mode, currentWindow: viewModel.state)
             }
             #if DEBUG
@@ -220,7 +250,7 @@ struct ContentRootShellView: View {
                 #endif
                 animateHUD {
                     agentNavigationHUD.dismiss()
-                    agentModelSelectionHUD.dismiss()
+                    agentModelSelectionHUD.dismiss(reason: .blockingOverlay)
                 }
                 return
             }
@@ -236,7 +266,7 @@ struct ContentRootShellView: View {
                 #if DEBUG
                     logHUDRoutingReceive(command: .modelSelection, note: note, disposition: .workspaceEntry)
                 #endif
-                animateHUD { agentModelSelectionHUD.dismiss() }
+                animateHUD { agentModelSelectionHUD.dismiss(reason: .workspaceEntry) }
                 return
             }
 
@@ -277,22 +307,41 @@ struct ContentRootShellView: View {
                     if agentModelSelectionHUD.isCommitting {
                         agentModelSelectionHUD.suspendForBlockingOverlay()
                     } else {
-                        agentModelSelectionHUD.dismiss()
+                        agentModelSelectionHUD.dismiss(reason: .blockingOverlay)
                     }
                 }
             }
         }
         .onChange(of: agentModelSelectionHUD.isCommitting) { _, isCommitting in
             if !isCommitting, isBlockingOverlayVisible {
-                animateHUD { agentModelSelectionHUD.dismiss() }
+                animateHUD { agentModelSelectionHUD.dismiss(reason: .blockingOverlay) }
             }
         }
-        .onChange(of: viewModel.state.promptManager.activeComposeTabID) { _, _ in
-            if agentNavigationHUD.isPresented, !agentNavigationHUD.isRouting {
-                animateHUD { agentNavigationHUD.dismiss() }
-            }
-            if agentModelSelectionHUD.isPresented, !agentModelSelectionHUD.isRouting {
-                animateHUD { agentModelSelectionHUD.dismiss() }
+        .onReceive(NotificationCenter.default.publisher(for: .activeComposeTabChanged)) { note in
+            let requestWindowID = note.userInfo?["windowID"] as? Int
+            let currentWindowID = viewModel.state.windowID
+            guard AgentHUDActiveTabChangeGate.matches(
+                requestWindowID: requestWindowID,
+                currentWindowID: currentWindowID
+            ) else { return }
+            // No scheduler hop: a later shortcut must not be dismissed by an older tab event.
+            #if DEBUG
+                let hudTraceID = agentModelSelectionHUD.debugTraceID
+                let modelPresented = agentModelSelectionHUD.isPresented
+                let modelCommitting = agentModelSelectionHUD.isCommitting
+                let navigationPresented = agentNavigationHUD.isPresented
+                let navigationRouting = agentNavigationHUD.isRouting
+                Self.hudRoutingLogger.debug(
+                    "active-tab-change windowID=\(currentWindowID, privacy: .public) hud=\(hudTraceID, privacy: .public) modelPresented=\(modelPresented, privacy: .public) modelCommitting=\(modelCommitting, privacy: .public) navigationPresented=\(navigationPresented, privacy: .public) navigationRouting=\(navigationRouting, privacy: .public)"
+                )
+            #endif
+            animateHUD {
+                _ = AgentHUDActiveTabChangeGate.handle(
+                    requestWindowID: requestWindowID,
+                    currentWindowID: currentWindowID,
+                    navigationHUD: agentNavigationHUD,
+                    modelSelectionHUD: agentModelSelectionHUD
+                )
             }
         }
     }
@@ -360,8 +409,9 @@ struct ContentRootShellView: View {
                 ).rawValue
             }
             let window = viewModel.state.nsWindow
+            let hudTraceID = agentModelSelectionHUD.debugTraceID
             Self.hudRoutingLogger.debug(
-                "receive command=\(command.rawValue, privacy: .public) mode=\(mode, privacy: .public) requestWindowID=\(requestWindowID ?? -1, privacy: .public) windowID=\(viewModel.state.windowID, privacy: .public) windowNumber=\(window?.windowNumber ?? -1, privacy: .public) windowIDMatch=\(noteTargetsCurrentWindow(note), privacy: .public) isKeyWindow=\(window?.isKeyWindow == true, privacy: .public) disposition=\(disposition.rawValue, privacy: .public)"
+                "receive command=\(command.rawValue, privacy: .public) mode=\(mode, privacy: .public) hud=\(hudTraceID, privacy: .public) requestWindowID=\(requestWindowID ?? -1, privacy: .public) windowID=\(viewModel.state.windowID, privacy: .public) windowNumber=\(window?.windowNumber ?? -1, privacy: .public) windowIDMatch=\(noteTargetsCurrentWindow(note), privacy: .public) isKeyWindow=\(window?.isKeyWindow == true, privacy: .public) disposition=\(disposition.rawValue, privacy: .public)"
             )
         }
     #endif

@@ -25,6 +25,15 @@ final class RemoteAgentModeCoordinator {
         var remoteSessionID: String
     }
 
+    /// Exact runtime target of one remote input handoff, captured before the first await.
+    private struct RemoteDispatchTarget {
+        let tabID: UUID
+        let controller: RemoteAgentSessionController
+        let hostID: String
+        let remoteSessionID: String?
+        let dispatch: RemoteInputDispatch
+    }
+
     struct WorkspaceOpenEpisodeKey: Hashable {
         var hostID: String
         var clientWorkspaceID: UUID
@@ -150,6 +159,12 @@ final class RemoteAgentModeCoordinator {
         }
     }
 
+    /// Starts a remote session with one user input. `dispatch` is the caller's immutable admission
+    /// identity (allocated at input admission); its delivery attempt is committed before the `start`
+    /// request, and the exact tab, controller, host binding, and recovery lane are revalidated after
+    /// every await. A successful host response is not provider acceptance, so durable input ends
+    /// `deliveryUnknown` (see `RemoteInputHandoffError` for the failure dispositions).
+    @discardableResult
     func startRemoteSession(
         session: AgentTabSession,
         message: String,
@@ -158,9 +173,12 @@ final class RemoteAgentModeCoordinator {
         windowID: Int?,
         workspaceID: String?,
         workspaceName: String?,
-        allowHostSessionNameAdoptionFromStartName: Bool = false
-    ) async throws {
-        let controller = try controller(for: session)
+        allowHostSessionNameAdoptionFromStartName: Bool = false,
+        dispatch: RemoteInputDispatch
+    ) async throws -> AgentRecoveryDispatchEvidence {
+        let target = try captureDispatchTarget(session: session, dispatch: dispatch)
+        let evidence = try await beginRemoteDispatch(target, session: session)
+        let controller = target.controller
         recordStartSessionName(
             sessionName,
             tabID: session.tabID,
@@ -170,14 +188,21 @@ final class RemoteAgentModeCoordinator {
         session.runState = .running
         session.setRunningStatus("Starting on \(session.remoteHost?.hostDisplayName ?? "remote host")…", source: .transport)
         viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-        let remoteSessionID = try await controller.start(
-            message: message,
-            modelSelectionRaw: modelSelectionRaw,
-            sessionName: sessionName,
-            windowID: windowID,
-            workspaceID: workspaceID,
-            workspaceName: workspaceName
-        )
+        let remoteSessionID: String
+        do {
+            remoteSessionID = try await controller.start(
+                message: message,
+                modelSelectionRaw: modelSelectionRaw,
+                sessionName: sessionName,
+                windowID: windowID,
+                workspaceID: workspaceID,
+                workspaceName: workspaceName
+            )
+        } catch {
+            throw Self.ambiguousRemoteHandoff(error, evidence: evidence)
+        }
+        // The host adopted the start. That is bridge/host evidence, not provider acceptance.
+        evidence.noteDeliveryUnknown()
         if var binding = session.remoteHost {
             binding.remoteSessionID = remoteSessionID
             session.remoteHost = binding
@@ -186,10 +211,21 @@ final class RemoteAgentModeCoordinator {
                 await self?.refreshWorkspaceSessionCatalogAfterSuccessfulStart(hostID: binding.hostID)
             }
         }
+        return evidence
     }
 
-    func steer(session: AgentTabSession, text: String) async throws {
-        let controller = try controller(for: session)
+    /// Steers the remote session with one user input. The observation preflight runs before the
+    /// dispatch is committed (it never hands the input off); the delivery attempt is committed right
+    /// before the `steer` request and the exact target is revalidated after every await. A successful
+    /// host response is not provider acceptance, so durable input ends `deliveryUnknown`.
+    @discardableResult
+    func steer(
+        session: AgentTabSession,
+        text: String,
+        dispatch: RemoteInputDispatch
+    ) async throws -> AgentRecoveryDispatchEvidence {
+        let target = try captureDispatchTarget(session: session, dispatch: dispatch)
+        let controller = target.controller
         // Self-heal: a session can reach steer without observation ever attaching —
         // e.g. a restored terminal child session that attachPersistedSessionIfNeeded
         // deliberately skipped, or a proxy whose earlier attach failed non-transiently.
@@ -198,10 +234,144 @@ final class RemoteAgentModeCoordinator {
         // steer and surfaces as a send failure (resending retries the attach).
         // Transient failures are absorbed inside attachAndCatchUp, which schedules
         // automatic observation recovery; the steer then proceeds.
-        if await !controller.hasAttachedObservation() {
-            try await controller.attachAndCatchUp()
+        // Nothing is committed yet, so a preflight failure or a stale target is a proven no-handoff.
+        do {
+            if await !controller.hasAttachedObservation() {
+                try await controller.attachAndCatchUp()
+            }
+        } catch {
+            throw RemoteInputHandoffError(disposition: .notHandedOff, cause: .remote(error), evidence: nil)
         }
-        try await controller.steer(text)
+        // Only the runtime target is revalidated here; the admission authority is decided by the
+        // dispatch begin (an untracked input under mandatory admission is refused there, not stale),
+        // and `beginRemoteDispatch` revalidates the full target after its commit.
+        guard isRuntimeTargetCurrent(target, session: session) else {
+            throw RemoteInputHandoffError(disposition: .notHandedOff, cause: .staleTarget, evidence: nil)
+        }
+        let evidence = try await beginRemoteDispatch(target, session: session)
+        do {
+            try await controller.steer(text)
+        } catch {
+            throw Self.ambiguousRemoteHandoff(error, evidence: evidence)
+        }
+        // The host accepted the steer command. That is bridge/host evidence, not provider acceptance.
+        evidence.noteDeliveryUnknown()
+        return evidence
+    }
+
+    // MARK: Remote input dispatch evidence
+
+    /// Captures the exact runtime target before any await. Throwing here is a proven no-handoff.
+    private func captureDispatchTarget(
+        session: AgentTabSession,
+        dispatch: RemoteInputDispatch
+    ) throws -> RemoteDispatchTarget {
+        let controller: RemoteAgentSessionController
+        do {
+            controller = try self.controller(for: session)
+        } catch {
+            throw RemoteInputHandoffError(disposition: .notHandedOff, cause: .remote(error), evidence: nil)
+        }
+        guard let binding = session.remoteHost else {
+            throw RemoteInputHandoffError(
+                disposition: .notHandedOff,
+                cause: .remote(RemoteClientError.protocolViolation("Session is not bound to a remote host.")),
+                evidence: nil
+            )
+        }
+        return RemoteDispatchTarget(
+            tabID: session.tabID,
+            controller: controller,
+            hostID: binding.hostID,
+            remoteSessionID: binding.normalizedRemoteSessionID,
+            dispatch: dispatch
+        )
+    }
+
+    /// Commits the delivery attempt (durable input) and revalidates the exact target after the await.
+    /// A refused commit or a stale target never reaches the network; a stale target settles the same
+    /// intent back to `queued` (proven pre-handoff).
+    private func beginRemoteDispatch(
+        _ target: RemoteDispatchTarget,
+        session: AgentTabSession
+    ) async throws -> AgentRecoveryDispatchEvidence {
+        let evidence: AgentRecoveryDispatchEvidence
+        let begun: Result<AgentRecoveryDispatchEvidence, AgentRecoveryAdmissionFailure> =
+            switch target.dispatch.source {
+            case let .input(input):
+                await AgentRecoveryDispatchEvidence.begin(
+                    session: session,
+                    constituents: [input],
+                    runAttemptID: nil,
+                    authorization: target.dispatch.authorization
+                )
+            case let .existingIntent(intent):
+                await AgentRecoveryDispatchEvidence.beginExistingIntent(
+                    session: session,
+                    intent: intent,
+                    runAttemptID: nil
+                )
+            }
+        switch begun {
+        case let .success(begun):
+            evidence = begun
+        case let .failure(failure):
+            Self.logger.notice("remote dispatch refused tab_id=\(target.tabID.uuidString, privacy: .public) failure=\(String(describing: failure), privacy: .public)")
+            throw RemoteInputHandoffError(disposition: .notHandedOff, cause: .dispatchRefused(failure), evidence: nil)
+        }
+        // Final synchronous ownership check (R06): callers reach the network with no suspension after
+        // this, so a lane retired or frozen for reset since the commit never hands off.
+        guard isDispatchTargetCurrent(target, session: session),
+              evidence.isValidForHandoff(in: session)
+        else {
+            evidence.noteNoHandoff(message: RemoteInputHandoffError.staleTargetMessage)
+            Self.logger.notice("remote dispatch target went stale before handoff tab_id=\(target.tabID.uuidString, privacy: .public)")
+            throw RemoteInputHandoffError(disposition: .notHandedOff, cause: .staleTarget, evidence: evidence)
+        }
+        return evidence
+    }
+
+    /// Synchronous freshness check: same live tab session, same controller, same host and remote
+    /// session, and the admission authority the input was issued under.
+    private func isDispatchTargetCurrent(_ target: RemoteDispatchTarget, session: AgentTabSession) -> Bool {
+        guard isRuntimeTargetCurrent(target, session: session) else { return false }
+        let durableBinding: AgentRecoveryLifecycleBinding? = switch target.dispatch.source {
+        case let .input(input):
+            input.queueReceipt?.intent.binding
+        case let .existingIntent(intent):
+            intent.binding
+        }
+        if let durableBinding {
+            guard let lane = session.recoveryLane,
+                  !lane.isRetired,
+                  lane.binding == durableBinding
+            else { return false }
+        } else {
+            guard session.recoveryAdmissionMode == .inactive else { return false }
+        }
+        return true
+    }
+
+    /// Same live tab session, same controller, and same host and remote session (no admission check).
+    private func isRuntimeTargetCurrent(_ target: RemoteDispatchTarget, session: AgentTabSession) -> Bool {
+        guard let viewModel, viewModel.sessions[target.tabID] === session else { return false }
+        guard controllersByTabID[target.tabID] === target.controller else { return false }
+        guard let binding = session.remoteHost,
+              binding.hostID == target.hostID,
+              binding.normalizedRemoteSessionID == target.remoteSessionID
+        else { return false }
+        return true
+    }
+
+    /// The request was handed to the remote bridge and failed without proof either way (the
+    /// controller can throw after the host adopted the input, e.g. in post-response observation, and
+    /// even start-target codes can follow a host-side retry). Never a retryable no-handoff.
+    private static func ambiguousRemoteHandoff(
+        _ error: Error,
+        evidence: AgentRecoveryDispatchEvidence
+    ) -> RemoteInputHandoffError {
+        evidence.noteDeliveryUnknown()
+        return RemoteInputHandoffError(disposition: .deliveryUnknown, cause: .remote(error), evidence: evidence)
     }
 
     func fork(
@@ -1952,6 +2122,12 @@ final class RemoteAgentModeCoordinator {
         workspaceName: String? = nil,
         hostName: String? = nil
     ) -> String {
+        if let handoffError = error as? RemoteInputHandoffError {
+            if let remoteError = handoffError.remoteError {
+                return describe(remoteError, workspaceName: workspaceName, hostName: hostName)
+            }
+            return handoffError.errorDescription ?? String(describing: handoffError)
+        }
         if let commandError = (error as? RemoteClientError)?.commandError {
             if commandError.code == "binding_required" {
                 return "The host couldn't route this message to its window. Try again — if it keeps failing, the session's window may have been closed on the host."
@@ -1994,5 +2170,89 @@ final class RemoteAgentModeCoordinator {
         let parts = message.split(separator: "'", omittingEmptySubsequences: false)
         guard parts.count >= 3 else { return nil }
         return normalizedFriendlyName(String(parts[1]))
+    }
+}
+
+// MARK: - Remote input dispatch (lossless restart Phase 1b)
+
+/// The caller-provided admission identity of one remote `start`/`steer` input. `input` is allocated
+/// once at input admission (a store-issued queue receipt, or an untracked identity only while the
+/// session's recovery admission is explicitly `.inactive`) and carries the original user item ID.
+/// Use `.explicitUserAction` for user-initiated resend and start-target picker retries: those are
+/// the only dispatches the store allows for `deliveryUnknown`/`failed` intents.
+struct RemoteInputDispatch {
+    enum Source {
+        /// Input admitted for this send (store-issued queue receipt, or untracked while inactive).
+        case input(AgentQueuedInputIdentity)
+        /// An intent already committed for this item, re-dispatched by an explicit user action
+        /// (read from the lane's record; no receipt is minted).
+        case existingIntent(AgentRecoveryExistingIntentReference)
+    }
+
+    let source: Source
+    let authorization: AgentRecoveryDispatchAuthorization
+
+    init(input: AgentQueuedInputIdentity, authorization: AgentRecoveryDispatchAuthorization = .liveQueue) {
+        source = .input(input)
+        self.authorization = authorization
+    }
+
+    /// Explicit user re-dispatch of an existing durable intent (always `.explicitUserAction`).
+    init(existingIntent: AgentRecoveryExistingIntentReference) {
+        source = .existingIntent(existingIntent)
+        authorization = .explicitUserAction
+    }
+}
+
+/// A remote `start`/`steer` input that did not complete with a host response.
+struct RemoteInputHandoffError: Error, LocalizedError {
+    enum Disposition: Equatable {
+        /// Nothing reached the remote bridge: target capture, observation preflight, dispatch
+        /// commit, or post-await revalidation failed. Durable input keeps (or settles back to) the
+        /// same `queued` intent.
+        case notHandedOff
+        /// The request reached the remote bridge without proof either way. Durable input stays
+        /// `deliveryUnknown`: no automatic resend and no retryable draft restore.
+        case deliveryUnknown
+    }
+
+    enum Cause {
+        /// Durable dispatch commit refused or failed (`AgentRecoveryDispatchEvidence.begin`).
+        case dispatchRefused(AgentRecoveryAdmissionFailure)
+        /// Tab session, controller, host binding, or recovery authority changed during an await.
+        case staleTarget
+        /// The remote client/bridge error (unchanged; see `remoteError`).
+        case remote(any Error)
+    }
+
+    static let staleTargetMessage = "The remote session changed before the message was sent."
+
+    let disposition: Disposition
+    let cause: Cause
+    /// Evidence of the committed dispatch; `nil` when no dispatch was begun.
+    let evidence: AgentRecoveryDispatchEvidence?
+
+    /// The remote client error, for start-target picker and error classification.
+    var remoteError: (any Error)? {
+        if case let .remote(error) = cause {
+            return error
+        }
+        return nil
+    }
+
+    /// `error`'s remote client error when it is a handoff error, otherwise `error` itself.
+    static func remoteError(of error: any Error) -> any Error {
+        (error as? RemoteInputHandoffError)?.remoteError ?? error
+    }
+
+    var errorDescription: String? {
+        switch cause {
+        case let .remote(error):
+            (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+        case .staleTarget:
+            Self.staleTargetMessage + " It stays saved."
+        case let .dispatchRefused(failure):
+            failure.dispatchFailureText
+        }
     }
 }

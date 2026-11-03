@@ -1,8 +1,10 @@
+import AppKit
 @testable import RepoPromptAgentCore
 @testable import RepoPromptApp
 @testable import RepoPromptPlatform
 @testable import RepoPromptUI
 @testable import RepoPromptWorkspace
+import SwiftUI
 import XCTest
 
 @MainActor
@@ -219,6 +221,34 @@ final class WindowCloseCoordinatorLifecycleTests: XCTestCase {
         XCTAssertEqual(validationStartCount, 0)
     }
 
+    /// R4-3: a window scene's existing activation (initial workspace activation) waits for app-wide
+    /// admission at registration; a window refused during an app quit never activates.
+    func testWindowSceneActivationWaitsForAdmissionAndARefusedWindowNeverActivates() async {
+        let refused = trackWindow(WindowState.forWindowScene())
+        let admitted = trackWindow(WindowState.forWindowScene())
+        XCTAssertEqual(refused.applicationAdmission, .pending)
+        XCTAssertEqual(admitted.applicationAdmission, .pending)
+
+        refused.refuseApplicationAdmission()
+        refused.activateAfterApplicationAdmission()
+        XCTAssertEqual(refused.applicationAdmission, .refusedDuringQuit, "a refusal is final")
+        await waitForPendingMainQueueWork()
+        for _ in 0 ..< 50 {
+            await Task.yield()
+        }
+        XCTAssertFalse(refused.workspaceManager.isInitialized, "a refused window never activates its workspace")
+        XCTAssertFalse(admitted.workspaceManager.isInitialized, "activation waits for admission")
+
+        admitted.activateAfterApplicationAdmission()
+        XCTAssertEqual(admitted.applicationAdmission, .admitted)
+        let deadline = Date().addingTimeInterval(fullSuiteAsyncTimeoutSeconds)
+        while !admitted.workspaceManager.isInitialized, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+        XCTAssertTrue(admitted.workspaceManager.isInitialized, "admission runs the deferred activation")
+        XCTAssertFalse(refused.workspaceManager.isInitialized)
+    }
+
     private func trackWindow(_ makeWindow: @autoclosure () -> WindowState) -> WindowState {
         let previousMCPAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
@@ -268,6 +298,26 @@ final class WindowCloseCoordinatorLifecycleTests: XCTestCase {
 
         XCTFail("Subscriber count did not stabilize at \(expectedCount); last count was \(latestCount)")
         return false
+    }
+
+    /// Real (offscreen, never ordered front) `NSHostingView` over the production
+    /// `WindowAdmissionLifecycleHost`: admission pending → admitted swaps the content branch but
+    /// never reports the window's content disappearing (which would unregister and tear it down).
+    func testAdmissionBranchChangeNeverReportsTheWindowContentDisappearing() {
+        let model = AdmissionHostingModel()
+        let recorder = AdmissionLifecycleRecorder()
+        let host = OffscreenAdmissionHost(rootView: ProductionAdmissionProbe(model: model, recorder: recorder))
+        defer { host.close() }
+        host.settle()
+        XCTAssertEqual(recorder.events, ["branch:pending", "appear"].sorted(), "the host appears once, pending")
+
+        recorder.reset()
+        model.admission = .admitted
+        host.settle()
+        XCTAssertEqual(recorder.count("branch:admitted"), 1, "the admitted branch must actually replace the pending one")
+        XCTAssertEqual(recorder.count("branch:pending:disappear"), 1, "the fixture observes the replaced branch disappearing")
+        XCTAssertEqual(recorder.count("disappear"), 0, "admission must not read as the window going away")
+        XCTAssertEqual(recorder.count("appear"), 0, "the window must not re-register")
     }
 
     private func waitForClientObservation(
@@ -628,6 +678,101 @@ private actor LifecycleCompletionProbe {
 
     func markCompleted() {
         isCompleted = true
+    }
+}
+
+@MainActor
+private final class AdmissionHostingModel: ObservableObject {
+    @Published var admission: WindowState.ApplicationAdmission = .pending
+}
+
+@MainActor
+private final class AdmissionLifecycleRecorder {
+    private(set) var raw: [String] = []
+
+    var events: [String] {
+        raw.sorted()
+    }
+
+    func record(_ event: String) {
+        raw.append(event)
+    }
+
+    func reset() {
+        raw.removeAll()
+    }
+
+    func count(_ event: String) -> Int {
+        raw.count(where: { $0 == event })
+    }
+}
+
+private struct ProductionAdmissionProbe: View {
+    @ObservedObject var model: AdmissionHostingModel
+    let recorder: AdmissionLifecycleRecorder
+
+    var body: some View {
+        WindowAdmissionLifecycleHost(
+            admission: model.admission,
+            onAppear: { recorder.record("appear") },
+            onDisappear: { recorder.record("disappear") }
+        ) { admission in
+            admissionBranch(admission, recorder: recorder)
+        }
+    }
+}
+
+/// Branch-per-admission content, inlined like `WindowContentView.admittedContent(_:)` (a
+/// `@ViewBuilder` member, not a separate view with its own identity).
+@MainActor
+@ViewBuilder
+private func admissionBranch(
+    _ admission: WindowState.ApplicationAdmission,
+    recorder: AdmissionLifecycleRecorder
+) -> some View {
+    switch admission {
+    case .admitted:
+        Text("admitted").onAppear { recorder.record("branch:admitted") }
+    case .pending:
+        Color.clear
+            .onAppear { recorder.record("branch:pending") }
+            .onDisappear { recorder.record("branch:pending:disappear") }
+    case .refusedDuringQuit:
+        Text("quitting").onAppear { recorder.record("branch:refusedDuringQuit") }
+    }
+}
+
+@MainActor
+private final class OffscreenAdmissionHost {
+    private let window: NSWindow
+    private let hostingView: NSView
+
+    init(rootView: some View) {
+        let size = CGSize(width: 320, height: 200)
+        let hostingView = NSHostingView(rootView: rootView)
+        hostingView.frame = CGRect(origin: .zero, size: size)
+        window = NSWindow(
+            contentRect: CGRect(origin: CGPoint(x: -10000, y: -10000), size: size),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        window.contentView = hostingView
+        self.hostingView = hostingView
+    }
+
+    func settle() {
+        for _ in 0 ..< 6 {
+            hostingView.layoutSubtreeIfNeeded()
+            RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+        }
+        hostingView.layoutSubtreeIfNeeded()
+    }
+
+    func close() {
+        window.contentView = nil
+        window.close()
     }
 }
 

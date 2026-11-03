@@ -43,7 +43,8 @@ final class OhMyPiACPHeadlessAgentProvider: HeadlessAgentProvider {
                 verifyLiveRoute: { runID in
                     await mcpHost.hasAuthoritativeLiveRunRoute(
                         runID: runID,
-                        expectedClientName: AgentProviderKind.ohMyPiMCPClientID
+                        expectedClientName: AgentProviderKind.ohMyPiMCPClientID,
+                        requiredAgentPID: nil
                     )
                 }
             )
@@ -108,7 +109,8 @@ final class OhMyPiACPHeadlessAgentProvider: HeadlessAgentProvider {
             resumeSessionID: message.resumeSessionID,
             attachments: [],
             taskLabelKind: nil,
-            additionalConfigOptionValues: config.additionalConfigOptionValues
+            additionalConfigOptionValues: config.additionalConfigOptionValues,
+            runtimeSession: message.runtimeSession
         )
     }
 

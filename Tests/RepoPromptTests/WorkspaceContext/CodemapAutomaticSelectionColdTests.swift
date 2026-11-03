@@ -557,7 +557,11 @@ final class CodemapAutomaticSelectionColdTests: WorkspaceFileContextStoreCodemap
         await coldStore.unloadRoot(id: coldRoot.id)
     }
 
-    func testAutomaticSelectionFinalizationDeadlineFailsClosedWhileCleanupContinues() async throws {
+    /// Finalization releases a ready, reusable remainder warm, so a blocked cleanup hook neither
+    /// runs nor consumes the finalization deadline. The fail-closed contract for a pending or
+    /// non-reusable remainder needs a remainder demand held through graph resolution and is not
+    /// covered here.
+    func testAutomaticSelectionFinalizationReleasesReadyRemainderWarmPastBlockedCleanup() async throws {
         let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
         let root = try repositoryFixture.makeRepository(
             named: "repository",
@@ -623,8 +627,8 @@ final class CodemapAutomaticSelectionColdTests: WorkspaceFileContextStoreCodemap
                 )
         }
 
-        let cleanupEntered = await cleanupGate.waitUntilEntered()
-        XCTAssertTrue(cleanupEntered)
+        // Finalization releases its ready remainder tickets warm: no demand cleanup runs, so a
+        // blocked cleanup hook cannot consume the deadline and the current result publishes.
         let completedBeforeDeadline = await waitForCompletionBeforeExternalDeadline(
             externalCompletion,
             clock: externalClock,
@@ -635,12 +639,19 @@ final class CodemapAutomaticSelectionColdTests: WorkspaceFileContextStoreCodemap
             await cleanupGate.release()
             let drained = await waitForBoundedCompletionDrain(externalCompletion)
             XCTAssertTrue(drained, "Finalization cleanup did not drain within its external bound")
-            return XCTFail("Finalization deadline did not fail closed within the external bound")
+            return XCTFail("Finalization did not complete within the external bound")
         }
         let result = try await resolution.value
-        XCTAssertTrue(result.targets.isEmpty)
-        XCTAssertNil(result.publicationReceipt)
-        XCTAssertEqual(result.aggregateCoverage, .stale(.publicationReceipt))
+        let cleanupEntered = await cleanupGate.waitUntilEntered(
+            timeout: .milliseconds(200),
+            failOnTimeout: false
+        )
+        XCTAssertFalse(cleanupEntered, "Warm finalization releases must not run demand cleanup.")
+        XCTAssertEqual(result.targets.map(\.fileID), [target.id])
+        let receipt = try XCTUnwrap(result.publicationReceipt, "\(result.aggregateCoverage)")
+        if let lease = receipt.publicationLease {
+            await lease.release()
+        }
         let sourceRetainCount = await store.codemapArtifactDemandRetainCountForTesting(
             rootEpoch: rootEpoch,
             fileID: source.id

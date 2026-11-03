@@ -19,6 +19,8 @@ import SwiftUI
 @MainActor
 class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
     private var quitRequestPhase: AppQuitRequestPhase = .idle
+    /// The shutdown request whose reply this delegate awaits (log correlation only).
+    private var shutdownRequestID: UUID?
     private var presentedQuitAlert: NSAlert?
     private weak var presentedQuitAlertParent: NSWindow?
     private let dockMenuController = DockMenuController()
@@ -159,6 +161,10 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        // Bound to THIS termination request (review A P1-09): taken before any path that may not
+        // start R4 (a cancelled confirmation, a request joining one in progress), so a later
+        // ordinary Quit never restarts.
+        let reason = WindowStatesManager.shared.shutdownReasonLatch.take()
         let activeItems = WindowStatesManager.shared.allWindows.flatMap { windowState in
             WindowCloseCoordinator.activeItems(for: windowState.makeCloseImpactSnapshot())
         }
@@ -169,19 +175,42 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
             activeItems: activeItems
         )
 
+        AgentLifecycleShutdownDiagnostics.terminateRequested(
+            decision: Self.diagnosticToken(decision),
+            phase: Self.diagnosticToken(quitRequestPhase),
+            reason: reason,
+            current: WindowStatesManager.shared.lifecycleShutdown.activeApplicationRequestID
+        )
         switch decision {
         case let .showConfirmation(confirmation):
-            presentQuitConfirmation(confirmation, sender: sender)
+            presentQuitConfirmation(confirmation, reason: reason, sender: sender)
         case .beginTermination:
-            beginTermination(sender: sender)
+            beginTermination(sender: sender, reason: reason)
         case .awaitCurrentRequest:
             break
         }
         return .terminateLater
     }
 
+    private static func diagnosticToken(_ decision: AppQuitRequestDecision) -> String {
+        switch decision {
+        case .showConfirmation: "show_confirmation"
+        case .beginTermination: "begin_termination"
+        case .awaitCurrentRequest: "await_current_request"
+        }
+    }
+
+    private static func diagnosticToken(_ phase: AppQuitRequestPhase) -> String {
+        switch phase {
+        case .idle: "idle"
+        case .awaitingConfirmation: "awaiting_confirmation"
+        case .terminating: "terminating"
+        }
+    }
+
     private func presentQuitConfirmation(
         _ confirmation: AppQuitConfirmation,
+        reason: AgentRecoveryShutdownReason,
         sender: NSApplication
     ) {
         let alert = NSAlert()
@@ -195,7 +224,7 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
 
         let completion: (NSApplication.ModalResponse) -> Void = { [weak self] response in
             Task { @MainActor in
-                self?.handleQuitConfirmationResponse(response, alert: alert, sender: sender)
+                self?.handleQuitConfirmationResponse(response, alert: alert, reason: reason, sender: sender)
             }
         }
         if let parentWindow = sender.keyWindow ?? sender.mainWindow {
@@ -229,13 +258,18 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
     private func handleQuitConfirmationResponse(
         _ response: NSApplication.ModalResponse,
         alert: NSAlert,
+        reason: AgentRecoveryShutdownReason,
         sender: NSApplication
     ) {
         guard quitRequestPhase == .awaitingConfirmation,
               presentedQuitAlert === alert
         else {
+            AgentLifecycleShutdownDiagnostics.quitConfirmationAnswered("stale")
             return
         }
+        AgentLifecycleShutdownDiagnostics.quitConfirmationAnswered(
+            response == .alertSecondButtonReturn ? "quit" : "cancel"
+        )
         if let parentWindow = presentedQuitAlertParent {
             NotificationCenter.default.removeObserver(
                 self,
@@ -247,34 +281,47 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         presentedQuitAlert = nil
 
         if response == .alertSecondButtonReturn {
-            beginTermination(sender: sender)
+            beginTermination(sender: sender, reason: reason)
         } else {
             quitRequestPhase = .idle
             sender.reply(toApplicationShouldTerminate: false)
         }
     }
 
-    private func beginTermination(sender: NSApplication) {
-        guard quitRequestPhase != .terminating else { return }
+    private func beginTermination(sender: NSApplication, reason: AgentRecoveryShutdownReason) {
+        guard quitRequestPhase != .terminating else {
+            AgentLifecycleShutdownDiagnostics.terminationBegan(
+                started: false,
+                current: WindowStatesManager.shared.lifecycleShutdown.activeApplicationRequestID,
+                cause: "already_terminating"
+            )
+            return
+        }
         quitRequestPhase = .terminating
 
-        // Signal termination only after the user has confirmed (or the warning is bypassed).
-        WindowStatesManager.shared.signalTermination()
-        ProcessTermination.beginAppTerminationFastPath()
-        MCPBackgroundModeCoordinator.shared.resetForTermination()
-
-        // Persist the final restorable window session before async shutdown begins.
-        // Using .terminateLater lets us do async work without deadlocking.
-        Task { @MainActor in
-            if !AppLaunchConfiguration.current.suppressesWindowPersistence {
-                await WindowStatesManager.shared.persistWindowSessionImmediately(reason: "appShouldTerminate")
+        // Two-stage quit (spec R4): the coordinator freezes admission synchronously, preserves
+        // layout and agent state (Stage A, cancellable), and only then sets the termination flags
+        // and tears down (Stage B). It owns the single reply: `false` after a cancelled Stage A
+        // (the app stays usable), `true` once Stage B finished or the user chose Quit Anyway.
+        let lifecycleShutdown = WindowStatesManager.shared.lifecycleShutdown
+        // A refused request replies synchronously, before any request of its own exists.
+        shutdownRequestID = nil
+        let started = lifecycleShutdown.requestApplicationQuit(reason: reason) { [weak self] shouldTerminate in
+            AgentLifecycleShutdownDiagnostics.terminateReply(shouldTerminate, current: self?.shutdownRequestID)
+            if !shouldTerminate {
+                self?.quitRequestPhase = .idle
+                self?.shutdownRequestID = nil
             }
-
-            // Shut down agent processes and MCP tools on the main actor WITHOUT blocking.
-            await OhMyPiThinkingCapabilityResolver.shared.cancel(reason: .appTermination)
-            await WindowStatesManager.shared.shutdownAllAgentSessions()
-            await WindowStatesManager.shared.stopAllServers()
-            sender.reply(toApplicationShouldTerminate: true)
+            sender.reply(toApplicationShouldTerminate: shouldTerminate)
+        }
+        // Not started: refused (it already replied `false`, resetting the phase, or an earlier quit
+        // is sealed past its point of no return), or joined the request in progress.
+        let refused = !started && (quitRequestPhase == .idle || lifecycleShutdown.isApplicationAdmissionSealed)
+        let cause = started ? "started" : refused ? "refused" : "joined_in_progress"
+        shutdownRequestID = refused ? nil : lifecycleShutdown.activeApplicationRequestID
+        AgentLifecycleShutdownDiagnostics.terminationBegan(started: started, current: shutdownRequestID, cause: cause)
+        if !started {
+            appDelegateDebugLog("quit request did not start a shutdown (\(cause))")
         }
     }
 

@@ -150,20 +150,21 @@ class PolicyTests(unittest.TestCase):
 
     def test_optimized_lane_argv_keeps_full_symbols_and_debug_policy_is_unchanged(self) -> None:
         # The exact vectors canonical_swift.sh classifies for the optimized-diagnostics lane.
-        prefix = ["build", "--build-system", "native", "--no-color-diagnostics",
-                  "--scratch-path", "/repo/.build/optimized-diagnostics"]
-        for tail in (["-c", "release"], ["-c", "release", "--show-bin-path"]):
-            for requested in (None, "off", "on"):
-                with self.subTest(tail=tail, requested=requested):
-                    decision = self.decide(prefix + tail, requested)
-                    self.assertEqual((decision.configuration, decision.effective), ("release", "on"))
-                    self.assertFalse(decision.skip)
-        # The scratch-path operand never changes the debug classification.
-        for argv in (prefix, prefix + ["-c", "debug"], prefix + ["--show-bin-path"]):
-            with self.subTest(argv=argv):
-                decision = self.decide(argv)
-                self.assertEqual((decision.configuration, decision.effective, decision.reason),
-                                 ("debug", "off", "debug_skip"))
+        # The optimized-incremental App lane classifies identically from its own scratch folder.
+        for scratch in ("/repo/.build/optimized-diagnostics", "/repo/.build/optimized-incremental"):
+            prefix = ["build", "--build-system", "native", "--no-color-diagnostics", "--scratch-path", scratch]
+            for tail in (["-c", "release"], ["-c", "release", "--show-bin-path"]):
+                for requested in (None, "off", "on"):
+                    with self.subTest(scratch=scratch, tail=tail, requested=requested):
+                        decision = self.decide(prefix + tail, requested)
+                        self.assertEqual((decision.configuration, decision.effective), ("release", "on"))
+                        self.assertFalse(decision.skip)
+            # The scratch-path operand never changes the debug classification.
+            for argv in (prefix, prefix + ["-c", "debug"], prefix + ["--show-bin-path"]):
+                with self.subTest(argv=argv):
+                    decision = self.decide(argv)
+                    self.assertEqual((decision.configuration, decision.effective, decision.reason),
+                                     ("debug", "off", "debug_skip"))
 
 
 class OptimizedLaneWrapperTests(unittest.TestCase):
@@ -171,7 +172,7 @@ class OptimizedLaneWrapperTests(unittest.TestCase):
 
     WRAPPER = SCRIPT_DIR / "canonical_swift.sh"
     POLICY_KEYS = {"RPCE_DEBUG_DSYM", "RPCE_INDEX_STORE", "REPOPROMPT_ENABLE_SENTRY", "SWIFT_DRIVER_DSYMUTIL_EXEC",
-                   "RPCE_OPTIMIZED_DIAGNOSTICS", "RPCE_ENABLE_BENCHMARK_TESTS", "RPCE_RUN_CODEMAP_E2E",
+                   "RPCE_OPTIMIZED_DIAGNOSTICS", "RPCE_OPTIMIZED_INCREMENTAL", "RPCE_ENABLE_BENCHMARK_TESTS", "RPCE_RUN_CODEMAP_E2E",
                    "RPCE_RUN_SCALE_TESTS", "DEVELOPER_DIR", "SDKROOT", "TOOLCHAINS", "PWD", "OLDPWD"}
 
     def setUp(self) -> None:
@@ -283,6 +284,105 @@ class OptimizedLaneWrapperTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIsNone(child_env)
         self.assertIn("must run from the package root", stderr)
+
+    def test_inherited_incremental_gate_never_changes_the_optimized_lane(self) -> None:
+        for tail in (["-c", "release"], ["-c", "release", "--show-bin-path"]):
+            with self.subTest(tail=tail):
+                plain = self.run_wrapper(self.lane("build", *tail))
+                inherited = self.run_wrapper(self.lane("build", *tail), {"RPCE_OPTIMIZED_INCREMENTAL": "1"})
+                self.assertEqual(inherited, plain)
+                self.assertFalse(any(item.startswith("RPCE_OPTIMIZED_INCREMENTAL") for item in plain[1]))
+                self.assertIn(self.scratch, plain[2])
+
+
+class OptimizedIncrementalLaneWrapperTests(unittest.TestCase):
+    """canonical_swift.sh --rpce-optimized-incremental: the optimized lane's rules, both gates, own scratch."""
+
+    FLAG = "--rpce-optimized-incremental"
+
+    def setUp(self) -> None:
+        self.base = OptimizedLaneWrapperTests("test_lane_requires_the_package_root_as_working_directory")
+        self.base.setUp()
+        self.addCleanup(self.base.doCleanups)
+        self.package = self.base.package
+        self.scratch = str(self.package / ".build" / "optimized-incremental")
+
+    def run_wrapper(self, arguments, extra_env=None, cwd=None):
+        return self.base.run_wrapper(arguments, extra_env, cwd)
+
+    def lane(self, *arguments):
+        return [self.FLAG, *arguments]
+
+    def test_lane_adds_both_gates_and_its_own_scratch_path(self) -> None:
+        _, plain_env, _, _ = self.run_wrapper(["build", "-c", "release"])
+        _, optimized_env, optimized_args, _ = self.run_wrapper(["--rpce-optimized-diagnostics", "build", "-c", "release"])
+        for tail in (["-c", "release"], ["-c", "release", "--show-bin-path"], ["--show-bin-path", "-c", "release"]):
+            for extra in ({}, {"RPCE_OPTIMIZED_INCREMENTAL": "0"}, {"RPCE_OPTIMIZED_INCREMENTAL": "1"},
+                          {"RPCE_OPTIMIZED_DIAGNOSTICS": "0"}, {"RPCE_DEBUG_DSYM": "off"}, {"RPCE_INDEX_STORE": "on"}):
+                with self.subTest(tail=tail, extra=extra):
+                    code, child_env, swift_args, stderr = self.run_wrapper(self.lane("build", *tail), extra)
+                    self.assertEqual(code, 0, stderr)
+                    # The optimized lane's environment plus exactly the incremental gate, appended last.
+                    self.assertEqual(optimized_env, plain_env + ["RPCE_OPTIMIZED_DIAGNOSTICS=1"])
+                    self.assertEqual(child_env, optimized_env + ["RPCE_OPTIMIZED_INCREMENTAL=1"])
+                    self.assertEqual(swift_args, ["build", "--build-system", "native", "--no-color-diagnostics",
+                                                  "--scratch-path", self.scratch, *tail])
+                    self.assertNotIn("--disable-index-store", swift_args)
+                    self.assertFalse(any(item.startswith("SWIFT_DRIVER_DSYMUTIL_EXEC=") for item in child_env))
+                    self.assertFalse(any(token.startswith("-j") for token in swift_args))  # SwiftPM picks -j
+                    self.assertIn("effective=on reason=configuration_release configuration=release", stderr)
+        self.assertNotIn(self.scratch, optimized_args)
+
+    def test_inherited_incremental_gate_never_reaches_swift_without_the_flag(self) -> None:
+        for arguments in (["build"], ["build", "-c", "release"], ["test", "list"], ["package", "resolve"]):
+            with self.subTest(arguments=arguments):
+                plain = self.run_wrapper(arguments)
+                inherited = self.run_wrapper(
+                    arguments, {"RPCE_OPTIMIZED_INCREMENTAL": "1", "RPCE_OPTIMIZED_DIAGNOSTICS": "1"}
+                )
+                self.assertEqual(inherited, plain)
+                self.assertFalse(any(item.startswith("RPCE_OPTIMIZED") for item in plain[1]))
+
+    def test_unsafe_mixed_or_unsupported_lane_argv_exits_2_before_swift(self) -> None:
+        cases = (
+            ([], "supports only the build command"),
+            (["test", "-c", "release"], "supports only the build command"),
+            (["--rpce-optimized-diagnostics", "build", "-c", "release"],
+             "supports only the build command; got '--rpce-optimized-diagnostics'"),
+            (["build"], "requires '-c release'"),
+            (["build", "-c", "debug"], "requires exactly one '-c release'"),
+            (["build", "-c", "release", "-c", "release"], "requires exactly one '-c release'"),
+            (["build", "-c=release"], "does not accept '-c=release'"),
+            (["build", "-c", "release", "--build-tests"], "does not accept '--build-tests'"),
+            (["build", "-c", "release", "-Xswiftc", "-wmo"], "does not accept '-Xswiftc'"),
+            (["build", "-c", "release", "--scratch-path", "/tmp/x"], "does not accept '--scratch-path'"),
+            (["build", "-c", "release", "--rpce-optimized-incremental"],
+             "does not accept '--rpce-optimized-incremental'"),
+            (["build", "-c", "release", "--rpce-optimized-diagnostics"],
+             "does not accept '--rpce-optimized-diagnostics'"),
+        )
+        for arguments, message in cases:
+            with self.subTest(arguments=arguments):
+                code, child_env, _, stderr = self.run_wrapper(self.lane(*arguments))
+                self.assertEqual(code, 2)
+                self.assertIsNone(child_env)
+                self.assertIn(f"canonical_swift.sh: {self.FLAG} {message}", stderr)
+                self.assertNotIn("rpce-debug-dsym:", stderr)
+        # The other order is rejected under the optimized lane's own name.
+        for arguments, message in (
+            (["--rpce-optimized-diagnostics", "build", "-c", "release", self.FLAG], f"does not accept '{self.FLAG}'"),
+            (["--rpce-optimized-diagnostics", self.FLAG, "build", "-c", "release"],
+             f"supports only the build command; got '{self.FLAG}'"),
+        ):
+            with self.subTest(arguments=arguments):
+                code, child_env, _, stderr = self.run_wrapper(arguments)
+                self.assertEqual((code, child_env), (2, None))
+                self.assertIn(f"canonical_swift.sh: --rpce-optimized-diagnostics {message}", stderr)
+        elsewhere = self.package / "Sources"
+        elsewhere.mkdir()
+        code, child_env, _, stderr = self.run_wrapper(self.lane("build", "-c", "release"), cwd=elsewhere)
+        self.assertEqual((code, child_env), (2, None))
+        self.assertIn(f"canonical_swift.sh: {self.FLAG} must run from the package root", stderr)
 
 
 class UUIDReaderTests(unittest.TestCase):

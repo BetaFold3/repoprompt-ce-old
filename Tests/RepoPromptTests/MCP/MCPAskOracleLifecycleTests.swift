@@ -205,7 +205,8 @@ final class MCPAskOracleLifecycleTests: XCTestCase {
             MCPServerViewModel.RequestMetadata(
                 connectionID: connectionID,
                 clientName: "ask-oracle-lifecycle-tests",
-                windowID: window.windowID
+                windowID: window.windowID,
+                actorRoutedRunTab: nil
             )
         }
 

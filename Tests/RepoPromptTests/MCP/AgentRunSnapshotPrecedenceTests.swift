@@ -142,7 +142,8 @@ final class AgentRunSnapshotPrecedenceTests: XCTestCase {
                 MCPServerViewModel.RequestMetadata(
                     connectionID: nil,
                     clientName: "agent-run-snapshot-precedence-tests",
-                    windowID: window.windowID
+                    windowID: window.windowID,
+                    actorRoutedRunTab: nil
                 )
             },
             requireTargetWindow: { window },

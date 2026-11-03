@@ -7,6 +7,7 @@ struct AgentComposerFocusRequest: Equatable {
         case newSession
         case newKnowledgeSession
         case reusedPlaceholder
+        case modelSelectionCommitted
     }
 
     let id: UUID
@@ -149,6 +150,42 @@ struct AgentComposerSubmissionLatch {
     }
 }
 
+/// The composer's submit-guidance notice. A transient notice clears after
+/// `transientDurationNanoseconds`; a persistent one (9-live V1: a durable-admission refusal) stays
+/// until the next submit attempt or composer text change.
+struct AgentComposerSubmitNotice: Equatable {
+    static let transientDurationNanoseconds: UInt64 = 3_000_000_000
+
+    private(set) var message: String?
+    private(set) var isPersistent = false
+
+    /// Shows `message` (an empty one shows nothing). Returns whether a dismiss timer is needed.
+    @discardableResult
+    mutating func show(_ message: String, persistent: Bool) -> Bool {
+        guard !message.isEmpty else { return false }
+        self.message = message
+        isPersistent = persistent
+        return !persistent
+    }
+
+    /// The dismiss timer of the transient `message` fired: clears it unless it was replaced or is
+    /// persistent. Returns whether it cleared.
+    mutating func transientTimerFired(for message: String) -> Bool {
+        guard !isPersistent, self.message == message else { return false }
+        self.message = nil
+        return true
+    }
+
+    /// A submit attempt or a composer text change: clears a persistent notice. Returns whether it
+    /// cleared.
+    mutating func clearPersistent() -> Bool {
+        guard isPersistent else { return false }
+        message = nil
+        isPersistent = false
+        return true
+    }
+}
+
 struct AgentScheduledSendProps: Equatable, Identifiable {
     enum Status: Equatable {
         case scheduled
@@ -183,6 +220,9 @@ struct AgentScheduledSendProps: Equatable, Identifiable {
     /// been acknowledged yet. Automatic sending is paused; the banner presents the confirmation
     /// state derived from the decision rather than from the persisted record.
     let pendingConfirmationSaving: PendingConfirmationSaving?
+    /// What unresolved recovery this schedule waits for (lossless restart F2): the scheduler's
+    /// recorded blocker, so Send now never looks like it silently did nothing.
+    let recoveryBlockedMessage: String?
 
     enum PendingConfirmationSaving: Equatable {
         case saving
@@ -194,9 +234,13 @@ struct AgentScheduledSendProps: Equatable, Identifiable {
         scheduledSend: AgentScheduledSendPersist,
         blockingSessionName: String? = nil,
         recoveryPhase: AgentScheduledSendRecoveryPhase? = nil,
-        pendingConfirmation: AgentScheduledSendPendingConfirmationStatus? = nil
+        pendingConfirmation: AgentScheduledSendPendingConfirmationStatus? = nil,
+        recoveryBlocker: AgentScheduledSendRecoveryBlocker? = nil
     ) {
         id = scheduledSend.id
+        recoveryBlockedMessage = scheduledSend.state == .dispatching
+            ? nil
+            : recoveryBlocker.map(Self.recoveryBlockedMessage(for:))
         self.tabID = tabID
         notBefore = scheduledSend.notBefore
         rawText = scheduledSend.rawText
@@ -256,6 +300,41 @@ struct AgentScheduledSendProps: Equatable, Identifiable {
     static let pendingConfirmationAttentionMessage =
         "Automatic sending is paused. Saving the confirmation failed; retry saving or confirm the message yourself."
 
+    /// Plain, short wording for the banner. The first applicable reason wins; counts are other
+    /// sessions in this workspace.
+    static func recoveryBlockedMessage(for blocker: AgentScheduledSendRecoveryBlocker) -> String {
+        func sessions(_ count: Int, _ adjective: String) -> String {
+            count == 1 ? "1 \(adjective) session" : "\(count) \(adjective) sessions"
+        }
+        if blocker.workspaceRestriction != nil {
+            return "Waiting: this workspace couldn't be checked for interrupted work. Restart RepoPrompt to check again."
+        }
+        if blocker.destinationUnresolved {
+            // Own-session causes vary (held transfer, restriction, earlier-launch process, crash
+            // hold); not every one is resolvable from Needs Attention, so no pointer is given.
+            return "Waiting until this session's recovery is resolved."
+        }
+        if !blocker.interruptedSessionIDs.isEmpty {
+            let count = blocker.interruptedSessionIDs.count
+            return "Will send after \(sessions(count, "interrupted")) in this workspace \(count == 1 ? "is" : "are") resolved: choose It stopped (not Dismiss) in Needs Attention…"
+        }
+        if !blocker.restrictedSessionIDs.isEmpty {
+            let count = blocker.restrictedSessionIDs.count
+            return "Will send after \(sessions(count, "unchecked")) in this workspace \(count == 1 ? "is" : "are") resolved. Restart RepoPrompt to check again."
+        }
+        if blocker.recoveryActionInProgress {
+            return "Will send after a recovery action in this workspace finishes."
+        }
+        if blocker.runtimeOwnershipUnresolved {
+            return "Will send after agent processes from an earlier launch are checked. See Needs Attention…"
+        }
+        let others = blocker.otherUnresolvedSessionIDs.count
+        if others > 0 {
+            return "Will send after \(others == 1 ? "1 session" : "\(others) sessions") in this workspace finish\(others == 1 ? "es" : "") recovery. Review Needs Attention…"
+        }
+        return "Will send after interrupted work in this workspace is resolved. Review Needs Attention…"
+    }
+
     private static func acceptedStatus(for phase: AgentScheduledSendRecoveryPhase?) -> Status {
         switch phase {
         case let .needsAttention(reason)?:
@@ -298,6 +377,7 @@ struct AgentScheduledSendProps: Equatable, Identifiable {
         firstEligibleAt = nil
         status = .unreadable
         pendingConfirmationSaving = nil
+        recoveryBlockedMessage = nil
         recoveryMessage = "This scheduled message was saved by a newer or incompatible version and can't be read here. It will never be sent automatically."
     }
 
@@ -372,6 +452,193 @@ struct AgentStaleResetRecoveryActions {
     let retryStopping: (_ tabID: UUID, _ recoveryID: UUID) async -> String?
 }
 
+/// Lossless-restart recovery banner: the exact session filter of the coordinator's app-wide
+/// recovery catalog (Phase 2) for the active session, plus its owner's composer-preparation
+/// failure. Only needs-action items are shown (O34-1); in the ready state the banner exists only
+/// while it has rows. Needs-action items elsewhere are counted on its Needs Attention button while
+/// it is shown. Opening a row never starts a provider.
+struct AgentRecoveryListProps: Equatable {
+    enum Status: Equatable {
+        case loading
+        case ready
+        /// Startup (or composition) failed: every send route stays closed until Retry succeeds.
+        case failed(String)
+    }
+
+    let status: Status
+    let rows: [AgentRecoveryListRowProps]
+    let canRetry: Bool
+    /// Undismissed needs-action catalog items outside this banner (shown in the Needs Attention
+    /// sheet).
+    var otherItemCount: Int = 0
+
+    /// Nothing to show in the ready state: no rows of this session. Items elsewhere never keep the
+    /// banner visible on their own (O34-1).
+    var isEmpty: Bool {
+        status == .ready && rows.isEmpty
+    }
+
+    /// Banner header. F3: `rows` are this session's items and `otherItemCount` the items elsewhere
+    /// (the "Needs Attention (n)…" button), so the two counts are never merged and a session with
+    /// no rows never claims "0 items need your attention".
+    var headerText: String {
+        switch status {
+        case .loading:
+            return "Checking for work interrupted when RepoPrompt last closed…"
+        case let .failed(message):
+            return message
+        case .ready:
+            if rows.isEmpty {
+                // Fallback only: a ready banner without rows is hidden (`isEmpty`), so this text is
+                // never shown.
+                return "Nothing interrupted in this session."
+            }
+            let elsewhere = otherItemCount == 1
+                ? "1 item elsewhere needs attention."
+                : "\(otherItemCount) items elsewhere need attention."
+            if otherItemCount == 0 {
+                return rows.count == 1
+                    ? "1 saved or interrupted item needs your attention."
+                    : "\(rows.count) saved or interrupted items need your attention."
+            }
+            let here = rows.count == 1
+                ? "1 saved or interrupted item in this session needs your attention."
+                : "\(rows.count) saved or interrupted items in this session need your attention."
+            return "\(here) \(elsewhere)"
+        }
+    }
+}
+
+/// One row of the app-wide Needs Attention sheet.
+struct AgentRecoveryNeedsAttentionRow: Equatable, Identifiable {
+    let row: AgentRecoveryListRowProps
+    let isDismissed: Bool
+    /// The item belongs to another workspace (actions may need that workspace open).
+    let isOtherWorkspace: Bool
+    /// Which sheet section lists it (O34-2).
+    let attention: AgentRecoveryCatalogAttention
+    /// Why the note is cleared from ordinary presentation (listed only under "Show dismissed and
+    /// cleared"); `nil` when it is not cleared.
+    var automaticClear: AgentRecoveryCatalogAutomaticClear?
+    /// The catalog item exactly as displayed: bulk Dismiss acts on it, never on a newer item with
+    /// the same ID.
+    var item: AgentRecoveryCatalogItem?
+
+    var id: String {
+        row.id
+    }
+
+    /// Listed only while "Show dismissed and cleared" is on (never counted).
+    var isHidden: Bool {
+        isDismissed || automaticClear != nil
+    }
+}
+
+extension Notification.Name {
+    /// A window's view model asks its root sheet host (`AgentRecoveryNeedsAttentionHost`) to present
+    /// the Needs Attention sheet; the host consumes the view model's pending request. `object`: the
+    /// `AgentModeViewModel`.
+    static let agentRecoveryNeedsAttentionRequested = Notification.Name("AgentRecovery.needsAttentionRequested")
+}
+
+struct AgentRecoveryListRowProps: Equatable, Identifiable {
+    enum Action: Hashable {
+        /// Move the held input into this session's (empty) composer, then withdraw it.
+        case edit
+        /// Withdraw the held input (the row stays until the withdrawal commits).
+        case remove
+        /// Open the session's tab; actions apply only to the open session.
+        case open
+        /// Confirm that the previous run is no longer running (the exact published crash hold).
+        case confirmStopped
+        /// Durably dismiss the card in its displayed state (it returns if that state changes). It
+        /// never resolves, withdraws, removes, confirms, or releases anything.
+        case dismiss
+        /// Remove the saved historical question (its request already ended).
+        case removeSavedQuestion
+        /// Place the displayed held or unsaved draft into this session's empty message box.
+        case restoreDraft
+        /// Discard exactly the displayed held or unsaved draft (after `confirmation`); current
+        /// typing is kept and saved.
+        case discardDraft
+        /// Write the message box again after a failed save.
+        case retrySave
+        /// R10: stop owning a held scheduled transfer (after `confirmation`). The message stays
+        /// visible with its uncertain delivery; it is never marked "not delivered" or resent.
+        case cancelSchedule
+        /// R6: run one fresh discovery of surviving agent processes (covers missed exit events).
+        case refreshProcesses
+        /// R6: persist Let finish for the displayed runtime; it keeps watching and stays restricted.
+        case letProcessFinish
+        /// Phase 4 (gated OFF in production): a new continuation message through normal dispatch.
+        case continueTurn
+        /// Phase 4 (gated OFF): send the one saved, never handed-off message through normal dispatch.
+        case sendSaved
+        /// Phase 4 (gated OFF): send a saved question's text and partial answer as ordinary input.
+        case answerAsInput
+        /// Phase 4 (gated OFF): import what the provider recorded; never sends anything.
+        case reconcileHistory
+        /// Phase 4 (gated OFF): explicit fresh conversation after a failed Claude resume.
+        case continueInNewConversation
+        /// Step 5b: open the existing delegated child session linked under this run attempt. It
+        /// only opens that session; nothing is recreated, restarted, or resent.
+        case openDelegatedSession(UUID)
+        /// Step 5a: copy the exact stored edit proposal (its full proposed text) to the pasteboard.
+        /// Never writes the target file.
+        case copyProposal
+        /// Step 5a: durably withdraw the stored edit proposal (after `confirmation`). The target
+        /// file is never touched.
+        case discardProposal
+    }
+
+    let id: String
+    let sessionID: UUID?
+    let sessionName: String
+    let title: String
+    let detail: String
+    /// Viewable full text (View): the original input when the row is held input, or the full
+    /// per-child status when the row is a run with delegated-child links.
+    let text: String?
+    let attachmentNames: [String]
+    let actions: [Action]
+    let isWorking: Bool
+    /// Persistent inline error of the last failed action (Retry by repeating it).
+    let error: String?
+    /// Explicit confirmation shown before a destructive `discardDraft`.
+    var confirmation: String?
+    /// Phase 4: editable continuation text shown before `continueTurn` / `continueInNewConversation`
+    /// is chosen (the R7 default). The exact edited text is what the choice reserves and sends.
+    var continuationText: String?
+    /// Phase 4: shown in the continuation editor when an earlier choice may have reached the agent;
+    /// sending from that editor is the explicit confirmation.
+    var continuationWarning: String?
+    /// Step 5a: opening View asks `AgentRecoveryListActions.inspect` for a transient comparison of
+    /// the target file with the stored proposal.
+    var inspectsOnView = false
+}
+
+struct AgentRecoveryListActions {
+    let perform: (_ rowID: String, _ action: AgentRecoveryListRowProps.Action) async -> Void
+    /// Phase 4: a continuation choice with the card's edited text and the warning it showed.
+    var performContinuation: (
+        _ rowID: String,
+        _ action: AgentRecoveryListRowProps.Action,
+        _ text: String,
+        _ acknowledgedWarning: String?
+    ) async -> Void = { _, _, _, _ in }
+    /// 9-live R4b/R5: the app-wide in-memory Continue draft of a row, read when its editor opens.
+    /// Required (review B L7): a construction site that omits it would silently lose R5.
+    let continuationDraft: (_ rowID: String) -> String?
+    /// 9-live R5: every edit in a row's Continue editor (in memory; survives the editor closing).
+    let updateContinuationDraft: (_ rowID: String, _ text: String) -> Void
+    let retryStartup: () -> Void
+    /// Presents the app-wide Needs Attention sheet.
+    var openNeedsAttention: () -> Void = {}
+    /// Step 5a: a transient, read-only comparison shown in an `inspectsOnView` row's viewer (nil
+    /// when unavailable). Never blocks View or Copy.
+    var inspect: (_ rowID: String) async -> String? = { _ in nil }
+}
+
 struct AgentComposerProps: Equatable {
     let currentTabID: UUID?
     let submitTarget: AgentComposerSubmitTarget?
@@ -413,6 +680,10 @@ struct AgentComposerProps: Equatable {
     let fileTagLookupContextIdentity: AgentWorkspaceLookupContextIdentity
     /// Pending child questions addressed to this tab's agent (delegated ask_user plan §6.5).
     var delegatedQuestions: [AgentDelegatedQuestionBannerRow] = []
+    /// Lossless-restart recovery list for this workspace (open and closed sessions).
+    var recoveryList: AgentRecoveryListProps?
+    /// R4 edit freeze of this window (quit or window close preserving it): the composer is disabled.
+    var isShutdownFrozen = false
 
     static let empty = AgentComposerProps(
         currentTabID: nil,

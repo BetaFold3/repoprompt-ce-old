@@ -296,11 +296,30 @@ final class CodeMapArtifactLeaseAdmission: @unchecked Sendable {
     private var countByDigest: [ScopedDigest: Int] = [:]
     private var activeBytes: UInt64 = 0
     private var accountingFailedClosed = false
+    #if DEBUG
+        private var maximumCountOverrideForTesting: Int?
+    #endif
 
     init(maximumCount: Int, maximumBytes: UInt64) {
         self.maximumCount = maximumCount
         self.maximumBytes = maximumBytes
     }
+
+    /// Read under `lock`.
+    private var effectiveMaximumCount: Int {
+        #if DEBUG
+            maximumCountOverrideForTesting ?? maximumCount
+        #else
+            maximumCount
+        #endif
+    }
+
+    #if DEBUG
+        /// Lowers (or, with nil, restores) the active-lease count limit for this admission.
+        func setMaximumCountForTesting(_ maximumCount: Int?) {
+            lock.withLock { maximumCountOverrideForTesting = maximumCount }
+        }
+    #endif
 
     func reserve(
         scope: UUID,
@@ -311,7 +330,7 @@ final class CodeMapArtifactLeaseAdmission: @unchecked Sendable {
             guard !accountingFailedClosed else {
                 throw CodeMapArtifactLeaseError.accountingOverflow
             }
-            guard reservations.count < maximumCount else {
+            guard reservations.count < effectiveMaximumCount else {
                 throw CodeMapArtifactLeaseError.busy(.activeLeaseCountLimit)
             }
             let (nextBytes, byteOverflow) = activeBytes.addingReportingOverflow(byteCount)
@@ -923,6 +942,18 @@ actor CodeMapArtifactStore {
         }
         return completed
     }
+
+    /// Identity of the lease admission this store draws on. Stores sharing one admission (the
+    /// process-wide one in production) compete for the same active-lease budget.
+    nonisolated var leaseAdmissionIdentity: ObjectIdentifier {
+        ObjectIdentifier(leaseAdmission)
+    }
+
+    #if DEBUG
+        func setActiveLeaseCountLimitForTesting(_ maximumCount: Int?) {
+            leaseAdmission.setMaximumCountForTesting(maximumCount)
+        }
+    #endif
 
     func accounting() -> CodeMapArtifactStoreAccounting {
         let leaseAccounting = leaseAdmission.snapshot()

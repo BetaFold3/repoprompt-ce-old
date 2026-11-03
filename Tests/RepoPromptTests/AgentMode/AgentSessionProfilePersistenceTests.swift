@@ -19,7 +19,8 @@ final class AgentSessionProfilePersistenceTests: XCTestCase {
                 "oracle_utils",
                 "ask_oracle",
                 "oracle_chat_log",
-                "agent_run"
+                "agent_run",
+                "workspace_steer"
             ]
         )
         XCTAssertEqual(
@@ -40,6 +41,11 @@ final class AgentSessionProfilePersistenceTests: XCTestCase {
         let encoded = try JSONEncoder().encode(session)
         let encodedString = String(data: encoded, encoding: .utf8) ?? ""
         XCTAssertTrue(encodedString.contains(#""profile":"knowledge""#), encodedString)
+        // Only the profile is stored; its tool allowlist is applied at run time, so allowlist
+        // changes (such as adding workspace_steer) reach saved Knowledge sessions unmigrated.
+        for toolName in KnowledgeSessionPolicy.allowedMCPToolNames {
+            XCTAssertFalse(encodedString.contains(toolName), "\(toolName) persisted in \(encodedString)")
+        }
 
         let decoded = try JSONDecoder().decode(AgentSession.self, from: encoded)
         XCTAssertEqual(decoded.serializationVersion, AgentSession.currentSerializationVersion)

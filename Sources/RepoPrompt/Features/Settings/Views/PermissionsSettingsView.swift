@@ -81,7 +81,7 @@ struct PermissionsSettingsView: View {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .foregroundColor(.orange)
                         .font(.caption)
-                    Text("All workspace operations will be automatically approved without confirmation.")
+                    Text("All workspace operations will be automatically approved without confirmation. Workspace steering grant requests always ask.")
                         .font(.caption)
                         .foregroundColor(.orange)
                 }
@@ -110,7 +110,7 @@ struct PermissionsSettingsView: View {
             }
 
             VStack(spacing: 12) {
-                ForEach(WorkspaceApprovalOperation.allCases, id: \.self) { operation in
+                ForEach(WorkspaceApprovalOperation.autoApprovableCases, id: \.self) { operation in
                     OperationPermissionRow(
                         operation: operation,
                         isEnabled: approvalManager.settings.autoApproveOperations.contains(operation),
@@ -326,6 +326,8 @@ private struct OperationPermissionRow: View {
             "Allow adding folders to workspaces"
         case .removeFolder:
             "Allow removing folders from workspaces"
+        case .workspaceSteeringGrant:
+            "Workspace steering grants always ask"
         }
     }
 }

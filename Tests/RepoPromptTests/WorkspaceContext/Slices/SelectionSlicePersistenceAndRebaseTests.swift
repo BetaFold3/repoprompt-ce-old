@@ -7,6 +7,54 @@ import CoreServices
 import XCTest
 
 final class SelectionSlicePersistenceAndRebaseTests: XCTestCase {
+    #if DEBUG
+        /// DEBUG-only: release builds intentionally keep the production root.
+        func testDefaultPartitionStoreWritesUnderPerProcessTestRootNotLiveStore() async throws {
+            let productionRoot = PartitionStore.productionPartitionsBaseURL().standardizedFileURL
+            XCTAssertTrue(productionRoot.path.hasSuffix("/Application Support/RepoPrompt CE/Partitions"), productionRoot.path)
+            let supportRoot = productionRoot.deletingLastPathComponent().path
+
+            // Stores built without an explicit baseURL use one per-process temporary root under XCTest.
+            let testRoot = PartitionStore.partitionsBaseURL().standardizedFileURL
+            XCTAssertEqual(testRoot, PartitionStore.partitionsBaseURL().standardizedFileURL)
+            XCTAssertNotEqual(testRoot.path, supportRoot, testRoot.path)
+            XCTAssertFalse(testRoot.path.hasPrefix(supportRoot + "/"), testRoot.path)
+
+            let leaf = "PartitionStoreDefaultRoot-\(UUID().uuidString)"
+            let workspaceRoot = FileManager.default.temporaryDirectory.appendingPathComponent(leaf, isDirectory: true)
+            let workspaceID = UUID()
+            _ = try await PartitionStore().apply(
+                forRoot: workspaceRoot.path,
+                scope: PartitionScope(workspaceID: workspaceID),
+                updates: [
+                    "Sources/A.swift": PartitionStore.SliceUpdate(
+                        ranges: [LineRange(start: 1, end: 2, description: "default-root")],
+                        fileModificationTime: nil,
+                        anchors: nil
+                    )
+                ],
+                mode: .set
+            )
+
+            let testEntries = try FileManager.default.contentsOfDirectory(atPath: testRoot.path)
+                .filter { $0.hasPrefix(leaf + "-") }
+            defer {
+                for entry in testEntries {
+                    try? FileManager.default.removeItem(at: testRoot.appendingPathComponent(entry, isDirectory: true))
+                }
+            }
+            XCTAssertEqual(testEntries.count, 1, "\(testEntries)")
+            let partitionFile = testRoot
+                .appendingPathComponent(testEntries.first ?? leaf, isDirectory: true)
+                .appendingPathComponent("filepartitions-\(workspaceID.uuidString.lowercased()).json")
+            XCTAssertTrue(FileManager.default.fileExists(atPath: partitionFile.path), partitionFile.path)
+
+            // Read-only check of the live store: nothing was written for this workspace root.
+            let liveEntries = (try? FileManager.default.contentsOfDirectory(atPath: productionRoot.path)) ?? []
+            XCTAssertFalse(liveEntries.contains { $0.hasPrefix(leaf + "-") }, "live Partitions gained an entry for \(leaf)")
+        }
+    #endif
+
     func testPartitionStoreColdReloadPreservesSlicesAndIsolatesScopes() async throws {
         let baseURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("SelectionSlicePersistenceAndRebaseTests-\(UUID().uuidString)", isDirectory: true)

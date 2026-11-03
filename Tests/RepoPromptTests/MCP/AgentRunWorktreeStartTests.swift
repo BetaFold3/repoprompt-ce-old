@@ -637,7 +637,8 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
                 connectionID: nil,
                 clientName: "same-tab-review-test",
                 windowID: window.windowID,
-                runPurpose: .unknown
+                runPurpose: .unknown,
+                actorRoutedRunTab: nil
             ),
             bindCurrentRequestToTab: { _, _ in },
             agentModeVM: viewModel,
@@ -1987,11 +1988,11 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
                 attachments: [],
                 taggedFileAttachments: [],
                 draftText: "queued ACP draft",
-                optimisticUserItemID: nil,
+                identity: .inactiveForTesting(in: session),
                 createdAt: Date()
             )
         ]
-        session.pendingInstructions = ["queued shared draft"]
+        session.setUntrackedPendingInstructionsForTesting(["queued shared draft"])
         viewModel.test_setCurrentTabIDOverride(tabID)
         defer { viewModel.test_setCurrentTabIDOverride(nil) }
 
@@ -3684,6 +3685,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
                         observeFirstAgentTaskIfNeeded()
                         await window.agentModeViewModel.cancelAgentRun(
                             tabID: trackedTabID,
+                            cause: .ordinary,
                             completion: .terminalTeardownCompleted
                         )
                         if let firstObservedAgentTask {
@@ -3896,6 +3898,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
                 for tabID in activeTabIDs {
                     await viewModel.cancelAgentRun(
                         tabID: tabID,
+                        cause: .ordinary,
                         completion: .terminalTeardownCompleted
                     )
                 }
@@ -4102,7 +4105,8 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
                 MCPServerViewModel.RequestMetadata(
                     connectionID: nil,
                     clientName: "agent-explore-worktree-start",
-                    windowID: window.windowID
+                    windowID: window.windowID,
+                    actorRoutedRunTab: nil
                 )
             },
             requireTargetWindow: { window },
@@ -4187,7 +4191,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         var service = AgentRunMCPToolService(
             toolName: MCPWindowToolName.agentRun,
             captureRequestMetadata: {
-                MCPServerViewModel.RequestMetadata(connectionID: connectionID, clientName: "agent-run-worktree-start", windowID: window.windowID)
+                MCPServerViewModel.RequestMetadata(connectionID: connectionID, clientName: "agent-run-worktree-start", windowID: window.windowID, actorRoutedRunTab: nil)
             },
             requireTargetWindow: { window },
             resolveRequestedTabID: { _ in nil },

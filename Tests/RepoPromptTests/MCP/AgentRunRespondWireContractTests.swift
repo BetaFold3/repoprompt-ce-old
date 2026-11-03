@@ -101,7 +101,8 @@ final class AgentRunRespondWireContractTests: XCTestCase {
                 MCPServerViewModel.RequestMetadata(
                     connectionID: nil,
                     clientName: "agent-run-respond-wire-contract-tests",
-                    windowID: window.windowID
+                    windowID: window.windowID,
+                    actorRoutedRunTab: nil
                 )
             },
             requireTargetWindow: { window },

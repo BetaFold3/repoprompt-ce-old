@@ -253,6 +253,89 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
         XCTAssertTrue(reply.codeStructure?.unmappedPaths?.isEmpty ?? true)
     }
 
+    func testBorrowedAutoReplyReportsRootScopedTerminalSupersededProjection() async throws {
+        let root = try makeTemporaryRoot(name: "AutoSupersededProjection")
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+        let source = root.appendingPathComponent("Source.swift")
+        try write(SwiftFixtureSource.emptyStruct("Source"), to: source)
+
+        let tabID = UUID()
+        let selection = StoredSelection(selectedPaths: [source.path], codemapAutoEnabled: true)
+        let (window, _) = await makeWindow(root: root, tabID: tabID, selection: selection)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let loadedRoot = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+            in: window,
+            path: root.path
+        )
+        let affectedEpoch = makeRootEpoch(rootID: loadedRoot.id)
+        let otherEpoch = makeRootEpoch()
+        let terminal = WorkspaceCodemapOperationIssue.automatic(.unavailable(.graph(.definitionUniverse(
+            rootEpoch: affectedEpoch,
+            reason: .projectionSuperseded
+        ))))
+        // Another root's different unavailable reason is not reported as superseded.
+        let otherUnavailable = WorkspaceCodemapOperationIssue.automatic(.unavailable(.graph(.definitionUniverse(
+            rootEpoch: otherEpoch,
+            reason: .notBuilt
+        ))))
+        let terminalPresentation = WorkspaceCodemapOperationPresentation(
+            orderedEntries: [],
+            coverage: .unavailable([terminal, otherUnavailable]),
+            issues: [terminal, otherUnavailable],
+            publicationReceipt: nil
+        )
+
+        let reply = await window.mcpServer.buildBorrowedTabSelectionReply(
+            codemapPresentation: terminalPresentation,
+            from: selection,
+            includeBlocks: true,
+            display: .relative,
+            lookupContext: .visibleWorkspace
+        )
+
+        XCTAssertEqual(reply.files?.count, 1, "Selected file content stays in the reply")
+        let issues = try XCTUnwrap(reply.codeStructure?.automaticCodemapIssues)
+        XCTAssertEqual(issues.map(\.rootID), [loadedRoot.id.uuidString])
+        XCTAssertEqual(issues.map(\.reason), ["projection_superseded"])
+        let message = try XCTUnwrap(issues.first?.message)
+        XCTAssertTrue(
+            message.contains(
+                "Automatic codemaps for this selection are unavailable because root '\(loadedRoot.name)'"
+            ),
+            message
+        )
+        XCTAssertTrue(message.contains("Selected files are unaffected"), message)
+        XCTAssertTrue(message.contains("continue without automatic codemaps"), message)
+        XCTAssertTrue(message.contains("then request automatic codemaps to schedule a fresh projection"), message)
+        // The terminal diagnosis must not be contradicted by a pending listing for the source.
+        XCTAssertFalse(
+            reply.codeStructure?.pendingPaths?.contains { $0.hasSuffix("Source.swift") } == true,
+            String(describing: reply.codeStructure?.pendingPaths)
+        )
+        let encoded = try XCTUnwrap(String(data: JSONEncoder().encode(reply), encoding: .utf8))
+        XCTAssertTrue(encoded.contains("\"automatic_codemap_issues\""), encoded)
+        XCTAssertTrue(encoded.contains("\"root_id\":\"\(loadedRoot.id.uuidString)\""), encoded)
+        XCTAssertFalse(encoded.contains(otherEpoch.rootID.uuidString), encoded)
+
+        // Control: an ordinary pending presentation keeps the field omitted.
+        let pending = WorkspaceCodemapOperationIssue.automatic(.pending([.graphRebuild(rootEpoch: affectedEpoch)]))
+        let pendingReply = await window.mcpServer.buildBorrowedTabSelectionReply(
+            codemapPresentation: WorkspaceCodemapOperationPresentation(
+                orderedEntries: [],
+                coverage: .pending([pending]),
+                issues: [pending],
+                publicationReceipt: nil
+            ),
+            from: selection,
+            includeBlocks: true,
+            display: .relative,
+            lookupContext: .visibleWorkspace
+        )
+        XCTAssertNil(pendingReply.codeStructure?.automaticCodemapIssues)
+        let pendingEncoded = try XCTUnwrap(String(data: JSONEncoder().encode(pendingReply), encoding: .utf8))
+        XCTAssertFalse(pendingEncoded.contains("automatic_codemap_issues"), pendingEncoded)
+    }
+
     func testActiveVisibleSelectionMarksMissingCachedFileTokensIncomplete() async throws {
         let root = try makeTemporaryRoot(name: "ActiveVisibleIncomplete")
         defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
@@ -496,7 +579,8 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
             connectionID: connectionID,
             clientName: clientName,
             windowID: window.windowID,
-            runPurpose: .agentModeRun
+            runPurpose: .agentModeRun,
+            actorRoutedRunTab: nil
         ))
         defer { window.mcpServer.setRequestMetadataOverrideForTesting(nil) }
 
@@ -1295,7 +1379,8 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
                 connectionID: connectionID,
                 clientName: "lookup-cache-coalescing-test",
                 windowID: window.windowID,
-                runPurpose: .agentModeRun
+                runPurpose: .agentModeRun,
+                actorRoutedRunTab: nil
             )
 
             let resolutionGate = TokenAccountingGate()
@@ -1405,7 +1490,8 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
                 connectionID: connectionID,
                 clientName: "lookup-cache-publication-test",
                 windowID: window.windowID,
-                runPurpose: .agentModeRun
+                runPurpose: .agentModeRun,
+                actorRoutedRunTab: nil
             )
 
             let postValidationGate = TokenAccountingGate()
@@ -1577,7 +1663,8 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
                 connectionID: connectionID,
                 clientName: "lookup-cache-test",
                 windowID: window.windowID,
-                runPurpose: .agentModeRun
+                runPurpose: .agentModeRun,
+                actorRoutedRunTab: nil
             )
             window.mcpServer.resetFileToolLookupContextCacheStatsForTesting()
 
@@ -1763,7 +1850,8 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
         let metadata = MCPServerViewModel.RequestMetadata(
             connectionID: nil,
             clientName: "selection-reply-compatibility-test",
-            windowID: window.windowID
+            windowID: window.windowID,
+            actorRoutedRunTab: nil
         )
 
         var bindingState = AgentSessionWorktreeBindingState.unavailable

@@ -1192,6 +1192,106 @@ final class HistoryMCPToolServiceTests: XCTestCase {
         XCTAssertEqual(dto.sessionID, fresh.id.uuidString)
     }
 
+    // MARK: - cancellation
+
+    func testCancellationFromTranscriptLoad_propagatesThroughEverySkippableCatch() async throws {
+        // A transcript load that fails with cancellation must never be skipped like an
+        // unreadable transcript (which would turn a cancelled call into a partial reply).
+        let cases: [(label: String, args: [String: Value])] = [
+            ("search", ["op": "search", "query": "anything"]),
+            ("time calendar", ["op": "time", "group_by": "day"]),
+            ("time session enrichment", ["op": "time", "group_by": "session"]),
+            ("list_sessions enrichment", ["op": "list_sessions"])
+        ]
+        for testCase in cases {
+            let scanner = MockHistoryScanner()
+            // Default records are stub-built, so enrichment paths load transcripts too.
+            scanner.scanResults = [makeScanResult(records: [makeRecord(name: "A"), makeRecord(name: "B")])]
+            scanner.transcriptProvider = { _ in throw CancellationError() }
+
+            do {
+                let reply = try await HistoryMCPToolService.execute(args: testCase.args, scanner: scanner)
+                XCTFail("\(testCase.label): expected CancellationError, got reply \(reply)")
+            } catch is CancellationError {
+                XCTAssertEqual(scanner.transcriptLoadRequests.count, 1, "\(testCase.label): no further loads after cancellation")
+            }
+        }
+    }
+
+    func testSearch_taskCancelledDuringTranscriptLoop_throwsAndStopsLoading() async throws {
+        let records = (0 ..< 3).map { makeRecord(name: "S\($0)") }
+        let scanner = MockHistoryScanner()
+        scanner.scanResults = [makeScanResult(records: records)]
+        let matchingTurn = AgentTranscriptTurn(
+            id: UUID(),
+            summary: AgentTranscriptTurnSummary(
+                requestText: nil,
+                conclusionText: nil,
+                compactConclusionText: "magic keyword",
+                middleSummaryText: nil,
+                toolCount: 0,
+                notableToolNames: [],
+                keyPaths: [],
+                compactedActivityCount: 0,
+                hadWarning: false,
+                hadError: false
+            ),
+            startedAt: Date(timeIntervalSince1970: 1000)
+        )
+        // The first load succeeds but cancels the calling task, modelling the watchdog
+        // deadline firing while the search loop runs.
+        scanner.transcriptProvider = { _ in
+            withUnsafeCurrentTask { $0?.cancel() }
+            return AgentTranscript(turns: [matchingTurn])
+        }
+
+        let task = Task {
+            try await HistoryMCPToolService.execute(args: ["op": "search", "query": "magic"], scanner: scanner)
+        }
+        do {
+            let reply = try await task.value
+            XCTFail("Expected CancellationError, got reply \(reply)")
+        } catch is CancellationError {
+            XCTAssertEqual(scanner.transcriptLoadRequests.count, 1, "Cancelled search must not load further transcripts")
+        }
+    }
+
+    func testCancellationDuringReplyConstruction_neverReturnsSuccessReply() async throws {
+        // The deadline can fire after the last in-op check, while the reply DTO is being
+        // built. `execute` must still surface CancellationError rather than a success reply.
+        let record = makeRecord(name: "S1")
+        let cases: [(label: String, args: [String: Value])] = [
+            ("list_sessions", ["op": "list_sessions"]),
+            ("search", ["op": "search", "query": "anything"]),
+            ("time", ["op": "time", "group_by": "day"]),
+            ("get_session", ["op": "get_session", "session_id": .string(record.id.uuidString), "around_turn": .int(0)])
+        ]
+        for testCase in cases {
+            let scanner = MockHistoryScanner()
+            scanner.scanResults = [makeScanResult(records: [record])]
+            scanner.transcriptProvider = { _ in
+                AgentTranscript(turns: [AgentTranscriptTurn(startedAt: Date(timeIntervalSince1970: 1000))])
+            }
+            let reachedReplyConstruction = LockedFlag()
+            let diagnostics = HistoryExecutionDiagnostics { phase, transition in
+                guard phase == .replyConstruction, transition == .started else { return }
+                reachedReplyConstruction.set()
+                // The observer runs synchronously on the executing task.
+                withUnsafeCurrentTask { $0?.cancel() }
+            }
+
+            let task = Task {
+                try await HistoryMCPToolService.execute(args: testCase.args, scanner: scanner, diagnostics: diagnostics)
+            }
+            do {
+                let reply = try await task.value
+                XCTFail("\(testCase.label): expected CancellationError, got reply \(reply)")
+            } catch is CancellationError {
+                XCTAssertTrue(reachedReplyConstruction.value, "\(testCase.label): cancellation must arrive during reply construction")
+            }
+        }
+    }
+
     // MARK: - role mapping
 
     func testSearch_roleMapping_toolExecution() async throws {
@@ -2158,19 +2258,25 @@ private struct FilterRequest: Equatable {
 
 private final class MockHistoryScanner: HistorySessionScanning {
     var scanResults: [HistoryWorkspaceScanResult] = []
-    /// Optional fresh-scan results for `scanAllWorkspacesRefreshing()`; defaults to
-    /// `scanResults` so tests that don't exercise the cache-bypass path are unaffected.
+    /// Optional targeted-refresh results for `refreshWorkspacesContainingSession`;
+    /// defaults to `scanResults` so tests that don't exercise the cache-bypass path are
+    /// unaffected.
     var refreshingScanResults: [HistoryWorkspaceScanResult]?
+    /// Session ids passed to `loadTranscriptForSearch`, in call order.
+    var transcriptLoadRequests: [UUID] = []
     /// Per-session override for `transcriptDerivedFieldsAreStale`; nil → not stale.
     var transcriptStalenessProvider: ((UUID) -> Bool)?
     var filterRequests: [FilterRequest] = []
     var transcriptProvider: ((UUID) throws -> AgentTranscript)?
 
-    func scanAllWorkspaces() async throws -> [HistoryWorkspaceScanResult] {
+    func scanAllWorkspaces(diagnostics _: HistoryExecutionDiagnostics?) async throws -> [HistoryWorkspaceScanResult] {
         scanResults
     }
 
-    func scanAllWorkspacesRefreshing() async throws -> [HistoryWorkspaceScanResult] {
+    func refreshWorkspacesContainingSession(
+        _: UUID,
+        diagnostics _: HistoryExecutionDiagnostics?
+    ) async throws -> [HistoryWorkspaceScanResult] {
         refreshingScanResults ?? scanResults
     }
 
@@ -2182,7 +2288,7 @@ private final class MockHistoryScanner: HistorySessionScanning {
         filePath: String?,
         from: Date?,
         to: Date?
-    ) -> [HistoryFilteredSessionRecord] {
+    ) throws -> [HistoryFilteredSessionRecord] {
         filterRequests.append(FilterRequest(
             workspace: workspace,
             agentKind: agentKind,
@@ -2203,7 +2309,12 @@ private final class MockHistoryScanner: HistorySessionScanning {
         }
     }
 
-    func loadTranscriptForSearch(sessionID: UUID, workspaceDir: URL) async throws -> AgentTranscript {
+    func loadTranscriptForSearch(
+        sessionID: UUID,
+        workspaceDir _: URL,
+        diagnostics _: HistoryExecutionDiagnostics?
+    ) async throws -> AgentTranscript {
+        transcriptLoadRequests.append(sessionID)
         guard let provider = transcriptProvider else {
             return .empty
         }
@@ -2216,5 +2327,23 @@ private final class MockHistoryScanner: HistorySessionScanning {
         workspaceDir: URL
     ) async -> Bool {
         transcriptStalenessProvider?(sessionID) ?? false
+    }
+}
+
+/// A thread-safe boolean set from a synchronous `@Sendable` observer.
+private final class LockedFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var isSet = false
+
+    func set() {
+        lock.lock()
+        isSet = true
+        lock.unlock()
+    }
+
+    var value: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return isSet
     }
 }

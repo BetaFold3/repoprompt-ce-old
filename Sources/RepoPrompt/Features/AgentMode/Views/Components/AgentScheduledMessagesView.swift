@@ -69,6 +69,9 @@ struct AgentScheduledMessagesView: View {
         .onReceive(NotificationCenter.default.publisher(for: .agentScheduledSendPendingConfirmationDidChange)) { _ in
             reloadToken &+= 1
         }
+        .onReceive(NotificationCenter.default.publisher(for: .agentScheduledSendDispositionDidChange)) { _ in
+            reloadToken &+= 1
+        }
     }
 
     private func rowView(_ row: AgentScheduledMessagesViewModel.Row) -> some View {

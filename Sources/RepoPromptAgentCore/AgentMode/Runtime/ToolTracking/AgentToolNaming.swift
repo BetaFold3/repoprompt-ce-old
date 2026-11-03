@@ -34,6 +34,10 @@ package func normalizedToolCardName(_ name: String?) -> String? {
 
 /// Get appropriate SF Symbol icon for a tool
 package func toolIcon(for toolName: String?) -> String {
+    // Presentation-only: recognize external MCP tools from the raw name before lossy normalization.
+    if ExternalMCPToolPresentation(rawToolName: toolName) != nil {
+        return ExternalMCPToolPresentation.iconName
+    }
     let normalized = normalizedToolCardName(toolName) ?? toolName
     switch normalized {
     case "ask_user_question", "ask_user", "AskUserQuestion", "request_user_input", "requestUserInput":
@@ -97,8 +101,21 @@ package func toolIcon(for toolName: String?) -> String {
     }
 }
 
-/// Get human-readable display name for a tool
+/// Get human-readable display name for a tool.
+///
+/// External MCP tools return a one-string compact label with the action first and the server
+/// retained (for example `Delete Event · BusyCal`), parsed from the raw name.
 package func toolDisplayName(for toolName: String?) -> String {
+    if let external = ExternalMCPToolPresentation(rawToolName: toolName) {
+        return external.compactLabel
+    }
+    return toolDisplayNameIgnoringExternalMCP(for: toolName)
+}
+
+/// Display name without external MCP recognition. Use when the input may already be a lossy
+/// normalized name, so an arbitrary dotted name whose suffix looks like `mcp__…` is not
+/// presented as an external MCP tool.
+func toolDisplayNameIgnoringExternalMCP(for toolName: String?) -> String {
     guard let nameRaw = toolName else { return "Tool" }
     let name = normalizedToolCardName(nameRaw) ?? nameRaw
 

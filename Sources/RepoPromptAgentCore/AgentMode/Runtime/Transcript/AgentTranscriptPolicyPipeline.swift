@@ -48,6 +48,55 @@ enum AgentTranscriptPolicyPipeline {
         return persistedNormalizedTranscript(normalized)
     }
 
+    /// Step 4d5 (import comparison only): the complete representations each of `items` can hold in a
+    /// tab after the ordinary save (canonical build, then `persistedTranscript`) and load, by ID. The
+    /// closed set is the two load boundaries crossed with the two result-preservation behaviors:
+    /// - loaded: `runtimeNormalizedTranscript`, then `runtimeTranscriptOnly`;
+    /// - rebuilt: the loaded transcript's working items rebuilt by the canonical builder, then
+    ///   `runtimeTranscriptOnly` (a load that rebuilds the turn, such as a cold restore);
+    /// - each, hidden: the runtime sanitizer with no preserved visible result (a result a later row
+    ///   hides).
+    ///
+    /// Equal images are listed once. `nil` when an image lacks an input row or repeats an ID. The
+    /// real pipeline is the only authority; nothing here persists, retains or exempts anything.
+    static func storageComparisonActivities(_ items: [AgentChatItem]) -> [UUID: [AgentTranscriptActivity]]? {
+        var sequenced = items
+        for index in sequenced.indices {
+            sequenced[index].sequenceIndex = index
+        }
+        let built = AgentTranscriptIO.buildTranscript(from: sequenced, nextSequenceIndex: sequenced.count, policy: .canonical)
+        let stored = persistedTranscript(from: built).transcript
+        let loaded = runtimeTranscriptOnly(AgentTranscriptIO.runtimeNormalizedTranscript(stored))
+        let rebuilt = runtimeTranscriptOnly(AgentTranscriptIO.buildTranscript(
+            from: AgentTranscriptIO.workingSourceItems(from: loaded),
+            nextSequenceIndex: sequenced.count,
+            policy: .canonical
+        ))
+        /// Assumes the runtime sanitizer is idempotent over an already runtime-stabilized transcript
+        /// (the real load sanitizes the normalized stored transcript once); the pure test checks it.
+        func hidden(_ transcript: AgentTranscript) -> AgentTranscript {
+            AgentToolResultPersistencePolicy.sanitizeTranscriptWithMetrics(
+                transcript,
+                preservedVisibleToolResultRowIDs: [],
+                purpose: .runtimePresentation
+            ).transcript
+        }
+        let inputIDs = Set(items.map(\.id))
+        guard inputIDs.count == items.count else { return nil }
+        var images: [UUID: [AgentTranscriptActivity]] = [:]
+        for transcript in [loaded, hidden(loaded), rebuilt, hidden(rebuilt)] {
+            var seen = Set<UUID>()
+            for activity in transcript.turns.flatMap(\.allActivities) where inputIDs.contains(activity.id) {
+                guard seen.insert(activity.id).inserted else { return nil }
+                if !(images[activity.id] ?? []).contains(activity) {
+                    images[activity.id, default: []].append(activity)
+                }
+            }
+            guard seen == inputIDs else { return nil }
+        }
+        return images
+    }
+
     static func persistedNormalizedTranscript(_ transcript: AgentTranscript) -> Result {
         materialize(
             AgentTranscriptHistoricalTruncationPolicy.truncatedTranscript(transcript),

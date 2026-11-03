@@ -385,7 +385,10 @@ enum AgentContextExportResolver {
             profile: .uiAssisted
         )
         let logicalRootDisplayNames = await lookupContext.logicalRootDisplayNamesByRootID(store: store)
-        let coordinator = presentationCoordinator ?? WorkspaceCodemapPresentationCoordinator(store: store)
+        let coordinator = presentationCoordinator ?? WorkspaceCodemapPresentationCoordinator(
+            store: store,
+            policy: .optionalEnrichment(for: presentationPlan.intent)
+        )
         do {
             return try await coordinator.withPresentation(
                 for: presentationPlan.intent,
@@ -474,7 +477,10 @@ enum AgentContextExportResolver {
             profile: .uiAssisted
         )
         do {
-            return try await WorkspaceCodemapPresentationCoordinator(store: request.store).withPresentation(
+            return try await WorkspaceCodemapPresentationCoordinator(
+                store: request.store,
+                policy: .optionalEnrichment(for: presentationPlan.intent)
+            ).withPresentation(
                 for: presentationPlan.intent,
                 rootScope: rootScope,
                 logicalRootDisplayNamesByRootID: lookupContext.logicalRootDisplayNamesByRootID(

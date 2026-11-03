@@ -22,6 +22,16 @@ enum ApplyEditsReviewDecision: Hashable {
     }
 }
 
+/// Step 5a: a review's identity, issued before its proposal is saved for recovery. Only the scope's
+/// latest ticket may still show its review or start its accepted write; a newer review, any scope
+/// cleanup (tab or window close), and an explicit lifecycle cancellation retire it. A
+/// re-subscription of the same scope does not. (The provider maps each decision case directly:
+/// only `reject` withdraws the saved proposal; `timeout` and `cancelled` keep it as history.)
+struct ApplyEditsReviewTicket: Hashable {
+    let scope: ApplyEditsApprovalScope
+    let reviewID: UUID
+}
+
 struct ApplyEditsApprovalSnapshot: Equatable {
     let scope: ApplyEditsApprovalScope
     var autoEditEnabled: Bool
@@ -56,6 +66,8 @@ actor ApplyEditsApprovalStore: Sendable {
     private var pendingByScope: [ApplyEditsApprovalScope: PendingRecord] = [:]
     private var subscriptions: [ApplyEditsApprovalScope: [UUID: SnapshotContinuation]] = [:]
     private var ownershipGenerationByScope: [ApplyEditsApprovalScope: UInt64] = [:]
+    /// The latest issued review ticket of each scope (Step 5a).
+    private var latestReviewIDByScope: [ApplyEditsApprovalScope: UUID] = [:]
     #if DEBUG
         private var testConditionalCleanupHook: (@Sendable (ApplyEditsApprovalScope, UInt64) async -> Void)?
         private var testInitialSetupHook: (@Sendable (ApplyEditsApprovalScope) async -> Void)?
@@ -111,15 +123,42 @@ actor ApplyEditsApprovalStore: Sendable {
         unifiedDiff: String,
         timeoutSeconds: TimeInterval
     ) async -> ApplyEditsReviewDecision {
+        let ticket = beginReview(scope: scope)
+        return await awaitReview(ticket, path: path, unifiedDiff: unifiedDiff, timeoutSeconds: timeoutSeconds)
+    }
+
+    /// Step 5a: replaces the scope's pending review (as `requestReview` always did) and issues the
+    /// next review's identity, so its proposal can be saved before the review is shown.
+    func beginReview(scope: ApplyEditsApprovalScope) -> ApplyEditsReviewTicket {
         let replaceReason = "Replaced by newer apply_edits preview"
         cancelPendingReview(scope: scope, reason: replaceReason)
+        let ticket = ApplyEditsReviewTicket(scope: scope, reviewID: UUID())
+        latestReviewIDByScope[scope] = ticket.reviewID
+        return ticket
+    }
 
+    /// Whether `ticket` may still show its review: still the scope's latest, not cleaned up since.
+    func isReviewTicketCurrent(_ ticket: ApplyEditsReviewTicket) -> Bool {
+        latestReviewIDByScope[ticket.scope] == ticket.reviewID
+    }
+
+    /// Shows `ticket`'s review and waits for its decision. A ticket replaced by a newer review, or
+    /// whose scope was cleaned up since it was issued, is `cancelled` without being shown.
+    func awaitReview(
+        _ ticket: ApplyEditsReviewTicket,
+        path: String,
+        unifiedDiff: String,
+        timeoutSeconds: TimeInterval
+    ) async -> ApplyEditsReviewDecision {
+        let scope = ticket.scope
         let review = PendingApplyEditsReview(
+            id: ticket.reviewID,
             scope: scope,
             path: path,
             unifiedDiff: unifiedDiff
         )
         let cancellationReason = "Cancelled while awaiting apply_edits review"
+        let staleReason = "Replaced or closed before the apply_edits review was shown"
         let timeoutNanoseconds = timeoutIntervalToNanoseconds(timeoutSeconds)
 
         let perfState = EditFlowPerf.begin(EditFlowPerf.Stage.ApplyEdits.approvalWait)
@@ -127,6 +166,10 @@ actor ApplyEditsApprovalStore: Sendable {
             await withCheckedContinuation { continuation in
                 guard !Task.isCancelled else {
                     continuation.resume(returning: .cancelled(reason: cancellationReason))
+                    return
+                }
+                guard isReviewTicketCurrent(ticket) else {
+                    continuation.resume(returning: .cancelled(reason: staleReason))
                     return
                 }
 
@@ -150,7 +193,7 @@ actor ApplyEditsApprovalStore: Sendable {
             }
         }, onCancel: {
             Task {
-                await self.cancelPendingReview(scope: scope, reason: cancellationReason)
+                await self.cancelPendingReview(scope: scope, reviewID: ticket.reviewID, reason: cancellationReason)
             }
         })
         EditFlowPerf.end(
@@ -169,14 +212,25 @@ actor ApplyEditsApprovalStore: Sendable {
         resolvePendingReviewIfMatching(scope: scope, reviewID: reviewID, decision: decision)
     }
 
+    /// Explicit lifecycle or replacement cancellation of the scope's review. It also expires the
+    /// scope's latest ticket, so an already accepted review still before its write (Step 5a:
+    /// awaiting `applicationStarted`) never writes. `beginReview` issues its own ticket after this.
+    /// The ID-scoped variant below (a cancelled waiter) never expires a newer ticket.
     func cancelPendingReview(scope: ApplyEditsApprovalScope, reason: String) {
+        latestReviewIDByScope.removeValue(forKey: scope)
         guard let record = pendingByScope[scope] else { return }
         finishPendingReview(scope: scope, record: record, decision: .cancelled(reason: reason))
+    }
+
+    /// Cancels only review `reviewID` (a cancelled waiter never cancels a newer review).
+    private func cancelPendingReview(scope: ApplyEditsApprovalScope, reviewID: UUID, reason: String) {
+        resolvePendingReviewIfMatching(scope: scope, reviewID: reviewID, decision: .cancelled(reason: reason))
     }
 
     func cleanupScope(_ scope: ApplyEditsApprovalScope) {
         ownershipGenerationByScope[scope, default: 0] &+= 1
         cancelPendingReview(scope: scope, reason: "Approval scope cleaned up")
+        latestReviewIDByScope.removeValue(forKey: scope)
         autoEditOverridesByScope.removeValue(forKey: scope)
         finishAndRemoveAllSubscriptions(for: scope)
     }
@@ -194,6 +248,7 @@ actor ApplyEditsApprovalStore: Sendable {
         guard ownershipGenerationByScope[scope] == generation else { return false }
         ownershipGenerationByScope[scope, default: 0] &+= 1
         cancelPendingReview(scope: scope, reason: "Approval scope cleaned up")
+        latestReviewIDByScope.removeValue(forKey: scope)
         autoEditOverridesByScope.removeValue(forKey: scope)
         finishAndRemoveAllSubscriptions(for: scope)
         return true
@@ -210,10 +265,14 @@ actor ApplyEditsApprovalStore: Sendable {
         for scope in subscriptions.keys where scope.windowID == windowID {
             scopesToCleanup.insert(scope)
         }
+        for scope in latestReviewIDByScope.keys where scope.windowID == windowID {
+            scopesToCleanup.insert(scope)
+        }
         guard !scopesToCleanup.isEmpty else { return }
         for scope in scopesToCleanup {
             ownershipGenerationByScope[scope, default: 0] &+= 1
             cancelPendingReview(scope: scope, reason: reason)
+            latestReviewIDByScope.removeValue(forKey: scope)
             autoEditOverridesByScope.removeValue(forKey: scope)
             finishAndRemoveAllSubscriptions(for: scope)
         }

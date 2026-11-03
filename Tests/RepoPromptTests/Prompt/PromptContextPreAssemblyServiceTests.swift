@@ -421,6 +421,53 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
         XCTAssertFalse(packaged.contains("RevokedPromptSentinel"))
     }
 
+    func testDefaultPresentationOmitsPendingAutomaticCodemapsAfterShortBoundedWait() async throws {
+        let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositoryFixture.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/Source.swift": "struct Source { let preAssemblyPendingSentinel: Target }\n",
+                "Sources/Target.swift": "struct Target { func preAssemblyPendingTargetSymbol() {} }\n"
+            ]
+        )
+        let codemapFixture = try CodemapStoreFixture(name: #function)
+        addTeardownBlock {
+            await codemapFixture.shutdown()
+            repositoryFixture.cleanup()
+        }
+        // Every artifact demand stays busy, so automatic readiness can never settle.
+        let store = codemapFixture.makeStore(demandResultHook: { _, _ in
+            .busy(retryAfterMilliseconds: 1000)
+        })
+        _ = try await store.loadRoot(path: root.path)
+        let request = makeScopedRequest(
+            store: store,
+            selection: StoredSelection(
+                selectedPaths: [root.appendingPathComponent("Sources/Source.swift").path],
+                codemapAutoEnabled: true
+            ),
+            codeMapUsage: .auto
+        )
+        let clock = ContinuousClock()
+        let started = clock.now
+
+        let result = try await PromptContextPreAssemblyService.withResolved(request) { $0 }
+
+        let elapsed = started.duration(to: clock.now)
+        XCTAssertLessThan(elapsed, .seconds(5), "Pre-assembly must not wait the full readiness deadline for pending automatic codemaps")
+        XCTAssertEqual(result.entries.map(\.file.standardizedRelativePath), ["Sources/Source.swift"])
+        XCTAssertTrue(result.entries.first?.loadedContent?.contains("preAssemblyPendingSentinel") == true)
+        XCTAssertFalse(result.entries.contains { $0.isCodemap })
+        XCTAssertTrue(result.codemapPresentation.orderedEntries.isEmpty)
+        switch result.codemapPresentation.coverage {
+        case .pending, .unavailable:
+            break
+        case .complete, .partial:
+            XCTFail("Pending automatic codemaps must report typed retry coverage")
+        }
+        XCTAssertFalse(result.codemapPresentation.issues.isEmpty)
+    }
+
     #if DEBUG
         func testFinalPackagingCancellationThrowsWithoutPublishingPayload() async throws {
             let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)

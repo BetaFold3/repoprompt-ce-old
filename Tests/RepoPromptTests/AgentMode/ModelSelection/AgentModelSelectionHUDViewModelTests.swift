@@ -354,9 +354,255 @@ final class AgentModelSelectionHUDViewModelTests: XCTestCase {
         XCTAssertEqual(presentationCount, 2, "Same-mode toggle-dismiss must not rebuild the presentation.")
     }
 
+    func testSuccessfulModelSelectionRunsFocusCallbackOnceAfterLogicalReset() async {
+        let viewModel = AgentModelSelectionHUDViewModel()
+        var observations: [PostCommitObservation] = []
+        var commitCount = 0
+        viewModel.present(mode: .switchModel) {
+            presentation(
+                leaves: [leaf(0, current: true), leaf(1)],
+                commit: { _ in commitCount += 1 },
+                onSuccessfulModelSelection: {
+                    observations.append(PostCommitObservation(viewModel))
+                }
+            )
+        }
+        XCTAssertTrue(observations.isEmpty, "Presenting the picker must not request composer focus.")
+
+        await viewModel.commitSelected()
+
+        XCTAssertEqual(commitCount, 1)
+        XCTAssertEqual(
+            observations,
+            [.dismissedReadyState],
+            "The callback runs exactly once, after the HUD has logically dismissed."
+        )
+        XCTAssertFalse(viewModel.isPresented)
+        XCTAssertEqual(viewModel.phase, .ready)
+
+        await viewModel.commitSelected()
+        XCTAssertEqual(commitCount, 1, "A repeated Enter after reset must not commit again.")
+        XCTAssertEqual(observations.count, 1, "A repeated Enter after reset must not replay focus.")
+    }
+
+    func testFailedModelSelectionNeverRunsFocusCallbackAndRetryRunsItOnce() async {
+        enum Failure: LocalizedError {
+            case rejected
+
+            var errorDescription: String? {
+                "Model rejected."
+            }
+        }
+
+        let viewModel = AgentModelSelectionHUDViewModel()
+        var shouldFail = true
+        var successCount = 0
+        viewModel.present(mode: .switchModel) {
+            presentation(
+                leaves: [leaf(0, current: true)],
+                commit: { _ in
+                    if shouldFail {
+                        throw Failure.rejected
+                    }
+                },
+                onSuccessfulModelSelection: { successCount += 1 }
+            )
+        }
+
+        await viewModel.commitSelected()
+        XCTAssertEqual(successCount, 0, "A failed commit must not move focus to the composer.")
+        XCTAssertTrue(viewModel.isPresented)
+        XCTAssertEqual(viewModel.phase, .ready)
+        XCTAssertEqual(viewModel.errorMessage, "Model rejected.")
+
+        shouldFail = false
+        await viewModel.commitSelected()
+        XCTAssertEqual(successCount, 1, "A successful retry in the same presentation restores focus once.")
+        XCTAssertFalse(viewModel.isPresented)
+    }
+
+    func testFocusCallbackNeverRunsForHandoffDismissalToggleOrIdleTabChange() async {
+        let viewModel = AgentModelSelectionHUDViewModel()
+        var successCount = 0
+        func focusingPresentation(_ index: Int) -> AgentModelSelectionHUDPresentation {
+            presentation(
+                leaves: [leaf(index, current: true)],
+                onSuccessfulModelSelection: { successCount += 1 }
+            )
+        }
+
+        viewModel.activeTabDidChange()
+        XCTAssertFalse(viewModel.isPresented)
+        XCTAssertEqual(viewModel.focusAssertionEpoch, 0, "An idle tab change is a no-op.")
+
+        viewModel.present(mode: .handoffLastReply) { focusingPresentation(0) }
+        await viewModel.commitSelected()
+        XCTAssertFalse(viewModel.isPresented)
+        XCTAssertEqual(successCount, 0, "Handoff never restores the source composer focus.")
+
+        viewModel.present(mode: .switchModel) { focusingPresentation(1) }
+        viewModel.present(mode: .handoffLastReply) { focusingPresentation(2) }
+        XCTAssertEqual(viewModel.mode, .handoffLastReply)
+        await viewModel.commitSelected()
+        XCTAssertEqual(successCount, 0, "Replacing switch mode with handoff drops the focus callback.")
+
+        viewModel.present(mode: .switchModel) { focusingPresentation(3) }
+        viewModel.dismiss()
+        await viewModel.commitSelected()
+        XCTAssertEqual(successCount, 0, "Dismissal must not request composer focus.")
+
+        viewModel.present(mode: .switchModel) { focusingPresentation(4) }
+        viewModel.present(mode: .switchModel) { focusingPresentation(5) }
+        XCTAssertFalse(viewModel.isPresented)
+        await viewModel.commitSelected()
+        XCTAssertEqual(successCount, 0, "Toggle dismissal must not request composer focus.")
+
+        viewModel.present(mode: .switchModel) { focusingPresentation(6) }
+        viewModel.activeTabDidChange()
+        XCTAssertFalse(viewModel.isPresented, "A tab change dismisses a ready HUD.")
+        await viewModel.commitSelected()
+        XCTAssertEqual(successCount, 0, "A tab-change dismissal must not request composer focus.")
+
+        viewModel.present(mode: .switchModel) { focusingPresentation(7) }
+        await viewModel.commitSelected()
+        XCTAssertEqual(successCount, 1, "A later fresh switch-model success still restores focus.")
+    }
+
+    func testTabChangeOrSuspensionDuringCommitCompletesWithoutFocusCallback() async {
+        enum Interruption {
+            case activeTabChanged
+            case blockingOverlay
+        }
+
+        let cases: [(mode: AgentModelSelectionHUDMode, interruption: Interruption)] = [
+            (.switchModel, .activeTabChanged),
+            (.switchModel, .blockingOverlay),
+            // Every real handoff switches tabs while committing.
+            (.handoffLastReply, .activeTabChanged)
+        ]
+        for (mode, interruption) in cases {
+            let label = "\(mode) + \(interruption)"
+            let viewModel = AgentModelSelectionHUDViewModel()
+            let gate = EnteredCommitGate()
+            var commitCount = 0
+            var successCount = 0
+            viewModel.present(mode: mode) {
+                presentation(
+                    leaves: [leaf(0, current: true)],
+                    commit: { _ in
+                        commitCount += 1
+                        await gate.enterAndWaitForRelease()
+                    },
+                    onSuccessfulModelSelection: { successCount += 1 }
+                )
+            }
+
+            let commit = Task { await viewModel.commitSelected() }
+            await gate.waitUntilEntered()
+            XCTAssertEqual(viewModel.phase, .committing, label)
+            XCTAssertEqual(viewModel.isRouting, mode == .handoffLastReply, label)
+
+            switch interruption {
+            case .activeTabChanged:
+                viewModel.activeTabDidChange()
+                XCTAssertTrue(
+                    viewModel.isPresented,
+                    "\(label): a committing HUD is protected from tab-change dismissal."
+                )
+            case .blockingOverlay:
+                viewModel.suspendForBlockingOverlay()
+                XCTAssertFalse(viewModel.isPresented, label)
+            }
+            XCTAssertEqual(viewModel.phase, .committing, label)
+
+            gate.release()
+            await commit.value
+
+            XCTAssertEqual(commitCount, 1, "\(label) must not cancel or repeat the commit.")
+            XCTAssertEqual(successCount, 0, "\(label) leaves no post-commit focus.")
+            XCTAssertFalse(viewModel.isPresented, label)
+            XCTAssertEqual(viewModel.phase, .ready, label)
+            XCTAssertFalse(viewModel.isRouting, label)
+            XCTAssertNil(viewModel.errorMessage, label)
+
+            var freshSuccessCount = 0
+            viewModel.present(mode: .switchModel) {
+                presentation(
+                    leaves: [leaf(1, current: true)],
+                    onSuccessfulModelSelection: { freshSuccessCount += 1 }
+                )
+            }
+            await viewModel.commitSelected()
+            XCTAssertEqual(
+                freshSuccessCount,
+                1,
+                "After \(label), the next presentation requests focus normally."
+            )
+            XCTAssertEqual(successCount, 0, "The invalidated callback is never revived.")
+        }
+    }
+
+    func testTabChangeDuringFailedCommitKeepsErrorAndRetryNeverRevivesFocusCallback() async {
+        enum Failure: LocalizedError {
+            case rejected
+
+            var errorDescription: String? {
+                "Rejected after tab change."
+            }
+        }
+
+        for mode in AgentModelSelectionHUDMode.allCases {
+            let viewModel = AgentModelSelectionHUDViewModel()
+            let gate = EnteredCommitGate()
+            var shouldFail = true
+            var commitCount = 0
+            var successCount = 0
+            viewModel.present(mode: mode) {
+                presentation(
+                    leaves: [leaf(0, current: true)],
+                    commit: { _ in
+                        commitCount += 1
+                        await gate.enterAndWaitForRelease()
+                        if shouldFail {
+                            throw Failure.rejected
+                        }
+                    },
+                    onSuccessfulModelSelection: { successCount += 1 }
+                )
+            }
+
+            let commit = Task { await viewModel.commitSelected() }
+            await gate.waitUntilEntered()
+            viewModel.activeTabDidChange()
+            XCTAssertTrue(viewModel.isPresented, "\(mode)")
+            XCTAssertEqual(viewModel.phase, .committing, "\(mode)")
+            gate.release()
+            await commit.value
+
+            XCTAssertTrue(viewModel.isPresented, "\(mode): a failure after a tab change keeps the HUD open.")
+            XCTAssertEqual(viewModel.phase, .ready, "\(mode)")
+            XCTAssertFalse(viewModel.isRouting, "\(mode)")
+            XCTAssertEqual(viewModel.errorMessage, "Rejected after tab change.", "\(mode)")
+            XCTAssertEqual(successCount, 0, "\(mode): failure never requests focus.")
+
+            // The gate is already released, so the retry completes without suspending.
+            shouldFail = false
+            await viewModel.commitSelected()
+            XCTAssertEqual(commitCount, 2, "\(mode)")
+            XCTAssertFalse(viewModel.isPresented, "\(mode)")
+            XCTAssertNil(viewModel.errorMessage, "\(mode)")
+            XCTAssertEqual(
+                successCount,
+                0,
+                "\(mode): a retry after the tab change must not revive the invalidated callback."
+            )
+        }
+    }
+
     private func presentation(
         leaves: [AgentModelSelectionLeaf],
-        commit: @escaping @MainActor (AgentModelSelectionLeaf) async throws -> Void = { _ in }
+        commit: @escaping @MainActor (AgentModelSelectionLeaf) async throws -> Void = { _ in },
+        onSuccessfulModelSelection: (@MainActor () -> Void)? = nil
     ) -> AgentModelSelectionHUDPresentation {
         AgentModelSelectionHUDPresentation(
             title: "Models",
@@ -364,6 +610,7 @@ final class AgentModelSelectionHUDViewModelTests: XCTestCase {
             index: AgentModelSelectionIndex(leaves: leaves),
             noticeText: nil,
             unavailableMessage: nil,
+            onSuccessfulModelSelection: onSuccessfulModelSelection,
             commit: commit
         )
     }
@@ -400,6 +647,82 @@ final class AgentModelSelectionHUDViewModelTests: XCTestCase {
                 identifier: [raw, String(index)]
             )
         )
+    }
+}
+
+/// State observed by the post-commit focus callback at the moment it runs.
+private struct PostCommitObservation: Equatable {
+    let isPresented: Bool
+    let phase: AgentModelSelectionHUDPhase
+    let isRouting: Bool
+    let hasLeaves: Bool
+    let hasSelection: Bool
+    let errorMessage: String?
+
+    static var dismissedReadyState: PostCommitObservation {
+        PostCommitObservation(
+            isPresented: false,
+            phase: .ready,
+            isRouting: false,
+            hasLeaves: false,
+            hasSelection: false,
+            errorMessage: nil
+        )
+    }
+
+    @MainActor
+    init(_ viewModel: AgentModelSelectionHUDViewModel) {
+        isPresented = viewModel.isPresented
+        phase = viewModel.phase
+        isRouting = viewModel.isRouting
+        hasLeaves = !viewModel.filteredLeaves.isEmpty
+        hasSelection = viewModel.selectedLeafID != nil
+        errorMessage = viewModel.errorMessage
+    }
+
+    private init(
+        isPresented: Bool,
+        phase: AgentModelSelectionHUDPhase,
+        isRouting: Bool,
+        hasLeaves: Bool,
+        hasSelection: Bool,
+        errorMessage: String?
+    ) {
+        self.isPresented = isPresented
+        self.phase = phase
+        self.isRouting = isRouting
+        self.hasLeaves = hasLeaves
+        self.hasSelection = hasSelection
+        self.errorMessage = errorMessage
+    }
+}
+
+/// Deterministic handshake: the test resumes only once the commit action is
+/// suspended inside the gate, so interruptions land while `.committing`.
+@MainActor
+private final class EnteredCommitGate {
+    private var hasEntered = false
+    private var isReleased = false
+    private var enteredContinuation: CheckedContinuation<Void, Never>?
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+    func enterAndWaitForRelease() async {
+        hasEntered = true
+        enteredContinuation?.resume()
+        enteredContinuation = nil
+        guard !isReleased else { return }
+        await withCheckedContinuation { releaseContinuation = $0 }
+    }
+
+    func waitUntilEntered() async {
+        guard !hasEntered else { return }
+        await withCheckedContinuation { enteredContinuation = $0 }
+    }
+
+    func release() {
+        isReleased = true
+        releaseContinuation?.resume()
+        releaseContinuation = nil
     }
 }
 

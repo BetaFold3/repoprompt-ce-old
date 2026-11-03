@@ -2200,7 +2200,9 @@ actor MCPService: Service {
     private func runPPIDWatchdog(initialPPID: pid_t) async throws {
         // Check every 5 seconds - balance between responsiveness and CPU usage
         while !Task.isCancelled {
-            try await Task.sleep(for: .seconds(5))
+            // Nanosecond overload: the generic `Task.sleep(for:)` specialization aborts in
+            // `swift_task_dealloc` in this binary (swiftlang/swift#86204).
+            try await Task.sleep(nanoseconds: 5_000_000_000)
 
             let currentPPID = getppid()
             if currentPPID != initialPPID {
@@ -2316,7 +2318,11 @@ actor MCPService: Service {
                 log.warning("Bootstrap connection lost (\(err)). Retrying in \(String(format: "%.1f", delay))s (attempt \(attempt), elapsed \(String(format: "%.0f", elapsedSinceFirstFailure))s)")
 
                 do {
-                    try await Task.sleep(for: .seconds(delay))
+                    // Nanosecond overload: helper crash reports abort in `swift_task_dealloc`
+                    // under the generic `Task.sleep(for:)` specialization on this line
+                    // (swiftlang/swift#86204). `delay` is capped at `maxDelay`; clamp the
+                    // lower bound so the conversion can never trap.
+                    try await Task.sleep(nanoseconds: UInt64(max(0, delay) * 1_000_000_000))
                 } catch is CancellationError {
                     // Cancelled by kill signal or PPID watchdog
                     throw CLIRuntimeError.hostDisconnected(.taskCancelled)

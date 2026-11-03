@@ -43,6 +43,8 @@ extension AgentModeViewModel {
         requestID: UUID,
         response: AgentMCPElicitationResponse
     ) {
+        // Answers are frozen while a shutdown preserves this window (same boundary as ask_user).
+        guard !isShutdownFrozen else { return }
         guard let session = sessions[tabID],
               let request = session.pendingMCPElicitationRequest,
               request.id == requestID

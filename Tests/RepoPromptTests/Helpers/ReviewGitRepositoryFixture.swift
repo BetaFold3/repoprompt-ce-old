@@ -5,9 +5,12 @@ import Foundation
 @testable import RepoPromptPlatform
 @testable import RepoPromptUI
 @testable import RepoPromptWorkspace
+import XCTest
 
 final class ReviewGitRepositoryFixture {
     let sandbox: URL
+    /// Calls to `rewriteIndexWithoutContentChange`, so each call backdates to a distinct mtime.
+    private var indexRewriteCount = 0
 
     init(name: String = "ReviewGitRepositoryFixture") throws {
         sandbox = FileManager.default.temporaryDirectory
@@ -171,6 +174,31 @@ final class ReviewGitRepositoryFixture {
             code: 4,
             userInfo: [NSLocalizedDescriptionKey: "git status kept rewriting a settled index"]
         )
+    }
+
+    /// Rewrites the index without changing any entry: backdates the tracked file's mtime (to a value
+    /// distinct per call, and from `settleIndex`'s) so `update-index --refresh` re-verifies its
+    /// unchanged content and records new stat data, then settles the index. Fails the test when the
+    /// index file was not rewritten.
+    func rewriteIndexWithoutContentChange(
+        path relativePath: String,
+        at root: URL,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws {
+        let indexURL = try gitPath("index", at: root)
+        let before = try Self.indexStat(at: indexURL)
+        indexRewriteCount += 1
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSinceNow: -10 - Double(indexRewriteCount))],
+            ofItemAtPath: root.appendingPathComponent(relativePath).path
+        )
+        _ = try runGit(["update-index", "-q", "--refresh"], at: root)
+        let after = try Self.indexStat(at: indexURL)
+        if before == after {
+            XCTFail("index not rewritten by a stat-only refresh of \(relativePath)", file: file, line: line)
+        }
+        try settleIndex(at: root)
     }
 
     /// Changes directory timestamps inside the Git directory, and optionally the worktree root,

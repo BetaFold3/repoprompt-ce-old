@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import OSLog
 
 /// Dispatches the `history` MCP tool operations (`list_sessions`, `search`, `time`,
 /// `get_session`)
@@ -14,6 +15,7 @@ package enum HistoryMCPToolService {
     package static let idleThresholdSettingsKey = "history.idle_threshold_minutes"
     private static let maxFilesTouchedPerListedSession = 20
     private static let maxGetSessionEntriesPerTurn = 20
+    private static let logger = Logger(subsystem: "com.repoprompt.agents", category: "HistoryTool")
 
     // MARK: - Public Entry Point
 
@@ -21,27 +23,77 @@ package enum HistoryMCPToolService {
     /// - Parameters:
     ///   - args: The MCP tool arguments (`[String: Value]`). Must contain `"op"`.
     ///   - scanner: A ``HistorySessionScanning`` conformant object for data access.
+    ///   - diagnostics: Optional per-call phase/counter recorder (one per call). When
+    ///     nil, a private one is still used for the summary log line.
     /// - Returns: A typed ``HistoryToolReply``. Scanner faults propagate via `throws`;
     ///   argument validation failures surface as a `.error` reply (preserving the tool's
     ///   "return a result with an `error` field" contract rather than throwing).
+    ///   Task cancellation always propagates as `CancellationError` — never as an
+    ///   empty, partial, or error reply.
     package static func execute(
         args: [String: Value],
-        scanner: HistorySessionScanning
+        scanner: HistorySessionScanning,
+        diagnostics: HistoryExecutionDiagnostics? = nil
     ) async throws -> HistoryToolReply {
-        guard let op = args["op"]?.stringValue, !op.isEmpty else {
+        let diagnostics = diagnostics ?? HistoryExecutionDiagnostics()
+        let op = args["op"]?.stringValue
+        diagnostics.setOperation(op)
+        var outcome = "error"
+        defer {
+            diagnostics.endPhase()
+            let line = diagnostics.summaryLine(outcome: outcome)
+            let isQuietOutcome = outcome == "success" || outcome == "invalid_arguments"
+            if isQuietOutcome, diagnostics.snapshot().elapsed < slowCallLogThreshold {
+                logger.info("\(line, privacy: .public)")
+            } else {
+                logger.notice("\(line, privacy: .public)")
+            }
+        }
+
+        do {
+            try Task.checkCancellation()
+            let reply = try await dispatch(op: op, args: args, scanner: scanner, diagnostics: diagnostics)
+            // Boundary invariant: a cancelled call never settles as a reply of any kind — not a
+            // success built during reply construction, nor an error reply such as a not-found
+            // produced after cancellation was requested.
+            try Task.checkCancellation()
+            if case .error = reply {
+                outcome = "invalid_arguments"
+            } else {
+                outcome = "success"
+            }
+            return reply
+        } catch {
+            // Boundary invariant: once cancelled, any failure surfaces as cancellation.
+            let surfaced: Error = (error is CancellationError || Task.isCancelled) ? CancellationError() : error
+            outcome = surfaced is CancellationError ? "cancelled" : "error"
+            throw surfaced
+        }
+    }
+
+    /// Successful calls slower than this log at `notice` (persisted) instead of `info`.
+    private static let slowCallLogThreshold: Duration = .seconds(5)
+
+    private static func dispatch(
+        op: String?,
+        args: [String: Value],
+        scanner: HistorySessionScanning,
+        diagnostics: HistoryExecutionDiagnostics
+    ) async throws -> HistoryToolReply {
+        guard let op, !op.isEmpty else {
             return .error(HistoryErrorReply(error: "Missing or empty required parameter 'op'"))
         }
 
         do {
             switch op {
             case "list_sessions":
-                return try await executeListSessions(args: args, scanner: scanner)
+                return try await executeListSessions(args: args, scanner: scanner, diagnostics: diagnostics)
             case "search":
-                return try await executeSearch(args: args, scanner: scanner)
+                return try await executeSearch(args: args, scanner: scanner, diagnostics: diagnostics)
             case "time":
-                return try await executeTime(args: args, scanner: scanner)
+                return try await executeTime(args: args, scanner: scanner, diagnostics: diagnostics)
             case "get_session":
-                return try await executeGetSession(args: args, scanner: scanner)
+                return try await executeGetSession(args: args, scanner: scanner, diagnostics: diagnostics)
             default:
                 return .error(HistoryErrorReply(error: "Unknown op '\(op)'. Valid ops: list_sessions, search, time, get_session"))
             }
@@ -50,11 +102,87 @@ package enum HistoryMCPToolService {
         }
     }
 
+    /// Rethrow cancellation from a catch whose other failures are skippable, so a
+    /// cancelled call never degrades into an empty or partial result.
+    private static func rethrowIfCancelled(_ error: Error) throws {
+        if error is CancellationError { throw error }
+        try Task.checkCancellation()
+    }
+
+    /// Inventory read shared by every op. `inventoryWait` is entered before awaiting
+    /// the scanner actor so time queued behind another call is attributed correctly.
+    private static func scanInventory(
+        _ scanner: HistorySessionScanning,
+        diagnostics: HistoryExecutionDiagnostics
+    ) async throws -> [HistoryWorkspaceScanResult] {
+        diagnostics.enter(.inventoryWait)
+        let results = try await scanner.scanAllWorkspaces(diagnostics: diagnostics)
+        diagnostics.endPhase()
+        return results
+    }
+
+    /// Transcript load for one session. `transcriptLoad` is entered before awaiting
+    /// the scanner actor.
+    private static func loadTranscript(
+        _ session: HistoryFilteredSessionRecord,
+        scanner: HistorySessionScanning,
+        diagnostics: HistoryExecutionDiagnostics
+    ) async throws -> AgentTranscript {
+        diagnostics.enter(.transcriptLoad)
+        return try await scanner.loadTranscriptForSearch(
+            sessionID: session.record.id,
+            workspaceDir: session.workspaceDir,
+            diagnostics: diagnostics
+        )
+    }
+
+    private static func filterSessions(
+        _ scanResults: [HistoryWorkspaceScanResult],
+        scanner: HistorySessionScanning,
+        diagnostics: HistoryExecutionDiagnostics,
+        workspace: String?,
+        agentKind: String?,
+        model: String?,
+        from: Date?,
+        to: Date?
+    ) throws -> [HistoryFilteredSessionRecord] {
+        diagnostics.enter(.filtering)
+        let filtered = try scanner.sessionsMatchingFilters(
+            scanResults,
+            workspace: workspace,
+            agentKind: agentKind,
+            model: model,
+            filePath: nil,
+            from: from,
+            to: to
+        )
+        let considered = scanResults.reduce(0) { $0 + $1.records.count }
+        diagnostics.updateCounters {
+            $0.recordsConsidered += considered
+            $0.recordsRetained += filtered.count
+        }
+        return filtered
+    }
+
+    private static func sortSessions(
+        _ sessions: [HistoryFilteredSessionRecord],
+        by sortRaw: String,
+        idleThresholdMinutes: Int,
+        diagnostics: HistoryExecutionDiagnostics
+    ) throws -> [HistoryFilteredSessionRecord] {
+        try Task.checkCancellation()
+        diagnostics.enter(.sorting)
+        let sorted = sortFilteredSessions(sessions, by: sortRaw, idleThresholdMinutes: idleThresholdMinutes)
+        try Task.checkCancellation()
+        return sorted
+    }
+
     // MARK: - list_sessions
 
     private static func executeListSessions(
         args: [String: Value],
-        scanner: HistorySessionScanning
+        scanner: HistorySessionScanning,
+        diagnostics: HistoryExecutionDiagnostics
     ) async throws -> HistoryToolReply {
         let workspaceFilter = args["workspace"]?.stringValue
         let agentKindFilter = args["agent_kind"]?.stringValue
@@ -70,14 +198,15 @@ package enum HistoryMCPToolService {
 
         let idleThresholdMinutes = try resolveIdleThreshold(args["idle_threshold_minutes"])
         let maxSessionsScanned = try resolveMaxSessionsScanned(args["max_sessions_scanned"])
-        let scanResults = try await scanner.scanAllWorkspaces()
+        let scanResults = try await scanInventory(scanner, diagnostics: diagnostics)
         let skippedWorkspaces = scanDiagnostics(from: scanResults)
-        let filtered = scanner.sessionsMatchingFilters(
+        let filtered = try filterSessions(
             scanResults,
+            scanner: scanner,
+            diagnostics: diagnostics,
             workspace: workspaceFilter,
             agentKind: agentKindFilter,
             model: modelFilter,
-            filePath: nil,
             from: dateFrom,
             to: dateTo
         )
@@ -85,19 +214,25 @@ package enum HistoryMCPToolService {
         // Keep metadata filtering/sorting cheap, then hydrate only bounded candidates.
         // When touched_file is present, stub-rebuilt records may have empty keyPaths, so
         // the file filter is applied after bounded on-demand enrichment.
-        var sorted = sortFilteredSessions(filtered, by: sortRaw == "duration" ? "last_activity" : sortRaw, idleThresholdMinutes: idleThresholdMinutes)
+        var sorted = try sortSessions(
+            filtered,
+            by: sortRaw == "duration" ? "last_activity" : sortRaw,
+            idleThresholdMinutes: idleThresholdMinutes,
+            diagnostics: diagnostics
+        )
         let candidates = Array(sorted.prefix(maxSessionsScanned))
         let sessionsScanned = candidates.count
         let scanTruncated = sorted.count > candidates.count
         // list_sessions uses index-inventory durations (recomputeStale off): cheap, but
         // can lag `time` for sessions whose transcript grew post-save; `time` is the
         // live-transcript-authoritative duration.
-        var hydrated = await Self.enrichingStubBuiltSessions(candidates, scanner: scanner)
+        var hydrated = try await Self.enrichingStubBuiltSessions(candidates, scanner: scanner, diagnostics: diagnostics)
         if sortRaw == "duration" {
-            hydrated = sortFilteredSessions(hydrated, by: sortRaw, idleThresholdMinutes: idleThresholdMinutes)
+            hydrated = try sortSessions(hydrated, by: sortRaw, idleThresholdMinutes: idleThresholdMinutes, diagnostics: diagnostics)
         }
         let totalSessions: Int
         if let filePathFilter {
+            diagnostics.enter(.filtering)
             hydrated = hydrated.filter { session in
                 session.record.keyPaths.contains { historyPath($0, matches: filePathFilter) }
             }
@@ -109,6 +244,8 @@ package enum HistoryMCPToolService {
         let truncated = sorted.count > limit
         let sliced = Array(sorted.prefix(limit))
 
+        try Task.checkCancellation()
+        diagnostics.enter(.replyConstruction)
         let sessions: [HistoryListSessionsReply.SessionDTO] = sliced.map { session in
             let r = session.record
             let filesTouched = Array(r.keyPaths).sorted()
@@ -148,7 +285,8 @@ package enum HistoryMCPToolService {
 
     private static func executeGetSession(
         args: [String: Value],
-        scanner: HistorySessionScanning
+        scanner: HistorySessionScanning,
+        diagnostics: HistoryExecutionDiagnostics
     ) async throws -> HistoryToolReply {
         guard let sessionIDRaw = args["session_id"]?.stringValue, !sessionIDRaw.isEmpty else {
             return .error(HistoryErrorReply(error: "Missing or empty required parameter 'session_id'"))
@@ -161,32 +299,39 @@ package enum HistoryMCPToolService {
         let contextTurns = clampGetSessionContextTurns(args["context_turns"]?.intValue)
         let roles = normalizedGetSessionRoles(args["roles"]?.arrayValue?.compactMap(\.stringValue))
 
-        let scanResults = try await scanner.scanAllWorkspaces()
-        func resolveSession(in results: [HistoryWorkspaceScanResult]) -> HistoryFilteredSessionRecord? {
-            results.lazy.flatMap { scan in
-                scan.records.map { record in
-                    HistoryFilteredSessionRecord(
+        let scanResults = try await scanInventory(scanner, diagnostics: diagnostics)
+        func resolveSession(in results: [HistoryWorkspaceScanResult]) throws -> HistoryFilteredSessionRecord? {
+            diagnostics.enter(.filtering)
+            for scan in results {
+                try Task.checkCancellation()
+                if let record = scan.records.first(where: { $0.id == sessionID }) {
+                    return HistoryFilteredSessionRecord(
                         record: record,
                         workspaceName: scan.workspaceName,
                         workspaceDir: scan.workspaceDir
                     )
                 }
-            }.first(where: { $0.record.id == sessionID })
+            }
+            return nil
         }
-        // F6: if the id isn't in the (possibly cached) inventory, force a fresh scan —
-        // the session may have been saved since the TTL cache was populated.
-        var session = resolveSession(in: scanResults)
+        // F6: if the id isn't in the (possibly cached) inventory, re-read only the
+        // workspace(s) holding that session's file — the session may have been saved
+        // since the TTL cache was populated. This is a bounded probe, not a second full
+        // inventory scan.
+        var session = try resolveSession(in: scanResults)
         if session == nil {
-            session = try await resolveSession(in: scanner.scanAllWorkspacesRefreshing())
+            diagnostics.enter(.inventoryWait)
+            let refreshed = try await scanner.refreshWorkspacesContainingSession(sessionID, diagnostics: diagnostics)
+            session = try resolveSession(in: refreshed)
         }
+        try Task.checkCancellation()
         guard let session else {
             return .error(HistoryErrorReply(error: "No history session found for session_id '\(sessionIDRaw)'"))
         }
 
-        let transcript = try await scanner.loadTranscriptForSearch(
-            sessionID: session.record.id,
-            workspaceDir: session.workspaceDir
-        )
+        let transcript = try await loadTranscript(session, scanner: scanner, diagnostics: diagnostics)
+        try Task.checkCancellation()
+        diagnostics.enter(.transcriptTraversal)
         let totalTurns = transcript.turns.count
         guard totalTurns > 0 else {
             return .getSession(HistoryGetSessionReply(
@@ -225,6 +370,7 @@ package enum HistoryMCPToolService {
         }
 
         for (turnIndex, turn) in budgetOrder {
+            try Task.checkCancellation()
             if remainingChars <= 0 {
                 replyTruncated = true
                 break
@@ -239,6 +385,8 @@ package enum HistoryMCPToolService {
             renderedTurnsByIndex[turnIndex] = rendered.dto
         }
 
+        try Task.checkCancellation()
+        diagnostics.enter(.replyConstruction)
         let turnDTOs = window.compactMap { renderedTurnsByIndex[$0.offset] }
         if turnDTOs.count < window.count { replyTruncated = true }
         let returnedTurnStart = turnDTOs.map(\.turnIndex).min() ?? requestedRange.lowerBound
@@ -267,7 +415,8 @@ package enum HistoryMCPToolService {
 
     private static func executeSearch(
         args: [String: Value],
-        scanner: HistorySessionScanning
+        scanner: HistorySessionScanning,
+        diagnostics: HistoryExecutionDiagnostics
     ) async throws -> HistoryToolReply {
         guard let rawQuery = args["query"]?.stringValue,
               !rawQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -288,12 +437,13 @@ package enum HistoryMCPToolService {
         let includeTurnRequestText = args["include_turn_request_text"]?.boolValue ?? false
         let maxSessionsScanned = try resolveMaxSessionsScanned(args["max_sessions_scanned"])
 
-        let scanResults = try await scanner.scanAllWorkspaces()
+        let scanResults = try await scanInventory(scanner, diagnostics: diagnostics)
         let skippedWorkspaces = scanDiagnostics(from: scanResults)
 
         let filtered = try resolveScopedSessions(
             scanResults: scanResults,
             scanner: scanner,
+            diagnostics: diagnostics,
             workspace: workspaceFilter,
             sessionID: sessionIDFilter,
             from: dateFrom,
@@ -306,8 +456,14 @@ package enum HistoryMCPToolService {
         var sessionsScanned = 0
         var scanTruncated = false
 
-        let orderedSessions = sortFilteredSessions(filtered, by: "last_activity", idleThresholdMinutes: AgentSessionMetadataRecord.defaultIdleThresholdMinutes)
+        let orderedSessions = try sortSessions(
+            filtered,
+            by: "last_activity",
+            idleThresholdMinutes: AgentSessionMetadataRecord.defaultIdleThresholdMinutes,
+            diagnostics: diagnostics
+        )
         for session in orderedSessions {
+            try Task.checkCancellation()
             if sessionsScanned >= maxSessionsScanned {
                 scanTruncated = true
                 break
@@ -316,16 +472,16 @@ package enum HistoryMCPToolService {
 
             let transcript: AgentTranscript
             do {
-                transcript = try await scanner.loadTranscriptForSearch(
-                    sessionID: session.record.id,
-                    workspaceDir: session.workspaceDir
-                )
+                transcript = try await loadTranscript(session, scanner: scanner, diagnostics: diagnostics)
             } catch {
+                try rethrowIfCancelled(error)
                 // Skip sessions whose transcripts can't be loaded.
                 continue
             }
 
+            diagnostics.enter(.transcriptTraversal)
             for (turnIndex, turn) in transcript.turns.enumerated() {
+                try Task.checkCancellation()
                 var turnMatches: [HistorySearchMatch] = []
 
                 // Search activity text. `source:"activities"` is the activity subset of
@@ -334,7 +490,10 @@ package enum HistoryMCPToolService {
                 // searchable under both filters — no carve-out that would make
                 // `source:"activities"` narrower than the activity matches in `source:"all"`).
                 if sourceFilter != "summaries" {
-                    for activity in turn.allActivities {
+                    let activities = turn.allActivities
+                    try Task.checkCancellation()
+                    for activity in activities {
+                        try Task.checkCancellation()
                         if activity.text.lowercased().contains(queryLower) {
                             let snippet = extractSnippet(text: activity.text, query: queryLower)
                             let roleString = mapActivityRole(activity.role)
@@ -403,12 +562,16 @@ package enum HistoryMCPToolService {
             }
         }
 
+        try Task.checkCancellation()
+        diagnostics.enter(.sorting)
         totalMatches = retainedMatches.count
         retainedMatches.sort { $0.timestamp > $1.timestamp }
+        try Task.checkCancellation()
 
         let truncated = totalMatches > limit
         let sliced = Array(retainedMatches.prefix(limit))
 
+        diagnostics.enter(.replyConstruction)
         let results: [HistorySearchReply.MatchDTO] = sliced.map { match in
             HistorySearchReply.MatchDTO(
                 sessionID: match.sessionID.uuidString,
@@ -437,7 +600,8 @@ package enum HistoryMCPToolService {
 
     private static func executeTime(
         args: [String: Value],
-        scanner: HistorySessionScanning
+        scanner: HistorySessionScanning,
+        diagnostics: HistoryExecutionDiagnostics
     ) async throws -> HistoryToolReply {
         guard let groupBy = args["group_by"]?.stringValue, !groupBy.isEmpty else {
             return .error(HistoryErrorReply(error: "Missing or empty required parameter 'group_by'. Valid values: day, week, month, session, workspace"))
@@ -456,12 +620,13 @@ package enum HistoryMCPToolService {
         let limit = clampLimit(args["limit"]?.intValue, default: 30, max: 100)
         let maxSessionsScanned = try resolveMaxSessionsScanned(args["max_sessions_scanned"])
 
-        let scanResults = try await scanner.scanAllWorkspaces()
+        let scanResults = try await scanInventory(scanner, diagnostics: diagnostics)
         let skippedWorkspaces = scanDiagnostics(from: scanResults)
 
         let filtered = try resolveScopedSessions(
             scanResults: scanResults,
             scanner: scanner,
+            diagnostics: diagnostics,
             workspace: workspaceFilter,
             sessionID: sessionIDFilter,
             from: dateFrom,
@@ -484,25 +649,40 @@ package enum HistoryMCPToolService {
                 maxSessionsScanned: maxSessionsScanned,
                 limit: limit,
                 skippedWorkspaces: skippedWorkspaces,
-                scanner: scanner
+                scanner: scanner,
+                diagnostics: diagnostics
             )
         }
 
         // Non-calendar grouping reads stored duration; hydrate only a bounded candidate set.
-        let candidates = Array(sortFilteredSessions(filtered, by: "last_activity", idleThresholdMinutes: idleThresholdMinutes).prefix(maxSessionsScanned))
+        let candidates = try Array(sortSessions(
+            filtered,
+            by: "last_activity",
+            idleThresholdMinutes: idleThresholdMinutes,
+            diagnostics: diagnostics
+        ).prefix(maxSessionsScanned))
         let sessionsScanned = candidates.count
         let scanTruncated = filtered.count > candidates.count
         // `recomputeStale` so group_by:session/workspace totals come from the live
         // transcript (matching the calendar path) instead of stale persisted primitives.
-        let enriched = await Self.enrichingStubBuiltSessions(candidates, scanner: scanner, recomputeStale: true)
+        let enriched = try await Self.enrichingStubBuiltSessions(
+            candidates,
+            scanner: scanner,
+            diagnostics: diagnostics,
+            recomputeStale: true
+        )
         // Report the full filtered count, matching the calendar path and list_sessions;
         // `sessionsScanned`/`scanTruncated` convey the bounded-scan semantic separately.
+        try Task.checkCancellation()
+        diagnostics.enter(.aggregation)
         let totalSessions = filtered.count
         let totalDuration = enriched.reduce(0) { $0 + $1.record.activeDurationSeconds(thresholdMinutes: idleThresholdMinutes) }
 
         let allGroups = groupSessions(enriched, by: groupBy, includeDetails: includeDetails, idleThresholdMinutes: idleThresholdMinutes)
+        try Task.checkCancellation()
         let groups = Array(allGroups.prefix(limit))
 
+        diagnostics.enter(.replyConstruction)
         return .time(HistoryTimeReply(
             totalSessions: totalSessions,
             totalActiveDurationSeconds: totalDuration,
@@ -530,11 +710,13 @@ package enum HistoryMCPToolService {
     private static func enrichingStubBuiltSessions(
         _ sessions: [HistoryFilteredSessionRecord],
         scanner: HistorySessionScanning,
+        diagnostics: HistoryExecutionDiagnostics,
         recomputeStale: Bool = false
-    ) async -> [HistoryFilteredSessionRecord] {
+    ) async throws -> [HistoryFilteredSessionRecord] {
         var enriched: [HistoryFilteredSessionRecord] = []
         enriched.reserveCapacity(sessions.count)
         for session in sessions {
+            try Task.checkCancellation()
             // Skip records that already carry transcript-derived fields. With
             // `recomputeStale` (used by `time`), also recompute when the session file
             // changed since the stored observed signature — so `time` totals aren't
@@ -544,6 +726,7 @@ package enum HistoryMCPToolService {
             let isStub = session.record.lacksTranscriptDerivedFields
             var isStale = false
             if recomputeStale {
+                diagnostics.enter(.transcriptLoad)
                 isStale = await scanner.transcriptDerivedFieldsAreStale(
                     for: session.record,
                     sessionID: session.record.id,
@@ -559,21 +742,23 @@ package enum HistoryMCPToolService {
                 // transcript means zero duration, matching the calendar path. Fall back
                 // to the stored record only on an actual load failure (missing/corrupt
                 // file), not on a successfully-loaded empty transcript.
-                let transcript = try await scanner.loadTranscriptForSearch(
-                    sessionID: session.record.id,
-                    workspaceDir: session.workspaceDir
-                )
+                let transcript = try await loadTranscript(session, scanner: scanner, diagnostics: diagnostics)
+                diagnostics.enter(.transcriptTraversal)
+                let enrichedRecord = session.record.enrichingTranscriptDerivedFields(from: transcript.turns)
+                try Task.checkCancellation()
                 enriched.append(
                     HistoryFilteredSessionRecord(
-                        record: session.record.enrichingTranscriptDerivedFields(from: transcript.turns),
+                        record: enrichedRecord,
                         workspaceName: session.workspaceName,
                         workspaceDir: session.workspaceDir
                     )
                 )
             } catch {
+                try rethrowIfCancelled(error)
                 enriched.append(session)
             }
         }
+        try Task.checkCancellation()
         return enriched
     }
 
@@ -587,6 +772,7 @@ package enum HistoryMCPToolService {
     private static func resolveScopedSessions(
         scanResults: [HistoryWorkspaceScanResult],
         scanner: HistorySessionScanning,
+        diagnostics: HistoryExecutionDiagnostics,
         workspace: String?,
         sessionID: String?,
         from: Date?,
@@ -595,12 +781,13 @@ package enum HistoryMCPToolService {
         if let sessionID, UUID(uuidString: sessionID) == nil {
             throw HistoryValidationError(message: "Invalid session_id: expected UUID format")
         }
-        let matched = scanner.sessionsMatchingFilters(
+        let matched = try filterSessions(
             scanResults,
+            scanner: scanner,
+            diagnostics: diagnostics,
             workspace: workspace,
             agentKind: nil,
             model: nil,
-            filePath: nil,
             from: from,
             to: to
         )
@@ -628,7 +815,8 @@ package enum HistoryMCPToolService {
         maxSessionsScanned: Int,
         limit: Int,
         skippedWorkspaces: [String],
-        scanner: HistorySessionScanning
+        scanner: HistorySessionScanning,
+        diagnostics: HistoryExecutionDiagnostics
     ) async throws -> HistoryToolReply {
         let calendar = Calendar.current
 
@@ -669,8 +857,14 @@ package enum HistoryMCPToolService {
         var detailDuration: [String: [UUID: Int]] = [:]
         var detailTurns: [String: [UUID: Int]] = [:]
 
-        let orderedSessions = sortFilteredSessions(sessions, by: "last_activity", idleThresholdMinutes: idleThresholdMinutes)
+        let orderedSessions = try sortSessions(
+            sessions,
+            by: "last_activity",
+            idleThresholdMinutes: idleThresholdMinutes,
+            diagnostics: diagnostics
+        )
         for session in orderedSessions {
+            try Task.checkCancellation()
             if sessionsScanned >= maxSessionsScanned {
                 scanTruncated = true
                 break
@@ -679,12 +873,13 @@ package enum HistoryMCPToolService {
 
             let transcript: AgentTranscript
             do {
-                transcript = try await scanner.loadTranscriptForSearch(
-                    sessionID: session.record.id,
-                    workspaceDir: session.workspaceDir
-                )
-            } catch { continue }
+                transcript = try await loadTranscript(session, scanner: scanner, diagnostics: diagnostics)
+            } catch {
+                try rethrowIfCancelled(error)
+                continue
+            }
 
+            diagnostics.enter(.aggregation)
             let sid = session.record.id
             sessionNames[sid] = session.record.name
             // Bucket this session's turn intervals by group key, then compute the merged
@@ -698,6 +893,7 @@ package enum HistoryMCPToolService {
             var toolCallsByKey: [String: Int] = [:]
 
             for turn in transcript.turns {
+                try Task.checkCancellation()
                 let start = turn.startedAt
                 if let dateFrom, start < dateFrom { continue }
                 if let dateTo, start > dateTo { continue }
@@ -723,7 +919,9 @@ package enum HistoryMCPToolService {
                 } else {
                     var cursor = start
                     while cursor < end {
-                        guard let g = groupBounds(for: cursor) else { break }
+                        // A corrupt far-future end makes this loop data-bounded only.
+                        try Task.checkCancellation()
+                        guard let g = groupBounds(for: cursor), g.end > cursor else { break }
                         let clippedEnd = min(end, g.end)
                         intervalsByKey[g.key, default: []].append((cursor, clippedEnd))
                         cursor = g.end
@@ -745,6 +943,8 @@ package enum HistoryMCPToolService {
             }
         }
 
+        try Task.checkCancellation()
+        diagnostics.enter(.replyConstruction)
         let sortedKeys = groupKeys.sorted().reversed()
         let allGroupDTOs: [HistoryTimeReply.GroupDTO] = sortedKeys.map { key in
             let details: [HistoryTimeReply.GroupDTO.DetailDTO]?

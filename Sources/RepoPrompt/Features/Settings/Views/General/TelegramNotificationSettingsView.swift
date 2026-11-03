@@ -41,6 +41,9 @@ struct TelegramNotificationSettingsView: View {
                         ForEach(service.notices, id: \.self) { notice in
                             note(notice.message)
                         }
+                        if let hint = service.sessionLinkHint {
+                            note(hint)
+                        }
                         if service.offIsUnsaved {
                             Button("Retry Saving Off") { _ = service.setEnabled(false) }
                         }

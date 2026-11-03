@@ -265,13 +265,17 @@ package enum ClaudeCodeIntegrationConfiguration {
         // Arguments: mcp add RepoPrompt --env KEY=value ... -- <serverCommand>
         // Note: name must come before --env flags for claude CLI argument parsing.
         let addArgs = ["mcp", "add", configuration.name] + mcpAddEnvironmentFlagArguments + ["--", configuration.command]
+        // R6: these short administrative config commands are not managed runtimes (no registration),
+        // but their copied environment never carries an inherited runtime marker.
+        let removedKeys: Set<String> = [ProcessLauncher.runtimeMarkerEnvironmentKey]
 
         do {
             let result = try await runner.run(
                 args: addArgs,
                 stdin: nil,
                 outputMode: .none,
-                timeout: 30
+                timeout: 30,
+                additionalRemovedKeys: removedKeys
             )
 
             if result.status == 0 {
@@ -287,14 +291,16 @@ package enum ClaudeCodeIntegrationConfiguration {
                     args: ["mcp", "remove", configuration.name],
                     stdin: nil,
                     outputMode: .none,
-                    timeout: 15
+                    timeout: 15,
+                    additionalRemovedKeys: removedKeys
                 )
                 if removeResult.status == 0 {
                     let readdResult = try await runner.run(
                         args: addArgs,
                         stdin: nil,
                         outputMode: .none,
-                        timeout: 30
+                        timeout: 30,
+                        additionalRemovedKeys: removedKeys
                     )
                     if readdResult.status == 0 {
                         return InstallResult(success: true, errorMessage: nil, wasAlreadyPresent: true)

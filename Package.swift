@@ -16,9 +16,14 @@ let benchmarkTestsEnabled = environment["RPCE_ENABLE_BENCHMARK_TESTS"] == "1"
 // Gate on, first-party Swift targets define DEBUG in the release build, plus a
 // lane marker. Packages/RepoPromptCore and Packages/RepoPromptAgentProviders
 // keep identical copies of this gate (manifests cannot share code).
+// Optimized-incremental App lane (`canonical_swift.sh --rpce-optimized-incremental`): the same gate
+// plus RPCE_OPTIMIZED_INCREMENTAL=1 adds the RPCE_OPTIMIZED_INCREMENTAL lane label to every
+// first-party module; only the root manifest also compiles RepoPromptApp non-WMO (below).
 let optimizedDiagnosticsLane = environment["RPCE_OPTIMIZED_DIAGNOSTICS"] == "1"
+let optimizedIncrementalLane = optimizedDiagnosticsLane && environment["RPCE_OPTIMIZED_INCREMENTAL"] == "1"
 let firstPartyDebugSettings: [SwiftSetting] = optimizedDiagnosticsLane
     ? [.define("DEBUG"), .define("RPCE_OPTIMIZED_DIAGNOSTICS", .when(configuration: .release))]
+    + (optimizedIncrementalLane ? [.define("RPCE_OPTIMIZED_INCREMENTAL", .when(configuration: .release))] : [])
     : [.define("DEBUG", .when(configuration: .debug))]
 
 var packageDependencies: [Package.Dependency] = [
@@ -49,6 +54,11 @@ var packageDependencies: [Package.Dependency] = [
     .package(url: "https://github.com/provencher/SwiftOpenAI", revision: "1211782eb337e7968124448a20d9260df1952012"),
     .package(url: "https://github.com/ChimeHQ/Neon.git", exact: "0.6.0"),
     .package(path: "Vendor/UniversalCharsetDetection"),
+    // Bounded passkey verifier experiment: linked only into the root test target (see
+    // repoPromptTestDependencies), not into any production target. Two vendored packages mirror
+    // upstream's own manifests (SwiftCBOR @ tools 5.5, SwiftWebAuthn @ tools 6.0).
+    .package(path: "Vendor/SwiftCBOR"),
+    .package(path: "Vendor/SwiftWebAuthn"),
     .package(url: "https://github.com/loopwork-ai/JSONSchema.git", exact: "1.3.0"),
     .package(url: "https://github.com/loopwork-ai/ontology.git", exact: "0.6.0"),
     .package(url: "https://github.com/getsentry/sentry-cocoa", exact: "9.17.1"),
@@ -91,7 +101,13 @@ var repoPromptAppDependencies: [Target.Dependency] = [
     .product(name: "Cuchardet", package: "UniversalCharsetDetection"),
     .product(name: "JSONSchema", package: "JSONSchema"),
     .product(name: "Ontology", package: "ontology"),
-    .product(name: "RepoPromptClaudeCompatibleProvider", package: "RepoPromptAgentProviders")
+    .product(name: "RepoPromptClaudeCompatibleProvider", package: "RepoPromptAgentProviders"),
+    // Remote passkey unlock (Step 2): the maintained-copy WebAuthn verifier is linked into the
+    // app target only. SwiftCBOR is pulled in transitively by WebAuthn but is never imported by
+    // production code. It is intentionally NOT added to RepoPromptGateway, RepoPromptRemoteWire,
+    // RepoPromptAgentCore or RepoPromptShared. Both are local path packages, so Package.resolved
+    // is unchanged.
+    .product(name: "WebAuthn", package: "SwiftWebAuthn")
 ]
 
 /// Shared by RepoPromptApp and the lower app-split library targets so compile conditions stay aligned.
@@ -100,6 +116,15 @@ let repoPromptLayerSwiftSettings: [SwiftSetting] = firstPartyDebugSettings + [
 ]
 
 var repoPromptAppSwiftSettings: [SwiftSetting] = repoPromptLayerSwiftSettings
+// Optimized-incremental App lane only: RepoPromptApp alone overrides SwiftPM's release
+// -whole-module-optimization (the driver honors the last of the pair) with incremental batch mode.
+// SwiftPM's own -j<host CPUs> sets frontend parallelism. Every other module keeps -O WMO;
+// Scripts/verify_build_lane_flags.py --lane optimized-incremental proves both on every lane package.
+if optimizedIncrementalLane {
+    repoPromptAppSwiftSettings.append(
+        .unsafeFlags(["-no-whole-module-optimization", "-incremental", "-enable-batch-mode"], .when(configuration: .release))
+    )
+}
 
 var repoPromptTestDependencies: [Target.Dependency] = [
     "RepoPromptApp",
@@ -109,9 +134,17 @@ var repoPromptTestDependencies: [Target.Dependency] = [
     "RepoPromptWorkspace",
     "RepoPromptGateway",
     "RepoPromptRemoteWire",
+    // Gateway WebSocket frame-sink tests drive the actual production NIO sink against an embedded
+    // channel (remote passkey unlock, Step 3). Test-only; not added to any production target.
+    .product(name: "NIOCore", package: "swift-nio"),
+    .product(name: "NIOEmbedded", package: "swift-nio"),
+    .product(name: "NIOWebSocket", package: "swift-nio"),
     .product(name: "RepoPromptShared", package: "RepoPromptCore"),
     .product(name: "RepoPromptMCPClientKit", package: "RepoPromptCore"),
-    .product(name: "RepoPromptMCPCore", package: "RepoPromptCore")
+    .product(name: "RepoPromptMCPCore", package: "RepoPromptCore"),
+    // Bounded passkey verifier experiment (test-only; not in the production runtime graph).
+    .product(name: "WebAuthn", package: "SwiftWebAuthn"),
+    .product(name: "SwiftCBOR", package: "SwiftCBOR")
 ]
 
 var repoPromptTestSwiftSettings: [SwiftSetting] = [
@@ -224,7 +257,9 @@ let package = Package(
         .executableTarget(
             name: "RepoPromptMCP",
             dependencies: [
-                .product(name: "RepoPromptMCPCore", package: "RepoPromptCore")
+                .product(name: "RepoPromptMCPCore", package: "RepoPromptCore"),
+                // Restart safely private relaunch mode only (`ProcessRelaunchHelper`).
+                "RepoPromptPlatform"
             ],
             path: "Sources/RepoPromptMCP",
             swiftSettings: firstPartyDebugSettings

@@ -16,15 +16,43 @@ final class InterceptingWindowDelegateProxy: NSObject, NSWindowDelegate {
             return forwardedDelegate?.windowShouldClose?(sender) ?? true
         }
 
+        let manager = windowState.windowStatesManager ?? WindowStatesManager.shared
+        // One-shot: a two-stage close finished Stage B (its forwarded veto was checked before the
+        // point of no return and `beginClose` already ran), so this close is not re-routed.
+        if windowState.closeCoordinator.consumeFinalizedCloseAuthorization() {
+            windowState.beginClose()
+            return true
+        }
+        if !manager.isTerminating {
+            let lifecycle = manager.lifecycleShutdown
+            // An app quit still preparing owns every window; a close of this window already in
+            // progress keeps its single request.
+            if lifecycle.isApplicationRequestActive || lifecycle.isWindowRequestActive(windowState.windowID) {
+                return false
+            }
+        }
+
         switch windowState.closeCoordinator.handleCloseAttempt(for: sender) {
         case .allow:
-            // Set isClosing early to suppress @Published mutations before AppKit
-            // sends focus/key events during close (fixes EXC_BAD_ACCESS in ObservationTracking).
-            let shouldClose = forwardedDelegate?.windowShouldClose?(sender) ?? true
-            if shouldClose {
-                windowState.beginClose()
+            guard !manager.isTerminating else {
+                // App quit past its point of no return: it already preserved and tore down.
+                // Set isClosing early to suppress @Published mutations before AppKit
+                // sends focus/key events during close (fixes EXC_BAD_ACCESS in ObservationTracking).
+                let shouldClose = forwardedDelegate?.windowShouldClose?(sender) ?? true
+                if shouldClose {
+                    windowState.beginClose()
+                }
+                return shouldClose
             }
-            return shouldClose
+            // Two-stage close: preserved and torn down first, then closed by a one-shot
+            // authorization. The forwarded delegate decides before anything irreversible.
+            return manager.handleLifecycleWindowCloseAttempt(
+                windowState,
+                forwardedVeto: { [weak self, weak sender] in
+                    guard let sender else { return false }
+                    return self?.forwardedDelegate?.windowShouldClose?(sender) ?? true
+                }
+            )
         case .background, .confirm, .denyDuplicatePrompt:
             return false
         }

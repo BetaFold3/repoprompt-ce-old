@@ -205,6 +205,7 @@ package enum ProcessTermination {
         processGroupID: pid_t?,
         status: inout Int32,
         rootExited: inout Bool,
+        rootReapConfirmed: inout Bool,
         deadline: TimeInterval,
         pollIntervalNs: UInt64,
         waitForProcessGroupExit: Bool,
@@ -215,9 +216,11 @@ package enum ProcessTermination {
                 let r = waitpid(pid, &status, WNOHANG)
                 if r == pid {
                     rootExited = true
+                    rootReapConfirmed = true
                 } else if r == -1, errno == EINTR {
                     continue
                 } else if r == -1, errno == ECHILD {
+                    // Gone from our children, but not reaped here: never exit proof for this pid.
                     rootExited = true
                 } else if r == -1 {
                     let message = String(cString: strerror(errno))
@@ -243,10 +246,12 @@ package enum ProcessTermination {
         sigkillGrace: TimeInterval,
         logger: (String) -> Void
     ) async -> Int32 {
-        await terminateAndReapStatus(
+        var rootReapConfirmed = false
+        return await terminateAndReapStatus(
             pid: pid,
             processGroupID: processGroupID,
             status: &status,
+            rootReapConfirmed: &rootReapConfirmed,
             sigtermGrace: sigtermGrace,
             sigkillGrace: sigkillGrace,
             logger: logger
@@ -257,6 +262,7 @@ package enum ProcessTermination {
         pid: pid_t,
         processGroupID: pid_t?,
         status: inout Int32,
+        rootReapConfirmed: inout Bool,
         sigtermGrace: TimeInterval,
         sigkillGrace: TimeInterval,
         logger: (String) -> Void
@@ -278,6 +284,7 @@ package enum ProcessTermination {
             processGroupID: processGroupID,
             status: &status,
             rootExited: &rootExited,
+            rootReapConfirmed: &rootReapConfirmed,
             deadline: sigtermDeadline,
             pollIntervalNs: shortPollNs,
             waitForProcessGroupExit: waitForProcessGroupExit,
@@ -317,6 +324,7 @@ package enum ProcessTermination {
             processGroupID: processGroupID,
             status: &status,
             rootExited: &rootExited,
+            rootReapConfirmed: &rootReapConfirmed,
             deadline: sigkillDeadline,
             pollIntervalNs: shortPollNs,
             waitForProcessGroupExit: waitForProcessGroupExit,
@@ -440,6 +448,44 @@ package enum ProcessTermination {
         timeout: TimeInterval?,
         logger: (String) -> Void = { _ in }
     ) async throws -> (status: ProcessExitStatus, timedOut: Bool) {
+        var rootReapConfirmed = false
+        return try await waitForTerminationStatus(
+            pid: pid,
+            processGroupID: processGroupID,
+            timeout: timeout,
+            rootReapConfirmed: &rootReapConfirmed,
+            logger: logger
+        )
+    }
+
+    /// Lossless restart R6: like `waitForTermination`, also reporting whether this call itself
+    /// reaped the exact root (`waitpid` returned `pid`). `ECHILD`, a wait failure or an
+    /// unconfirmed escalation is never reported as a reap.
+    package static func waitForTerminationReportingRoot(
+        pid: pid_t,
+        processGroupID: pid_t?,
+        timeout: TimeInterval?,
+        logger: (String) -> Void = { _ in }
+    ) async throws -> (exitCode: Int32, timedOut: Bool, rootReaped: Bool) {
+        var rootReapConfirmed = false
+        let outcome = try await waitForTerminationStatus(
+            pid: pid,
+            processGroupID: processGroupID,
+            timeout: timeout,
+            rootReapConfirmed: &rootReapConfirmed,
+            logger: logger
+        )
+        return (outcome.status.normalizedExitCode, outcome.timedOut, rootReapConfirmed)
+    }
+
+    // swiftlint:disable:next function_body_length
+    private static func waitForTerminationStatus(
+        pid: pid_t,
+        processGroupID: pid_t?,
+        timeout: TimeInterval?,
+        rootReapConfirmed: inout Bool,
+        logger: (String) -> Void
+    ) async throws -> (status: ProcessExitStatus, timedOut: Bool) {
         var status: Int32 = 0
         let start = ProcessInfo.processInfo.systemUptime
         let shortPollNs = UInt64(pollInterval * 1_000_000_000)
@@ -461,6 +507,7 @@ package enum ProcessTermination {
                         pid: pid,
                         processGroupID: processGroupID,
                         status: &status,
+                        rootReapConfirmed: &rootReapConfirmed,
                         sigtermGrace: timing.sigtermGrace,
                         sigkillGrace: timing.sigkillGrace,
                         logger: logger
@@ -469,7 +516,10 @@ package enum ProcessTermination {
                 }
 
                 let r = waitpid(pid, &status, WNOHANG)
-                if r == pid { return (decodeWaitStatus(status), false) }
+                if r == pid {
+                    rootReapConfirmed = true
+                    return (decodeWaitStatus(status), false)
+                }
                 if r == 0 {
                     if ProcessInfo.processInfo.systemUptime >= deadline {
                         let timing = currentTiming()
@@ -478,6 +528,7 @@ package enum ProcessTermination {
                             pid: pid,
                             processGroupID: processGroupID,
                             status: &status,
+                            rootReapConfirmed: &rootReapConfirmed,
                             sigtermGrace: timing.sigtermGrace,
                             sigkillGrace: timing.sigkillGrace,
                             logger: logger
@@ -504,6 +555,7 @@ package enum ProcessTermination {
                     pid: pid,
                     processGroupID: processGroupID,
                     status: &status,
+                    rootReapConfirmed: &rootReapConfirmed,
                     sigtermGrace: timing.sigtermGrace,
                     sigkillGrace: timing.sigkillGrace,
                     logger: logger
@@ -512,7 +564,10 @@ package enum ProcessTermination {
             }
 
             let r = waitpid(pid, &status, WNOHANG)
-            if r == pid { return (decodeWaitStatus(status), false) }
+            if r == pid {
+                rootReapConfirmed = true
+                return (decodeWaitStatus(status), false)
+            }
             if r == 0 {
                 try? await Task.sleep(nanoseconds: currentPollNs())
                 continue
@@ -543,5 +598,30 @@ package enum ProcessTermination {
             sigkillGrace: sigkillGrace ?? timing.sigkillGrace,
             logger: logger
         )
+    }
+
+    /// Lossless restart R6: `terminateAndReap`, also reporting whether this call itself reaped the
+    /// exact root (`waitpid` returned `pid`). `ECHILD`, a wait failure or an expired grace period is
+    /// never reported as a reap, so callers never treat it as exit proof.
+    package static func terminateAndReapReportingRoot(
+        pid: pid_t,
+        processGroupID: pid_t?,
+        sigtermGrace: TimeInterval? = nil,
+        sigkillGrace: TimeInterval? = nil,
+        logger: (String) -> Void = { _ in }
+    ) async -> (exitCode: Int32, rootReaped: Bool) {
+        var status: Int32 = 0
+        var rootReapConfirmed = false
+        let timing = currentTiming()
+        let exitStatus = await terminateAndReapStatus(
+            pid: pid,
+            processGroupID: processGroupID,
+            status: &status,
+            rootReapConfirmed: &rootReapConfirmed,
+            sigtermGrace: sigtermGrace ?? timing.sigtermGrace,
+            sigkillGrace: sigkillGrace ?? timing.sigkillGrace,
+            logger: logger
+        )
+        return (exitStatus.normalizedExitCode, rootReapConfirmed)
     }
 }

@@ -264,11 +264,24 @@ final class AgentModeViewModel: ObservableObject {
     /// Selected workflow for the active tab
     var selectedWorkflow: AgentWorkflowDefinition?
 
+    /// App-scoped lossless-restart recovery composition, installed by `AgentRecoveryAppComposition`
+    /// before any hydration (see `AgentModeViewModel+Recovery.swift`); `nil` only when composition
+    /// is inactive (XCTest without explicit injection) or failed (then admission is fail-closed).
+    var recoveryCoordinator: AgentRecoveryCoordinator?
+
+    /// Admission mode applied to every live and new session once recovery is composed. `.mandatory`
+    /// means every user input is committed durably before projection or handoff (fail closed).
+    var recoveryAdmissionModeForSessions: AgentRecoveryAdmissionMode = .inactive
+
     /// When true, the first message in a new chat will ask the agent to interview
-    /// the user with 2–3 clarifying questions before starting work.
+    /// the user with 2–3 clarifying questions before starting work. Projection of the active
+    /// session's `AgentTabSession.interviewFirst`; writes are mirrored into that session.
     var interviewFirst: Bool = false {
         didSet {
             guard interviewFirst != oldValue else { return }
+            if let session = activeSession, session.interviewFirst != interviewFirst {
+                session.interviewFirst = interviewFirst
+            }
             syncStatusPillsUIState()
         }
     }
@@ -308,6 +321,7 @@ final class AgentModeViewModel: ObservableObject {
                         from: previousAgent,
                         to: selectedAgent
                     )
+                    retireRegisteredACPControllerOnProviderSwitch(session, from: previousAgent, to: selectedAgent)
                 }
                 session.selectedAgent = selectedAgent
                 if !isModelRawValid(selectedModelRaw, for: selectedAgent) {
@@ -589,7 +603,13 @@ final class AgentModeViewModel: ObservableObject {
     private let workspaceFileContextStore: WorkspaceFileContextStore?
     weak var workspaceManager: WorkspaceManagerViewModel?
     private weak var mcpServer: MCPServerViewModel?
-    let dataService = AgentSessionDataService.shared
+    /// The session writer. When recovery is composed it is the coordinator's DataService (the one
+    /// whose gate fences the recovery store), so every transcript save, reset commit, and recovery
+    /// write share one lifecycle gate. The coordinator is installed once, before sessions load.
+    var dataService: AgentSessionDataService {
+        recoveryCoordinator?.dataService ?? AgentSessionDataService.shared
+    }
+
     private var sidebarPrioritizedIndexBuilder: SidebarPrioritizedIndexBuilder = { request in
         try await AgentSessionDataService.shared.buildPrioritizedSidebarIndex(request)
     }
@@ -631,9 +651,65 @@ final class AgentModeViewModel: ObservableObject {
     var scheduledSendRecoveryObserver: AnyCancellable?
     var scheduledSendDeletionObserver: AnyCancellable?
     var scheduledSendPendingConfirmationObserver: AnyCancellable?
+    /// Refreshes the schedule banner when its recorded recovery blocker changes (lossless restart F2).
+    var scheduledSendDispositionObserver: AnyCancellable?
+    var scheduledSendDeliveryEvidenceObserver: AnyCancellable?
+    /// F-10: retries projected transfers once startup admission opens (for example after Retry).
+    var scheduledSendStartupAdmissionObserver: AnyCancellable?
+    /// Re-joins recovery-held pending handoffs when their lane's delivery evidence lands.
+    var recoveryPendingHandoffEvidenceObserver: AnyCancellable?
+    /// Refreshes recovery UI when the coordinator's startup state, results, or holds change.
+    var recoveryCoordinatorChangeObserver: AnyCancellable?
+    /// Refreshes the recovery list when records are committed after startup or composer recovery
+    /// state (held composer, unsaved or held input, write failures) changes. Never schedules.
+    var recoveryLiveStateObserver: AnyCancellable?
+    /// Why production recovery composition failed (mandatory admission stays fail-closed).
+    var recoveryCompositionFailure: String?
+    /// Production composition's startup retry (nil when not composed by the app).
+    var recoveryStartupRetry: (@MainActor () -> Void)?
+    /// A Needs Attention request this window's sheet host has not presented yet.
+    var recoveryNeedsAttentionRequestPending = false
+    /// Opens a recovery item's session in another workspace through the existing agent-session
+    /// navigation route (replaceable in tests; it never starts a provider).
+    var recoveryListRouteToSession: RecoveryListSessionRouter = AgentModeViewModel.routeRecoveryListSessionThroughDeepLinks
     /// Injection seam for scheduled dispatch: replaces `startAgentRun` so provider acceptance
     /// outcomes can be driven without a live provider. `nil` uses the real run path.
     var scheduledDispatchRunStarter: ScheduledDispatchRunStarter?
+    /// Lossless restart Phase 4 explicit recovery actions, from the app's one activation
+    /// (`AgentRecoveryActivation.production`); `AgentRecoveryAppComposition.install(into:)` sets the
+    /// same composition's runner explicitly.
+    lazy var recoveryActionRunner = AgentRecoveryAppComposition.makeActionRunner()
+    /// Stable action requests per recovery item and choice, so a repeated click joins its
+    /// reservation (same action ID, same planned user item) until its outcome is recorded.
+    var recoveryActionRequestsBySlot: [RecoveryActionSlot: AgentRecoveryActionRequest] = [:]
+    /// A previous launch's open action joined and shown on an item; the next explicit choice on
+    /// that item names it (`supersedesActionID`). The store revalidates its join every time.
+    var recoveryPriorActionsByItem: [AgentRecoveryCardKey: RecoveryPriorAction] = [:]
+    /// Registry knowledge used to locate a Claude conversation's native history (Phase 4); the
+    /// composition's registry (set again by `install(into:)`).
+    var recoveryHistoryRegistry: AgentProcessRegistry? = AgentProcessRegistry.production
+    #if DEBUG
+        /// Tests: replaces the registry's Claude history-home lookup (fixture homes only).
+        var test_recoveryClaudeHistoryHomes: (@MainActor (String) async -> [String])?
+        /// Tests: replaces the history locator's fallback candidate homes (fixture homes only; under
+        /// XCTest without it the fallback has no candidates).
+        var test_recoveryClaudeHistoryLocatorHomes: (@MainActor () async -> [String])?
+        /// Tests: stands in for the registry's one refresh when no home is recorded (only while
+        /// `test_recoveryClaudeHistoryHomes` is set; otherwise no refresh happens in a fixture).
+        var test_recoveryRefreshHistoryRegistry: (@MainActor () async -> Void)?
+        /// Tests: replaces the runner's result of an explicit recovery choice (the request is built,
+        /// gated and cached as usual; nothing is reserved or sent). Production never sets it.
+        var test_recoveryActionResult: (@MainActor (AgentRecoveryActionRequest) async -> AgentRecoveryActionResult)?
+        /// Tests: Claude history-home lookups and history reads this window performed.
+        var test_recoveryClaudeHistoryAccessCount = 0
+        /// Tests: replaces this host's Claude pre-byte baseline admission result (coordinator wiring
+        /// tests; the producer itself is covered with a qualified runner). Production never sets it.
+        var test_claudeDispatchBaselineAdmission: (@MainActor (
+            AgentDispatchBaselineIdentity?,
+            AgentSessionProviderHistoryRecovery.DispatchBaseline.OutboundUserMessage?,
+            AgentTabSession
+        ) async -> AgentRuntimeWriteAdmission)?
+    #endif
     /// Presenter for the discard confirmation required before a lifecycle operation destroys a tab
     /// whose retained local conversation cannot be saved (stale-reset recovery). `nil` refuses the
     /// operation instead of discarding silently; the app composition installs an alert presenter.
@@ -648,6 +724,8 @@ final class AgentModeViewModel: ObservableObject {
     #if DEBUG
         /// Test-only workspace used for session persistence when no workspace manager exists.
         var test_persistenceWorkspaceOverride: WorkspaceModel?
+        /// Test-only grant store for the workspace-steering final fence (`workspaceSteeringGrantStore`).
+        var test_workspaceSteeringGrantStoreOverride: WorkspaceSteeringGrantStore?
         /// Test seam: awaited inside `handleComposeTabsWillClose` after runtime teardown and
         /// immediately before the final save, so a peer reset and a local mutation can be
         /// interleaved between the preflight and that save.
@@ -666,10 +744,40 @@ final class AgentModeViewModel: ObservableObject {
         /// captured and immediately before the durable write, so a mutation can land during the
         /// awaited write.
         var test_saveSessionBeforeWriteHook: (@MainActor (AgentTabSession) async -> Void)?
-        /// Test seam: awaited inside `ensurePersistenceState` immediately before create-only
-        /// authority is prepared for a never-persisted session, so another save request can be
-        /// coalesced behind the in-flight initial save.
+        /// Test seam (O11): when it returns an outcome, Send saved's placement save uses that outcome
+        /// instead of the owner write (suppressed, reset-only, non-writing, or stale outcomes).
+        var test_recoverySavedPlacementSaveOutcomeOverride: (@MainActor (AgentTabSession) async -> SessionSaveOutcome?)?
+        /// Test seam: awaited by `clearChatPreservingRecovery` while it owns the session writer slot,
+        /// immediately before the reset commit (a failure can be injected or input attempted here).
+        var test_recoveryResetBeforeCommitHook: (@MainActor (AgentTabSession) async -> Void)?
+        /// Test seam (Step 5b): awaited by `mcpCommitDelegatedChildLink` with the child, after its
+        /// covering save and immediately before the parent's link commit (inside the link await).
+        var test_delegatedChildLinkAwaitHook: (@MainActor (AgentTabSession) async -> Void)?
+        /// Test seam (Step 5a): awaited with the session inside each new edit-review await: before the
+        /// `pending` and `applicationStarted` commits, and before the accepted review's ticket check.
+        var test_editProposalRecoveryAwaitHook: (@MainActor (AgentTabSession, EditProposalRecoveryAwaitPoint) async -> Void)?
+        /// Test seam (Step 5a): replaces the pasteboard for Copy proposal (also Step 5c Copy patch).
+        var test_recoveryListPasteboardWriter: (@MainActor (String) -> Void)?
+        /// Test seam (Step 5c): awaited with the session before each new worktree-merge review await.
+        var test_worktreeMergeAwaitHook: (@MainActor (AgentTabSession, WorktreeMergeAwaitPoint) async -> Void)?
+        /// Test seam (Step 5c): replaces the VCS merge apply (counts handoffs without Git).
+        var test_worktreeMergeApplyOverride: (@MainActor (GitWorktreeMergeApplyRequest) async throws -> GitWorktreeMergeApplyResult)?
+        /// Test seam (Step 5c): replaces the read-only merge inspection.
+        var test_worktreeMergeInspectOverride: (@MainActor (GitWorktreeMergeInspectRequest) async throws -> GitWorktreeMergeInspection)?
+        /// Test seam: awaited in `finalizeDeletedAgentSessionReferences` after a deleted session's
+        /// owner was detached from its tab and before its awaited teardown, so a replacement owner
+        /// can be installed on the tab while the cleanup is suspended.
+        var test_deletedSessionTeardownHook: (@MainActor (AgentTabSession) async -> Void)?
+        /// Replaces the debounce, maximum-wait, and retry sleeps of session saves.
+        var test_saveTimerSleepOverride: (@MainActor (SaveTimerKind, ContinuousClock.Instant) async throws -> Void)?
+        /// Test seam: awaited inside `ensurePersistenceState` immediately before a never-persisted
+        /// session's file is exclusively created, so another save request can be coalesced behind
+        /// the in-flight initial save.
         var test_initialPersistencePreparationHook: (@MainActor (AgentTabSession) async -> Void)?
+        /// Test seam: awaited inside `ensurePersistenceState` after exclusive creation durably
+        /// committed and before its authority is adopted, so the persistence context can change
+        /// between the commit and adoption.
+        var test_initialPersistenceCommittedHook: (@MainActor (AgentTabSession) async -> Void)?
         /// Test seam: awaited inside `performPersistedSessionLoad` after the payload is prepared
         /// and before any ownership/staleness validation, so a binding change or an active-stream
         /// update can be interleaved against a held reload.
@@ -797,7 +905,25 @@ final class AgentModeViewModel: ObservableObject {
             AgentTabSession
         ) async -> AgentRunTerminalPublicationResult)?
     #endif
-    private var hasPreparedForWindowClose = false
+    private(set) var hasPreparedForWindowClose = false
+    /// The single irreversible teardown (Stage B); a repeated request joins it instead of returning
+    /// before the teardown finished.
+    private var windowCloseTeardownTask: Task<Void, Never>?
+    /// Stage A freeze of this window's sessions (see `AgentModeViewModel+Shutdown.swift`).
+    @Published var shutdownFreezeState: AgentModeShutdownFreezeState?
+    /// Per tab, the exact question snapshots this window's Stage A wrote and the lane they were
+    /// written to (live resolution and Cancel remove only those interaction IDs).
+    var shutdownQuestionSnapshots: [UUID: AgentModeShutdownQuestionSnapshots] = [:]
+    /// Serializes this window's live-resolution and Cancel snapshot removals; a later Stage A joins
+    /// it before writing.
+    var shutdownQuestionSnapshotWriteTask: Task<Void, Never>?
+    /// This window's latest Stage A preparation, whichever request started it. A later one (Retry,
+    /// or a successor request after Cancel or window-close supersession) joins it and the removals
+    /// it enqueued before capturing questions.
+    var shutdownPreparationTask: Task<AgentModeShutdownReport, Never>?
+    /// Question-snapshot removals whose write failed, keyed by the lane they target. Kept (never
+    /// dropped before a receipt) and retried before the next Stage A writes.
+    var shutdownFailedQuestionSnapshotRemovals: [ObjectIdentifier: AgentModeShutdownFailedQuestionRemoval] = [:]
     private static let uiRefreshCoalesceDelayNanos: UInt64 = 75_000_000
     private static let sessionSidebarRestoreBatchSize = 32
     private nonisolated static let sessionSidebarRestoreRetryLimit = 1
@@ -806,6 +932,8 @@ final class AgentModeViewModel: ObservableObject {
     private nonisolated static let detachedTranscriptEvictionChunkSize = 5
     private nonisolated static let pendingToolFinalizationNonToolBoundary = 200
     nonisolated static let staleComposerSubmitTargetMessage = "This composer changed before the message could be sent. Please try again."
+    nonisolated static let staleInstructionTargetMessage =
+        "The target session changed before the instruction could be sent. Nothing was sent."
     private nonisolated static let childAgentRunWaitDrainTimeoutSeconds: TimeInterval = 2.0
 
     #if DEBUG
@@ -3137,39 +3265,56 @@ final class AgentModeViewModel: ObservableObject {
                 }
                 return result
             },
-            startFollowUpRun: { [weak self] tabID, initialMessage, afterStart in
+            startFollowUpRun: { [weak self] tabID, instruction, afterStart in
+                // `instruction.constituents` are the queued identities; the run service commits their
+                // dispatch before any runner is admitted.
                 Task { [weak self] in
-                    await self?.startAgentRun(tabID: tabID, initialMessage: initialMessage)
+                    guard let self else { return }
+                    let outcome = await startAgentRun(
+                        tabID: tabID,
+                        initialMessage: instruction.text,
+                        inputConstituents: instruction.constituents
+                    )
+                    // Durable input that was never handed off stays queued and visible (same intents).
+                    if instruction.isDurable, Self.runStartDidNotHandOff(outcome), let session = sessions[tabID] {
+                        session.pendingInstructions.insert(instruction, at: 0)
+                        session.isDirty = true
+                        scheduleSave(for: tabID)
+                    }
                     afterStart?()
                 }
             },
             restoreDraftText: { [weak self] tabID, text, message, strategy in
                 self?.restoreComposerDraft(tabID: tabID, text: text, message: message, strategy: strategy)
             },
-            augmentUserMessageForProviderSend: { [weak self] text, attachments, taggedFileAttachments, session in
-                guard let self else { return text }
+            augmentUserMessageForProviderSend: { [weak self] text, attachments, taggedFileAttachments, session, carriers in
+                guard let self else { return AgentStagedProviderText(text: text) }
                 return await augmentUserMessageForProviderSend(
                     text,
                     attachments: attachments,
                     taggedFileAttachments: taggedFileAttachments,
                     agent: session?.selectedAgent,
-                    session: session
+                    session: session,
+                    carriers: carriers
                 )
             },
             stageResumeRecoveryHandoffIfNeeded: { [weak self] session in
                 await self?.stageResumeRecoveryHandoffIfNeeded(for: session)
             },
             prependPendingHandoffIfNeeded: { [weak self] text, session in
-                self?.prependPendingHandoffIfNeeded(text, session: session) ?? text
+                self?.stagePendingHandoffIfNeeded(text, session: session) ?? AgentStagedProviderText(text: text)
             },
-            recordPendingHandoffSendOutcome: { [weak self] session, didSend in
-                self?.recordPendingHandoffSendOutcome(for: session, didSend: didSend)
+            stagePendingHandoffForDurableDispatch: { [weak self] text, session in
+                await self?.stagePendingHandoffForDurableDispatch(text, session: session) ?? .failed
+            },
+            recordPendingHandoffSendOutcome: { [weak self] session, stage, disposition in
+                self?.recordPendingHandoffStageOutcome(for: session, stage: stage, disposition: disposition)
             },
             signalMCPInstructionDelivered: { [weak self] session in
                 await self?.signalMCPInstructionDelivered(for: session)
             },
-            recordDelegatedQuestionNoticeSendOutcome: { [weak self] session, stageID, didSend in
-                self?.recordDelegatedQuestionNoticeSendOutcome(for: session, stageID: stageID, didSend: didSend)
+            recordDelegatedQuestionNoticeSendOutcome: { [weak self] session, stageID, disposition in
+                self?.recordDelegatedQuestionNoticeSendOutcome(for: session, stageID: stageID, disposition: disposition)
             },
             captureAttentionTurnCompletion: { [weak self] session, revision in
                 self?.captureAttentionTurnCompletion(for: session, revision: revision)
@@ -3194,6 +3339,9 @@ final class AgentModeViewModel: ObservableObject {
             },
             endBackgroundNativeMessage: { [weak self] sourceID, session in
                 self?.endBackgroundMessage(fromSource: sourceID, session: session)
+            },
+            deliverRequeuedHeadToLiveInstructionWait: { [weak self] session in
+                _ = self?.deliverRequeuedHeadToLiveInstructionWaitIfNeeded(session)
             }
         )
         let toolTrackingHooks = makeToolTrackingHooks()
@@ -3771,7 +3919,19 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     func prepareForWindowClose() async {
-        guard !hasPreparedForWindowClose else { return }
+        await prepareForWindowClose(reason: .windowClose)
+    }
+
+    /// Irreversible teardown of this window's agent state (two-stage shutdown Stage B, or the
+    /// legacy close path). Idempotent and joinable: every caller awaits the same teardown, which
+    /// runs exactly once. Nothing durable is withdrawn here: queued intents stay queued (teardown
+    /// only resumes an instruction wait), preserved questions are not refreshed, and the run
+    /// shutdown `reason` was recorded by Stage A (the legacy path records none).
+    func prepareForWindowClose(reason: AgentRecoveryShutdownReason) async {
+        if let windowCloseTeardownTask {
+            await windowCloseTeardownTask.value
+            return
+        }
         hasPreparedForWindowClose = true
         unregisterObserverRegistrations()
         detachScheduledSendCoordinator()
@@ -3787,12 +3947,22 @@ final class AgentModeViewModel: ObservableObject {
         pendingRemoteStartWindowPicker = nil
         workspaceSwitchProvider.cancelAllBackgroundCleanup()
         cancelSessionIndexRefresh(releaseFrozenOrder: true)
+        let teardownCause = AgentRunTerminalCause(shutdownReason: reason)
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await performWindowCloseTeardown(cause: teardownCause)
+        }
+        windowCloseTeardownTask = task
+        await task.value
+    }
+
+    private func performWindowCloseTeardown(cause: AgentRunTerminalCause) async {
         let tabIDs = Array(sessions.keys)
         await withTaskGroup(of: Void.self) { group in
             for tabID in tabIDs {
                 group.addTask { @MainActor [weak self] in
                     guard let self, let session = sessions[tabID] else { return }
-                    await prepareSessionForWindowClose(session)
+                    await prepareSessionForWindowClose(session, teardownCause: cause)
                 }
             }
         }
@@ -3811,7 +3981,15 @@ final class AgentModeViewModel: ObservableObject {
         )
     }
 
-    private func prepareSessionForWindowClose(_ session: AgentTabSession) async {
+    private func prepareSessionForWindowClose(
+        _ session: AgentTabSession,
+        teardownCause: AgentRunTerminalCause
+    ) async {
+        // Before any cancellation: a runner that commits first after its task is cancelled still
+        // records the lifecycle cause (Stage A only recorded the provisional shutdown reason).
+        if session.lifecycleTeardownCause == nil {
+            session.lifecycleTeardownCause = teardownCause
+        }
         removePendingUIRefresh(for: session.tabID)
         cancelPersistedLoad(for: session)
         // The window close was confirmed upstream (its impact sheet listed unsaved conversations).
@@ -3824,6 +4002,13 @@ final class AgentModeViewModel: ObservableObject {
         // does not depend on agentTask being non-nil. Cancelling the task
         // handle early just sends the stop signal sooner; the graceful path
         // still finalizes run state and disposes the provider.
+        // The conversation is retained, so buffered assistant text is applied, not discarded.
+        session.drainPendingAssistantDelta()
+        // O49: before the run task is cancelled, so run end settles a started Claude turn as
+        // accepted and a started ACP prompt failing from this teardown reports receipt (window
+        // close and app quit Stage B).
+        claudeCoordinator.noteRepoPromptTeardownRequested(session)
+        session.acpController?.noteRepoPromptTeardownRequested()
         session.cancelEphemeralRuntimeState()
         cancelPendingQuestion(for: session)
         cancelPendingApproval(for: session)
@@ -3831,7 +4016,7 @@ final class AgentModeViewModel: ObservableObject {
         cancelPendingInstruction(for: session)
         await teardownMCPControl(for: session, cleanupSessionStore: true)
         if session.runState.isActive {
-            await cancelAgentRun(tabID: session.tabID)
+            await cancelAgentRun(tabID: session.tabID, cause: teardownCause)
         }
         await cleanupACPStateForDeletedSession(session)
         await session.disposeProviderIfPresent()
@@ -3845,6 +4030,10 @@ final class AgentModeViewModel: ObservableObject {
             reason: "window_close"
         )
         await releaseSessionWorktreeOwnership(sessionID: sessionID)
+        // Only the maximum wait ends here (and cannot re-arm after close begins). A pending debounce is
+        // kept: the two-stage shutdown's final flush (`finalizeTranscriptsAfterShutdown`) supersedes
+        // it, and the legacy close path still relies on it for state the cleanup above re-dirtied.
+        clearTranscriptSaveMaxWait(session)
     }
 
     // MARK: - Tab Management
@@ -3862,6 +4051,11 @@ final class AgentModeViewModel: ObservableObject {
             sessionActivationGeneration &+= 1
         }
         let activationGeneration = sessionActivationGeneration
+        // R13: the outgoing tab's composer is written at the switch boundary, not left to the
+        // debounce. Its lane is bound to its own durable session, so nothing crosses tabs.
+        if let outgoingTabID = lastProcessedTabID, outgoingTabID != tabID, let outgoing = sessions[outgoingTabID] {
+            flushRecoveryComposer(for: outgoing)
+        }
         #if DEBUG || EDIT_FLOW_PERF
             if let tabID {
                 AgentInteractionLatencyProbe.tabActivationHandlerEntered(tabID: tabID, windowID: windowID)
@@ -4061,8 +4255,13 @@ final class AgentModeViewModel: ObservableObject {
             // Source items are the canonical mutable session data. Schedule
             // persistence from the source mutation itself so inactive presentation
             // deferral cannot make durability depend on derived UI refresh work.
+            // The maximum wait is armed here too: this callback precedes the dirty mark.
+            noteTranscriptPersistenceMutation(session)
             scheduleSave(for: session.tabID)
             scheduleDerivedTranscriptRefresh(for: session, reason: .liveMutation, mutation: mutation, caller: caller)
+        }
+        newSession.onPersistenceMutation = { [weak self] session in
+            self?.noteTranscriptPersistenceMutation(session)
         }
         newSession.onRunStateChanged = { [weak self] session in
             guard let self else { return }
@@ -4099,6 +4298,11 @@ final class AgentModeViewModel: ObservableObject {
         {
             seedUnhydratedSession(newSession, from: indexEntry)
         }
+        // First-draft observation precedes the first composer mutation (including a seeded tab
+        // draft), so input typed before any lane exists is an owner-scoped recovery obligation.
+        installRecoveryComposerObservation(on: newSession)
+        // Also without a coordinator: a failed production composition stays mandatory (fail closed).
+        newSession.recoveryAdmissionMode = recoveryAdmissionModeForSessions
         if let draft = tabDraftText.removeValue(forKey: tabID) {
             newSession.draftText = draft
         }
@@ -4128,30 +4332,33 @@ final class AgentModeViewModel: ObservableObject {
         return session.agentMessageRuntimeFootersByItemID
     }
 
-    func recordAgentTurnUserAnchor(for session: AgentTabSession, userItem: AgentChatItem) {
+    /// `startedAt` overrides the item's timestamp when an already shown bubble is reused for a new
+    /// run (Send saved): the bubble keeps its own timestamp, the run's footer starts now.
+    func recordAgentTurnUserAnchor(for session: AgentTabSession, userItem: AgentChatItem, startedAt: Date? = nil) {
+        let startedAt = startedAt ?? userItem.timestamp
         if session.runState == .running {
             completeNextAgentTurnRuntimeFooterIfNeeded(
                 for: session,
-                endedAt: userItem.timestamp,
+                endedAt: startedAt,
                 maxSequenceIndexExclusive: userItem.sequenceIndex
             )
         }
 
         if shouldRestartActiveAgentRunElapsedTimer(for: session) {
-            restartActiveAgentRunElapsedTimer(for: session, startedAt: userItem.timestamp)
+            restartActiveAgentRunElapsedTimer(for: session, startedAt: startedAt)
         }
 
         let anchor = AgentTabSession.AgentTurnRuntimeAnchor(
             userItemID: userItem.id,
             userSequenceIndex: userItem.sequenceIndex,
-            startedAt: userItem.timestamp
+            startedAt: startedAt
         )
         if session.runState == .waitingForUser,
            !session.pendingTurnRuntimeAnchors.isEmpty
         {
             completeNextAgentTurnRuntimeFooterIfNeeded(
                 for: session,
-                endedAt: userItem.timestamp,
+                endedAt: startedAt,
                 maxSequenceIndexExclusive: userItem.sequenceIndex
             )
         }
@@ -5411,6 +5618,38 @@ final class AgentModeViewModel: ObservableObject {
                         prepareDurationMS = WorkspaceRestorePerfLog.elapsedMS(since: prepareStartMS)
                     }
                 #endif
+                // No payload is a genuine creator only when the UUID was never deleted. A binding
+                // restored after a crash between the deletion tombstone and the workspace unbind
+                // could never save (every creation is fenced by the tombstone), so it is neither
+                // declared loaded nor adopted: the existing deletion cleanup CAS-clears only the
+                // bindings that still name this UUID. A stale-reset recovery keeps its retained,
+                // already-surfaced "missing file" outcome instead.
+                let bindsDeletedSession = staleResetRecoveryAttemptID == nil && session.staleResetRecovery == nil
+                    ? try await dataService.isAgentSessionDeleted(id: sessionID)
+                    : false
+                guard persistentBindingTransitionIsCurrent(hydrationToken.transition),
+                      persistedLoadAttemptIsCurrent(loadAttemptID, session: session)
+                else {
+                    #if DEBUG
+                        logPerform(outcome: "staleAfterDeletionCheck")
+                    #endif
+                    return .unresolved
+                }
+                if bindsDeletedSession {
+                    Self.logCodexDebug("[AgentModeVM][PersistedLoad] restored binding names a deleted session tab=\(session.tabID) session=\(sessionID)")
+                    let workspaceID = workspace.id
+                    Task { @MainActor [weak self] in
+                        await self?.finalizeDeletedAgentSessionReferences(
+                            sessionID: sessionID,
+                            workspaceID: workspaceID,
+                            reason: "restored_deleted_binding"
+                        )
+                    }
+                    #if DEBUG
+                        logPerform(outcome: "deletedBinding")
+                    #endif
+                    return .unresolved
+                }
                 session.hasLoadedPersistedState = mayDeclareLoadedWithoutPairedAuthority(session, sessionID: sessionID)
                 publishPersistedLoadDisposition(.noPayload, for: session, token: hydrationToken, attemptID: loadAttemptID)
                 #if DEBUG
@@ -5716,6 +5955,11 @@ final class AgentModeViewModel: ObservableObject {
 
         session.runState = payload.normalizedRunState
         session.providerSessionID = agentSession.providerSessionID
+        session.providerHistoryRecovery = agentSession.providerHistoryRecovery
+        // Step 4d3c: live-producer ownership is deliberately kept. Hydration does not detach the
+        // tab's Claude controller, so a still-attached producer that inserted a key now present in
+        // the hydrated ledger must still revoke it when refused (exact keys never match another
+        // conversation's rows).
         session.providerTokenUsageByTurn = agentSession.providerTokenUsageByTurn
         // Restore preserved accounting before any live ingestion. The persisted payload is
         // authoritative here; pre-hydration accumulator state never overwrites it on save.
@@ -5724,6 +5968,7 @@ final class AgentModeViewModel: ObservableObject {
             payload: agentSession.pendingHandoffPayload,
             createdAt: agentSession.pendingHandoffCreatedAt,
             sourceItemID: agentSession.pendingHandoffSourceItemID,
+            payloadID: agentSession.pendingHandoffPayloadID,
             defersProviderLockUntilSend: agentSession.pendingHandoffDefersProviderLockUntilSend,
             isStagedForSend: false
         )
@@ -5731,6 +5976,10 @@ final class AgentModeViewModel: ObservableObject {
         // The transcript above and this lifetime/reset state came from the same gate-held
         // editable load; they are adopted together and only replaced by this owner's own commits.
         session.persistenceState = payload.persistenceState
+        recoveryPersistenceStateDidChange(for: session)
+        // A hydrated payload may already have been carried by an intent before a crash: it is held
+        // until the lane's delivery evidence proves it free (no duplicate prepend).
+        resolvePendingHandoffRecoveryJoin(for: session)
         session.persistedIncarnationSessionID = agentSession.id
         if isStaleResetRecoveryReplacement {
             // Authority for the persisted snapshot is installed; the recovery episode ends here.
@@ -5844,6 +6093,7 @@ final class AgentModeViewModel: ObservableObject {
             )
             installHydratedScheduledSend(from: payload.persistedSession, into: session)
             session.persistenceState = payload.persistenceState
+            recoveryPersistenceStateDidChange(for: session)
             session.persistedIncarnationSessionID = sessionID
             session.hasLoadedPersistedState = true
             return true
@@ -6431,6 +6681,10 @@ final class AgentModeViewModel: ObservableObject {
             resolvedBy: resolvedBy,
             resolvedAt: Date()
         )
+        refreshRecoveryQuestionSnapshotsAfterLiveResolution(for: session, interactionID: interactionID)
+        // After the reply ran: exactly this interaction's live snapshot is removed (retried, never
+        // re-replied, if the removal fails).
+        endRecoveryQuestions(for: session, [interactionID])
         guard session.mcpControlContext != nil else { return }
         wakeCurrentMCPWaitersForInteractionResolutionFireAndForget(for: session)
     }
@@ -6899,7 +7153,7 @@ final class AgentModeViewModel: ObservableObject {
         return labels
     }
 
-    private func mcpPendingInteraction(for session: AgentTabSession) -> AgentRunMCPSnapshot.Interaction? {
+    func mcpPendingInteraction(for session: AgentTabSession) -> AgentRunMCPSnapshot.Interaction? {
         if let review = session.pendingWorktreeMergeReview {
             var details: [AgentRunMCPSnapshot.Interaction.Detail] = [
                 .init(label: "Operation ID", value: review.operationID, isCode: false),
@@ -8128,9 +8382,11 @@ final class AgentModeViewModel: ObservableObject {
                         cancelPendingInstruction(for: session)
                         // Terminal publication synchronously detaches the old provider/controller,
                         // so rebinding does not wait on potentially non-cooperative teardown.
+                        // The user confirmed stopping the active run to change location.
                         await runService.cancelRun(
                             tabID: session.tabID,
                             session: session,
+                            cause: .userCancel,
                             intent: .executionLocationChange,
                             completion: .terminalPublished
                         )
@@ -8298,6 +8554,28 @@ final class AgentModeViewModel: ObservableObject {
         }
     }
 
+    /// R6: a registered ACP controller kept warm across a provider switch would keep its session
+    /// owned against the next provider's launch. It is retired on the switch, and its cleanup is
+    /// retained for registered successor starts to join. Unregistered controllers keep the
+    /// existing warm retention.
+    private func retireRegisteredACPControllerOnProviderSwitch(
+        _ session: AgentTabSession,
+        from previousAgent: AgentProviderKind,
+        to nextAgent: AgentProviderKind
+    ) {
+        guard previousAgent != nextAgent,
+              previousAgent.acpProviderID != nil,
+              let controller = session.acpController,
+              controller.joinsRetirementBeforeSuccessor
+        else { return }
+        session.acpController = nil
+        AgentModeProcessRunIdentity.clearProcessRunID(for: session)
+        session.retainRuntimeRetirement {
+            await controller.cancelPrompt()
+            await controller.shutdown()
+        }
+    }
+
     private func invalidateProviderContextForExecutionLocationChange(_ session: AgentTabSession) async {
         await session.disposeProviderIfPresent()
         if let controller = session.acpController {
@@ -8308,6 +8586,9 @@ final class AgentModeViewModel: ObservableObject {
         }
         if session.codexController != nil || session.codexConversationID != nil || session.codexRolloutPath != nil || session.selectedAgent == .codexExec {
             await codexCoordinator.shutdownCodexSession(session)
+            // The conversation is retained across a location change: buffered text is applied
+            // before the Codex state clear would discard it.
+            session.drainPendingAssistantDelta()
             codexCoordinator.clearCodexSessionState(session)
         }
         await claudeCoordinator.shutdownClaudeSessionIfNeeded(session)
@@ -8646,6 +8927,7 @@ final class AgentModeViewModel: ObservableObject {
                 from: previousAgent,
                 to: normalized.agent
             )
+            retireRegisteredACPControllerOnProviderSwitch(session, from: previousAgent, to: normalized.agent)
         }
 
         session.selectedAgent = normalized.agent
@@ -9395,29 +9677,14 @@ final class AgentModeViewModel: ObservableObject {
 
     /// Awaits the Codex send acknowledgement and either returns the resolved delivery type
     /// or throws an MCP error if the send was dropped, stale, cancelled, or timed out.
-    private func awaitCodexSteerAck(
-        session: AgentTabSession,
-        attemptID: UUID
-    ) async throws -> MCPInstructionDispatch {
-        let state = await session.codexSteerAckTracker.awaitTerminalState(attemptID: attemptID)
-        switch state {
-        case .durablyQueued:
-            return .queuedFollowUp
-        case .steerAccepted, .startAccepted, .controlAccepted:
-            return .dispatchedCodexTurn
-        case .cancelled:
-            if Task.isCancelled {
-                throw CancellationError()
-            }
-            throw MCPError.invalidParams(
-                state.failureDescriptionForMCP ?? "Codex steer was cancelled before it reached the active run."
-            )
-        case .failed, .stale, .timedOut:
-            throw MCPError.internalError(
-                state.failureDescriptionForMCP ?? "Codex steer was not confirmed by the provider."
-            )
+    /// Owned Codex MCP submission drivers, keyed by tracker attempt; each removes itself on completion.
+    private var codexMCPSubmissionDrivers: [UUID: Task<Void, Never>] = [:]
+
+    #if DEBUG
+        var test_openCodexMCPSubmissionDriverCount: Int {
+            codexMCPSubmissionDrivers.count
         }
-    }
+    #endif
 
     private struct MCPActiveDispatchWakeIdentity: Equatable {
         let sessionID: UUID
@@ -9592,10 +9859,45 @@ final class AgentModeViewModel: ObservableObject {
         guard let session = mcpControlledSession(sessionID: sessionID) else {
             throw MCPError.invalidParams("The requested agent run is no longer active.")
         }
+        return try await dispatchSessionInstruction(
+            session: session,
+            sessionID: sessionID,
+            text: text,
+            allowStartingRun: allowStartingRun,
+            workflow: workflow,
+            nativePreparedTurn: nativePreparedTurn,
+            target: .mcpControlled
+        )
+    }
+
+    /// Session-targeted instruction send shared by MCP control and remote attention-root control:
+    /// the normal non-composer send path (durable admission, waiting continuation, provider
+    /// steering, follow-up, or a new run). `target` names the authority that resolved `session`;
+    /// every post-await submission fence re-resolves it and requires the same live object.
+    /// `readinessText` is the text the final readiness check evaluates when it differs from the
+    /// submitted text (workspace steering submits an attributed message but checks the original).
+    func dispatchSessionInstruction(
+        session: AgentTabSession,
+        sessionID: UUID,
+        text: String,
+        allowStartingRun: Bool,
+        workflow: AgentWorkflowDefinition?,
+        nativePreparedTurn: NativeSlashPreparedUserTurn?,
+        target: SessionInstructionTarget,
+        readinessText: String? = nil
+    ) async throws -> MCPInstructionDispatch {
+        guard instructionTargetSession(sessionID: sessionID, target: target) === session else {
+            throw MCPError.invalidParams("The requested agent run is no longer active.")
+        }
+        // Step 5b: a linked delegated child start keeps its parent admission through the final
+        // pre-submit predicate. Nil (every other dispatch) is unchanged.
+        let childLinkFence = mcpDelegatedChildDispatchFence(for: sessionID)
+        try mcpRequireDelegatedChildDispatchFence(childLinkFence)
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedText.isEmpty else {
             throw MCPError.invalidParams("message is required.")
         }
+        let readinessText = readinessText ?? trimmedText
         if let interaction = mcpPendingInteraction(for: session),
            interaction.kind != .instruction
         {
@@ -9604,7 +9906,7 @@ final class AgentModeViewModel: ObservableObject {
             )
         }
 
-        var delivery: MCPInstructionDispatch
+        let delivery: MCPInstructionDispatch
         let codexAttemptID: UUID?
         let signalsDeliveryAfterDispatch: Bool
         if session.runState == .waitingForUser, session.instructionContinuation != nil {
@@ -9625,99 +9927,238 @@ final class AgentModeViewModel: ObservableObject {
             signalsDeliveryAfterDispatch = false
         }
 
-        let activeDispatchWakeIdentity = codexAttemptID == nil
-            ? nil
-            : mcpActiveDispatchWakeIdentity(for: session, sessionID: sessionID)
-        let ackCancellationTarget = codexAttemptID.map {
-            (tracker: session.codexSteerAckTracker, attemptID: $0)
+        if let codexAttemptID {
+            return try await dispatchCodexMCPInstructionWithBoundedAck(
+                session: session,
+                sessionID: sessionID,
+                attemptID: codexAttemptID,
+                text: trimmedText,
+                workflow: workflow,
+                nativePreparedTurn: nativePreparedTurn,
+                childLinkFence: childLinkFence,
+                target: target,
+                readinessText: readinessText
+            )
         }
-        return try await withTaskCancellationHandler {
-            defer {
-                if Task.isCancelled, let codexAttemptID {
-                    session.codexSteerAckTracker.cancel(attemptID: codexAttemptID)
-                }
-            }
 
-            let submission: UserTurnSubmissionResult
-            session.isMCPInstructionDispatchInProgress = true
-            defer {
-                session.isMCPInstructionDispatchInProgress = false
-            }
-            submission = withMCPWorkflowOverride(session: session, workflow: workflow) {
-                if let nativePreparedTurn {
-                    return submitPreparedUserTurn(
-                        tabID: session.tabID,
-                        session: session,
-                        trimmedText: trimmedText,
-                        attachmentsToSend: [],
-                        taggedFilesToSend: [],
-                        activeWorkflow: nativePreparedTurn.bubbleWorkflow,
-                        nativePreparedTurn: nativePreparedTurn,
-                        codexAttemptID: codexAttemptID
-                    )
+        let submission: UserTurnSubmissionResult
+        session.isMCPInstructionDispatchInProgress = true
+        defer {
+            session.isMCPInstructionDispatchInProgress = false
+        }
+        // Durable admission (when required) commits the MCP input before its bubble or any
+        // handoff; the same identity reaches the waiting continuation, steering, and follow-up
+        // routes. A refused or failed commit sends nothing.
+        submission = await submitUserTurnAdmittingRecoveryInput(
+            text: trimmedText,
+            tabID: session.tabID,
+            origin: .mcp,
+            workflowOverride: workflow,
+            nativePreparedTurn: nativePreparedTurn,
+            isStillCurrent: { [weak self] in
+                // Same live target, and (remote roots) still dispatch-ready: loaded, and the text
+                // does not parse as a native control-plane command at this boundary.
+                guard let self,
+                      sessionInstructionTargetIsReady(
+                          session: session,
+                          sessionID: sessionID,
+                          target: target,
+                          text: readinessText
+                      )
+                else {
+                    return false
                 }
-                return submitUserTurn(
-                    text: trimmedText,
-                    tabID: session.tabID,
-                    codexAttemptID: codexAttemptID
-                )
+                // Step 5b final submission fence: this caller's task (never the owned Codex driver)
+                // also refuses a cancelled linked child start.
+                guard let childLinkFence else { return true }
+                return !Task.isCancelled && mcpDelegatedChildLinkAdmissionIsCurrent(childLinkFence)
             }
-            switch submission {
-            case .submitted:
-                Self.steeringDebugLog("[AgentRunSteeringWake] mcpDispatch submitted sessionID=\(sessionID) delivery=\(delivery.rawValue) runState=\(session.runState.rawValue) isActiveDispatch=\(delivery.isActiveRunDispatch) runID=\(String(describing: session.runID))")
-                if let codexAttemptID {
-                    try await startQueuedProviderSteeringForMCPDispatch(delivery: delivery, session: session)
-                    session.codexSteerAckTracker.authorizeDispatch(attemptID: codexAttemptID)
-                    delivery = try await awaitCodexSteerAck(session: session, attemptID: codexAttemptID)
-                    let didWake: Bool
-                    if let activeDispatchWakeIdentity {
-                        didWake = await wakeMCPWaitersForActiveDispatch(
-                            delivery: delivery,
-                            session: session,
-                            sessionID: sessionID,
-                            expectedIdentity: activeDispatchWakeIdentity
-                        )
-                    } else {
-                        Self.steeringDebugLog("[AgentRunSteeringWake] skip wake: active Codex dispatch had no captured identity sessionID=\(sessionID)")
-                        didWake = false
-                    }
-                    if didWake, delivery.signalsMCPDeliveryAfterDispatch {
-                        _ = await signalMCPInstructionDeliveredIfIdentityMatches(
-                            for: session,
-                            expectedIdentity: activeDispatchWakeIdentity
-                        )
-                    }
-                } else {
-                    if delivery == .queuedClaudeInterrupt {
-                        _ = await wakeMCPWaitersForActiveDispatch(delivery: delivery, session: session, sessionID: sessionID)
-                    }
-                    try await startQueuedProviderSteeringForMCPDispatch(delivery: delivery, session: session)
-                    if delivery.isActiveRunDispatch, delivery != .queuedClaudeInterrupt {
-                        _ = await wakeMCPWaitersForActiveDispatch(delivery: delivery, session: session, sessionID: sessionID)
-                    }
-                    if signalsDeliveryAfterDispatch {
-                        await signalMCPInstructionDelivered(for: session)
-                    }
-                }
-                handleObservedMCPStateChange(for: session)
-                return delivery
-            case let .blocked(message):
-                if let codexAttemptID {
-                    session.codexSteerAckTracker.cancel(attemptID: codexAttemptID)
-                }
-                throw MCPError.invalidParams(message.isEmpty ? "Unable to deliver the instruction." : message)
-            case .scheduled:
-                // MCP instructions are never scheduled; the submit paths above cannot produce this.
-                if let codexAttemptID {
-                    session.codexSteerAckTracker.cancel(attemptID: codexAttemptID)
-                }
-                throw MCPError.invalidParams("Scheduled sending is not available for MCP instructions.")
+        )
+        switch submission {
+        case .submitted:
+            Self.steeringDebugLog("[AgentRunSteeringWake] mcpDispatch submitted sessionID=\(sessionID) delivery=\(delivery.rawValue) runState=\(session.runState.rawValue) isActiveDispatch=\(delivery.isActiveRunDispatch) runID=\(String(describing: session.runID))")
+            if delivery == .queuedClaudeInterrupt {
+                _ = await wakeMCPWaitersForActiveDispatch(delivery: delivery, session: session, sessionID: sessionID)
             }
-        } onCancel: {
-            guard let ackCancellationTarget else { return }
-            Task { @MainActor in
-                ackCancellationTarget.tracker.cancel(attemptID: ackCancellationTarget.attemptID)
+            try await startQueuedProviderSteeringForMCPDispatch(delivery: delivery, session: session)
+            if delivery.isActiveRunDispatch, delivery != .queuedClaudeInterrupt {
+                _ = await wakeMCPWaitersForActiveDispatch(delivery: delivery, session: session, sessionID: sessionID)
             }
+            if signalsDeliveryAfterDispatch {
+                await signalMCPInstructionDelivered(for: session)
+            }
+            handleObservedMCPStateChange(for: session)
+            return delivery
+        case let .blocked(message):
+            throw MCPError.invalidParams(message.isEmpty ? "Unable to deliver the instruction." : message)
+        case .scheduled:
+            // MCP instructions are never scheduled; the submit paths above cannot produce this.
+            throw MCPError.invalidParams("Scheduled sending is not available for MCP instructions.")
+        }
+    }
+
+    /// Refusal reported by a Codex MCP submission driver that never handed anything off.
+    private final class CodexMCPDispatchRefusal {
+        var message: String?
+    }
+
+    /// Codex MCP dispatch with a bounded acknowledgement (2.5 s production default). The submission
+    /// (durable admission, submit, dispatch authorization) runs in one owned driver task while this
+    /// caller immediately awaits the attempt's deadline, so a slow or hung admission/receipt write
+    /// cannot extend the wait. The caller never joins the driver: after the driver marks the operation
+    /// started, the deadline or caller cancellation returns non-retryable uncertainty while the
+    /// admitted operation continues and may still queue (receipt-backed) or deliver the input.
+    private func dispatchCodexMCPInstructionWithBoundedAck(
+        session: AgentTabSession,
+        sessionID: UUID,
+        attemptID: UUID,
+        text: String,
+        workflow: AgentWorkflowDefinition?,
+        nativePreparedTurn: NativeSlashPreparedUserTurn?,
+        childLinkFence: MCPDelegatedChildLinkAdmission?,
+        target: SessionInstructionTarget,
+        readinessText: String
+    ) async throws -> MCPInstructionDispatch {
+        let tracker = session.codexSteerAckTracker
+        let activeDispatchWakeIdentity = mcpActiveDispatchWakeIdentity(for: session, sessionID: sessionID)
+        let refusal = CodexMCPDispatchRefusal()
+        // Created before the wait below arms the deadline; it first runs once this caller suspends,
+        // with no asynchronous preparation gap in between.
+        let driver = Task { @MainActor [weak self] in
+            await self?.runCodexMCPSubmissionDriver(
+                session: session,
+                sessionID: sessionID,
+                attemptID: attemptID,
+                text: text,
+                workflow: workflow,
+                nativePreparedTurn: nativePreparedTurn,
+                refusal: refusal,
+                childLinkFence: childLinkFence,
+                target: target,
+                readinessText: readinessText
+            )
+            self?.codexMCPSubmissionDrivers[attemptID] = nil
+        }
+        codexMCPSubmissionDrivers[attemptID] = driver
+
+        let state = await tracker.awaitTerminalState(attemptID: attemptID)
+        let delivery: MCPInstructionDispatch
+        switch state {
+        case .durablyQueued:
+            // Only a store-issued queue receipt acknowledges a queued follow-up.
+            delivery = .queuedFollowUp
+        case .steerAccepted, .startAccepted, .controlAccepted:
+            delivery = .dispatchedCodexTurn
+        case .cancelled:
+            // Settled `.cancelled` only when the driver was prevented from starting.
+            if Task.isCancelled {
+                throw CancellationError()
+            }
+            throw MCPError.invalidParams(
+                state.failureDescriptionForMCP ?? "Codex steer was cancelled before it reached the active run."
+            )
+        case .deliveryUnknown:
+            // Not "sent" and not "failed": the caller is told not to resend; the operation keeps the
+            // bubble and the durable intent (never retried here). Also the post-start deadline and
+            // post-start caller cancellation.
+            throw MCPError.internalError(
+                state.failureDescriptionForMCP ?? CodexSteerAckTracker.unconfirmedOutcomeMessage
+            )
+        case .failed:
+            if let refused = refusal.message {
+                throw MCPError.invalidParams(refused)
+            }
+            throw MCPError.internalError(
+                state.failureDescriptionForMCP ?? "Codex steer was not confirmed by the provider."
+            )
+        case .stale, .timedOut:
+            throw MCPError.internalError(
+                state.failureDescriptionForMCP ?? "Codex steer was not confirmed by the provider."
+            )
+        }
+        let didWake: Bool
+        if let activeDispatchWakeIdentity {
+            didWake = await wakeMCPWaitersForActiveDispatch(
+                delivery: delivery,
+                session: session,
+                sessionID: sessionID,
+                expectedIdentity: activeDispatchWakeIdentity
+            )
+        } else {
+            Self.steeringDebugLog("[AgentRunSteeringWake] skip wake: active Codex dispatch had no captured identity sessionID=\(sessionID)")
+            didWake = false
+        }
+        if didWake, delivery.signalsMCPDeliveryAfterDispatch {
+            _ = await signalMCPInstructionDeliveredIfIdentityMatches(
+                for: session,
+                expectedIdentity: activeDispatchWakeIdentity
+            )
+        }
+        handleObservedMCPStateChange(for: session)
+        return delivery
+    }
+
+    /// The owned submission for one Codex MCP attempt. It submits nothing unless it marks the
+    /// operation started first; once started it is never cancelled, withdrawn, or restarted to match
+    /// its acknowledgement, and every exit maps to a truthful tracker outcome (a refusal resolves
+    /// `.failed` only when nothing was handed off).
+    private func runCodexMCPSubmissionDriver(
+        session: AgentTabSession,
+        sessionID: UUID,
+        attemptID: UUID,
+        text: String,
+        workflow: AgentWorkflowDefinition?,
+        nativePreparedTurn: NativeSlashPreparedUserTurn?,
+        refusal: CodexMCPDispatchRefusal,
+        childLinkFence: MCPDelegatedChildLinkAdmission?,
+        target: SessionInstructionTarget,
+        readinessText: String
+    ) async {
+        let tracker = session.codexSteerAckTracker
+        guard tracker.markOperationStarted(attemptID: attemptID) else { return }
+        session.isMCPInstructionDispatchInProgress = true
+        defer {
+            session.isMCPInstructionDispatchInProgress = false
+        }
+        // Durable admission (when required) commits the MCP input before its bubble or any
+        // handoff; the same identity reaches steering and the Codex fallback routes. A refused or
+        // failed commit sends nothing.
+        let submission = await submitUserTurnAdmittingRecoveryInput(
+            text: text,
+            tabID: session.tabID,
+            origin: .mcp,
+            codexAttemptID: attemptID,
+            workflowOverride: workflow,
+            nativePreparedTurn: nativePreparedTurn,
+            isStillCurrent: { [weak self] in
+                guard let self,
+                      sessionInstructionTargetIsReady(
+                          session: session,
+                          sessionID: sessionID,
+                          target: target,
+                          text: readinessText
+                      )
+                else {
+                    return false
+                }
+                return childLinkFence.map { self.mcpDelegatedChildLinkAdmissionIsCurrent($0) } ?? true
+            }
+        )
+        switch submission {
+        case .submitted:
+            Self.steeringDebugLog("[AgentRunSteeringWake] mcpDispatch submitted sessionID=\(sessionID) delivery=\(MCPInstructionDispatch.dispatchedCodexTurn.rawValue) runState=\(session.runState.rawValue) runID=\(String(describing: session.runID))")
+            // The submit path's provider task awaits this authorization, then resolves the attempt
+            // with its acceptance, queue receipt, or uncertainty.
+            tracker.authorizeDispatch(attemptID: attemptID)
+        case let .blocked(message):
+            let message = message.isEmpty ? "Unable to deliver the instruction." : message
+            refusal.message = message
+            tracker.resolve(attemptID: attemptID, state: .failed(message: message))
+        case .scheduled:
+            // MCP instructions are never scheduled; the submit paths cannot produce this.
+            let message = "Scheduled sending is not available for MCP instructions."
+            refusal.message = message
+            tracker.resolve(attemptID: attemptID, state: .failed(message: message))
         }
     }
 
@@ -9761,6 +10202,33 @@ final class AgentModeViewModel: ObservableObject {
         guard let session = mcpControlledSession(sessionID: sessionID) else {
             throw MCPError.invalidParams("The requested agent run is no longer active.")
         }
+        return try await resolveSessionPendingInteraction(
+            session: session,
+            sessionID: sessionID,
+            interactionID: interactionID,
+            payload: payload,
+            workflow: workflow,
+            resolvedBy: resolvedBy,
+            target: .mcpControlled
+        )
+    }
+
+    /// Session-targeted resolution shared by MCP control and remote attention-root control. The
+    /// exact pending interaction must still match `interactionID`; `allowedKinds` (nil = all) is
+    /// checked before any attribution is staged. Staged `resolvedBy` is always cleared on exit.
+    func resolveSessionPendingInteraction(
+        session: AgentTabSession,
+        sessionID: UUID,
+        interactionID: UUID,
+        payload: MCPInteractionResponsePayload,
+        workflow: AgentWorkflowDefinition?,
+        resolvedBy: String?,
+        target: SessionInstructionTarget,
+        allowedKinds: Set<AgentRunMCPSnapshot.Interaction.Kind>? = nil
+    ) async throws -> MCPInstructionDispatch? {
+        guard instructionTargetSession(sessionID: sessionID, target: target) === session else {
+            throw MCPError.invalidParams("The requested agent run is no longer active.")
+        }
 
         // Infer the interaction kind from the live pending interaction
         guard let currentInteraction = mcpPendingInteraction(for: session) else {
@@ -9770,6 +10238,20 @@ final class AgentModeViewModel: ObservableObject {
             throw MCPError.invalidParams("The pending interaction no longer matches interaction_id.")
         }
         let kind = currentInteraction.kind
+        if let allowedKinds, !allowedKinds.contains(kind) {
+            throw MCPError.invalidParams(
+                "This control path cannot resolve \(kind.rawValue) interactions. Resolve it on the Mac."
+            )
+        }
+        switch kind {
+        case .question, .mcpElicitation, .userInput:
+            // Answers are frozen while a shutdown preserves this window: refused before any change.
+            guard !isShutdownFrozen else {
+                throw MCPError.invalidParams(AgentModeShutdownAnswerRefused().errorDescription ?? "")
+            }
+        default:
+            break
+        }
         // Stage `resolved_by` attribution for the resolution funnels; they consume it
         // synchronously via `recordMCPInteractionResolution`. The defer clears any
         // leftover staging when a branch throws before resolving, so a later
@@ -9788,11 +10270,14 @@ final class AgentModeViewModel: ObservableObject {
             guard !text.isEmpty else {
                 throw MCPError.invalidParams("response is required for instruction prompts.")
             }
-            return try await mcpDispatchInstruction(
+            return try await dispatchSessionInstruction(
+                session: session,
                 sessionID: sessionID,
                 text: text,
                 allowStartingRun: false,
-                workflow: workflow
+                workflow: workflow,
+                nativePreparedTurn: nil,
+                target: target
             )
         case .question:
             guard let pendingAskUser = session.pendingAskUser,
@@ -10586,6 +11071,9 @@ final class AgentModeViewModel: ObservableObject {
             if selectedWorkflow != session.selectedWorkflow {
                 selectedWorkflow = session.selectedWorkflow
             }
+            if interviewFirst != session.interviewFirst {
+                interviewFirst = session.interviewFirst
+            }
             if autoEditPermissionGuidance != nil {
                 autoEditPermissionGuidance = nil
             }
@@ -10661,7 +11149,7 @@ final class AgentModeViewModel: ObservableObject {
                 + pendingClaudeReasoningStatusBytes
                 + pendingAssistantDeltaBytes
             let pendingInstructionBytes = session.pendingInstructions.reduce(0) { partial, instruction in
-                partial + instruction.utf8.count
+                partial + instruction.text.utf8.count
             }
             let ownership = session.activeRunOwnership
             let liveness = session.activeRunLiveness
@@ -12517,6 +13005,28 @@ final class AgentModeViewModel: ObservableObject {
         return builtPresentation
     }
 
+    /// O11: installs a prepared saved-input placement through the paired owner operation (working
+    /// items and their canonical transcript together) and marks it dirty. The historical envelope
+    /// keeps its turn ID while losing its request, which the turn-shape projection cache token
+    /// cannot see, so the turn projection caches are dropped once for this explicit action.
+    func installRecoverySavedInputPlacement(
+        _ candidate: AgentTranscriptSavedInputRelocationCandidate,
+        in session: AgentTabSession
+    ) {
+        session.turnProjectionCaches = [:]
+        session.rawInputSanitizeEvidence = nil
+        hydrateSession(
+            session,
+            withCanonicalItems: candidate.workingItems,
+            transcript: candidate.transcript,
+            reason: .savedInputRelocation
+        )
+        session.nextSequenceIndex = max(session.nextSequenceIndex, candidate.nextSequenceIndex)
+        session.isDirty = true
+        updateBindingsFromSession(session)
+        requestUIRefresh(tabID: session.tabID, urgent: true)
+    }
+
     @discardableResult
     private func hydrateSession(
         _ session: AgentTabSession,
@@ -12787,6 +13297,8 @@ final class AgentModeViewModel: ObservableObject {
         // cancelEphemeralRuntimeState() cancels and nils agentTask before the
         // graceful cancelAgentRun() call in handleWorkspaceSwitch. See
         // prepareSessionForWindowClose for why this ordering is safe.
+        // The conversation is retained, so buffered assistant text is applied, not discarded.
+        session.drainPendingAssistantDelta()
         session.cancelEphemeralRuntimeState()
         clearPendingAssistantDelta(session)
         cancelPendingQuestion(for: session)
@@ -12797,6 +13309,9 @@ final class AgentModeViewModel: ObservableObject {
             _ = mcpRunToolCanceller(runID, "workspace_switch")
         }
         remoteCoordinator.stop(tabID: session.tabID)
+        // The new workspace's owner is already installed and this session is discarded next, so
+        // the drain above is memory-only; no timer may save it later under another context.
+        cancelTranscriptSaveTimers(session)
         return target
     }
 
@@ -12858,7 +13373,7 @@ final class AgentModeViewModel: ObservableObject {
             )
         }
         for session in sessions.values where session.runState.isActive {
-            await cancelAgentRun(tabID: session.tabID)
+            await cancelAgentRun(tabID: session.tabID, cause: .ordinary)
         }
         claudeCoordinator.detachAllClaudeToolTrackingHandlersForWorkspaceSwitch()
         codexCoordinator.stop()
@@ -13560,7 +14075,7 @@ final class AgentModeViewModel: ObservableObject {
 
             removePendingUIRefresh(for: tabID)
             cancelPersistedLoad(for: session)
-            flushPendingAssistantDelta(session)
+            session.drainPendingAssistantDelta()
             cancelPendingQuestion(for: session)
             cancelPendingApproval(for: session)
             cancelPendingApplyEditsReview(for: session, reason: "Cancelled because tab is closing")
@@ -13597,15 +14112,17 @@ final class AgentModeViewModel: ObservableObject {
             if session.remoteHost != nil {
                 await retireRemoteIngestion(for: session)
             } else if session.runState.isActive {
+                // Closing the tab is the user's confirmed stop of its run.
                 _ = await cancelAgentRun(
                     target: makeRunCancelTarget(tabID: tabID, session: session),
+                    cause: .userCancel,
                     completion: .terminalTeardownCompleted
                 )
             } else if isTabRunning(tabID)
                 || session.activeRunOwnership != nil
                 || session.terminalCommitInProgress
             {
-                await cancelAgentRun(tabID: tabID, completion: .terminalTeardownCompleted)
+                await cancelAgentRun(tabID: tabID, cause: .userCancel, completion: .terminalTeardownCompleted)
             }
             guard ownerStillCurrent(target) else {
                 abortComposeTabRemoval(operation, vetoedTabIDs: [tabID])
@@ -13629,7 +14146,9 @@ final class AgentModeViewModel: ObservableObject {
             }
 
             // Subscription identifiers were captured above; only now may session-owned ephemeral
-            // state be cleared without dropping terminal output.
+            // state be cleared without dropping terminal output. Text buffered during the
+            // shutdown awaits is applied first so the final save below includes it.
+            session.drainPendingAssistantDelta()
             session.cancelEphemeralRuntimeState()
             if let stopTask = session.staleResetRecoveryTask {
                 await stopTask.value
@@ -14107,8 +14626,10 @@ final class AgentModeViewModel: ObservableObject {
             AgentModePerfDiagnostics.event("save.schedule", tabID: tabID, fields: ["replaced": String(replacedPendingSave), "dirty": String(session.isDirty)])
         #endif
         session.saveDebounceTask?.cancel()
+        let sleep = saveTimerSleep
+        let debounceDeadline = ContinuousClock.now + Self.saveDebounceInterval
         session.saveDebounceTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 1_000_000_000) // 1 second debounce
+            try? await sleep(.debounce, debounceDeadline)
             guard !Task.isCancelled else { return }
             await self?.saveSession(for: tabID)
         }
@@ -14219,7 +14740,7 @@ final class AgentModeViewModel: ObservableObject {
         guard let session = sessions[tabID],
               let context = explicitContext ?? currentSessionPersistenceContext(),
               sessionPersistenceContextIsCurrent(context),
-              session.isDirty || session.activeAgentSessionID == nil
+              session.isDirty || session.activeAgentSessionID == nil || !session.pendingAssistantDelta.isEmpty
         else {
             #if DEBUG
                 AgentModePerfDiagnostics.event("save.session.skipped", tabID: tabID, fields: ["reason": "missingContextOwnerOrClean"])
@@ -14245,9 +14766,14 @@ final class AgentModeViewModel: ObservableObject {
             #endif
             return .notWritten
         }
+        // Buffered assistant text belongs in this snapshot (R3): it is applied through its
+        // producer's flush before any revision, item snapshot, or commit token is captured.
+        session.drainPendingAssistantDelta()
+        guard session.isDirty || session.activeAgentSessionID == nil else {
+            return .notWritten
+        }
 
-        let hasConversationContent = !session.items.isEmpty || !session.transcript.turns.isEmpty || session.runState.isActive || session.hasPendingQuestionUI || session.pendingApproval != nil || session.pendingPermissionsRequest != nil || session.pendingApplyEditsReview != nil || session.pendingWorktreeMergeReview != nil || session.worktreeMergeOperations.contains { $0.status.isActive } || session.scheduledSend != nil
-        if session.activeAgentSessionID == nil, !hasConversationContent {
+        if session.activeAgentSessionID == nil, !hasPersistableConversationContent(session) {
             return .notWritten
         }
         guard let sessionID = ensureSessionBoundToTab(session) else {
@@ -14288,7 +14814,8 @@ final class AgentModeViewModel: ObservableObject {
                 in: &workingItemsSnapshot,
                 terminalState: session.runState,
                 includeExplicitRepoPromptToolCalls: session.selectedAgent == .codexExec || session.selectedAgent.acpProviderID != nil,
-                nonToolBoundary: Self.pendingToolFinalizationNonToolBoundary
+                nonToolBoundary: Self.pendingToolFinalizationNonToolBoundary,
+                protectedItemIDs: session.providerHistoryRecovery?.claudeLocalItemIDs ?? []
             )
             if repairedCount > 0 {
                 session.setItemsSilently(workingItemsSnapshot, reason: .pendingToolFinalizationRepair)
@@ -14456,81 +14983,14 @@ final class AgentModeViewModel: ObservableObject {
         let lastUserMessageAt = persistableSnapshot.lastUserMessageAt
         let canonicalItemCount = persistableSnapshot.canonicalVisibleRowCount
         let sessionName = resolvedSessionDisplayName(for: tabID)
-        let undeliveredRemoteUserItemIDs = Set(session.items.lazy.filter {
-            $0.kind == .user && $0.isUndeliveredRemoteSend
-        }.map(\.id))
-        let persistedRemoteResendPayloadsByItemID: [String: PersistedRemoteResendPayload] = Dictionary(
-            uniqueKeysWithValues: session.remoteResendPayloadsByItemID.compactMap { itemID, payload in
-                guard undeliveredRemoteUserItemIDs.contains(itemID) else { return nil }
-                return (
-                    itemID.uuidString,
-                    PersistedRemoteResendPayload(
-                        providerText: payload.providerText,
-                        wasStart: payload.wasStart,
-                        modelSelectionRaw: payload.modelSelectionRaw,
-                        sessionName: payload.sessionName,
-                        workspaceName: payload.workspaceName,
-                        windowID: payload.windowID,
-                        workspaceID: payload.workspaceID
-                    )
-                )
-            }
-        )
-        let toolNameByItemID: [UUID: String] = Dictionary(
-            uniqueKeysWithValues: session.items.compactMap { item in
-                item.toolName.map { (item.id, $0) }
-            }
-        )
-        let uiToolResultPayloadsByItemID: [String: String] = Dictionary(
-            uniqueKeysWithValues: session.ephemeralToolResultPayloadByItemID.compactMap { itemID, rawPayload in
-                guard let uiPayload = AgentToolResultPersistencePolicy.uiFacingOracleIdentityJSON(
-                    toolName: toolNameByItemID[itemID],
-                    rawResultJSON: rawPayload
-                ) else {
-                    return nil
-                }
-                return (itemID.uuidString, uiPayload)
-            }
-        )
-        var agentSession = AgentSession(
-            id: sessionID,
+        var agentSession = makePersistedAgentSession(
+            for: session,
+            tabID: tabID,
+            sessionID: sessionID,
             workspaceID: workspace.id,
-            composeTabID: tabID,
-            name: sessionName,
-            items: [],
-            uiToolResultPayloadsByItemID: uiToolResultPayloadsByItemID,
-            transcript: persistableSnapshot.transcript,
-            itemCount: canonicalItemCount,
-            transcriptProjectionCounts: persistableSnapshot.projectionCounts,
-            lastUserMessageAt: lastUserMessageAt,
-            agentKind: session.selectedAgent.rawValue,
-            agentModel: session.selectedModelRaw,
-            ohMyPiThinkingSelections: session.ohMyPiThinkingSelections.nilIfEmpty,
-            agentReasoningEffort: session.selectedReasoningEffortRaw,
-            lastRunState: session.runState.rawValue,
-            providerSessionID: session.providerSessionID,
-            remoteHost: session.remoteHost,
-            remoteResendPayloadsByItemID: persistedRemoteResendPayloadsByItemID,
-            locallyAttributedStartItemID: session.locallyAttributedStartItemID,
-            autoEditEnabled: session.autoEditEnabled,
-            providerTokenUsageByTurn: session.providerTokenUsageByTurn,
-            providerUsage: session.usageAccounting.flatMap {
-                $0.ownerSessionID == sessionID ? $0.persistedRepresentation : nil
-            },
-            parentSessionID: session.parentSessionID,
-            pendingHandoffPayload: session.pendingHandoff.payload,
-            pendingHandoffCreatedAt: session.pendingHandoff.createdAt,
-            pendingHandoffSourceItemID: session.pendingHandoff.sourceItemID,
-            pendingHandoffDefersProviderLockUntilSend: session.pendingHandoff.defersProviderLockUntilSend,
-            scheduledSend: session.scheduledSend,
-            lastScheduledDispatch: session.lastScheduledDispatch,
-            isMCPOriginated: session.isMCPOriginated,
-            origin: session.origin,
-            profile: session.profile,
-            worktreeBindings: session.worktreeBindings,
-            worktreeMergeOperations: session.worktreeMergeOperations
+            sessionName: sessionName,
+            persistableSnapshot: persistableSnapshot
         )
-        codexCoordinator.applyCodexPersistence(from: session, to: &agentSession)
         guard let saveToken = makeSaveCommitToken(for: session, context: context),
               isSaveCommitTokenCurrent(saveToken)
         else {
@@ -14546,8 +15006,37 @@ final class AgentModeViewModel: ObservableObject {
         let transcriptResetReceipt = session.pendingTranscriptResetReceipt
         // Captured lifetime: an existing incarnation saves under its own service-issued state
         // (never refreshed after a deletion or missing-file failure); a genuine initial creation
-        // obtains create-only state first.
-        guard let persistenceState = await ensurePersistenceState(for: session, sessionID: sessionID, workspace: workspace, context: context) else {
+        // first commits the session file exclusively from this snapshot, then saves normally.
+        let acquisition = await acquirePersistenceState(
+            for: session,
+            sessionID: sessionID,
+            workspace: workspace,
+            context: context,
+            initialSession: agentSession,
+            trustedCanonicalItemCount: canonicalItemCount
+        )
+        // Exclusive creation in this call durably committed exactly this snapshot. Every later
+        // exit that writes nothing more reports that real write as durable but not clean (as a
+        // coalesced save does) instead of `.notWritten`; the projection stays dirty, and the
+        // deletion/reset handlers below still run.
+        let notWrittenOutcome: SessionSaveOutcome = acquisition.createdDurably
+            ? .written(SessionSaveReceipt(
+                sourceItemsRevision: saveToken.sourceItemsRevision,
+                persistenceMutationGeneration: saveToken.persistenceMutationGeneration,
+                projectionClean: false
+            ))
+            : .notWritten
+        guard let persistenceState = acquisition.state else {
+            if acquisition.createdDurably {
+                // The creation's authority is not usable for this save (the context or owner
+                // changed meanwhile): a fresh owner-current save writes the newer projection.
+                requestFreshSaveForCurrentOwner(
+                    sessionID: sessionID,
+                    fallbackSession: session,
+                    context: context
+                )
+                return notWrittenOutcome
+            }
             // Fail closed: a hydrated tab without captured ownership of an existing incarnation
             // never overwrites that file from memory. Surface it instead of failing silently.
             if session.persistenceRevokedSessionID != sessionID {
@@ -14579,13 +15068,11 @@ final class AgentModeViewModel: ObservableObject {
                 fallbackSession: session,
                 context: context
             )
-            return .notWritten
+            return notWrittenOutcome
         }
-        // A session this tab already wrote or hydrated targets its existing incarnation: an
-        // explicitly deleted file is never recreated by a queued or debounced save.
-        let fileCreationPolicy: AgentSessionFileCreationPolicy = session.persistedIncarnationSessionID == sessionID
-            ? .requireExisting
-            : .createIfMissing
+        // Owner saves always target the existing incarnation (creation already committed above):
+        // an explicitly deleted or missing file is never recreated by a queued or debounced save.
+        let fileCreationPolicy: AgentSessionFileCreationPolicy = .requireExisting
         let saveReceipt = SessionSaveReceipt(
             sourceItemsRevision: saveToken.sourceItemsRevision,
             persistenceMutationGeneration: saveToken.persistenceMutationGeneration,
@@ -14598,7 +15085,11 @@ final class AgentModeViewModel: ObservableObject {
                 }
             #endif
             guard isSaveCommitTokenOwnerCurrent(saveToken) else {
-                return .notWritten
+                return notWrittenOutcome
+            }
+            // A pending history import commits in this same save (rows + ledger + receipt).
+            let historyImport = session.pendingHistoryImportCommit.flatMap { pending in
+                agentSession.providerHistoryRecovery?.lastImportCommit == pending ? pending : nil
             }
             let commit = try await dataService.saveAgentSession(
                 agentSession,
@@ -14608,7 +15099,8 @@ final class AgentModeViewModel: ObservableObject {
                 intentionallyRemovingFinalizedScheduledSendItems: finalizedItemRemovals,
                 committingTranscriptReset: transcriptResetReceipt,
                 fileCreationPolicy: fileCreationPolicy,
-                persistenceState: persistenceState
+                persistenceState: persistenceState,
+                committingHistoryImport: historyImport
             )
             let fileURL = commit.fileURL
             // Acknowledgements are identity-aware: only the owner that issued this save adopts
@@ -14617,6 +15109,7 @@ final class AgentModeViewModel: ObservableObject {
                session.activeAgentSessionID == sessionID
             {
                 session.persistenceState = commit.persistenceState
+                recoveryPersistenceStateDidChange(for: session)
                 session.persistedIncarnationSessionID = sessionID
                 if !finalizedItemRemovals.isEmpty {
                     session.pendingFinalizedScheduledSendItemRemovals.removeAll { removal in
@@ -14625,6 +15118,12 @@ final class AgentModeViewModel: ObservableObject {
                 }
                 if let transcriptResetReceipt, session.pendingTranscriptResetReceipt == transcriptResetReceipt {
                     session.pendingTranscriptResetReceipt = nil
+                }
+                if let historyImport {
+                    session.committedHistoryImportID = historyImport.importID
+                    if session.pendingHistoryImportCommit == historyImport {
+                        session.pendingHistoryImportCommit = nil
+                    }
                 }
             }
             agentSession.fileURL = fileURL
@@ -14637,7 +15136,7 @@ final class AgentModeViewModel: ObservableObject {
                     context: context
                 )
                 return commit.disposition == .resetAlreadyCommitted
-                    ? .notWritten
+                    ? notWrittenOutcome
                     : .written(SessionSaveReceipt(
                         sourceItemsRevision: saveReceipt.sourceItemsRevision,
                         persistenceMutationGeneration: saveReceipt.persistenceMutationGeneration,
@@ -14652,6 +15151,8 @@ final class AgentModeViewModel: ObservableObject {
                 return .resetAcknowledged
             }
             session.isDirty = false
+            // A clean receipt of the current owner and projection satisfies the maximum wait.
+            clearTranscriptSaveMaxWait(session)
             session.lastUserMessageAt = lastUserMessageAt
             if let lastUserMessageAt {
                 sessionIndexStore.setSortDate(lastUserMessageAt, forTabID: tabID)
@@ -14696,9 +15197,11 @@ final class AgentModeViewModel: ObservableObject {
             #endif
             return .written(saveReceipt)
         } catch AgentScheduledSendMutationError.staleDeletionGeneration,
-            AgentScheduledSendMutationError.invalidPersistenceStamp
+            AgentScheduledSendMutationError.invalidPersistenceStamp,
+            AgentScheduledSendMutationError.sessionDeleted,
+            AgentScheduledSendMutationError.staleIncarnation
         {
-            guard isSaveCommitTokenOwnerCurrent(saveToken) else { return .notWritten }
+            guard isSaveCommitTokenOwnerCurrent(saveToken) else { return notWrittenOutcome }
             // Committed deletion or a stale lifetime for this exact owner: drop every schedule
             // projection so no later writer recreates the file from this tab's stale state, and
             // never acquire a fresh stamp for it.
@@ -14706,9 +15209,9 @@ final class AgentModeViewModel: ObservableObject {
                 AgentModePerfDiagnostics.event("save.session.deleted", tabID: tabID, fields: ["sessionID": sessionID.uuidString])
             #endif
             handleDurableSessionDeleted(session, sessionID: sessionID)
-            return .notWritten
+            return notWrittenOutcome
         } catch AgentScheduledSendMutationError.sessionNotFound {
-            guard isSaveCommitTokenOwnerCurrent(saveToken) else { return .notWritten }
+            guard isSaveCommitTokenOwnerCurrent(saveToken) else { return notWrittenOutcome }
             // Valid lifetime, file missing: accidental loss, not deletion. The dirty data and the
             // captured ownership are kept; the retained recovery (if any) reconstructs the file and
             // a later save writes normally. Nothing is recreated from this tab's transcript.
@@ -14716,9 +15219,9 @@ final class AgentModeViewModel: ObservableObject {
                 AgentModePerfDiagnostics.event("save.session.missingFile", tabID: tabID, fields: ["sessionID": sessionID.uuidString])
             #endif
             print("[AgentModeVM] session file missing for \(sessionID); save deferred until it is restored")
-            return .notWritten
+            return notWrittenOutcome
         } catch let AgentScheduledSendMutationError.staleTranscriptResetGeneration(_, reportedResetGeneration) {
-            guard isSaveCommitTokenOwnerCurrent(saveToken) else { return .notWritten }
+            guard isSaveCommitTokenOwnerCurrent(saveToken) else { return notWrittenOutcome }
             // A committed reset this owner does not know about: fail closed. The stale transcript
             // is never rewritten under a refreshed stamp. The exact owner that issued this save
             // retains its working view and drops authority; only an explicitly confirmed paired
@@ -14732,14 +15235,110 @@ final class AgentModeViewModel: ObservableObject {
                 submittedState: persistenceState,
                 reportedResetGeneration: reportedResetGeneration
             )
-            return .notWritten
+            return notWrittenOutcome
         } catch {
             #if DEBUG
                 AgentModePerfDiagnostics.event("save.session.error", tabID: tabID, fields: ["error": String(describing: error)])
             #endif
             print("[AgentModeVM] Failed to save session: \(error)")
-            return .notWritten
+            return notWrittenOutcome
         }
+    }
+
+    /// Full persisted snapshot of `session` for `sessionID`: the single builder shared by the
+    /// normal save and the recovery transcript-reset commit.
+    func makePersistedAgentSession(
+        for session: AgentTabSession,
+        tabID: UUID,
+        sessionID: UUID,
+        workspaceID: UUID,
+        sessionName: String,
+        persistableSnapshot: PersistableTranscriptSnapshot
+    ) -> AgentSession {
+        let undeliveredRemoteUserItemIDs = Set(session.items.lazy.filter {
+            $0.kind == .user && $0.isUndeliveredRemoteSend
+        }.map(\.id))
+        let persistedRemoteResendPayloadsByItemID: [String: PersistedRemoteResendPayload] = Dictionary(
+            uniqueKeysWithValues: session.remoteResendPayloadsByItemID.compactMap { itemID, payload in
+                guard undeliveredRemoteUserItemIDs.contains(itemID) else { return nil }
+                return (
+                    itemID.uuidString,
+                    PersistedRemoteResendPayload(
+                        providerText: payload.providerText,
+                        wasStart: payload.wasStart,
+                        modelSelectionRaw: payload.modelSelectionRaw,
+                        sessionName: payload.sessionName,
+                        workspaceName: payload.workspaceName,
+                        windowID: payload.windowID,
+                        workspaceID: payload.workspaceID
+                    )
+                )
+            }
+        )
+        let toolNameByItemID: [UUID: String] = Dictionary(
+            uniqueKeysWithValues: session.items.compactMap { item in
+                item.toolName.map { (item.id, $0) }
+            }
+        )
+        let uiToolResultPayloadsByItemID: [String: String] = Dictionary(
+            uniqueKeysWithValues: session.ephemeralToolResultPayloadByItemID.compactMap { itemID, rawPayload in
+                guard let uiPayload = AgentToolResultPersistencePolicy.uiFacingOracleIdentityJSON(
+                    toolName: toolNameByItemID[itemID],
+                    rawResultJSON: rawPayload
+                ) else {
+                    return nil
+                }
+                return (itemID.uuidString, uiPayload)
+            }
+        )
+        var agentSession = AgentSession(
+            id: sessionID,
+            workspaceID: workspaceID,
+            composeTabID: tabID,
+            name: sessionName,
+            items: [],
+            uiToolResultPayloadsByItemID: uiToolResultPayloadsByItemID,
+            transcript: persistableSnapshot.transcript,
+            itemCount: persistableSnapshot.canonicalVisibleRowCount,
+            transcriptProjectionCounts: persistableSnapshot.projectionCounts,
+            lastUserMessageAt: persistableSnapshot.lastUserMessageAt,
+            agentKind: session.selectedAgent.rawValue,
+            agentModel: session.selectedModelRaw,
+            ohMyPiThinkingSelections: session.ohMyPiThinkingSelections.nilIfEmpty,
+            agentReasoningEffort: session.selectedReasoningEffortRaw,
+            lastRunState: session.runState.rawValue,
+            providerSessionID: session.providerSessionID,
+            remoteHost: session.remoteHost,
+            remoteResendPayloadsByItemID: persistedRemoteResendPayloadsByItemID,
+            locallyAttributedStartItemID: session.locallyAttributedStartItemID,
+            autoEditEnabled: session.autoEditEnabled,
+            providerTokenUsageByTurn: session.providerTokenUsageByTurn,
+            providerUsage: session.usageAccounting.flatMap {
+                $0.ownerSessionID == sessionID ? $0.persistedRepresentation : nil
+            },
+            parentSessionID: session.parentSessionID,
+            pendingHandoffPayload: session.pendingHandoff.payload,
+            pendingHandoffCreatedAt: session.pendingHandoff.createdAt,
+            pendingHandoffSourceItemID: session.pendingHandoff.sourceItemID,
+            pendingHandoffPayloadID: session.pendingHandoff.payloadID,
+            pendingHandoffDefersProviderLockUntilSend: session.pendingHandoff.defersProviderLockUntilSend,
+            scheduledSend: session.scheduledSend,
+            lastScheduledDispatch: session.lastScheduledDispatch,
+            isMCPOriginated: session.isMCPOriginated,
+            origin: session.origin,
+            profile: session.profile,
+            worktreeBindings: session.worktreeBindings,
+            worktreeMergeOperations: session.worktreeMergeOperations,
+            providerHistoryRecovery: session.providerHistoryRecovery
+        )
+        codexCoordinator.applyCodexPersistence(from: session, to: &agentSession)
+        return agentSession
+    }
+
+    /// Whether an unbound session has anything a save would persist (unbound sessions without
+    /// conversation content are never written).
+    func hasPersistableConversationContent(_ session: AgentTabSession) -> Bool {
+        !session.items.isEmpty || !session.transcript.turns.isEmpty || session.runState.isActive || session.hasPendingQuestionUI || session.pendingApproval != nil || session.pendingPermissionsRequest != nil || session.pendingApplyEditsReview != nil || session.pendingWorktreeMergeReview != nil || session.worktreeMergeOperations.contains { $0.status.isActive } || session.scheduledSend != nil
     }
 
     func isSaveInFlight(sessionID: UUID) -> Bool {
@@ -14788,19 +15387,6 @@ final class AgentModeViewModel: ObservableObject {
 
     func hasLiveRunRouteInCurrentMCPServer(_ runID: UUID) -> Bool {
         mcpServer?.hasLiveRunID(runID) == true
-    }
-
-    /// Submit a user message to the agent
-    func submitUserMessage(_ text: String) {
-        _ = submitUserTurn(text: text)
-    }
-
-    @discardableResult
-    func submitUserTurn(text: String) -> UserTurnSubmissionResult {
-        guard let tabID = currentTabID else {
-            return .blocked(message: "")
-        }
-        return submitUserTurn(text: text, tabID: tabID)
     }
 
     @discardableResult
@@ -14876,6 +15462,7 @@ final class AgentModeViewModel: ObservableObject {
         let target = claim.attempt.target
         let claimedSourceSession = claim.sourceSession
         guard composerSubmitClaimIsCurrent(claim) else {
+            logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "claim_not_current", persistent: true)
             return .blocked(message: Self.staleComposerSubmitTargetMessage)
         }
         defer {
@@ -14885,14 +15472,17 @@ final class AgentModeViewModel: ObservableObject {
         switch target.route {
         case .existingAgentSession:
             guard let preparedSession = try? await ensureSessionReady(tabID: target.tabID) else {
+                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "session_not_ready", persistent: true)
                 return .blocked(message: Self.composeTabRemovalInProgressMessage)
             }
             guard preparedSession === claimedSourceSession,
                   composerSubmitClaimIsCurrent(claim)
             else {
+                logRejectedSubmitTarget(target, session: preparedSession, reason: "prepared_session_or_claim_changed", persistent: true)
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
             }
             if let blockedMessage = newWorkBlockedMessage(for: preparedSession) {
+                logRejectedSubmitTarget(target, session: preparedSession, reason: "new_work_blocked", persistent: true)
                 return .blocked(message: blockedMessage)
             }
             if let rejectionReason = submitTargetRejectionReason(
@@ -14900,7 +15490,7 @@ final class AgentModeViewModel: ObservableObject {
                 session: preparedSession,
                 validateSubmissionToken: false
             ) {
-                logRejectedSubmitTarget(target, session: preparedSession, reason: rejectionReason)
+                logRejectedSubmitTarget(target, session: preparedSession, reason: rejectionReason, persistent: true)
                 resyncAfterRejectedSubmitTarget(target)
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
             }
@@ -14909,7 +15499,14 @@ final class AgentModeViewModel: ObservableObject {
                   initialLocation != .local,
                   pendingState.initialStartLocation == initialLocation
             else {
-                let result = submitUserTurn(text: text, tabID: target.tabID)
+                let result = await submitUserTurnAdmittingRecoveryInput(
+                    text: text,
+                    tabID: target.tabID,
+                    origin: .composer,
+                    isStillCurrent: {
+                        self.composerSubmitClaimIsCurrent(claim) && self.sessions[target.tabID] === preparedSession
+                    }
+                )
                 if result == .submitted {
                     clearComposerDraftIfUnchanged(for: claim)
                 }
@@ -14933,6 +15530,7 @@ final class AgentModeViewModel: ObservableObject {
                 }
             }
             if let blocked = preflightInitialUserTurn(text: text, session: preparedSession) {
+                logRejectedSubmitTarget(target, session: preparedSession, reason: "initial_turn_preflight_blocked", persistent: true)
                 return blocked
             }
             do {
@@ -14948,12 +15546,13 @@ final class AgentModeViewModel: ObservableObject {
                         && Self.pendingUserTurnState(from: preparedSession) == pendingState
                 }
             } catch {
+                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "initial_location_preparation_failed", persistent: true)
                 return .blocked(message: (error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
             }
             guard composerSourceAgentSessionID(tabID: target.tabID, session: preparedSession)
                 == target.expectedSourceAgentSessionID
             else {
-                logRejectedSubmitTarget(target, session: preparedSession, reason: "agent_session_id_mismatch")
+                logRejectedSubmitTarget(target, session: preparedSession, reason: "agent_session_id_mismatch", persistent: true)
                 resyncAfterRejectedSubmitTarget(target)
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
             }
@@ -14963,16 +15562,25 @@ final class AgentModeViewModel: ObservableObject {
                   sourceSnapshot.matches(sessions[target.tabID]),
                   Self.pendingUserTurnState(from: preparedSession) == pendingState
             else {
+                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "state_changed_during_location_preparation", persistent: true)
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
             }
             if let blocked = preflightInitialUserTurn(text: text, session: preparedSession) {
+                logRejectedSubmitTarget(target, session: preparedSession, reason: "initial_turn_preflight_blocked_after_preparation", persistent: true)
                 return blocked
             }
             preparedSession.pendingInitialStartLocation = .local
             if target.tabID == currentTabID {
                 applySessionToBindings(preparedSession)
             }
-            let result = submitUserTurn(text: text, tabID: target.tabID)
+            let result = await submitUserTurnAdmittingRecoveryInput(
+                text: text,
+                tabID: target.tabID,
+                origin: .composer,
+                isStillCurrent: {
+                    self.composerSubmitClaimIsCurrent(claim) && self.sessions[target.tabID] === preparedSession
+                }
+            )
             if result == .submitted {
                 clearComposerDraftIfUnchanged(for: claim)
             }
@@ -14998,6 +15606,7 @@ final class AgentModeViewModel: ObservableObject {
                             && Self.pendingUserTurnState(from: sourceSession) == pendingState
                     }
                 } catch {
+                    logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "initial_location_workspace_preflight_failed", persistent: true)
                     return .blocked(message: (error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
                 }
                 sourceSession.isPreparingInitialWorktree = true
@@ -15014,15 +15623,18 @@ final class AgentModeViewModel: ObservableObject {
                 }
             }
             guard let destinationTabID = await createAndActivateSessionTab() else {
+                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "first_send_destination_not_created", persistent: true)
                 return .blocked(message: "Failed to create a new agent session.")
             }
             guard !Task.isCancelled,
                   composerSubmitClaimIsCurrent(claim)
             else {
+                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "claim_not_current_after_destination_created", persistent: true)
                 await discardFreshFirstSendDestinationIfPossible(destinationTabID)
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
             }
             guard sessions[target.tabID] === sourceSession else {
+                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "source_session_replaced", persistent: true)
                 await discardFreshFirstSendDestinationIfPossible(destinationTabID)
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
             }
@@ -15031,7 +15643,7 @@ final class AgentModeViewModel: ObservableObject {
                 session: sourceSession,
                 validateSubmissionToken: false
             ) {
-                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: rejectionReason)
+                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: rejectionReason, persistent: true)
                 resyncAfterRejectedSubmitTarget(target)
                 await discardFreshFirstSendDestinationIfPossible(destinationTabID)
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
@@ -15039,13 +15651,13 @@ final class AgentModeViewModel: ObservableObject {
             guard composerSubmitClaimIsCurrent(claim),
                   sourceSnapshot.matches(sessions[target.tabID])
             else {
-                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "source_pending_state_changed")
+                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "source_pending_state_changed", persistent: true)
                 resyncAfterRejectedSubmitTarget(target)
                 await discardFreshFirstSendDestinationIfPossible(destinationTabID)
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
             }
             guard destinationTabID != target.tabID else {
-                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "invalid_first_send_destination")
+                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "invalid_first_send_destination", persistent: true)
                 resyncAfterRejectedSubmitTarget(target)
                 await discardFreshFirstSendDestinationIfPossible(destinationTabID)
                 return .blocked(message: "Failed to create a new agent session.")
@@ -15053,7 +15665,7 @@ final class AgentModeViewModel: ObservableObject {
             guard let destinationSession = session(for: destinationTabID, createIfNeeded: true),
                   isFreshFirstSendDestination(destinationSession)
             else {
-                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "invalid_first_send_destination")
+                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "invalid_first_send_destination", persistent: true)
                 resyncAfterRejectedSubmitTarget(target)
                 await discardFreshFirstSendDestinationIfPossible(destinationTabID)
                 return .blocked(message: "Failed to create a new agent session.")
@@ -15080,6 +15692,7 @@ final class AgentModeViewModel: ObservableObject {
             // guard below can never be satisfied and the first send blocks.
             installPendingUserTurnState(pendingState, on: destinationSession)
             if let blocked = preflightInitialUserTurn(text: text, session: destinationSession) {
+                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "destination_preflight_blocked", persistent: true)
                 clearPendingUserTurnState(on: destinationSession)
                 await discardFreshFirstSendDestinationIfPossible(destinationTabID)
                 return blocked
@@ -15095,6 +15708,7 @@ final class AgentModeViewModel: ObservableObject {
                             && Self.pendingUserTurnState(from: destinationSession) == pendingState
                     }
                 } catch {
+                    logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "destination_location_preparation_failed", persistent: true)
                     clearPendingUserTurnState(on: destinationSession)
                     await discardFreshFirstSendDestinationIfPossible(destinationTabID)
                     return .blocked(message: (error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
@@ -15107,10 +15721,12 @@ final class AgentModeViewModel: ObservableObject {
                   sourceSnapshot.matches(sessions[target.tabID]),
                   Self.pendingUserTurnState(from: destinationSession) == pendingState
             else {
+                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "state_changed_during_destination_preparation", persistent: true)
                 clearPendingUserTurnState(on: destinationSession)
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
             }
             if let blocked = preflightInitialUserTurn(text: text, session: destinationSession) {
+                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "destination_preflight_blocked_after_preparation", persistent: true)
                 clearPendingUserTurnState(on: destinationSession)
                 return blocked
             }
@@ -15118,7 +15734,16 @@ final class AgentModeViewModel: ObservableObject {
             if destinationTabID == currentTabID {
                 applySessionToBindings(destinationSession)
             }
-            let result = submitUserTurn(text: text, tabID: destinationTabID)
+            let result = await submitUserTurnAdmittingRecoveryInput(
+                text: text,
+                tabID: destinationTabID,
+                origin: .composer,
+                isStillCurrent: {
+                    self.composerSubmitClaimIsCurrent(claim)
+                        && self.sessions[destinationTabID] === destinationSession
+                        && self.sessions[target.tabID] === sourceSession
+                }
+            )
             guard result == .submitted else {
                 clearPendingUserTurnState(on: destinationSession)
                 return result
@@ -15499,11 +16124,19 @@ final class AgentModeViewModel: ObservableObject {
         }
     }
 
+    /// Submits one user turn. `admitted` is the durably admitted snapshot (R12) and is required
+    /// whenever recovery admission is not inactive; `nil` selects the legacy untracked input of
+    /// inactive admission explicitly (F1: no implicit default).
+    /// `composerInput: false` marks a non-admitted non-composer input (MCP or a paired device): it
+    /// sends only its own text and the active workflow, and never reads or clears the composer's
+    /// attachments, tagged files, workflow, or interview-first choice.
     @discardableResult
     func submitUserTurn(
         text: String,
         tabID: UUID,
-        codexAttemptID: UUID? = nil
+        codexAttemptID: UUID?,
+        admitted: AdmittedUserTurnInput?,
+        composerInput: Bool = true
     ) -> UserTurnSubmissionResult {
         guard let session = session(for: tabID, createIfNeeded: true) else {
             return .blocked(message: Self.composeTabRemovalInProgressMessage)
@@ -15512,8 +16145,8 @@ final class AgentModeViewModel: ObservableObject {
             return .blocked(message: blockedMessage)
         }
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        let attachmentsToSend = session.pendingImageAttachments
-        let taggedFilesToSend = session.pendingTaggedFileAttachments
+        let attachmentsToSend = admitted?.attachments ?? (composerInput ? session.pendingImageAttachments : [])
+        let taggedFilesToSend = admitted?.taggedFiles ?? (composerInput ? session.pendingTaggedFileAttachments : [])
         guard !trimmedText.isEmpty || !attachmentsToSend.isEmpty || !taggedFilesToSend.isEmpty else {
             return .blocked(message: "")
         }
@@ -15525,7 +16158,7 @@ final class AgentModeViewModel: ObservableObject {
 
         scheduleSkillCatalogRefresh()
 
-        let activeWorkflow = session.selectedWorkflow
+        let activeWorkflow = if let admitted { admitted.workflow } else { session.selectedWorkflow }
         let nativePreparedTurn: NativeSlashPreparedUserTurn?
         if let nativeSlashCommand = resolvedNativeSlashCommand(in: trimmedText, session: session) {
             if let validationFailure = validateNativeSlashCommandUsage(
@@ -15539,6 +16172,11 @@ final class AgentModeViewModel: ObservableObject {
             }
             switch nativeSlashCommand.command.behavior {
             case .controlPlane:
+                // An explicit recovery action's payload is a user turn; a control-plane command has
+                // no dispatch its hold could settle on (review A P1-01).
+                if admitted?.identity.actionAuthorization != nil {
+                    return .blocked(message: "A recovery message can't run a slash command. Nothing was sent.")
+                }
                 let goalAction: CodexAgentModeCoordinator.GoalSlashAction? = nativeSlashCommand.command == .goal
                     ? CodexAgentModeCoordinator.goalSlashAction(from: nativeSlashCommand.argumentsText)
                     : nil
@@ -15583,6 +16221,12 @@ final class AgentModeViewModel: ObservableObject {
         } else {
             nativePreparedTurn = nil
         }
+        // F1: a user turn under non-inactive admission needs its admitted snapshot; refuse before any
+        // clearing, bubble, attachment reservation, or MCP signal (control-plane commands above
+        // carry no user turn).
+        if admitted == nil, session.recoveryAdmissionMode != .inactive {
+            return .blocked(message: Self.durableQueueAdmissionRequiredMessage)
+        }
         if nativePreparedTurn == nil,
            let validationFailure = validateSlashSkillUsage(in: trimmedText, activeWorkflow: activeWorkflow)
         {
@@ -15604,11 +16248,19 @@ final class AgentModeViewModel: ObservableObject {
             return invocation.definition.asBubbleWorkflowDefinition()
         }()
 
-        // Capture and clear workflow before sending
-        session.selectedWorkflow = nil
-        selectedWorkflow = nil
-        session.pendingImageAttachments.removeAll()
-        session.pendingTaggedFileAttachments.removeAll()
+        // Capture and clear workflow before sending. An admitted composer snapshot removes only what
+        // it submitted, so edits made since admission survive (R12); an admitted non-composer input
+        // (MCP) never touches the composer.
+        if let admitted {
+            if admitted.consumesComposer {
+                consumeSubmittedComposerInput(admitted, session: session)
+            }
+        } else if composerInput {
+            session.selectedWorkflow = nil
+            selectedWorkflow = nil
+            session.pendingImageAttachments.removeAll()
+            session.pendingTaggedFileAttachments.removeAll()
+        }
 
         if session.activeAgentSessionID != nil, !session.hasLoadedPersistedState {
             Self.logCodexDebug("[AgentModeVM][RunID] deferring send until hydration completes for tab \(tabID)")
@@ -15621,7 +16273,9 @@ final class AgentModeViewModel: ObservableObject {
                     taggedFilesToSend: taggedFilesToSend,
                     activeWorkflow: bubbleWorkflow,
                     nativePreparedTurn: nativePreparedTurn,
-                    codexAttemptID: codexAttemptID
+                    codexAttemptID: codexAttemptID,
+                    admitted: admitted,
+                    composerInput: composerInput
                 )
             }
             return .submitted
@@ -15635,8 +16289,185 @@ final class AgentModeViewModel: ObservableObject {
             taggedFilesToSend: taggedFilesToSend,
             activeWorkflow: bubbleWorkflow,
             nativePreparedTurn: nativePreparedTurn,
-            codexAttemptID: codexAttemptID
+            codexAttemptID: codexAttemptID,
+            admitted: admitted,
+            composerInput: composerInput
         )
+    }
+
+    /// R12: removes exactly the admitted snapshot's attachments, tagged files, and workflow from the
+    /// live composer (by identity). Anything added or changed since admission stays.
+    private func consumeSubmittedComposerInput(_ admitted: AdmittedUserTurnInput, session: AgentTabSession) {
+        let submittedImageIDs = Set(admitted.attachments.map(\.id))
+        if !submittedImageIDs.isEmpty {
+            session.pendingImageAttachments.removeAll { submittedImageIDs.contains($0.id) }
+        }
+        let submittedTaggedFiles = admitted.taggedFiles
+        if !submittedTaggedFiles.isEmpty {
+            session.pendingTaggedFileAttachments.removeAll { submittedTaggedFiles.contains($0) }
+        }
+        if let submittedWorkflow = admitted.workflow, session.selectedWorkflow == submittedWorkflow {
+            session.selectedWorkflow = nil
+            if session.tabID == currentTabID {
+                selectedWorkflow = nil
+            }
+        }
+    }
+
+    /// Composer and MCP submission with durable recovery admission (lossless restart). When the
+    /// session requires it, the input is committed `queued` (composer revision consumed, pending
+    /// handoff captured) BEFORE the synchronous submit clears pending state or appends the bubble;
+    /// a refused or failed commit returns `.blocked` with the composer untouched, and the committed
+    /// identity (its item ID is the bubble's) and one immutable snapshot of the submitted input (R12)
+    /// are carried unchanged to every route. An admitted input whose submit is refused synchronously
+    /// is released per R01 (`releaseRefusedRecoveryAdmission`: withdrawn only once nothing depends on
+    /// it). Sessions that do not require admission, and native control-plane commands (no user
+    /// turn), submit as before.
+    ///
+    /// `reservedPayloadOnly` (recovery continuations, review B F5): exactly `text` is sent as a new
+    /// admitted user turn. The live composer (draft text, attachments, tagged files, selected
+    /// workflow, interview-first) is neither read nor consumed, no workflow wraps the text, slash
+    /// commands are refused, and every non-admitted fallback is refused instead of submitting the
+    /// composer's state.
+    func submitUserTurnAdmittingRecoveryInput(
+        text: String,
+        tabID: UUID,
+        origin: AgentRecoveryIntentOrigin,
+        codexAttemptID: UUID? = nil,
+        workflowOverride: AgentWorkflowDefinition? = nil,
+        nativePreparedTurn: NativeSlashPreparedUserTurn? = nil,
+        userItemID: UUID = UUID(),
+        reservedPayloadOnly: Bool = false,
+        actionAuthorization: AgentRecoveryActionAuthorization? = nil,
+        isStillCurrent: @MainActor () -> Bool = { true }
+    ) async -> UserTurnSubmissionResult {
+        // Only a reserved recovery payload carries an action's authority (review A P1-01).
+        guard actionAuthorization == nil || reservedPayloadOnly else {
+            return .blocked(message: Self.recoveryReservedPayloadUnadmittedMessage)
+        }
+        // Every route submits through `submit`. The non-admitted routes (not required, control-plane,
+        // and the post-admission `.notRequired`) take the caller's predicate here as their final
+        // synchronous check before any mutation; the admitted branch below checks it itself,
+        // synchronously before `submit`, and releases a refused admission.
+        let composerInput = origin != .mcp
+        let staleTargetMessage = origin == .mcp
+            ? Self.staleInstructionTargetMessage
+            : Self.staleComposerSubmitTargetMessage
+        func submit(_ admitted: AdmittedUserTurnInput?) -> UserTurnSubmissionResult {
+            guard let session = sessions[tabID] else {
+                return .blocked(message: Self.composeTabRemovalInProgressMessage)
+            }
+            if admitted == nil {
+                guard isStillCurrent() else { return .blocked(message: staleTargetMessage) }
+            }
+            let submitTurn: () -> UserTurnSubmissionResult = {
+                if let nativePreparedTurn {
+                    return self.submitPreparedUserTurn(
+                        tabID: tabID,
+                        session: session,
+                        trimmedText: text.trimmingCharacters(in: .whitespacesAndNewlines),
+                        attachmentsToSend: [],
+                        taggedFilesToSend: [],
+                        activeWorkflow: nativePreparedTurn.bubbleWorkflow,
+                        nativePreparedTurn: nativePreparedTurn,
+                        codexAttemptID: codexAttemptID,
+                        admitted: admitted,
+                        composerInput: composerInput
+                    )
+                }
+                return self.submitUserTurn(
+                    text: text,
+                    tabID: tabID,
+                    codexAttemptID: codexAttemptID,
+                    admitted: admitted,
+                    composerInput: composerInput
+                )
+            }
+            // MCP turns always run under their own (possibly empty) workflow; composer turns use the
+            // composer's selection.
+            guard origin == .mcp else { return submitTurn() }
+            return withMCPWorkflowOverride(session: session, workflow: workflowOverride, operation: submitTurn)
+        }
+        guard let session = session(for: tabID, createIfNeeded: true) else {
+            return .blocked(message: Self.composeTabRemovalInProgressMessage)
+        }
+        guard requiresDurableRecoveryAdmission(for: session) else {
+            return reservedPayloadOnly ? .blocked(message: Self.recoveryReservedPayloadUnadmittedMessage) : submit(nil)
+        }
+        // Refusals the synchronous submit would return before projecting anything admit nothing.
+        if let blockedMessage = newWorkBlockedMessage(for: session) {
+            return .blocked(message: blockedMessage)
+        }
+        let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if reservedPayloadOnly {
+            guard !trimmedText.isEmpty, nativePreparedTurn == nil, origin != .composer, origin != .mcp else {
+                return .blocked(message: Self.recoveryReservedPayloadUnadmittedMessage)
+            }
+            guard resolvedNativeSlashCommand(in: trimmedText, session: session) == nil else {
+                return .blocked(message: "A recovery continuation can't run a slash command. Nothing was sent.")
+            }
+        }
+        let consumesComposer = origin == .composer
+        // R12: the whole submitted input is captured synchronously, before any await. A native
+        // prepared turn carries no composer attachments (it submits none).
+        let capturesComposerInput = consumesComposer && nativePreparedTurn == nil
+        let attachments = capturesComposerInput ? session.pendingImageAttachments : []
+        let taggedFiles = capturesComposerInput ? session.pendingTaggedFileAttachments : []
+        guard !trimmedText.isEmpty || !attachments.isEmpty || !taggedFiles.isEmpty else {
+            return .blocked(message: "")
+        }
+        if nativePreparedTurn == nil,
+           resolvedNativeSlashCommand(in: trimmedText, session: session)?.command.behavior == .controlPlane
+        {
+            return submit(nil)
+        }
+        let workflow = reservedPayloadOnly ? nil : (origin == .mcp ? workflowOverride : session.selectedWorkflow)
+        let interviewFirst = consumesComposer && effectiveInterviewFirst(for: session)
+        let admission = await admitRecoveryInput(
+            session: session,
+            userItemID: userItemID,
+            origin: origin,
+            text: consumesComposer ? text : trimmedText,
+            attachments: attachments,
+            taggedFiles: taggedFiles,
+            workflow: workflow,
+            interviewFirst: interviewFirst,
+            consumesComposer: consumesComposer,
+            actionAuthorization: actionAuthorization
+        )
+        switch admission {
+        case .notRequired:
+            return reservedPayloadOnly ? .blocked(message: Self.recoveryReservedPayloadUnadmittedMessage) : submit(nil)
+        case let .blocked(message):
+            return .blocked(message: message)
+        case let .admitted(identity, lane, content, admittedAttachments):
+            let admitted = AdmittedUserTurnInput(
+                identity: identity,
+                content: content,
+                attachments: admittedAttachments,
+                taggedFiles: taggedFiles,
+                workflow: workflow,
+                interviewFirst: interviewFirst,
+                consumesComposer: consumesComposer
+            )
+            guard isStillCurrent(), sessions[tabID] === session, session.recoveryLane === lane, !lane.isRetired else {
+                if origin == .composer {
+                    AgentComposerSubmitDiagnostics.submitRejected(
+                        reason: "admission_no_longer_current",
+                        route: "recovery_admission",
+                        targetTabID: tabID,
+                        currentTabID: currentTabID
+                    )
+                }
+                await releaseRefusedRecoveryAdmission(admitted, lane: lane, session: session)
+                return .blocked(message: staleTargetMessage)
+            }
+            let result = submit(admitted)
+            if result != .submitted {
+                await releaseRefusedRecoveryAdmission(admitted, lane: lane, session: session)
+            }
+            return result
+        }
     }
 
     func clearRemoteStartWindowPickerIfOwned(by tabID: UUID) {
@@ -15654,9 +16485,10 @@ final class AgentModeViewModel: ObservableObject {
         optimisticUserItemID: UUID
     ) -> Bool {
         guard sessions[session.tabID] === session else { return false }
+        // A picker choice is an explicit user retry of the same item and intent (never automatic).
         let hostName = session.remoteHost?.hostDisplayName ?? "remote host"
         let pending = RemoteStartWindowPickerState(
-            error: error,
+            error: RemoteInputHandoffError.remoteError(of: error),
             tabID: session.tabID,
             hostName: hostName,
             message: message,
@@ -15716,13 +16548,17 @@ final class AgentModeViewModel: ObservableObject {
         // by host truth during catch-up without duplicating the user turn.
         session.runState = .failed
         session.setRunningStatus(nil, source: nil)
+        let remoteError = RemoteInputHandoffError.remoteError(of: error)
         let description = RemoteAgentModeCoordinator.describe(
-            error,
+            remoteError,
             workspaceName: workspaceManager?.activeWorkspace?.name,
             hostName: session.remoteHost?.hostDisplayName
         )
-        let text = "\(prefix): \(description)"
-        let commandCode = (error as? RemoteClientError)?.commandError?.code ?? ""
+        // Delivery unknown is never presented as a plain failure: the host may have the input.
+        let text = Self.isRemoteDeliveryUnknown(error)
+            ? "\(prefix): \(description) The host may have received it; check before resending."
+            : "\(prefix): \(description)"
+        let commandCode = (remoteError as? RemoteClientError)?.commandError?.code ?? ""
         let usesSystemPresentation = Self.remoteFailureOffersLocalFallback(error)
             || ["workspace_not_open", "workspace_mismatch"]
             .contains(commandCode)
@@ -15809,6 +16645,10 @@ final class AgentModeViewModel: ObservableObject {
         Task { [weak self, weak session] in
             guard let self, let session else { return }
             do {
+                // Resend is an explicit user action on the existing item (never a new intent).
+                guard let dispatch = await remoteExplicitRetryDispatch(for: session, userItemID: itemID) else {
+                    throw Self.remoteDispatchUnavailableError
+                }
                 if shouldStartRemote {
                     try await remoteCoordinator.startRemoteSession(
                         session: session,
@@ -15817,11 +16657,12 @@ final class AgentModeViewModel: ObservableObject {
                         sessionName: payload.sessionName,
                         windowID: payload.windowID,
                         workspaceID: payload.workspaceID,
-                        workspaceName: payload.workspaceName
+                        workspaceName: payload.workspaceName,
+                        dispatch: dispatch
                     )
                     session.locallyAttributedStartItemID = itemID
                 } else {
-                    try await remoteCoordinator.steer(session: session, text: payload.providerText)
+                    try await remoteCoordinator.steer(session: session, text: payload.providerText, dispatch: dispatch)
                 }
                 session.mutateItemsBatch { items in
                     if let index = items.firstIndex(where: { $0.id == itemID }) {
@@ -15837,7 +16678,8 @@ final class AgentModeViewModel: ObservableObject {
                     session.remoteResendInFlightItemIDs.remove(itemID)
                     return
                 }
-                let isTargetError = shouldStartRemote && Self.isRemoteStartTargetError(error)
+                let isTargetError = shouldStartRemote
+                    && Self.isRemoteStartTargetError(RemoteInputHandoffError.remoteError(of: error))
                 let retryPayload = isTargetError
                     ? AgentRemoteResendPayload(
                         providerText: payload.providerText,
@@ -15904,11 +16746,11 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     private static func isRemoteStartTargetError(_ error: Error) -> Bool {
-        RemoteStartWindowPickerState.isTargetError(error)
+        RemoteStartWindowPickerState.isTargetError(RemoteInputHandoffError.remoteError(of: error))
     }
 
     private static func remoteFailureOffersLocalFallback(_ error: Error) -> Bool {
-        guard let remoteError = error as? RemoteClientError else { return false }
+        guard let remoteError = RemoteInputHandoffError.remoteError(of: error) as? RemoteClientError else { return false }
         switch remoteError {
         case .hostNotFound, .hostRevoked, .missingDeviceKey, .timeout, .transport, .connectionClosed:
             return true
@@ -16008,6 +16850,13 @@ final class AgentModeViewModel: ObservableObject {
             }
 
             do {
+                // Workspace-open retry: an explicit user action on the existing item.
+                guard let dispatch = await remoteExplicitRetryDispatch(
+                    for: session,
+                    userItemID: pending.optimisticUserItemID
+                ) else {
+                    throw Self.remoteDispatchUnavailableError
+                }
                 try await remoteCoordinator.startRemoteSession(
                     session: session,
                     message: pending.message,
@@ -16015,7 +16864,8 @@ final class AgentModeViewModel: ObservableObject {
                     sessionName: pending.sessionName,
                     windowID: nil,
                     workspaceID: nil,
-                    workspaceName: workspaceName
+                    workspaceName: workspaceName,
+                    dispatch: dispatch
                 )
                 session.locallyAttributedStartItemID = pending.optimisticUserItemID
                 session.mutateItemsBatch { items in
@@ -16070,6 +16920,13 @@ final class AgentModeViewModel: ObservableObject {
         Task { [weak self, weak session] in
             guard let self, let session else { return }
             do {
+                // Picker choice: an explicit user action on the existing item.
+                guard let dispatch = await remoteExplicitRetryDispatch(
+                    for: session,
+                    userItemID: pending.optimisticUserItemID
+                ) else {
+                    throw Self.remoteDispatchUnavailableError
+                }
                 try await remoteCoordinator.startRemoteSession(
                     session: session,
                     message: pending.message,
@@ -16079,7 +16936,8 @@ final class AgentModeViewModel: ObservableObject {
                     // Guard only against the host-reported workspace of the chosen
                     // window — never a client-local workspace UUID.
                     workspaceID: option.workspaceID,
-                    workspaceName: nil
+                    workspaceName: nil,
+                    dispatch: dispatch
                 )
                 session.locallyAttributedStartItemID = pending.optimisticUserItemID
                 session.mutateItemsBatch { items in
@@ -16172,13 +17030,22 @@ final class AgentModeViewModel: ObservableObject {
         attachmentsToSend: [AgentImageAttachment],
         taggedFilesToSend: [AgentTaggedFileAttachment],
         activeWorkflow: AgentWorkflowDefinition?,
-        nativePreparedTurn: NativeSlashPreparedUserTurn? = nil,
-        codexAttemptID: UUID? = nil
+        nativePreparedTurn: NativeSlashPreparedUserTurn?,
+        codexAttemptID: UUID?,
+        admitted: AdmittedUserTurnInput?,
+        composerInput: Bool
     ) async {
-        guard let session = sessions[tabID] else { return }
+        guard let session = sessions[tabID] else {
+            // R01: never withdrawn here; the admitted intent stays held for explicit recovery.
+            recoveryCoordinator?.noteRecoveryActionSubmissionEnded(admitted?.identity.actionAuthorization)
+            return
+        }
         await prepareSessionForRunStart(tabID: tabID, session: session)
-        guard let hydratedSession = sessions[tabID] else { return }
-        _ = submitPreparedUserTurn(
+        guard let hydratedSession = sessions[tabID] else {
+            recoveryCoordinator?.noteRecoveryActionSubmissionEnded(admitted?.identity.actionAuthorization)
+            return
+        }
+        let result = submitPreparedUserTurn(
             tabID: tabID,
             session: hydratedSession,
             trimmedText: trimmedText,
@@ -16186,8 +17053,21 @@ final class AgentModeViewModel: ObservableObject {
             taggedFilesToSend: taggedFilesToSend,
             activeWorkflow: activeWorkflow,
             nativePreparedTurn: nativePreparedTurn,
-            codexAttemptID: codexAttemptID
+            codexAttemptID: codexAttemptID,
+            admitted: admitted,
+            composerInput: composerInput
         )
+        // The caller already reported `.submitted`; a refusal after hydration releases the admitted
+        // intent under R01 (held unless its exact draft is durably back in the composer).
+        if result != .submitted, let admitted {
+            // A recovery action's submission settles here: nothing was or can be handed off.
+            recoveryCoordinator?.noteRecoveryActionSubmissionEnded(admitted.identity.actionAuthorization)
+            // Send saved (review A P1-06): the saved intent was the user's message before this choice;
+            // a refused re-dispatch keeps it queued (never withdrawn), exactly as before the choice.
+            if !admitted.resendsAuthorizedSavedIntent, let lane = hydratedSession.recoveryLane {
+                await releaseRefusedRecoveryAdmission(admitted, lane: lane, session: hydratedSession)
+            }
+        }
     }
 
     private static func shouldWakeParentAgentRunWaitersForActiveSubmit(
@@ -16234,10 +17114,44 @@ final class AgentModeViewModel: ObservableObject {
         attachmentsToSend: [AgentImageAttachment],
         taggedFilesToSend: [AgentTaggedFileAttachment],
         activeWorkflow: AgentWorkflowDefinition?,
-        nativePreparedTurn: NativeSlashPreparedUserTurn? = nil,
-        codexAttemptID: UUID? = nil
+        nativePreparedTurn: NativeSlashPreparedUserTurn?,
+        codexAttemptID: UUID?,
+        admitted: AdmittedUserTurnInput?,
+        composerInput: Bool = true
     ) -> UserTurnSubmissionResult {
         Self.logCodexDebug("[AgentModeVM] submitUserTurn: tabID=\(tabID), selectedAgent=\(session.selectedAgent), attachments=\(attachmentsToSend.count), taggedFiles=\(taggedFilesToSend.count), workflow=\(activeWorkflow?.displayName ?? "none")")
+        let admittedIdentity = admitted?.identity
+        // F1: every route below needs a durable identity unless admission is inactive. Refuse before
+        // the bubble, attachment reservation, interview-first consumption, or any MCP signal.
+        if admittedIdentity == nil, session.recoveryAdmissionMode != .inactive {
+            return .blocked(message: Self.durableQueueAdmissionRequiredMessage)
+        }
+        // Review A P1-01: an explicit recovery action's own payload only starts a local run, whose
+        // dispatch evidence settles the action's hold; a live run or remote host never queues it.
+        if admittedIdentity?.actionAuthorization != nil, session.runState.isActive || session.remoteHost != nil {
+            return .blocked(message: Self.recoveryActionSessionBusyMessage)
+        }
+        // Review A P1-06 / O11: Send saved reuses its intent's one bubble, which its preparation
+        // placed (or found) as the clean request of the final turn and committed before the queue
+        // receipt. Without that exact, still-current preparation nothing is appended or sent: an
+        // absent bubble was reconstructed and saved by the preparation, never here. Decided
+        // synchronously with the reuse below (no suspension between check and use).
+        var reusedUserItem: AgentChatItem?
+        if let admitted, admitted.resendsAuthorizedSavedIntent {
+            switch recoverySavedPreparedBubble(
+                admitted,
+                session: session,
+                trimmedText: trimmedText,
+                attachments: attachmentsToSend,
+                taggedFiles: taggedFilesToSend,
+                workflow: activeWorkflow
+            ) {
+            case let .success(item):
+                reusedUserItem = item
+            case let .failure(refusal):
+                return .blocked(message: refusal.message)
+            }
+        }
 
         let prepared = appendPreparedUserTurn(
             tabID: tabID,
@@ -16247,7 +17161,12 @@ final class AgentModeViewModel: ObservableObject {
             taggedFilesToSend: taggedFilesToSend,
             activeWorkflow: activeWorkflow,
             nativePreparedTurn: nativePreparedTurn,
-            inputSource: .composer
+            inputSource: .composer,
+            preassignedUserItemID: admittedIdentity?.userItemID,
+            // A non-composer input never takes or consumes the composer's interview-first choice.
+            admittedInterviewFirst: admitted.map(\.interviewFirst) ?? (composerInput ? nil : false),
+            consumesComposerInterview: admitted?.consumesComposer ?? composerInput,
+            reusedUserItem: reusedUserItem
         )
         let userItem = prepared.userItem
         let effectiveUserText = prepared.effectiveUserText
@@ -16286,6 +17205,15 @@ final class AgentModeViewModel: ObservableObject {
         }
 
         if session.remoteHost != nil {
+            // The input's admission identity: its committed queue receipt, or untracked while
+            // admission is inactive (fail closed when mandatory without one).
+            guard let remoteDispatch = remoteSendDispatch(
+                for: session,
+                userItemID: userItem.id,
+                receipt: admittedIdentity?.queueReceipt
+            ) else {
+                return .blocked(message: Self.durableQueueAdmissionRequiredMessage)
+            }
             remoteRunLocallyFallbackItemIDByTabID.removeValue(forKey: tabID)
             session.pendingRemoteOptimisticUserItemIDs.insert(userItem.id)
             session.pendingRemoteOptimisticProviderTextByItemID[userItem.id] = wrappedText
@@ -16339,11 +17267,12 @@ final class AgentModeViewModel: ObservableObject {
                             windowID: nil,
                             workspaceID: nil,
                             workspaceName: workspaceName,
-                            allowHostSessionNameAdoptionFromStartName: didDeriveRemoteSessionName
+                            allowHostSessionNameAdoptionFromStartName: didDeriveRemoteSessionName,
+                            dispatch: remoteDispatch
                         )
                         session.locallyAttributedStartItemID = userItem.id
                     } else {
-                        try await remoteCoordinator.steer(session: session, text: wrappedText)
+                        try await remoteCoordinator.steer(session: session, text: wrappedText, dispatch: remoteDispatch)
                     }
                 } catch {
                     if shouldStartRemote,
@@ -16379,14 +17308,22 @@ final class AgentModeViewModel: ObservableObject {
         }
 
         if session.selectedAgent == .codexExec {
+            // The admitted durable identity (queue ID == intent ID), or untracked while admission is
+            // inactive; fail closed when mandatory without one.
+            guard let identity = admittedIdentity
+                ?? AgentQueuedInputIdentity.untracked(userItemID: userItem.id, in: session)
+            else {
+                return .blocked(message: Self.durableQueueAdmissionRequiredMessage)
+            }
             let dispatchTicket = session.codexDispatchSerialGate.issueTicket()
             let fallbackContext = AgentTabSession.CodexFallbackSubmissionContext(
-                queueID: UUID(),
+                // A durable identity is queued under its recovery intent ID (the receipt's intent).
+                queueID: identity.intentID ?? UUID(),
                 providerText: wrappedText,
                 images: attachmentsToSend,
                 taggedFileAttachments: taggedFilesToSend,
                 draftText: trimmedText,
-                optimisticUserItemID: userItem.id,
+                identity: identity,
                 origin: codexAttemptID.map(AgentTabSession.CodexFallbackOrigin.mcp) ?? .manual,
                 dispatchTicket: dispatchTicket
             )
@@ -16404,7 +17341,7 @@ final class AgentModeViewModel: ObservableObject {
                         self.removeUnconfirmedMCPOptimisticCodexUserItem(
                             session: session,
                             tabID: tabID,
-                            itemID: userItem.id,
+                            itemID: prepared.removableUserItemID,
                             reason: "dispatch authorization did not complete"
                         )
                         return
@@ -16416,18 +17353,23 @@ final class AgentModeViewModel: ObservableObject {
                     initialMessage: wrappedText,
                     attachments: attachmentsToSend,
                     taggedFileAttachments: taggedFilesToSend,
+                    // Codex carries its identity in the fallback context.
+                    inputConstituents: nil,
                     codexFallbackContext: fallbackContext
                 )
+                self.noteRecoveryActionStartReturned(identity, outcome: sendOutcome, isCodex: true)
                 if sendOutcome?.didSend != true {
                     self.clearPendingCodexComputerUseActivationIfMatched(
                         session: session,
                         activationID: stagedCodexComputerUseActivationID
                     )
-                    if codexAttemptID != nil {
+                    // Delivery unknown: the provider may have the input; the bubble stays (never
+                    // deleted, restored as a draft, or retried).
+                    if codexAttemptID != nil, !Self.isDeliveryUnknown(sendOutcome) {
                         self.removeUnconfirmedMCPOptimisticCodexUserItem(
                             session: session,
                             tabID: tabID,
-                            itemID: userItem.id,
+                            itemID: prepared.removableUserItemID,
                             reason: "send outcome was not accepted or durably queued"
                         )
                     }
@@ -16436,8 +17378,10 @@ final class AgentModeViewModel: ObservableObject {
                 let terminalState: CodexSteerAckTracker.TerminalState = switch sendOutcome {
                 case .sent:
                     .steerAccepted
-                case let .queuedFallback(queueID, _):
-                    .durablyQueued(queueID: queueID)
+                case let .queuedFallback(receipt, _):
+                    .durablyQueued(receipt: receipt)
+                case let .deliveryUnknown(message):
+                    .deliveryUnknown(message: message)
                 case let .stale(reason):
                     .stale(reason: reason)
                 case .cancelled:
@@ -16455,6 +17399,14 @@ final class AgentModeViewModel: ObservableObject {
             return UserTurnSubmissionResult.submitted
         }
 
+        // One immutable identity for this input across every route below: the intent committed
+        // before the optimistic clear (`submitUserTurnAdmittingRecoveryInput`), or untracked while
+        // admission is inactive; none once admission is mandatory (fail closed).
+        guard let inputIdentity = admittedIdentity
+            ?? AgentQueuedInputIdentity.untracked(userItemID: userItem.id, in: session)
+        else {
+            return .blocked(message: Self.durableQueueAdmissionRequiredMessage)
+        }
         let userInputTokenEstimate = enqueueUserTurnTokenEstimate(
             wrappedText: wrappedText,
             attachments: attachmentsToSend,
@@ -16468,46 +17420,119 @@ final class AgentModeViewModel: ObservableObject {
             if session.selectedAgent.usesClaudeNativeRuntime, !attachmentsToSend.isEmpty {
                 Task { [weak self] in
                     guard let self else { return }
-                    await cancelAgentRun(tabID: tabID)
+                    await cancelAgentRun(tabID: tabID, cause: .ordinary)
                     await startAgentRun(
                         tabID: tabID,
                         initialMessage: wrappedText,
                         attachments: attachmentsToSend,
-                        taggedFileAttachments: taggedFilesToSend
+                        taggedFileAttachments: taggedFilesToSend,
+                        inputConstituents: [inputIdentity],
+                        holdsPrefixBlockedInput: true
                     )
                 }
                 return UserTurnSubmissionResult.submitted
             }
             if session.instructionContinuation != nil {
+                // R05-R1b: an older queued head owns the live wait, even while its own delivery is
+                // suspended or blocked; this input queues behind it instead of claiming the wait.
+                if !session.pendingInstructions.isEmpty {
+                    queueBehindOlderInstructionHead(
+                        session: session,
+                        wrappedText: wrappedText,
+                        identity: inputIdentity,
+                        hasAttachments: !attachmentsToSend.isEmpty || !taggedFilesToSend.isEmpty
+                    )
+                    return UserTurnSubmissionResult.submitted
+                }
                 let textForContinuation = wrappedText
                 let continuationAttachments = attachmentsToSend
                 let continuationTaggedFiles = taggedFilesToSend
                 _ = dequeuePendingNonCodexUserTokens(for: session) ?? userInputTokenEstimate
                 Task { @MainActor [weak self, weak session] in
                     guard let self, let session else { return }
-                    let augmentedText = await augmentUserMessageForProviderSend(
+                    let augmented = await augmentUserMessageForProviderSend(
                         textForContinuation,
                         attachments: continuationAttachments,
                         taggedFileAttachments: continuationTaggedFiles,
                         agent: session.selectedAgent,
-                        session: session
+                        session: session,
+                        carriers: [inputIdentity]
                     )
-                    guard let liveContinuation = session.instructionContinuation else { return }
-                    let resumedText = deliverDelegatedQuestionNoticesWithImmediateInput(augmentedText, session: session)
-                    let resumedTurnTokens = Self.estimateRuntimeTokens(for: resumedText)
-                    addUserInputTokensToActiveNonCodexTurn(resumedTurnTokens, for: session)
-                    session.instructionTimeoutTask?.cancel()
-                    session.instructionTimeoutTask = nil
-                    session.instructionContinuation = nil
-                    session.instructionWaitID = nil
-                    session.waitingPrompt = nil
-                    session.runState = .running
-                    updateBindingsFromSession(session)
-                    liveContinuation.resume(returning: UserInstructionResponse(
-                        text: resumedText,
-                        timedOut: false,
-                        elapsedSeconds: 0
-                    ))
+                    if let blockedReason = augmented.blockedReason {
+                        // Its handoff prefix could not be saved with it: never resumed without it.
+                        holdBlockedDurableInput([inputIdentity], session: session, reason: blockedReason)
+                        return
+                    }
+                    let augmentedText = augmented.text
+                    // Returning the text to the waiting tool is this input's stage-delivery boundary;
+                    // every exit before it releases the exact pending-handoff stage it created.
+                    var stageDelivered = false
+                    defer {
+                        recordPendingHandoffStageOutcome(
+                            for: session,
+                            stage: augmented.pendingHandoffStage,
+                            disposition: stageDelivered ? .sent : .notSent
+                        )
+                    }
+                    let hasAttachments = !continuationAttachments.isEmpty || !continuationTaggedFiles.isEmpty
+                    guard session.instructionContinuation != nil else {
+                        // B R1-1: the wait ended during preparation; the saved input is shown as held.
+                        holdBlockedDurableInput([inputIdentity], session: session, reason: Self.instructionWaitEndedHoldReason)
+                        return
+                    }
+                    // R05-R1b: a head queued during preparation keeps its priority.
+                    guard session.pendingInstructions.isEmpty else {
+                        queueBehindOlderInstructionHead(
+                            session: session,
+                            wrappedText: textForContinuation,
+                            identity: inputIdentity,
+                            hasAttachments: hasAttachments
+                        )
+                        return
+                    }
+                    // Before-handoff dispatch commit (durable input), then revalidate the exact
+                    // wait (same wait ID and run attempt), lane, and empty queue with no suspension
+                    // before the claim: a stale continuation never receives the input.
+                    let expectedWaitID = session.instructionWaitID
+                    let expectedRunAttemptID = session.activeRunAttemptID
+                    let dispatchEvidence: AgentRecoveryDispatchEvidence
+                    switch await AgentRecoveryDispatchEvidence.beginUnderActiveRun(
+                        session: session,
+                        constituents: [inputIdentity]
+                    ) {
+                    case let .success(evidence):
+                        dispatchEvidence = evidence
+                    case let .failure(failure):
+                        print("[AgentModeVM][Recovery] waiting continuation not resumed: \(failure)")
+                        // Nothing was handed off (for example the run has no compatible ownership):
+                        // the saved input is shown as held, never sent unlinked.
+                        holdBlockedDurableInput([inputIdentity], session: session, reason: failure.dispatchFailureText)
+                        return
+                    }
+                    guard claimLiveInstructionWait(
+                        session: session,
+                        expectedWaitID: expectedWaitID,
+                        expectedRunAttemptID: expectedRunAttemptID,
+                        evidence: dispatchEvidence,
+                        text: augmentedText,
+                        beforeClaim: { session.pendingInstructions.isEmpty }
+                    ) else {
+                        // Nothing was handed off (settled back to queued). Behind a head queued
+                        // meanwhile it keeps FIFO order; otherwise the wait changed and the saved
+                        // input is shown as held (B R1-1), never resent automatically.
+                        if session.runState.isActive, !session.pendingInstructions.isEmpty {
+                            queueBehindOlderInstructionHead(
+                                session: session,
+                                wrappedText: textForContinuation,
+                                identity: inputIdentity,
+                                hasAttachments: hasAttachments
+                            )
+                        } else {
+                            holdBlockedDurableInput([inputIdentity], session: session, reason: Self.instructionWaitEndedHoldReason)
+                        }
+                        return
+                    }
+                    stageDelivered = true
                 }
                 return UserTurnSubmissionResult.submitted
             }
@@ -16516,27 +17541,35 @@ final class AgentModeViewModel: ObservableObject {
         // If agent is not running, start it
         if !session.runState.isActive {
             Task {
-                await startAgentRun(
+                let outcome = await startAgentRun(
                     tabID: tabID,
                     initialMessage: wrappedText,
                     attachments: attachmentsToSend,
-                    taggedFileAttachments: taggedFilesToSend
+                    taggedFileAttachments: taggedFilesToSend,
+                    inputConstituents: [inputIdentity],
+                    holdsPrefixBlockedInput: true
                 )
+                noteRecoveryActionStartReturned(inputIdentity, outcome: outcome, isCodex: false)
             }
-        } else if let route = activeProviderSteeringRoute(for: session, attachments: attachmentsToSend) {
-            submitActiveProviderSteering(
-                route,
-                session: session,
-                wrappedText: wrappedText,
-                attachmentsToSend: attachmentsToSend,
-                taggedFilesToSend: taggedFilesToSend,
-                trimmedText: trimmedText,
-                userItem: userItem,
-                userInputTokenEstimate: userInputTokenEstimate
-            )
         } else {
-            // Shared follow-up queue for providers that consume queued instructions at the next turn boundary.
-            session.pendingInstructions.append(wrappedText)
+            // Queued input carries its admission identity.
+            let identity = inputIdentity
+            if let route = activeProviderSteeringRoute(for: session, attachments: attachmentsToSend) {
+                submitActiveProviderSteering(
+                    route,
+                    session: session,
+                    wrappedText: wrappedText,
+                    attachmentsToSend: attachmentsToSend,
+                    taggedFilesToSend: taggedFilesToSend,
+                    trimmedText: trimmedText,
+                    userItem: userItem,
+                    identity: identity,
+                    userInputTokenEstimate: userInputTokenEstimate
+                )
+            } else {
+                // Shared follow-up queue for providers that consume queued instructions at the next turn boundary.
+                session.pendingInstructions.append(AgentPendingInstruction(text: wrappedText, identity: identity))
+            }
         }
         return UserTurnSubmissionResult.submitted
     }
@@ -16546,7 +17579,15 @@ final class AgentModeViewModel: ObservableObject {
     /// Codex computer-use staging, interview-first wrapping (composer flag or frozen record flag),
     /// workflow wrapping, tagged-file auto-selection, delta flush, anchor bookkeeping, append, and
     /// the debounced save. `.scheduled` supplies the attempt's deterministic item id and never
-    /// reads or clears composer pending state.
+    /// reads or clears composer pending state. `admittedInterviewFirst` is the admitted snapshot's
+    /// interview choice (R12; `nil` only for legacy untracked composer input, which reads the live
+    /// choice). Only a composer submission (`consumesComposerInterview`) consumes the live one-shot
+    /// interview choice; an admitted non-composer input (MCP, Send saved) leaves it alone.
+    ///
+    /// `reusedUserItem` (review A P1-06, Send saved only): the authorized, already shown
+    /// deterministic bubble of the saved intent. It is left exactly as shown (no append, duplicate,
+    /// sequence-counter, or timestamp change); the new run attaches to that same turn, and the
+    /// result reports `.reused` so failure cleanup never deletes it.
     func appendPreparedUserTurn(
         tabID: UUID,
         session: AgentTabSession,
@@ -16554,8 +17595,12 @@ final class AgentModeViewModel: ObservableObject {
         attachmentsToSend: [AgentImageAttachment],
         taggedFilesToSend: [AgentTaggedFileAttachment],
         activeWorkflow: AgentWorkflowDefinition?,
-        nativePreparedTurn: NativeSlashPreparedUserTurn? = nil,
-        inputSource: UserTurnInputSource
+        nativePreparedTurn: NativeSlashPreparedUserTurn?,
+        inputSource: UserTurnInputSource,
+        preassignedUserItemID: UUID?,
+        admittedInterviewFirst: Bool?,
+        consumesComposerInterview: Bool = true,
+        reusedUserItem: AgentChatItem? = nil
     ) -> PreparedUserTurnAppend {
         let bubbleText = Self.userBubbleText(
             trimmedText: trimmedText,
@@ -16563,7 +17608,9 @@ final class AgentModeViewModel: ObservableObject {
             taggedFiles: taggedFilesToSend,
             workflow: activeWorkflow
         )
-        if case .composer = inputSource, nativePreparedTurn?.shouldEnableCodexComputerUse == true {
+        if case .composer = inputSource, reusedUserItem == nil,
+           nativePreparedTurn?.shouldEnableCodexComputerUse == true
+        {
             session.pendingCodexComputerUseActivation = AgentCodexComputerUseActivation(
                 id: UUID(),
                 createdAt: Date()
@@ -16576,10 +17623,16 @@ final class AgentModeViewModel: ObservableObject {
         let itemID: UUID
         switch inputSource {
         case .composer:
-            itemID = UUID()
+            // A durably admitted input is shown as the item its intent was committed for.
+            itemID = reusedUserItem?.id ?? preassignedUserItemID ?? UUID()
+            let interviewFirst = admittedInterviewFirst ?? effectiveInterviewFirst(for: session)
             if interviewFirst, Self.sessionQualifiesForInterviewFirst(session) {
                 effectiveUserText = Self.interviewFirstWrappedUserText(effectiveUserText)
-                interviewFirst = false
+                // The submitted choice is consumed (one-shot) by a composer submission only; an
+                // admitted non-composer input carries its own choice and leaves the live one alone.
+                if consumesComposerInterview {
+                    setInterviewFirst(false, for: session)
+                }
             }
         case let .scheduled(record, attempt):
             itemID = attempt.itemID
@@ -16609,6 +17662,19 @@ final class AgentModeViewModel: ObservableObject {
             flushPendingAssistantDelta(session)
         }
 
+        if let reusedUserItem {
+            // The shown bubble stays exactly as it is; this run's runtime footer starts now.
+            recordAgentTurnUserAnchor(for: session, userItem: reusedUserItem, startedAt: Date())
+            updateBindingsFromSession(session)
+            return PreparedUserTurnAppend(
+                userItem: reusedUserItem,
+                effectiveUserText: effectiveUserText,
+                wrappedText: wrappedText,
+                codexCompactionInFlight: codexCompactionInFlight,
+                stagedCodexComputerUseActivationID: stagedCodexComputerUseActivationID,
+                disposition: .reused
+            )
+        }
         let userItem = AgentChatItem.user(
             bubbleText,
             id: itemID,
@@ -16626,7 +17692,8 @@ final class AgentModeViewModel: ObservableObject {
             effectiveUserText: effectiveUserText,
             wrappedText: wrappedText,
             codexCompactionInFlight: codexCompactionInFlight,
-            stagedCodexComputerUseActivationID: stagedCodexComputerUseActivationID
+            stagedCodexComputerUseActivationID: stagedCodexComputerUseActivationID,
+            disposition: .appended
         )
     }
 
@@ -16765,8 +17832,10 @@ final class AgentModeViewModel: ObservableObject {
         taggedFilesToSend: [AgentTaggedFileAttachment],
         trimmedText: String,
         userItem: AgentChatItem,
+        identity: AgentQueuedInputIdentity,
         userInputTokenEstimate: Int
     ) {
+        assert(identity.userItemID == userItem.id, "Steering identity must name its optimistic user bubble")
         switch route {
         case .acpPrompt:
             // ACP live steering uses the same serialized queued-flush shape as
@@ -16783,7 +17852,7 @@ final class AgentModeViewModel: ObservableObject {
                 attachments: attachmentsToSend,
                 taggedFileAttachments: taggedFilesToSend,
                 draftText: trimmedText,
-                optimisticUserItemID: userItem.id,
+                identity: identity,
                 createdAt: Date()
             )
             session.pendingACPSteeringInstructions.append(steering)
@@ -16804,17 +17873,30 @@ final class AgentModeViewModel: ObservableObject {
                 // Attention notifications only: a completion deferred behind this queued steering is
                 // re-evaluated once this handoff settled (after the direct start returned).
                 defer { attentionCompletionProgress(for: session) }
+                let followUp = AgentPendingInstruction(text: queued.providerText, identity: queued.identity)
                 if session.runState.isActive {
-                    session.pendingInstructions.insert(queued.providerText, at: 0)
+                    session.pendingInstructions.insert(followUp, at: 0)
+                    // The agent may already be parked in its instruction wait: hand it the head.
+                    deliverRequeuedHeadToLiveInstructionWaitIfNeeded(session)
                 } else if session.runState == .completed, session.acpController != nil {
                     let afterStart = beginAttentionFollowUpObservation(for: session)
-                    await startAgentRun(tabID: session.tabID, initialMessage: queued.providerText)
+                    let outcome = await startAgentRun(
+                        tabID: session.tabID,
+                        initialMessage: queued.providerText,
+                        inputConstituents: [queued.identity]
+                    )
+                    // Durable input that was never handed off stays queued as a follow-up.
+                    if followUp.isDurable, Self.runStartDidNotHandOff(outcome) {
+                        session.pendingInstructions.insert(followUp, at: 0)
+                        session.isDirty = true
+                        scheduleSave(for: session.tabID)
+                    }
                     afterStart()
                 } else {
                     // ACP steering should never bounce back into the composer. If the
                     // active-steering queue was rejected before the run service could take it,
                     // preserve it as a normal provider follow-up instead.
-                    session.pendingInstructions.insert(queued.providerText, at: 0)
+                    session.pendingInstructions.insert(followUp, at: 0)
                     session.isDirty = true
                     updateBindingsFromSession(session)
                     scheduleSave(for: session.tabID)
@@ -16831,7 +17913,7 @@ final class AgentModeViewModel: ObservableObject {
                 attachments: attachmentsToSend,
                 taggedFileAttachments: taggedFilesToSend,
                 draftText: trimmedText,
-                optimisticUserItemID: userItem.id,
+                identity: identity,
                 createdAt: Date(),
                 supersedingProtectedTurnIDs: []
             )
@@ -17682,8 +18764,9 @@ final class AgentModeViewModel: ObservableObject {
         attachments: [AgentImageAttachment] = [],
         taggedFileAttachments: [AgentTaggedFileAttachment] = [],
         agent: AgentProviderKind? = nil,
-        session: AgentTabSession? = nil
-    ) async -> String {
+        session: AgentTabSession? = nil,
+        carriers: [AgentQueuedInputIdentity]
+    ) async -> AgentStagedProviderText {
         let effectiveAgent = session?.selectedAgent ?? agent ?? activeSession?.selectedAgent ?? selectedAgent
         let withSkillExpansion = await expandSlashSkillInvocationIfNeeded(text, agentKind: effectiveAgent)
         let lookupContext: WorkspaceLookupContext = if let session {
@@ -17703,26 +18786,48 @@ final class AgentModeViewModel: ObservableObject {
             attachments: attachments,
             agent: effectiveAgent
         )
-        guard let session else { return withAttachmentRendering }
-        return prependPendingHandoffIfNeeded(withAttachmentRendering, session: session)
+        guard let session else { return AgentStagedProviderText(text: withAttachmentRendering) }
+        return await stagePendingHandoff(withAttachmentRendering, session: session, carriers: carriers)
     }
 
+    /// Text-only form of `stagePendingHandoffIfNeeded` (the stage it creates still awaits an outcome).
     @MainActor
     func prependPendingHandoffIfNeeded(
         _ text: String,
         session: AgentTabSession
     ) -> String {
+        stagePendingHandoffIfNeeded(text, session: session).text
+    }
+
+    /// Prepends the pending-handoff payload as a new exact stage unless it is already staged into
+    /// another input or held as possibly delivered (an uncertain stage or an unresolved recovery
+    /// join): a held payload is never prepended again automatically. A legacy payload is assigned
+    /// its durable payload ID here (persisted by the next save).
+    @MainActor
+    func stagePendingHandoffIfNeeded(
+        _ text: String,
+        session: AgentTabSession
+    ) -> AgentStagedProviderText {
         guard let handoffPayload = session.pendingHandoff.payload,
-              session.pendingHandoff.isStagedForSend == false
+              !session.pendingHandoff.isReservedForSend
         else {
-            return text
+            return AgentStagedProviderText(text: text)
         }
         let trimmedPayload = handoffPayload.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedPayload.isEmpty else {
-            return text
+            return AgentStagedProviderText(text: text)
         }
+        let hadPayloadID = session.pendingHandoff.payloadID != nil
+        guard let payloadID = session.pendingHandoff.ensurePayloadID() else {
+            return AgentStagedProviderText(text: text)
+        }
+        if !hadPayloadID {
+            session.isDirty = true
+        }
+        let stage = AgentPendingHandoffStage(payloadID: payloadID)
+        session.pendingHandoff.stage = stage
         session.pendingHandoff.isStagedForSend = true
-        return trimmedPayload + "\n\n" + text
+        return AgentStagedProviderText(text: trimmedPayload + "\n\n" + text, pendingHandoffStage: stage)
     }
 
     // SEARCH-HELPER: Handoff, Resume, Recovery, Transcript, Session Transfer
@@ -17782,6 +18887,7 @@ final class AgentModeViewModel: ObservableObject {
             payload: payload,
             createdAt: Date(),
             sourceItemID: cutoffItemID,
+            payloadID: UUID(),
             defersProviderLockUntilSend: false,
             isStagedForSend: false
         )
@@ -17802,18 +18908,38 @@ final class AgentModeViewModel: ObservableObject {
         )
     }
 
+    /// Settles exactly `stage` of the pending-handoff payload (stage-delivery semantics, not provider
+    /// acceptance; delegated child-question notices settle separately by their own stage):
+    /// - `.sent` consumes that payload (never downgraded: the payload is gone);
+    /// - `.notSent` releases the stage for a later send (verified non-handoff or rejection);
+    /// - `.deliveryUnknown` holds it: no consumption, no re-prepend, no release.
+    /// A nil, superseded, or other-payload stage is a no-op, so a late outcome never settles a newer
+    /// stage or clears a newer payload. A recovery hold is resolved only by the recovery join.
     @MainActor
-    private func recordPendingHandoffSendOutcome(for session: AgentTabSession, didSend: Bool) {
-        // Delegated child-question notices settle separately, keyed by their exact stage
-        // (`Hooks.recordDelegatedQuestionNoticeSendOutcome`), never by this tab-wide outcome.
-        guard session.pendingHandoff.isStagedForSend else { return }
-        if didSend {
+    func recordPendingHandoffStageOutcome(
+        for session: AgentTabSession,
+        stage: AgentPendingHandoffStage?,
+        disposition: AgentStagedInputDisposition
+    ) {
+        guard let stage,
+              session.pendingHandoff.stage == stage,
+              session.pendingHandoff.payloadID == stage.payloadID
+        else { return }
+        switch disposition {
+        case .sent:
             session.pendingHandoff.clearAfterSend()
             session.isDirty = true
             scheduleSave(for: session.tabID)
-            return
+        case .notSent:
+            guard session.pendingHandoff.deliveryHold?.isRecoveryHold != true else { return }
+            session.pendingHandoff.stage = nil
+            session.pendingHandoff.deliveryHold = nil
+            session.pendingHandoff.isStagedForSend = false
+        case .deliveryUnknown:
+            if session.pendingHandoff.deliveryHold == nil {
+                session.pendingHandoff.deliveryHold = .deliveryUnknown
+            }
         }
-        session.pendingHandoff.isStagedForSend = false
     }
 
     @MainActor
@@ -17969,14 +19095,24 @@ final class AgentModeViewModel: ObservableObject {
     /// provider runner is invoked (after the Codex dispatch ticket, message augmentation, and
     /// workspace resolution). A `false` answer aborts before any provider work with
     /// `.stale(reason: AgentModeRunService.providerHandoffRevokedReason)`.
+    ///
+    /// `inputConstituents` are the immutable identities captured when this input was admitted, in
+    /// order. `nil` is the legacy untracked input of inactive recovery admission; when the session
+    /// requires durable admission it fails closed (`.stale`, nothing handed off) instead.
+    ///
+    /// `holdsPrefixBlockedInput` (B R1-1): for callers that do not re-queue on failure, a start
+    /// refused because its pending-handoff prefix could not be saved shows the carried durable input
+    /// as held. Callers that re-queue a not-handed-off start leave it `false` (never both).
     @discardableResult
     func startAgentRun(
         tabID: UUID,
         initialMessage: String,
         attachments: [AgentImageAttachment] = [],
         taggedFileAttachments: [AgentTaggedFileAttachment] = [],
+        inputConstituents: [AgentQueuedInputIdentity]?,
         codexFallbackContext: AgentTabSession.CodexFallbackSubmissionContext? = nil,
-        providerHandoffAuthorization: (@MainActor () -> Bool)? = nil
+        providerHandoffAuthorization: (@MainActor () -> Bool)? = nil,
+        holdsPrefixBlockedInput: Bool = false
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome? {
         guard let session = session(for: tabID, createIfNeeded: true) else {
             return .failed(message: Self.composeTabRemovalInProgressMessage)
@@ -18014,18 +19150,45 @@ final class AgentModeViewModel: ObservableObject {
                 handleObservedMCPStateChange(for: session)
             }
         }
+        // Codex routes carry their identity in `codexFallbackContext`; every other route needs one
+        // (checked after the dispatch-ticket and follow-up defers are installed, and before the tab
+        // is bound, the session prepared, or any input text is staged — F1).
+        let constituents: [AgentQueuedInputIdentity]
+        if let inputConstituents {
+            constituents = inputConstituents
+        } else if let untracked = AgentQueuedInputIdentity.untracked(userItemID: nil, in: session) {
+            constituents = [untracked]
+        } else if session.selectedAgent == .codexExec, codexFallbackContext?.identity.isDurable == true {
+            constituents = []
+        } else {
+            return .stale(reason: Self.durableQueueAdmissionRequiredMessage)
+        }
         guard ensureSessionBoundToTab(session) != nil else {
             return .failed(message: "The tab could not be bound to an agent session.")
         }
         await prepareSessionForRunStart(tabID: tabID, session: session)
         await prepareMCPWaitTrackingForRunStart(session: session)
-        let augmentedMessage = await augmentUserMessageForProviderSend(
+        let carriers = constituents.isEmpty ? codexFallbackContext.map { [$0.identity] } ?? [] : constituents
+        let augmented = await augmentUserMessageForProviderSend(
             initialMessage,
             attachments: attachments,
             taggedFileAttachments: taggedFileAttachments,
             agent: session.selectedAgent,
-            session: session
+            session: session,
+            carriers: carriers
         )
+        if let blockedReason = augmented.blockedReason {
+            // Nothing was dispatched or staged: re-queuing callers keep durable input queued (same
+            // intents), exactly as for any other start that provably handed nothing off; the others
+            // show it as held.
+            if holdsPrefixBlockedInput {
+                holdBlockedDurableInput(carriers, session: session, reason: blockedReason)
+            }
+            return .failed(message: blockedReason)
+        }
+        let augmentedMessage = augmented.text
+        // Exact pending-handoff stage this start's text carries (nil when nothing was prepended).
+        let pendingHandoffStage = augmented.pendingHandoffStage
         // Idle parent only (plan §6.2): pending child questions ride on this turn's first input
         // as a labeled runtime block (never the user's text). A busy parent gets them with its
         // next eligible tool result instead, so steer/supersede/queued-fallback inputs never
@@ -18049,7 +19212,7 @@ final class AgentModeViewModel: ObservableObject {
                 images: context.images,
                 taggedFileAttachments: context.taggedFileAttachments,
                 draftText: context.draftText,
-                optimisticUserItemID: context.optimisticUserItemID,
+                identity: context.identity,
                 origin: context.origin,
                 dispatchTicket: context.dispatchTicket
             )
@@ -18062,23 +19225,23 @@ final class AgentModeViewModel: ObservableObject {
             initialUserMessage: augmentedMessage,
             initialMessageForRun: initialMessageForRun,
             attachments: attachments,
+            inputConstituents: constituents,
             codexFallbackContext: preparedCodexFallbackContext,
             providerHandoffAuthorization: providerHandoffAuthorization,
-            delegatedQuestionStageID: delegatedQuestionStageID
+            delegatedQuestionStageID: delegatedQuestionStageID,
+            pendingHandoffStage: pendingHandoffStage
         )
-        // A stage the send outcome did not resolve is released when the start never reached the
-        // provider (stale/cancelled/failed, a queued Codex fallback, or an inactive run);
-        // otherwise it awaits that exact stage's outcome.
-        let startReportedNoSend = switch startOutcome {
-        case .sent?, nil:
-            false
-        case .some:
-            true
+        // Start-tail settlement of stages the provider outcome did not already resolve: a start that
+        // provably handed nothing off releases them; uncertainty holds them; an admitted runner
+        // still owes its outcome (an inactive run alone is not proof of non-handoff).
+        let startDisposition = Self.stagedInputStartDisposition(for: startOutcome)
+        if let startDisposition {
+            recordPendingHandoffStageOutcome(for: session, stage: pendingHandoffStage, disposition: startDisposition)
         }
         settleDelegatedQuestionTurnStageAfterRunStart(
             delegatedQuestionStageID,
             session: session,
-            startReportedNoSend: startReportedNoSend
+            startDisposition: startDisposition
         )
         return startOutcome
     }
@@ -18176,7 +19339,11 @@ final class AgentModeViewModel: ObservableObject {
             sessionProfile: session.profile,
             delegationAudience: mcpDelegationRunToolPolicy(for: session).promptAudience
         )
-        return AgentMessage(systemPrompt: systemPrompt, userMessage: fullMessage, resumeSessionID: resumeSessionID)
+        var message = AgentMessage(systemPrompt: systemPrompt, userMessage: fullMessage, resumeSessionID: resumeSessionID)
+        // R6: a managed headless launch for this run carries the session's lifecycle, run attempt
+        // and this process run (`unavailable` without a live recovery lane; never fabricated).
+        message.runtimeSession = session.runtimeSessionScope(processRunID: runID)
+        return message
     }
 
     private static let claudeReasoningStatusBufferCharacterLimit = 4000
@@ -18464,6 +19631,15 @@ final class AgentModeViewModel: ObservableObject {
                     )
                 }
             }
+            // Step 4d3b (inactive: only a default-off qualified Claude producer attaches evidence).
+            // Evidence is processed before any generic mutation; an accepted complete text is the
+            // result's only effect (the content it rode on is never applied a second time).
+            if let evidence = result.claudeLiveTranscriptEvidence,
+               applyClaudeLiveTranscriptEvidence(evidence, result: result, session: session, isBackground: isBackground)
+            {
+                requestUIRefresh(tabID: session.tabID)
+                return
+            }
             var shouldUpdateBindings = false
             switch result.type {
             case "content":
@@ -18525,7 +19701,15 @@ final class AgentModeViewModel: ObservableObject {
                     return nil
                 }()
 
-                if let index = tailAssistantIndex {
+                if let index = tailAssistantIndex,
+                   isProviderHistoryAssociatedItem(session.items[index].id, session: session)
+                {
+                    // Step 4d3a: a row matched to Claude's history is never rewritten. Equal text
+                    // is already shown; other text becomes a new visible row.
+                    if session.items[index].text != content {
+                        session.appendItem(AgentChatItem.assistant(content, sequenceIndex: session.nextSequenceIndex))
+                    }
+                } else if let index = tailAssistantIndex {
                     var updated = session.items[index]
                     updated.text = content
                     updated.isStreaming = false
@@ -18630,9 +19814,33 @@ final class AgentModeViewModel: ObservableObject {
                 addToolOutputTokens(outputJSON, for: session)
                 guard !AgentToolTrackingSupport.shouldHideToolFromTranscript(toolName) else { break }
                 let invocationID = result.toolInvocationID
-                if let invocationID,
-                   let index = session.items.lastIndex(where: { $0.toolInvocationID == invocationID })
+                let invocationIndex = invocationID.flatMap { invocationID in
+                    session.items.lastIndex(where: { $0.toolInvocationID == invocationID })
+                }
+                let nameIndex = invocationIndex == nil
+                    ? session.items.lastIndex(where: {
+                        // A name-only match stays within the same delivery's tool calls (for background
+                        // output, the same stream's).
+                        $0.kind == .toolCall && $0.toolName == toolName
+                            && session.isDeliveryRow($0.id, background: isBackground, sourceID: backgroundSourceID)
+                    })
+                    : nil
+                // Step 4d5: a row matched to Claude's history (live or imported, with or without a
+                // valid proof) is never converted; the output is shown as its own unidentified row,
+                // carrying the matched call's arguments as the conversion would have.
+                if let index = invocationIndex ?? nameIndex,
+                   isProviderHistoryAssociatedItem(session.items[index].id, session: session)
                 {
+                    let toolResultItem = AgentChatItem.toolResult(
+                        name: toolName,
+                        invocationID: invocationID,
+                        argsJSON: argsJSON ?? session.items[index].toolArgsJSON,
+                        resultJSON: outputJSON,
+                        isError: result.toolIsError,
+                        sequenceIndex: session.nextSequenceIndex
+                    )
+                    session.appendItem(toolResultItem)
+                } else if let index = invocationIndex {
                     var updated = session.items[index]
                     updated.kind = .toolResult
                     updated.toolResultJSON = outputJSON
@@ -18640,12 +19848,7 @@ final class AgentModeViewModel: ObservableObject {
                     updated.toolIsError = result.toolIsError
                     updated.text = outputJSON
                     session.replaceItem(at: index, with: updated)
-                } else if let index = session.items.lastIndex(where: {
-                    // A name-only match stays within the same delivery's tool calls (for background
-                    // output, the same stream's).
-                    $0.kind == .toolCall && $0.toolName == toolName
-                        && session.isDeliveryRow($0.id, background: isBackground, sourceID: backgroundSourceID)
-                }) {
+                } else if let index = nameIndex {
                     var updated = session.items[index]
                     updated.kind = .toolResult
                     updated.toolInvocationID = invocationID ?? updated.toolInvocationID
@@ -18898,12 +20101,14 @@ final class AgentModeViewModel: ObservableObject {
         maxSequenceIndexExclusive: Int?
     ) -> Int {
         var finalizedCount = 0
+        let protectedItemIDs = session.providerHistoryRecovery?.claudeLocalItemIDs ?? []
         session.mutateItemsBatch(touchActivity: false) { items in
             finalizedCount = Self.finalizePendingToolCallsInItems(
                 &items,
                 terminalState: terminalState,
                 includeExplicitRepoPromptToolCalls: includeExplicitRepoPromptToolCalls,
-                maxSequenceIndexExclusive: maxSequenceIndexExclusive
+                maxSequenceIndexExclusive: maxSequenceIndexExclusive,
+                protectedItemIDs: protectedItemIDs
             )
         }
         if finalizedCount > 0 {
@@ -18926,14 +20131,16 @@ final class AgentModeViewModel: ObservableObject {
         _ items: inout [AgentChatItem],
         terminalState: AgentSessionRunState,
         includeExplicitRepoPromptToolCalls: Bool = false,
-        maxSequenceIndexExclusive: Int?
+        maxSequenceIndexExclusive: Int?,
+        protectedItemIDs: Set<UUID>
     ) -> Int {
         AgentTranscriptIO.finalizePendingToolCalls(
             in: &items,
             terminalState: terminalState,
             includeExplicitRepoPromptToolCalls: includeExplicitRepoPromptToolCalls,
             maxSequenceIndexExclusive: maxSequenceIndexExclusive,
-            nonToolBoundary: pendingToolFinalizationNonToolBoundary
+            nonToolBoundary: pendingToolFinalizationNonToolBoundary,
+            protectedItemIDs: protectedItemIDs
         )
     }
 
@@ -18942,6 +20149,9 @@ final class AgentModeViewModel: ObservableObject {
         if session.assistantDeltaFlushTask == nil {
             session.assistantDeltaTaskGeneration &+= 1
             let taskGeneration = session.assistantDeltaTaskGeneration
+            session.assistantDeltaDrain = { [weak self] session in
+                self?.flushPendingAssistantDelta(session)
+            }
             session.assistantDeltaFlushTask = Task { [weak self, weak session] in
                 do {
                     try await Task.sleep(nanoseconds: 250_000_000)
@@ -19052,7 +20262,10 @@ final class AgentModeViewModel: ObservableObject {
     private func applyBackgroundAssistantDelta(_ delta: String, sourceID: UUID?, session: AgentTabSession) -> Bool {
         // Buffered text belongs to a run; materialize it first so order and rows stay separate.
         flushPendingAssistantDelta(session)
-        if let index = backgroundCurrentAssistantIndex(in: session, sourceID: sourceID) {
+        // Step 4d3a: a row matched to Claude's history is never extended; the text starts a new row.
+        if let index = backgroundCurrentAssistantIndex(in: session, sourceID: sourceID),
+           !isProviderHistoryAssociatedItem(session.items[index].id, session: session)
+        {
             session.mutateItem(at: index) { item in
                 item.text += delta
                 item.isStreaming = true
@@ -19075,7 +20288,10 @@ final class AgentModeViewModel: ObservableObject {
 
     @discardableResult
     func applyAssistantDelta(_ delta: String, session: AgentTabSession) -> Bool {
-        if let streamingAssistantIndex = resumableStreamingAssistantIndexAcrossTrailingUserInterjections(in: session) {
+        // Step 4d3a: a row matched to Claude's history is never extended; the text starts a new row.
+        if let streamingAssistantIndex = resumableStreamingAssistantIndexAcrossTrailingUserInterjections(in: session),
+           !isProviderHistoryAssociatedItem(session.items[streamingAssistantIndex].id, session: session)
+        {
             session.mutateItem(at: streamingAssistantIndex) { item in
                 item.text += delta
             }
@@ -19089,6 +20305,338 @@ final class AgentModeViewModel: ObservableObject {
         assistantItem.isStreaming = true
         session.appendItem(assistantItem)
         return true
+    }
+
+    /// Whether `id` is a local row associated to Claude provider history (Step 4d3a): its payload
+    /// is the provider's, so live output never mutates it, whatever the row's envelope digest.
+    private func isProviderHistoryAssociatedItem(_ id: UUID, session: AgentTabSession) -> Bool {
+        session.providerHistoryRecovery?.associatesClaudeLocalItem(id) ?? false
+    }
+
+    /// Step 4d3b canonical owner of qualified Claude live output (inactive: no production producer
+    /// attaches evidence). Called on the main actor after the delivery guard, before any generic
+    /// mutation. Returns `true` only when the result was fully applied here (an accepted or already
+    /// recorded complete text); otherwise the result continues through the legacy display path
+    /// unidentified. Every refusal makes the producer's launch permanently unqualified for this tab
+    /// and invalidates only the proofs that launch newly inserted and still owns (Step 4d3c; a proof
+    /// is never regenerated or healed). An exact agreement ends ownership of its exchange's keys
+    /// (Step 4d7), so a later refusal of the launch keeps those proofs.
+    ///
+    /// Step 4d5 adds the single main-thread Read chain: its call, result and final text are each
+    /// inserted only while every earlier link is still held (its ledger entry and valid proof, and
+    /// its exact canonical payload anywhere in the canonical transcript), so a dropped or refused
+    /// link leaves every later row unidentified.
+    private func applyClaudeLiveTranscriptEvidence(
+        _ evidence: ClaudeLiveTranscriptEvidence,
+        result: AIStreamResult,
+        session: AgentTabSession,
+        isBackground: Bool
+    ) -> Bool {
+        guard session.selectedAgent.usesClaudeNativeRuntime else { return false }
+        let producer = evidence.producerLaunchToken
+        switch evidence.kind {
+        case let .completeText(complete):
+            return applyClaudeLiveTranscriptCompleteText(
+                complete, prerequisites: [], producer: producer, session: session, isBackground: isBackground
+            )
+
+        case let .readToolCall(call):
+            return applyClaudeLiveTranscriptToolRow(
+                call, prerequisites: [], result: result, producer: producer, session: session, isBackground: isBackground
+            )
+
+        case let .readToolResult(row, call):
+            return applyClaudeLiveTranscriptToolRow(
+                row, prerequisites: [call], result: result, producer: producer, session: session, isBackground: isBackground
+            )
+
+        case let .readAnswer(answer, call, resultRow):
+            return applyClaudeLiveTranscriptCompleteText(
+                answer, prerequisites: [call, resultRow], producer: producer, session: session, isBackground: isBackground
+            )
+
+        case let .readAgreement(call, resultRow, answer):
+            // All three rows must still be held with their exact canonical payloads and valid proofs.
+            let canonical = AgentProviderHistoryCanonicalView(transcript: session.transcript, suffixItems: session.items)
+            let agrees = !session.claudeLiveTranscriptRefusedProducers.contains(producer)
+                && holdsClaudeLiveTranscriptToolRow(call, canonical: canonical, session: session)
+                && holdsClaudeLiveTranscriptToolRow(resultRow, canonical: canonical, session: session)
+                && answer.matchesProjection
+                && holdsClaudeLiveTranscriptRow(
+                    answer.ledgerItem, canonicalItem: answer.canonicalItem, canonical: canonical, session: session
+                )
+            if agrees {
+                // Step 4d7: only the whole agreed chain's keys this producer owns.
+                consumeClaudeLiveTranscriptOwnership(
+                    of: [call.ledgerKey, resultRow.ledgerKey, answer.ledgerKey], producer: producer, session: session
+                )
+            } else {
+                refuseClaudeLiveTranscript(producer: producer, session: session)
+            }
+            return false
+
+        case let .resultAgreement(localItemID, text):
+            // Step 4d7: the owner must hold exactly the reader's projection of the turn's identified
+            // row (exact ledger entry and proof, exact complete canonical payload).
+            if let agreedKey = claudeLiveTranscriptTextAgreementKey(
+                localItemID: localItemID, text: text, producer: producer, session: session
+            ) {
+                consumeClaudeLiveTranscriptOwnership(of: [agreedKey], producer: producer, session: session)
+            } else {
+                refuseClaudeLiveTranscript(producer: producer, session: session)
+            }
+            return false
+
+        case .disqualified:
+            refuseClaudeLiveTranscript(producer: evidence.producerLaunchToken, session: session)
+            return false
+        }
+    }
+
+    /// One qualified complete assistant text (Step 4d3b), after its chain's `prerequisites` (Step
+    /// 4d5; empty for a single-text turn, which then behaves exactly as before).
+    private func applyClaudeLiveTranscriptCompleteText(
+        _ complete: ClaudeLiveTranscriptCompleteText,
+        prerequisites: [ClaudeLiveTranscriptToolRow],
+        producer: UUID,
+        session: AgentTabSession,
+        isBackground: Bool
+    ) -> Bool {
+        // The evidence must be the reader's exact projection (ID and digest), its row must carry
+        // that ID, and it must belong to the tab's own Claude conversation when that is known.
+        guard !isBackground,
+              !session.claudeLiveTranscriptRefusedProducers.contains(producer),
+              complete.matchesProjection,
+              session.providerSessionID.map({ $0.isEmpty || $0 == complete.nativeSessionID }) ?? true,
+              !(session.providerHistoryRecovery?.hasProoflessClaudeItem(nativeSessionID: complete.nativeSessionID) ?? false),
+              let canonicalItem = complete.canonicalItem,
+              canonicalItem.id == complete.localItemID
+        else {
+            refuseClaudeLiveTranscript(producer: producer, session: session)
+            return false
+        }
+        let canonical = AgentProviderHistoryCanonicalView(transcript: session.transcript, suffixItems: session.items)
+        guard prerequisites.allSatisfy({ holdsClaudeLiveTranscriptToolRow($0, canonical: canonical, session: session) }) else {
+            refuseClaudeLiveTranscript(producer: producer, session: session)
+            return false
+        }
+        let ledgerItem = complete.ledgerItem
+        if let existing = session.providerHistoryRecovery?.nativeItem(forKey: complete.ledgerKey) {
+            // Same key, identity, valid proof and the actual canonical payload: already recorded.
+            // A single-text turn (no prerequisites) keeps its Step 4d3b suffix check; a Read answer
+            // is held like its prerequisites, anywhere in the canonical view (persisted turns too).
+            if existing == ledgerItem, prerequisites.isEmpty,
+               let row = session.items.first(where: { $0.id == complete.localItemID }),
+               row.kind == .assistant, row.text == canonicalItem.text, !row.isStreaming
+            {
+                return true
+            }
+            if existing == ledgerItem, !prerequisites.isEmpty,
+               holdsClaudeLiveTranscriptRow(ledgerItem, canonicalItem: canonicalItem, canonical: canonical, session: session)
+            {
+                return true
+            }
+            refuseClaudeLiveTranscript(producer: producer, session: session)
+            return false
+        }
+        // A local row (anywhere in the canonical transcript) already holding the deterministic ID
+        // without this ledger entry is a collision: the old row stays, the text shows unidentified.
+        guard !AgentProviderHistoryAssociationPreflight.canonicalItemIDs(canonical).contains(complete.localItemID) else {
+            refuseClaudeLiveTranscript(producer: producer, session: session)
+            return false
+        }
+        // Older run text is materialized first and its segment ends, so the canonical row follows it.
+        _ = clearClaudeReasoningStatus(session)
+        flushPendingAssistantDelta(session)
+        endAssistantSegment(session, background: false)
+        insertClaudeLiveTranscriptRow(canonicalItem, ledgerItem: ledgerItem, producer: producer, session: session)
+        return true
+    }
+
+    /// Step 4d5: one qualified Read call or result row. Every identity, chain and display check that
+    /// could refuse runs before any effect, so such a refusal leaves the translated result to the
+    /// legacy path (shown unidentified, accounted once there). The one later refusal is a provider
+    /// handler consuming the event after the legacy tool preamble ran; it returns handled, exactly as
+    /// the legacy path would have, so the preamble never runs twice. An accepted new row takes the
+    /// legacy tool preamble and the translated result's own accounting exactly once; a duplicate of a
+    /// held row (live or imported) is already shown and gets neither accounting nor ownership.
+    private func applyClaudeLiveTranscriptToolRow(
+        _ row: ClaudeLiveTranscriptToolRow,
+        prerequisites: [ClaudeLiveTranscriptToolRow],
+        result: AIStreamResult,
+        producer: UUID,
+        session: AgentTabSession,
+        isBackground: Bool
+    ) -> Bool {
+        let expectedType = row.kind == .toolCall ? "tool_call" : "tool_result"
+        let canonical = AgentProviderHistoryCanonicalView(transcript: session.transcript, suffixItems: session.items)
+        guard !isBackground,
+              !session.claudeLiveTranscriptRefusedProducers.contains(producer),
+              row.kind == .toolCall || row.kind == .toolResult,
+              result.type == expectedType,
+              let toolName = result.toolName,
+              row.matchesProjection,
+              session.providerSessionID.map({ $0.isEmpty || $0 == row.nativeSessionID }) ?? true,
+              !(session.providerHistoryRecovery?.hasProoflessClaudeItem(nativeSessionID: row.nativeSessionID) ?? false),
+              let canonicalItem = row.canonicalItem,
+              canonicalItem.id == row.localItemID,
+              prerequisites.allSatisfy({ holdsClaudeLiveTranscriptToolRow($0, canonical: canonical, session: session) }),
+              // The legacy path's pure display predicates: a row it would drop, hide or auto-complete
+              // is never made canonical.
+              !AgentToolTrackingSupport.shouldSuppressProviderToolEvent(toolName: toolName, invocationID: result.toolInvocationID),
+              !AgentToolTrackingSupport.shouldHideToolFromTranscript(toolName),
+              row.kind != .toolCall
+              || !AgentToolTrackingSupport.shouldAutoCompleteProviderToolCall(
+                  for: session, toolName: toolName, invocationID: result.toolInvocationID
+              )
+        else {
+            refuseClaudeLiveTranscript(producer: producer, session: session)
+            return false
+        }
+        let ledgerItem = row.ledgerItem
+        if let existing = session.providerHistoryRecovery?.nativeItem(forKey: row.ledgerKey) {
+            // Same key, identity and valid proof, with the exact canonical payload held: already shown.
+            if existing == ledgerItem, AgentProviderHistoryAssociationPreflight.holdsCanonicalPayload(canonicalItem, in: canonical) {
+                return true
+            }
+            refuseClaudeLiveTranscript(producer: producer, session: session)
+            return false
+        }
+        guard !AgentProviderHistoryAssociationPreflight.canonicalItemIDs(canonical).contains(row.localItemID) else {
+            refuseClaudeLiveTranscript(producer: producer, session: session)
+            return false
+        }
+        // The legacy tool preamble (reasoning status stays visible through tool execution).
+        flushPendingAssistantDelta(session)
+        endAssistantSegment(session, background: false)
+        endActiveReasoningSegment(session)
+        if runService.handleProviderToolStreamEvent(result, session: session) {
+            // A provider handler consumed the event, as it would have on the legacy path.
+            refuseClaudeLiveTranscript(producer: producer, session: session)
+            return true
+        }
+        // The translated result's original values, accounted once (as the legacy path would).
+        let argsJSON = result.toolArgsJSON ?? result.toolArgs
+        if row.kind == .toolCall {
+            addToolInputTokens(argsJSON, for: session)
+        } else {
+            let outputJSON = result.toolResultJSON ?? result.toolOutput ?? ""
+            addToolOutputTokens(outputJSON, for: session)
+            // No Codex live-bash reconcile: it never applies to Claude-native results (9-live R3).
+        }
+        insertClaudeLiveTranscriptRow(canonicalItem, ledgerItem: ledgerItem, producer: producer, session: session)
+        return true
+    }
+
+    /// Row, ledger entry and the producer's ownership of that new key change together in this
+    /// main-actor snapshot; the existing serialized save persists the row and entry (no import
+    /// receipt, cursor or prefix proof). Ownership is transient (Step 4d3c).
+    private func insertClaudeLiveTranscriptRow(
+        _ canonicalItem: AgentChatItem,
+        ledgerItem: AgentSessionProviderHistoryRecovery.NativeItem,
+        producer: UUID,
+        session: AgentTabSession
+    ) {
+        var ledger = session.providerHistoryRecovery ?? AgentSessionProviderHistoryRecovery()
+        ledger.nativeItems.append(ledgerItem)
+        session.providerHistoryRecovery = ledger
+        session.claudeLiveTranscriptOwnedKeys[producer, default: []].insert(ledgerItem.key)
+        session.appendItem(canonicalItem)
+        session.isDirty = true
+        scheduleSave(for: session.tabID)
+    }
+
+    /// Step 4d7 single-text agreement: the ledger key of the turn's identified row, or `nil` when the
+    /// owner does not hold exactly it. The one applicable Claude ledger entry for `localItemID` (in
+    /// the tab's conversation when known) must equal, in full (identity, kind, ordinal, local ID and
+    /// digest), the reader's projection of its native entry with `text`; its key must be unique; and
+    /// the canonical transcript (persisted turns plus suffix) must hold exactly one complete,
+    /// non-streaming copy of that projection. The projection is compared, never stored.
+    private func claudeLiveTranscriptTextAgreementKey(
+        localItemID: UUID,
+        text: String,
+        producer: UUID,
+        session: AgentTabSession
+    ) -> String? {
+        guard !session.claudeLiveTranscriptRefusedProducers.contains(producer),
+              let nativeItems = session.providerHistoryRecovery?.nativeItems
+        else { return nil }
+        let associated = nativeItems.filter {
+            $0.providerRaw == ClaudeSessionHistoryReader.providerRaw && $0.localItemID == localItemID
+        }
+        guard associated.count == 1, let stored = associated.first,
+              session.providerSessionID.map({ $0.isEmpty || $0 == stored.nativeSessionID }) ?? true,
+              nativeItems.count(where: { $0.key == stored.key }) == 1,
+              let expected = ClaudeLiveTranscriptCompleteText.projecting(
+                  nativeSessionID: stored.nativeSessionID, nativeEntryID: stored.nativeEntryID, text: text
+              ),
+              expected.localItemID == localItemID,
+              expected.ledgerItem == stored
+        else { return nil }
+        let canonical = AgentProviderHistoryCanonicalView(transcript: session.transcript, suffixItems: session.items)
+        guard holdsClaudeLiveTranscriptRow(
+            expected.ledgerItem, canonicalItem: expected.canonicalItem, canonical: canonical, session: session
+        ) else { return nil }
+        return expected.ledgerKey
+    }
+
+    /// Step 4d7: a successful agreement ends the producer's revocation ownership of exactly the
+    /// exchange's keys it owns (transient only: no ledger, row, digest, receipt, cursor, dirty mark
+    /// or save). Keys it never owned (imported, another producer's, a duplicate) are a no-op, and an
+    /// emptied entry is removed. A later refusal still latches and invalidates every remaining key.
+    private func consumeClaudeLiveTranscriptOwnership(of keys: Set<String>, producer: UUID, session: AgentTabSession) {
+        guard var owned = session.claudeLiveTranscriptOwnedKeys[producer], !owned.isDisjoint(with: keys) else { return }
+        owned.subtract(keys)
+        session.claudeLiveTranscriptOwnedKeys[producer] = owned.isEmpty ? nil : owned
+    }
+
+    /// Step 4d5 chain prerequisite: `row` is the reader's projection and is still held.
+    private func holdsClaudeLiveTranscriptToolRow(
+        _ row: ClaudeLiveTranscriptToolRow,
+        canonical: AgentProviderHistoryCanonicalView,
+        session: AgentTabSession
+    ) -> Bool {
+        row.matchesProjection
+            && holdsClaudeLiveTranscriptRow(row.ledgerItem, canonicalItem: row.canonicalItem, canonical: canonical, session: session)
+    }
+
+    /// Held: the ledger records exactly this entry (identity and valid proof), and the canonical
+    /// transcript (persisted turns plus suffix) holds exactly one complete copy of its canonical
+    /// payload, whether this producer, another producer or an import inserted it.
+    private func holdsClaudeLiveTranscriptRow(
+        _ ledgerItem: AgentSessionProviderHistoryRecovery.NativeItem,
+        canonicalItem: AgentChatItem?,
+        canonical: AgentProviderHistoryCanonicalView,
+        session: AgentTabSession
+    ) -> Bool {
+        guard ledgerItem.envelopeDigest != nil,
+              let canonicalItem,
+              canonicalItem.id == ledgerItem.localItemID,
+              session.providerHistoryRecovery?.nativeItem(forKey: ledgerItem.key) == ledgerItem
+        else { return false }
+        return AgentProviderHistoryAssociationPreflight.holdsCanonicalPayload(canonicalItem, in: canonical)
+    }
+
+    /// Step 4d3b/4d3c refusal: the producer never qualifies again in this tab (transient; the
+    /// producer's own latch is the durable-for-its-launch authority). Only the proofs of the keys
+    /// this producer newly inserted and still owns are cleared (its ownership is discarded, so a
+    /// repeated refusal is idempotent), keeping keys, local items, rows, extras, receipts and
+    /// baselines; imported, another producer's, Codex and (Step 4d7) already agreed proofs are
+    /// untouched. Intended (Step 4d7): when every key it inserted had agreed, the refusal clears no
+    /// proof, so a later distinct producer may still qualify under the normal admission checks; the
+    /// refused producer never does, and no already-cleared proof is ever healed. A ledger-only
+    /// change is marked dirty explicitly and saved through the existing serialized save; no owned
+    /// key changes nothing.
+    private func refuseClaudeLiveTranscript(producer: UUID, session: AgentTabSession) {
+        session.claudeLiveTranscriptRefusedProducers.insert(producer)
+        let ownedKeys = session.claudeLiveTranscriptOwnedKeys.removeValue(forKey: producer) ?? []
+        guard !ownedKeys.isEmpty,
+              var ledger = session.providerHistoryRecovery,
+              ledger.invalidateClaudeEnvelopeProofs(forKeys: ownedKeys)
+        else { return }
+        session.providerHistoryRecovery = ledger
+        session.isDirty = true
+        scheduleSave(for: session.tabID)
     }
 
     /// Retires `sourceID`'s stream's current background row; other streams keep theirs.
@@ -19182,6 +20730,7 @@ final class AgentModeViewModel: ObservableObject {
     /// Callers that destroy provider-owned infrastructure can explicitly await terminal teardown.
     func cancelAgentRun(
         tabID: UUID,
+        cause: AgentRunTerminalCause,
         completion: AgentModeRunService.CancellationCompletion = .terminalPublished
     ) async {
         guard let session = sessions[tabID] else { return }
@@ -19196,7 +20745,7 @@ final class AgentModeViewModel: ObservableObject {
             }
             return
         }
-        await runService.cancelRun(tabID: tabID, session: session, completion: completion)
+        await runService.cancelRun(tabID: tabID, session: session, cause: cause, completion: completion)
     }
 
     /// Cancel a render-time run target, refusing if the live tab no longer matches that target.
@@ -19204,6 +20753,7 @@ final class AgentModeViewModel: ObservableObject {
     @discardableResult
     func cancelAgentRun(
         target: AgentRunCancelTarget,
+        cause: AgentRunTerminalCause,
         completion: AgentModeRunService.CancellationCompletion = .terminalPublished
     ) async -> Bool {
         guard let session = sessions[target.tabID] else {
@@ -19235,7 +20785,7 @@ final class AgentModeViewModel: ObservableObject {
             return false
         }
         cancelPendingInstruction(for: session)
-        await runService.cancelRun(tabID: target.tabID, session: session, completion: completion)
+        await runService.cancelRun(tabID: target.tabID, session: session, cause: cause, completion: completion)
         return true
     }
 
@@ -19480,8 +21030,17 @@ final class AgentModeViewModel: ObservableObject {
         session: AgentTabSession?,
         reason: String,
         attempt: AgentComposerSubmitAttempt? = nil,
-        activeAttempt: AgentComposerSubmitAttempt? = nil
+        activeAttempt: AgentComposerSubmitAttempt? = nil,
+        persistent: Bool = false
     ) {
+        if persistent {
+            AgentComposerSubmitDiagnostics.submitRejected(
+                reason: reason,
+                route: target.route.rawValue,
+                targetTabID: target.tabID,
+                currentTabID: currentTabID
+            )
+        }
         let liveSourceAgentSessionID = composerSourceAgentSessionID(tabID: target.tabID, session: session)
         let reportedAttempt = attempt ?? session?.activeComposerSubmitAttempt
         let reportedActiveAttempt = activeAttempt ?? session?.activeComposerSubmitAttempt
@@ -19617,20 +21176,32 @@ final class AgentModeViewModel: ObservableObject {
     ) async throws -> UserInstructionResponse {
         // Ensure session exists (creates if needed, loads persisted state)
         let session = try await ensureSessionReady(tabID: tabID, reconnectActiveProviders: true)
+        // The newest wait call owns the wait; an older call still suspended in a queued-head drain
+        // never hands its head off.
+        let waitOwnerID = UUID()
+        session.instructionWaitOwnerID = waitOwnerID
 
         if session.instructionContinuation != nil || session.instructionTimeoutTask != nil {
             cancelPendingInstruction(for: session)
         }
 
-        // Check for queued instructions first
-        if !session.pendingInstructions.isEmpty {
-            let queuedText = session.pendingInstructions.removeFirst()
-            let augmentedText = await augmentUserMessageForProviderSend(
+        // Queued instructions drain first, in FIFO order. A durable head goes through the
+        // before-handoff dispatch commit under the existing run (R05/F4); it is never skipped, so no
+        // later input can overtake it through the wait installed below.
+        if let head = session.pendingInstructions.first, head.isDurable {
+            return try await deliverDurableQueuedInstructionHead(head, session: session, waitOwnerID: waitOwnerID)
+        }
+        if let head = session.pendingInstructions.first, !head.isDurable {
+            let queuedText = session.pendingInstructions.removeFirst().text
+            let augmented = await augmentUserMessageForProviderSend(
                 queuedText,
                 agent: session.selectedAgent,
-                session: session
+                session: session,
+                carriers: []
             )
-            let text = deliverDelegatedQuestionNoticesWithImmediateInput(augmentedText, session: session)
+            let text = deliverDelegatedQuestionNoticesWithImmediateInput(augmented.text, session: session)
+            // Returning the text is the handoff: the exact pending-handoff stage it carries is delivered.
+            recordPendingHandoffStageOutcome(for: session, stage: augmented.pendingHandoffStage, disposition: .sent)
             return UserInstructionResponse(text: text, timedOut: false, elapsedSeconds: 0)
         }
 
@@ -19668,6 +21239,7 @@ final class AgentModeViewModel: ObservableObject {
                     await runService.cancelRun(
                         tabID: session.tabID,
                         session: session,
+                        cause: .ordinary,
                         intent: .userStop,
                         completion: .terminalPublished
                     )
@@ -19678,6 +21250,220 @@ final class AgentModeViewModel: ObservableObject {
                     ))
                 }
             }
+        }
+    }
+
+    /// A durable queued head that could not be handed to the waiting tool. The head stays queued and
+    /// saved; no wait is installed, so later input cannot overtake it.
+    struct QueuedInstructionDeliveryError: LocalizedError {
+        let message: String
+        var errorDescription: String? {
+            message
+        }
+    }
+
+    /// R05/F4: drains the durable queue head into this instruction wait under the existing run.
+    /// Provider text is prepared first; then the dispatch commit, then exact revalidation of the
+    /// wait owner, run attempt, head, and lane with no suspension before the head is removed and its
+    /// text returned. Returning the text is only a local handoff to the waiting tool, not proof the
+    /// provider received its result (R05-R1a): the dispatch is recorded `deliveryUnknown`, never
+    /// `providerAccepted`. Any failure before the handoff keeps the head in place (FIFO preserved).
+    private func deliverDurableQueuedInstructionHead(
+        _ head: AgentPendingInstruction,
+        session: AgentTabSession,
+        waitOwnerID: UUID
+    ) async throws -> UserInstructionResponse {
+        let runID = session.runID
+        let runAttemptID = session.activeRunAttemptID
+        func ownsHead() -> Bool {
+            session.instructionWaitOwnerID == waitOwnerID
+                && session.runID == runID
+                && session.activeRunAttemptID == runAttemptID
+                && session.runState.isActive
+                && session.instructionContinuation == nil
+                && session.pendingInstructions.first == head
+                && !Task.isCancelled
+        }
+        let augmented = await augmentUserMessageForProviderSend(
+            head.text,
+            agent: session.selectedAgent,
+            session: session,
+            carriers: head.constituents
+        )
+        if let blockedReason = augmented.blockedReason {
+            // Its handoff prefix could not be saved with it: the head stays queued (FIFO preserved).
+            throw QueuedInstructionDeliveryError(message: blockedReason)
+        }
+        var stageDelivered = false
+        defer {
+            recordPendingHandoffStageOutcome(
+                for: session,
+                stage: augmented.pendingHandoffStage,
+                disposition: stageDelivered ? .sent : .notSent
+            )
+        }
+        guard ownsHead() else { throw CancellationError() }
+        let evidence: AgentRecoveryDispatchEvidence
+        switch await AgentRecoveryDispatchEvidence.beginUnderActiveRun(
+            session: session,
+            constituents: head.constituents
+        ) {
+        case let .success(begun):
+            evidence = begun
+        case let .failure(failure):
+            print("[AgentModeVM][Recovery] queued instruction head not delivered: \(failure)")
+            throw QueuedInstructionDeliveryError(message: failure.dispatchFailureText)
+        }
+        guard ownsHead(), evidence.isValidForHandoff(in: session) else {
+            evidence.noteNoHandoff(message: AgentModeRunService.recoveryDispatchTargetChangedReason)
+            throw CancellationError()
+        }
+        session.pendingInstructions.removeFirst()
+        let text = deliverDelegatedQuestionNoticesWithImmediateInput(augmented.text, session: session)
+        stageDelivered = true
+        // Local handoff only: no downstream evidence proves the provider consumed the tool result.
+        evidence.noteDeliveryUnknown()
+        return UserInstructionResponse(text: text, timedOut: false, elapsedSeconds: 0)
+    }
+
+    /// Atomically hands `text` to the live instruction wait `expectedWaitID` (same run attempt) under
+    /// `evidence`'s committed dispatch, with no suspension between revalidation and the claim.
+    /// `false` (no handoff reported, nothing resumed) when the wait, run attempt, or lane changed.
+    /// On success the claimed continuation owns the exact input. Resuming it is a local handoff, not
+    /// proof the provider received the tool result (R05-R1a): the dispatch is `deliveryUnknown`.
+    private func claimLiveInstructionWait(
+        session: AgentTabSession,
+        expectedWaitID: UUID?,
+        expectedRunAttemptID: UUID?,
+        evidence: AgentRecoveryDispatchEvidence,
+        text: String,
+        countsUserInputTokens: Bool = true,
+        beforeClaim: () -> Bool = { true }
+    ) -> Bool {
+        guard let liveContinuation = session.instructionContinuation,
+              session.instructionWaitID == expectedWaitID,
+              session.activeRunAttemptID == expectedRunAttemptID,
+              evidence.isValidForHandoff(in: session),
+              beforeClaim()
+        else {
+            evidence.noteNoHandoff(message: AgentModeRunService.recoveryDispatchTargetChangedReason)
+            return false
+        }
+        let resumedText = deliverDelegatedQuestionNoticesWithImmediateInput(text, session: session)
+        if countsUserInputTokens {
+            addUserInputTokensToActiveNonCodexTurn(Self.estimateRuntimeTokens(for: resumedText), for: session)
+        }
+        // Atomic claim (main actor): clearing the stored continuation before resuming it means no
+        // timeout or cancellation can resume it too.
+        session.instructionTimeoutTask?.cancel()
+        session.instructionTimeoutTask = nil
+        session.instructionContinuation = nil
+        session.instructionWaitID = nil
+        session.waitingPrompt = nil
+        session.runState = .running
+        updateBindingsFromSession(session)
+        liveContinuation.resume(returning: UserInstructionResponse(
+            text: resumedText,
+            timedOut: false,
+            elapsedSeconds: 0
+        ))
+        // Local handoff only: no downstream evidence proves the provider consumed the tool result.
+        evidence.noteDeliveryUnknown()
+        return true
+    }
+
+    /// Held-input reason when the instruction wait ended before a submitted input could be handed to it.
+    static let instructionWaitEndedHoldReason = "The agent stopped waiting before this message reached it. It was kept and not sent."
+
+    /// Held-input reason for input with attachments that arrived behind an older queued message
+    /// (the follow-up queue carries text only, so it is kept instead of queued without them).
+    static let queuedBehindOlderInputHoldReason = "An earlier message is still queued ahead of it. It was kept and not sent."
+
+    /// R05-R1b: input arriving while an older queue head owns the live instruction wait is queued
+    /// behind that head (FIFO), never handed to the wait ahead of it. Input with attachments is shown
+    /// as held instead, since a queued follow-up carries text only.
+    private func queueBehindOlderInstructionHead(
+        session: AgentTabSession,
+        wrappedText: String,
+        identity: AgentQueuedInputIdentity,
+        hasAttachments: Bool
+    ) {
+        if hasAttachments, identity.isDurable {
+            holdBlockedDurableInput([identity], session: session, reason: Self.queuedBehindOlderInputHoldReason)
+            return
+        }
+        session.pendingInstructions.append(AgentPendingInstruction(text: wrappedText, identity: identity))
+        session.isDirty = true
+        updateBindingsFromSession(session)
+        scheduleSave(for: session.tabID)
+    }
+
+    /// A queue head put back (`insert(_:at: 0)`) after the agent already installed its instruction
+    /// wait would otherwise sit until that wait ends. It is delivered to the live wait under the same
+    /// contract as a new input reaching a wait: prepared text, dispatch commit under the existing
+    /// run, exact revalidation (wait, run attempt, head, lane), then the atomic claim. Any failure
+    /// keeps the head queued and saved (FIFO preserved); nothing is sent unlinked.
+    /// Returns the delivery task (nil when there is no live wait or no head) so callers can observe it.
+    @discardableResult
+    func deliverRequeuedHeadToLiveInstructionWaitIfNeeded(_ session: AgentTabSession) -> Task<Void, Never>? {
+        guard session.runState == .waitingForUser,
+              session.instructionContinuation != nil,
+              let head = session.pendingInstructions.first
+        else { return nil }
+        let expectedWaitID = session.instructionWaitID
+        let expectedRunAttemptID = session.activeRunAttemptID
+        return Task { @MainActor [weak self, weak session] in
+            guard let self, let session else { return }
+            let stillOwnsHead: @MainActor () -> Bool = {
+                session.instructionContinuation != nil
+                    && session.instructionWaitID == expectedWaitID
+                    && session.activeRunAttemptID == expectedRunAttemptID
+                    && session.pendingInstructions.first == head
+            }
+            let augmented = await augmentUserMessageForProviderSend(
+                head.text,
+                agent: session.selectedAgent,
+                session: session,
+                carriers: head.constituents
+            )
+            var stageDelivered = false
+            defer {
+                recordPendingHandoffStageOutcome(
+                    for: session,
+                    stage: augmented.pendingHandoffStage,
+                    disposition: stageDelivered ? .sent : .notSent
+                )
+            }
+            // A blocked prefix keeps the head queued (visible in the queue, never sent without it).
+            guard augmented.blockedReason == nil, stillOwnsHead() else { return }
+            let evidence: AgentRecoveryDispatchEvidence
+            switch await AgentRecoveryDispatchEvidence.beginUnderActiveRun(
+                session: session,
+                constituents: head.constituents
+            ) {
+            case let .success(begun):
+                evidence = begun
+            case let .failure(failure):
+                print("[AgentModeVM][Recovery] re-queued head not delivered to the live wait: \(failure)")
+                return
+            }
+            guard claimLiveInstructionWait(
+                session: session,
+                expectedWaitID: expectedWaitID,
+                expectedRunAttemptID: expectedRunAttemptID,
+                evidence: evidence,
+                text: augmented.text,
+                // Like the queue-head drain: a queued input's tokens are not counted again here.
+                countsUserInputTokens: false,
+                beforeClaim: {
+                    guard session.pendingInstructions.first == head else { return false }
+                    session.pendingInstructions.removeFirst()
+                    session.isDirty = true
+                    return true
+                }
+            ) else { return }
+            stageDelivered = true
+            scheduleSave(for: session.tabID)
         }
     }
 
@@ -19742,6 +21528,8 @@ final class AgentModeViewModel: ObservableObject {
             interaction: interaction,
             timeoutStartedAt: interaction.askedAt
         )
+        // Durable before it is shown (plan §E); ownership and blocking rules are revalidated.
+        try await commitAskUserForRecovery(pending, session: session, tabID: tabID)
         session.pendingAskUser = pending
         reconcileInteractiveRunState(session)
         updateBindingsFromSession(session)
@@ -19768,8 +21556,8 @@ final class AgentModeViewModel: ObservableObject {
         }
     }
 
-    private func rejectAskUserIfBlockingInteractionExists(in session: AgentTabSession) throws {
-        if session.pendingAskUser != nil {
+    func rejectAskUserIfBlockingInteractionExists(in session: AgentTabSession) throws {
+        if session.pendingAskUser != nil || session.recoveryQuestionCreationReservation != nil {
             throw MCPError.invalidParams("ask_user is already waiting for a response in this session.")
         }
         if session.pendingApproval != nil || session.pendingPermissionsRequest != nil || session.pendingApplyEditsReview != nil || session.pendingWorktreeMergeReview != nil {
@@ -19784,15 +21572,20 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     func updateAskUserDraft(tabID: UUID, interactionID: UUID, questionID: String, draft: AgentAskUserDraft) {
+        // Frozen by shutdown preparation: the snapshot being written must stay the latest answer.
+        guard !isShutdownFrozen else { return }
         guard let session = sessions[tabID],
               var pending = session.pendingAskUser,
               pending.interaction.id == interactionID,
-              pending.interaction.questions.contains(where: { $0.id == questionID })
+              pending.interaction.questions.contains(where: { $0.id == questionID }),
+              // An answer is flushing before its reply: the submitted answer stays the latest.
+              !isRecoveryQuestionResolutionReserved(session, interactionID: interactionID)
         else { return }
         guard pending.draftsByQuestionID[questionID] != draft else { return }
         pending.draftsByQuestionID[questionID] = draft
         session.pendingAskUser = pending
         updateBindingsFromSession(session)
+        noteRecoveryQuestionDraftChanged(for: session, interactionID: interactionID)
     }
 
     func updateAskUserQuestionIndex(tabID: UUID, interactionID: UUID, index: Int) {
@@ -19856,7 +21649,9 @@ final class AgentModeViewModel: ObservableObject {
                   session.pendingAskUserTimeoutGeneration == generation,
                   let pending = session.pendingAskUser,
                   pending.interaction.id == interactionID,
-                  let continuation = session.askUserContinuation
+                  let continuation = session.askUserContinuation,
+                  // A submitted answer is flushing before its reply: the answer wins.
+                  !isRecoveryQuestionResolutionReserved(session, interactionID: interactionID)
             else { return }
 
             session.pendingInteractionResolutionAttribution = "timeout"
@@ -19889,7 +21684,10 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     func submitAskUserResponse(tabID: UUID, interactionID: UUID) {
-        guard let session = sessions[tabID], session.pendingAskUser?.interaction.id == interactionID else { return }
+        guard !isShutdownFrozen else { return }
+        guard let session = sessions[tabID], session.pendingAskUser?.interaction.id == interactionID,
+              !isRecoveryQuestionResolutionReserved(session, interactionID: interactionID)
+        else { return }
         do {
             if session.remoteHost != nil {
                 try resolveRemoteAskUserResponse(for: session, interactionID: interactionID, skipAll: false)
@@ -19902,9 +21700,12 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     func submitAskUserResponse(tabID: UUID, interactionID: UUID, draftsByQuestionID: [String: AgentAskUserDraft]) throws {
+        // Refused before the drafts are replaced: the preserved snapshot stays the latest answer.
+        guard !isShutdownFrozen else { throw AgentModeShutdownAnswerRefused() }
         guard let session = sessions[tabID],
               var pending = session.pendingAskUser,
-              pending.interaction.id == interactionID
+              pending.interaction.id == interactionID,
+              !isRecoveryQuestionResolutionReserved(session, interactionID: interactionID)
         else { return }
         pending.draftsByQuestionID = draftsByQuestionID
         session.pendingAskUser = pending
@@ -19916,7 +21717,10 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     func skipAskUser(tabID: UUID, interactionID: UUID) {
-        guard let session = sessions[tabID], session.pendingAskUser?.interaction.id == interactionID else { return }
+        guard !isShutdownFrozen else { return }
+        guard let session = sessions[tabID], session.pendingAskUser?.interaction.id == interactionID,
+              !isRecoveryQuestionResolutionReserved(session, interactionID: interactionID)
+        else { return }
         if session.remoteHost != nil {
             try? resolveRemoteAskUserResponse(for: session, interactionID: interactionID, skipAll: true)
         } else {
@@ -19925,6 +21729,7 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     private func resolveAskUserResponse(for session: AgentTabSession, interactionID: UUID, skipAll: Bool) throws {
+        guard !isShutdownFrozen else { throw AgentModeShutdownAnswerRefused() }
         guard let pending = session.pendingAskUser,
               pending.interaction.id == interactionID,
               let continuation = session.askUserContinuation
@@ -19932,6 +21737,35 @@ final class AgentModeViewModel: ObservableObject {
 
         let response = try buildAskUserResponse(from: pending, skipAll: skipAll)
 
+        // A submitted answer is made durable before the reply (a skip has nothing to save).
+        if !skipAll, resolveAfterRecoveryQuestionFlush(
+            for: session,
+            interactionID: interactionID,
+            resolve: { [weak self] session in
+                guard let self,
+                      let pending = session.pendingAskUser,
+                      pending.interaction.id == interactionID,
+                      let continuation = session.askUserContinuation,
+                      let response = try? buildAskUserResponse(from: pending, skipAll: false)
+                else { return }
+                completeAskUserResolution(for: session, interactionID: interactionID, response: response, continuation: continuation)
+            },
+            notSent: { [weak self] session in
+                self?.rearmAskUserTimeoutAfterAbandonedAnswer(session, interactionID: interactionID)
+            }
+        ) {
+            return
+        }
+        completeAskUserResolution(for: session, interactionID: interactionID, response: response, continuation: continuation)
+    }
+
+    /// The existing `ask_user` reply, run exactly once per resolution.
+    private func completeAskUserResolution(
+        for session: AgentTabSession,
+        interactionID: UUID,
+        response: AgentAskUserResponse,
+        continuation: CheckedContinuation<AgentAskUserResponse, Error>
+    ) {
         invalidatePendingAskUserTimeout(for: session)
         session.pendingAskUser = nil
         session.askUserContinuation = nil
@@ -19946,6 +21780,7 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     private func resolveRemoteAskUserResponse(for session: AgentTabSession, interactionID: UUID, skipAll: Bool) throws {
+        guard !isShutdownFrozen else { throw AgentModeShutdownAnswerRefused() }
         guard let pending = session.pendingAskUser,
               pending.interaction.id == interactionID
         else { return }
@@ -19997,9 +21832,11 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     func submitUserInputResponse(tabID: UUID, requestID: CodexAppServerRequestID, response: AgentRequestUserInputResponse) {
+        guard !isShutdownFrozen else { return }
         guard let session = sessions[tabID],
               let request = session.pendingUserInputRequest,
-              request.requestID == requestID
+              request.requestID == requestID,
+              !isRecoveryQuestionResolutionReserved(session, interactionID: request.id)
         else {
             return
         }
@@ -20011,7 +21848,29 @@ final class AgentModeViewModel: ObservableObject {
             requestUIRefresh(tabID: tabID, urgent: true)
             return
         }
-        codexCoordinator.submitUserInputResponse(session: session, requestID: requestID, response: response)
+        // The latest non-secret answers are made durable before the reply.
+        if resolveAfterRecoveryQuestionFlush(for: session, interactionID: request.id, resolve: { [weak self] session in
+            guard let self, session.pendingUserInputRequest?.id == request.id else { return }
+            completeUserInputResponse(for: session, request: request, response: response)
+        }) {
+            return
+        }
+        completeUserInputResponse(for: session, request: request, response: response)
+    }
+
+    /// The existing native user-input reply, run exactly once per resolution.
+    private func completeUserInputResponse(
+        for session: AgentTabSession,
+        request: AgentRequestUserInputRequest,
+        response: AgentRequestUserInputResponse
+    ) {
+        let tabID = session.tabID
+        codexCoordinator.submitUserInputResponse(
+            session: session,
+            requestID: request.requestID,
+            receipt: request.codexReceipt,
+            response: response
+        )
         session.pendingUserInputRequest = nil
         if !session.queuedUserInputRequests.isEmpty {
             session.pendingUserInputRequest = session.queuedUserInputRequests.removeFirst()
@@ -20024,6 +21883,16 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     private func cancelPendingQuestion(for session: AgentTabSession) {
+        // Ended questions: removed, unless lifecycle teardown preserves them. A pending native
+        // user-input request is not cleared here, so it is not ended either.
+        var endedQuestions = Set(session.queuedUserInputRequests.map(\.id) + session.queuedMCPElicitationRequests.map(\.id))
+        if let pending = session.pendingAskUser { endedQuestions.insert(pending.interaction.id) }
+        if let request = session.pendingMCPElicitationRequest { endedQuestions.insert(request.id) }
+        if let reserved = session.recoveryQuestionCreationReservation {
+            // An ask_user still being saved is cancelled too (its creation sees the cleared reservation).
+            endedQuestions.insert(reserved)
+            session.recoveryQuestionCreationReservation = nil
+        }
         invalidatePendingAskUserTimeout(for: session)
         let continuation = session.askUserContinuation
         session.askUserContinuation = nil
@@ -20034,11 +21903,15 @@ final class AgentModeViewModel: ObservableObject {
         session.queuedMCPElicitationRequests.removeAll()
         reconcileInteractiveRunState(session)
         reconcileDelegatedQuestionNotices(trigger: "askUserCancelled")
+        endRecoveryQuestions(for: session, endedQuestions)
         continuation?.resume(throwing: CancellationError())
         publishRunInteractionStateChange(for: session, reason: .pendingQuestionCancelled)
     }
 
     private func cancelPendingApproval(for session: AgentTabSession) {
+        var endedQuestions = Set(session.queuedMCPElicitationRequests.map(\.id))
+        if let request = session.pendingMCPElicitationRequest { endedQuestions.insert(request.id) }
+        endRecoveryQuestions(for: session, endedQuestions)
         session.pendingApproval = nil
         session.pendingPermissionsRequest = nil
         session.pendingMCPElicitationRequest = nil
@@ -20452,20 +22325,184 @@ final class AgentModeViewModel: ObservableObject {
         guard let session = sessions[tabID] else { return }
         // A retained stale-reset view is replaced only by its confirmed reload, never reset here.
         guard !staleResetRecoveryBlocksNewWork(session) else { return }
+        guard recoveryCoordinator != nil else {
+            performClearChat(session, tabID: tabID, committedRecoveryReset: false)
+            return
+        }
+        Task { [weak self] in
+            _ = await self?.clearChatPreservingRecovery(tabID: tabID)
+        }
+    }
 
-        // An explicit reset intentionally removes finalized scheduled markers; the next save
-        // must carry their exact identities so persistence tombstones them instead of
-        // protecting them against what would otherwise look like a stale snapshot.
-        session.pendingFinalizedScheduledSendItemRemovals.append(
-            contentsOf: session.finalizedScheduledSendItemMarkers
+    /// Result of a recovery-composed transcript reset (`clearChatPreservingRecovery`).
+    enum RecoveryTranscriptResetOutcome: Equatable {
+        /// The reset receipt committed durably, then the live session was cleared.
+        case committed
+        /// No durable session exists yet: cleared locally exactly as without recovery.
+        case clearedUnsaved
+        /// Nothing was cleared and the generation did not advance; the old state stays usable.
+        case vetoed(String)
+    }
+
+    /// Lossless-restart reset ordering (spec R2). Preserves the old generation's composer (or
+    /// vetoes), joins the in-flight session writer and then holds the writer slot itself, commits
+    /// the reset receipt through the existing foundation save from a cleared candidate built by
+    /// the normal snapshot builder, and only after that commit clears live and provider state.
+    /// Admission stays frozen until the commit retires the old lane; on failure nothing was cleared
+    /// and the freeze is released (the generation did not advance).
+    func clearChatPreservingRecovery(tabID: UUID) async -> RecoveryTranscriptResetOutcome {
+        guard let session = sessions[tabID] else { return .vetoed("the tab is gone") }
+        guard !staleResetRecoveryBlocksNewWork(session) else { return .vetoed("stale reset recovery is pending") }
+        if let failure = await prepareRecoveryTranscriptReset(for: session) {
+            print("[AgentModeVM][Recovery] transcript reset vetoed to preserve composer input: \(failure)")
+            return .vetoed(String(describing: failure))
+        }
+        let preparedLane = session.recoveryLane
+        func veto(_ reason: String) -> RecoveryTranscriptResetOutcome {
+            endRecoveryTranscriptResetPreparation(for: session, lane: preparedLane)
+            print("[AgentModeVM][Recovery] transcript reset not committed: \(reason)")
+            return .vetoed(reason)
+        }
+        guard sessions[tabID] === session, !staleResetRecoveryBlocksNewWork(session) else {
+            return veto("the owner changed during preparation")
+        }
+        guard let sessionID = session.activeAgentSessionID, session.persistenceState(for: sessionID) != nil else {
+            guard preparedLane == nil, session.persistenceState == nil else {
+                return veto("the session has durable state but no current authority")
+            }
+            performClearChat(session, tabID: tabID, committedRecoveryReset: false)
+            return .clearedUnsaved
+        }
+        guard let preparedLane, !preparedLane.isRetired else {
+            return veto("no recovery lane owns the session")
+        }
+        // Join the in-flight writer (never a queued/coalesced return), then own the writer slot so
+        // no snapshot of the old transcript can be written around the reset commit.
+        while saveInFlightSessionIDs.contains(sessionID) {
+            await withCheckedContinuation { saveCompletionWaiters[sessionID, default: []].append($0) }
+        }
+        guard sessions[tabID] === session,
+              session.activeAgentSessionID == sessionID,
+              session.recoveryLane === preparedLane,
+              !preparedLane.isRetired,
+              !staleResetRecoveryBlocksNewWork(session),
+              let state = session.persistenceState(for: sessionID),
+              let context = currentSessionPersistenceContext(),
+              sessionPersistenceContextIsCurrent(context),
+              state.stamp.workspaceID == context.workspace.id
+        else {
+            return veto("the owner or persistence context changed while joining the session writer")
+        }
+        saveInFlightSessionIDs.insert(sessionID)
+        defer {
+            saveInFlightSessionIDs.remove(sessionID)
+            for waiter in saveCompletionWaiters.removeValue(forKey: sessionID) ?? [] {
+                waiter.resume()
+            }
+            if saveRequestedWhileInFlightSessionIDs.remove(sessionID) != nil, sessions[tabID] === session {
+                scheduleSave(for: tabID)
+            }
+        }
+        let receipt = session.pendingTranscriptResetReceipt ?? AgentSessionTranscriptResetReceipt(id: UUID())
+        let removals = session.pendingFinalizedScheduledSendItemRemovals + session.finalizedScheduledSendItemMarkers
+        var candidate = makePersistedAgentSession(
+            for: session,
+            tabID: tabID,
+            sessionID: sessionID,
+            workspaceID: context.workspace.id,
+            sessionName: resolvedSessionDisplayName(for: tabID),
+            persistableSnapshot: PersistableTranscriptSnapshot(
+                transcript: .empty,
+                projectionCounts: AgentTranscriptProjectionCounts(),
+                canonicalVisibleRowCount: 0,
+                lastUserMessageAt: nil
+            )
         )
-        // Each explicit reset carries its own stable receipt until the save that commits it; a
-        // save retried for the same reset reuses it.
-        session.pendingTranscriptResetReceipt = AgentSessionTranscriptResetReceipt(id: UUID())
+        // The candidate mirrors exactly what `performClearChat` clears.
+        candidate.uiToolResultPayloadsByItemID = [:]
+        candidate.remoteResendPayloadsByItemID = [:]
+        candidate.locallyAttributedStartItemID = nil
+        candidate.providerSessionID = nil
+        candidate.providerHistoryRecovery = nil
+        candidate.providerTokenUsageByTurn = []
+        candidate.codexConversationID = nil
+        candidate.codexRolloutPath = nil
+        candidate.codexModel = nil
+        candidate.codexReasoningEffort = nil
+        candidate.codexContextWindow = nil
+        candidate.codexLastTotalTokens = nil
+        candidate.codexTotalTotalTokens = nil
+        let commit: AgentSessionSaveCommit
+        do {
+            #if DEBUG
+                if let hook = test_recoveryResetBeforeCommitHook {
+                    await hook(session)
+                }
+            #endif
+            commit = try await dataService.saveAgentSession(
+                candidate,
+                for: context.workspace,
+                preparation: .alreadyCanonicalTranscript,
+                trustedCanonicalItemCount: 0,
+                intentionallyRemovingFinalizedScheduledSendItems: removals,
+                committingTranscriptReset: receipt,
+                fileCreationPolicy: .requireExisting,
+                persistenceState: state
+            )
+        } catch AgentScheduledSendMutationError.staleDeletionGeneration,
+            AgentScheduledSendMutationError.invalidPersistenceStamp,
+            AgentScheduledSendMutationError.sessionDeleted,
+            AgentScheduledSendMutationError.staleIncarnation
+        {
+            if sessions[tabID] === session {
+                handleDurableSessionDeleted(session, sessionID: sessionID)
+            }
+            return veto("the session was deleted")
+        } catch {
+            // Nothing was cleared and the generation did not advance (a commit that raced this
+            // failure is idempotent under the same receipt and rejects stale old-generation writes).
+            return veto("the reset commit failed: \(error)")
+        }
+        guard sessions[tabID] === session, session.activeAgentSessionID == sessionID else {
+            // Committed for a replaced owner: its own reload adopts the reset; nothing is cleared here.
+            return veto("the owner changed during the reset commit")
+        }
+        session.persistenceState = commit.persistenceState
+        session.persistedIncarnationSessionID = sessionID
+        session.pendingTranscriptResetReceipt = nil
+        session.pendingFinalizedScheduledSendItemRemovals.removeAll { removals.contains($0) }
+        // The successor claim retires the frozen lane (binding changed: nothing is written under
+        // either generation; the preserved composer is held by the new one).
+        recoveryPersistenceStateDidChange(for: session)
+        performClearChat(session, tabID: tabID, committedRecoveryReset: true)
+        return .committed
+    }
+
+    private func performClearChat(_ session: AgentTabSession, tabID: UUID, committedRecoveryReset: Bool) {
+        if !committedRecoveryReset {
+            // An explicit reset intentionally removes finalized scheduled markers; the next save
+            // must carry their exact identities so persistence tombstones them instead of
+            // protecting them against what would otherwise look like a stale snapshot.
+            session.pendingFinalizedScheduledSendItemRemovals.append(
+                contentsOf: session.finalizedScheduledSendItemMarkers
+            )
+            // Each explicit reset carries its own stable receipt until the save that commits it; a
+            // save retried for the same reset reuses it.
+            session.pendingTranscriptResetReceipt = AgentSessionTranscriptResetReceipt(id: UUID())
+        }
         session.setItemsSilently([], reason: .clearedChat)
         session.clearDerivedTranscriptCaches()
-        session.pendingImageAttachments.removeAll()
-        session.pendingTaggedFileAttachments.removeAll()
+        if committedRecoveryReset {
+            // The preserved old-generation composer stays exactly as written (held after the
+            // reset); the cleared attachments are not reported as an old-generation edit.
+            session.withRecoveryComposerObservationSuppressed {
+                session.pendingImageAttachments.removeAll()
+                session.pendingTaggedFileAttachments.removeAll()
+            }
+        } else {
+            session.pendingImageAttachments.removeAll()
+            session.pendingTaggedFileAttachments.removeAll()
+        }
         session.attachmentsPendingProviderConsumptionCleanup.removeAll()
         session.nextSequenceIndex = 0
         session.attentionTextProvenance = nil
@@ -20480,6 +22517,15 @@ final class AgentModeViewModel: ObservableObject {
         // restore the old conversation or affect a replacement controller.
         claudeCoordinator.prepareForConversationResetSync(session)
         session.providerSessionID = nil
+        // The history ledger belongs to the cleared transcript (reset semantics only). Live-producer
+        // ownership of its keys goes with it, as the controller was detached above (the only
+        // ownership reset); the refused-producer latch is kept (Step 4d3c).
+        session.providerHistoryRecovery = nil
+        session.claudeLiveTranscriptOwnedKeys = [:]
+        session.recoveryResumeFallbackSuppressedConversationID = nil
+        session.recoveryResumeUnavailableConversationID = nil
+        session.pendingHistoryImportCommit = nil
+        session.committedHistoryImportID = nil
         session.providerTokenUsageByTurn.removeAll()
         session.claudeConfiguredContextWindow = nil
         session.claudeConfiguredContextWindowKey = nil
@@ -20641,7 +22687,14 @@ final class AgentModeViewModel: ObservableObject {
             }
         }
 
+        // Retire synchronously (no suspension since the binding scan above): every live owner
+        // still bound to the deleted UUID is detached from its tab together with all tab-scoped
+        // state, before any await. A tab hosting another owner is never touched, and an owner
+        // installed on the tab while the teardown below is suspended is never targeted by it.
+        var detachedOwners: [(session: AgentTabSession, runID: UUID?)] = []
         for tabID in stateCleanupTabIDs {
+            let owner = sessions[tabID].flatMap { $0.activeAgentSessionID == sessionID ? $0 : nil }
+            guard owner != nil || sessions[tabID] == nil else { continue }
             removePendingUIRefresh(for: tabID)
             if activeSessionLoadInProgressTabID == tabID {
                 activeSessionLoadInProgressTabID = nil
@@ -20649,28 +22702,51 @@ final class AgentModeViewModel: ObservableObject {
             sessionIndexStore.removeSortDate(forTabID: tabID)
             tabsWithActiveAgentRun.remove(tabID)
             mcpControlledTabIDs.remove(tabID)
-
-            guard let session = sessions[tabID], session.activeAgentSessionID == sessionID else { continue }
+            guard let session = owner else { continue }
+            detachedOwners.append((session, session.runID))
             cancelPersistedLoad(for: session)
             session.cancelEphemeralRuntimeState()
             cancelPendingQuestion(for: session)
             cancelPendingApproval(for: session)
             cancelPendingApplyEditsReview(for: session, reason: "Session deleted")
-            await teardownApplyEditsApprovalSessionSync(for: session, cleanupScope: true)
             cancelPendingInstruction(for: session)
-            await cleanupACPStateForDeletedSession(session)
-            await teardownMCPControl(for: session, cleanupSessionStore: true)
-            await session.disposeProviderIfPresent()
-            await codexCoordinator.shutdownCodexSession(session)
-            await claudeCoordinator.shutdownClaudeSession(session)
-            await cleanupMCPRunRoutingIfPresent(
-                boundSessionID: sessionID,
-                liveSession: session,
-                reason: reason
-            )
             clearRemoteStartWindowPickerIfOwned(by: tabID)
             remoteCoordinator.stop(tabID: tabID)
             sessions.removeValue(forKey: tabID)
+        }
+        // Tab owners as of the detach: a later owner of an affected tab is a replacement.
+        let ownersAfterDetach = Dictionary(uniqueKeysWithValues: affectedTabIDs.map { tabID in
+            (tabID, sessions[tabID].map(ObjectIdentifier.init))
+        })
+        // Awaited teardown of the detached objects only, using the detached-owner pattern
+        // (workspace-switch discard): no tab-scoped publication, and coordinator tab state is
+        // released only when it still belongs to the captured run.
+        for (session, runID) in detachedOwners {
+            #if DEBUG
+                if let hook = test_deletedSessionTeardownHook {
+                    await hook(session)
+                }
+            #endif
+            await teardownApplyEditsApprovalSessionSync(for: session, cleanupScope: true)
+            await cleanupACPStateForDeletedSession(session)
+            await teardownMCPControl(for: session, cleanupSessionStore: true, publishChanges: false)
+            await session.disposeProviderIfPresent()
+            await codexCoordinator.shutdownCodexSession(
+                session,
+                clearTabScopedCoordinatorState: false,
+                detachedRunID: runID
+            )
+            await claudeCoordinator.shutdownClaudeSession(
+                session,
+                clearTabScopedCoordinatorState: false,
+                detachedRunID: runID
+            )
+            await cleanupMCPRunRoutingIfPresent(
+                boundSessionID: sessionID,
+                liveSession: session,
+                explicitRunID: runID,
+                reason: reason
+            )
         }
 
         await releaseSessionWorktreeOwnership(sessionID: sessionID)
@@ -20688,9 +22764,12 @@ final class AgentModeViewModel: ObservableObject {
         }
 
         let activeTabID = currentTabID
-        if activeTabID.map(affectedTabIDs.contains) == true {
-            lastProcessedTabID = nil
-            onTabChanged(activeTabID)
+        if let activeTabID, affectedTabIDs.contains(activeTabID) {
+            // A replacement installed during the teardown already owns and presents the tab.
+            if sessions[activeTabID].map(ObjectIdentifier.init) == ownersAfterDetach[activeTabID] ?? nil {
+                lastProcessedTabID = nil
+                onTabChanged(activeTabID)
+            }
         } else if activeTabID == nil, !affectedTabIDs.isEmpty {
             lastProcessedTabID = nil
             onTabChanged(nil)
@@ -21399,6 +23478,7 @@ final class AgentModeViewModel: ObservableObject {
             payload: payload,
             createdAt: Date(),
             sourceItemID: upToItemID,
+            payloadID: UUID(),
             defersProviderLockUntilSend: true,
             isStagedForSend: false
         )

@@ -290,6 +290,9 @@ final class CodexReadOnlyCompanionLaunchTests: XCTestCase {
             },
             codexControllerFactoryWithComputerUse: { _, _, _, _, permissionProfile, sessionProfile, _, _ in
                 let controller = LifecycleNoopCodexController(recorder: recorder, startedConversationID: "companion-thread")
+                // Production Agent Mode controllers are runtime-registered (R6): a toggle's replaced
+                // controller's shutdown is retained and joined before the successor starts.
+                controller.joinsRetirementBeforeSuccessor = true
                 // Mirrors the production factory: the same gate and preference, read at creation.
                 if CodexAgentModeCoordinator.codexReadOnlyCompanionAllowed(
                     sessionProfile: sessionProfile,

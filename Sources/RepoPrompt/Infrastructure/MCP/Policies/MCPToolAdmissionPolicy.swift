@@ -72,6 +72,7 @@ enum MCPToolAdmissionPolicy {
         MCPWindowToolName.setStatus: .control,
         MCPWindowToolName.waitForNextInstruction: .control,
         MCPWindowToolName.history: .control,
+        MCPWindowToolName.workspaceSteer: .control,
         // The parent script never holds a read slot while awaiting its children (plan §6 D3);
         // its own one-per-connection and one-per-window cap is `MCPCodeModeScriptAdmission`.
         MCPWindowToolName.codeMode: .control

@@ -41,7 +41,7 @@ final class MCPHistoryToolProvider: MCPWindowToolProviding {
             **Scope**: Window routing does not imply workspace scope; history scans all saved workspaces by default. Use `workspace` to filter by saved name, UUID, or `Workspace-*` storage directory. Stale indexes are skipped and reported in `skipped_workspaces`.
 
             **Truncation**: `truncated` means `limit` capped returned results; `scan_truncated` means `max_sessions_scanned` capped work.
-            **Caching**: The cross-workspace session inventory is cached for ~90 seconds for query-loop performance. A session saved within that window may not appear in `list_sessions`/`search`/`time` until the cache expires. `get_session` retries once with a cache-bypassed scan on `session_id` miss so freshly-saved sessions can resolve immediately; transcript content is signature-checked and cache-invalidated when the session file changes.
+            **Caching**: The cross-workspace session inventory is cached for ~90 seconds for query-loop performance. A session saved within that window may not appear in `list_sessions`/`search`/`time` until the cache expires. `get_session` re-reads only the workspace holding the session file on a `session_id` miss so freshly-saved sessions can resolve immediately; transcript content is signature-checked and cache-invalidated when the session file changes.
             """,
             annotations: .repoPromptLocalReadOnly,
             inputSchema: .object(
@@ -96,8 +96,45 @@ final class MCPHistoryToolProvider: MCPWindowToolProviding {
                 required: ["op"]
             )
         ) { _, args in
-            let reply = try await HistoryMCPToolService.execute(args: args, scanner: self.scanner)
+            let reply = try await HistoryMCPToolService.execute(
+                args: args,
+                scanner: self.scanner,
+                diagnostics: Self.makeDiagnostics(recorder: MCPToolExecutionHandlerPhaseContext.recorder)
+            )
             return try Self.encode(reply)
+        }
+    }
+
+    // MARK: - Handler Phases
+
+    /// One diagnostics object per call. Its phase observer forwards to the watchdog's
+    /// handler-phase recorder synchronously (no actor hop, no detached task), so the
+    /// watchdog's timeout trace names the phase the call was in, in order.
+    nonisolated static func makeDiagnostics(
+        recorder: MCPToolExecutionHandlerPhaseRecorder?
+    ) -> HistoryExecutionDiagnostics {
+        guard let recorder else { return HistoryExecutionDiagnostics() }
+        return HistoryExecutionDiagnostics { phase, transition in
+            recorder.reportSynchronously(
+                handlerPhase(for: phase),
+                transition: transition == .started ? .started : .completed
+            )
+        }
+    }
+
+    nonisolated static func handlerPhase(
+        for phase: HistoryExecutionDiagnostics.Phase
+    ) -> MCPToolExecutionHandlerPhase {
+        switch phase {
+        case .inventoryWait: .historyInventoryWait
+        case .inventoryEnumeration: .historyInventoryEnumeration
+        case .inventoryIndexScan: .historyInventoryIndexScan
+        case .filtering: .historyFiltering
+        case .sorting: .historySorting
+        case .transcriptLoad: .historyTranscriptLoad
+        case .transcriptTraversal: .historyTranscriptTraversal
+        case .aggregation: .historyAggregation
+        case .replyConstruction: .historyReplyConstruction
         }
     }
 

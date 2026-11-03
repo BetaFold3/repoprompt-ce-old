@@ -26,7 +26,10 @@ package enum ClaudeCLIModelDiscoveryProbe {
         "--tools", "", "--no-session-persistence"
     ]
 
-    static func run(config originalConfig: CLIProcessConfiguration) async throws -> Result {
+    static func run(
+        config originalConfig: CLIProcessConfiguration,
+        launchAuthority: AgentRuntimeLaunchAuthority = .production
+    ) async throws -> Result {
         var config = originalConfig
         config.captureStdoutTailBytes = maximumOutputBytes
         config.captureStderrTailBytes = 8192
@@ -45,10 +48,24 @@ package enum ClaudeCLIModelDiscoveryProbe {
         defer { try? FileManager.default.removeItem(at: root) }
         config.workingDirectory = root.path
         let runner = CLIProcessRunner(config: config)
+        // R6: a managed control start — its own sessionless runtime (`--no-session-persistence`, a
+        // private temporary directory, so no worktree or conversation key), reserved before the
+        // spawn and committed before the initialize write. Nil while registration is off.
+        // First-party only (checked above): the standard Claude provider; no permission request.
+        let launch = launchAuthority.makeLaunch(AgentRuntimeLaunchContext(
+            family: .claudeHeadless,
+            provider: .claude(.standard),
+            session: .sessionless,
+            worktreePath: nil,
+            permission: .unavailable
+        ))
         do {
             let result = try await runner.run(
                 args: arguments, stdin: input, outputMode: .none, timeout: 15,
-                additionalRemovedKeys: ["CLAUDECODE"], cancelChildOnTaskCancellation: true
+                // Managed launch boundary: an inherited runtime marker never reaches the child.
+                additionalRemovedKeys: ["CLAUDECODE", ProcessLauncher.runtimeMarkerEnvironmentKey],
+                cancelChildOnTaskCancellation: true,
+                launchOwnership: launch
             )
             await runner.cancelAll()
             try Task.checkCancellation()

@@ -487,11 +487,13 @@ struct AgentSessionRow: View {
         let tint: Color = switch attention.kind {
         case .conflicted: .orange
         case .awaitingApproval: .purple
+        case .historicalReview: .secondary
         case .awaitingCommit: .yellow
         }
         let glyph = switch attention.kind {
         case .conflicted: "exclamationmark.triangle.fill"
         case .awaitingApproval: "arrow.triangle.merge"
+        case .historicalReview: "clock.arrow.circlepath"
         case .awaitingCommit: "checkmark.circle"
         }
         return Image(systemName: glyph)

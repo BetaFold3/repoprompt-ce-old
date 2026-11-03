@@ -31,15 +31,30 @@ enum MCPToolExecutionWatchdogError: Error, Equatable {
 struct MCPToolExecutionWatchdogEnvironment {
     let now: @Sendable () async -> Duration
     let sleep: @Sendable (Duration) async throws -> Void
+    /// Same clock as `now`, readable without suspending, when the environment can offer
+    /// it. Lets synchronous handler-phase reports share the watchdog's time base.
+    let synchronousNow: (@Sendable () -> Duration)?
+
+    init(
+        now: @escaping @Sendable () async -> Duration,
+        sleep: @escaping @Sendable (Duration) async throws -> Void,
+        synchronousNow: (@Sendable () -> Duration)? = nil
+    ) {
+        self.now = now
+        self.sleep = sleep
+        self.synchronousNow = synchronousNow
+    }
 
     static func continuous() -> Self {
         let clock = ContinuousClock()
         let origin = clock.now
+        let elapsed: @Sendable () -> Duration = { origin.duration(to: clock.now) }
         return Self(
-            now: { origin.duration(to: clock.now) },
+            now: { elapsed() },
             sleep: { duration in
                 try await Task.sleep(for: duration)
-            }
+            },
+            synchronousNow: elapsed
         )
     }
 }

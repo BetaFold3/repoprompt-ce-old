@@ -315,7 +315,10 @@ enum AgentNavigationHUDSnapshotBuilder {
                     ?? entry?.worktreeBindingSummaries.first?.worktreeName
                     ?? entry?.worktreeBindingSummaries.first?.branch,
                 mergeAttention: nil,
-                mergeLabel: entry?.activeWorktreeMergeSummaries.max(by: { $0.updatedAt < $1.updatedAt })?.targetLabel,
+                mergeLabel: entry.flatMap { entry in
+                    AgentWorktreeMergeBlockerSelector.primarySummary(in: entry.activeWorktreeMergeSummaries)
+                        ?? entry.activeWorktreeMergeSummaries.max(by: { $0.updatedAt < $1.updatedAt })
+                }?.targetLabel,
                 isMCPControlled: entry?.isMCPOriginated == true,
                 isArchived: true,
                 searchFields: searchFields

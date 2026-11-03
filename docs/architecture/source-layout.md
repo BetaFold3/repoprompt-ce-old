@@ -47,7 +47,7 @@ Sources/
     Diagnostics/                 # workspace restore/root-load/worktree-startup instrumentation and MCP tool work counts
     Diffing/                     # diff parsing/application/generation substrate and edit-flow performance tracing
     FileSystem/                  # filesystem services, ignore rules (incl. GitignoreCompiler), watcher ingress, and workspace inventory
-    Persistence/                 # code-map and durable artifact stores, MCP filesystem constants
+    Persistence/                 # code-map and durable artifact stores, MCP filesystem constants, Workspaces store root resolver (WorkspaceStorageRoot)
     Search/                      # search matches/options, path filtering, and store-backed workspace search
     SyntaxParsing/               # syntax manager
     Utilities/                   # standardized paths and checkout path identity
@@ -140,7 +140,7 @@ The old IDE-era Prompt selected-files panel is also removed. Do not add back `Pr
 - New reusable bootstrap MCP client plumbing shared by the CLI and gateway clients goes under `Packages/RepoPromptCore/Sources/RepoPromptMCPClientKit`.
 - New gateway-only app-link, auth, audit, relay, push, server, watch, resource, and wire-adapter code goes under `Sources/RepoPromptGateway`; dependency-free remote-control protocol DTOs and signing helpers remain in `Sources/RepoPromptRemoteWire`.
 - New app-local MCP/socket/routing helpers go under `Sources/RepoPrompt/Infrastructure/MCP`, not `Sources/RepoPrompt/Shared`.
-- New importable CLI implementation code goes under `Packages/RepoPromptCore/Sources/RepoPromptMCPCore`; `Sources/RepoPromptMCP` remains the thin executable entry only.
+- New importable CLI implementation code goes under `Packages/RepoPromptCore/Sources/RepoPromptMCPCore`; `Sources/RepoPromptMCP` remains the thin executable entry only. Its one exception is the private Restart-safely relaunch mode (`--rpce-private-relaunch-v1`, lossless restart Phase 4): `main.swift` classifies that reserved argument before any MCP code runs and delegates to `RepoPromptPlatform` (`Infrastructure/Process/ProcessRelaunchHelper.swift`, which owns the closed v1 protocol). `RepoPromptPlatform` is therefore a dependency of the `RepoPromptMCP` target only; no new product or target exists for the helper.
 - New test doubles, fixtures, parser inputs, sample projects, benchmark-only fixture data, and XCTest-only helpers go under `Tests/RepoPromptTests`, not the app target.
 - Do not create directories named `Tests`, `TestSupport`, or `Fixtures` under `Sources/RepoPrompt`, `Sources/RepoPromptAgentCore`, `Sources/RepoPromptPlatform`, `Sources/RepoPromptUI`, or `Sources/RepoPromptWorkspace`.
 - Do not put parser fixtures or sample parser inputs under `Sources/RepoPromptWorkspace/SyntaxParsing` or `Sources/RepoPromptPlatform/Infrastructure/SyntaxParsing`; keep only production parser/query code there.
@@ -210,7 +210,7 @@ make guardrails
 The guardrail script verifies:
 
 - the shipped `RepoPrompt` executable source root contains only its entry file, declares exactly one `@main`, and the current `RepoPromptApp` implementation target declares none;
-- the shipped `RepoPromptMCP` executable source root contains only `main.swift` and delegates implementation to the `RepoPromptMCPCore` package product;
+- the shipped `RepoPromptMCP` executable source root contains only `main.swift` and delegates implementation to the `RepoPromptMCPCore` package product (plus the private relaunch mode in `RepoPromptPlatform`);
 - `Package.swift` keeps the current implementation target named `RepoPromptApp` at `Sources/RepoPrompt`, with the `RepoPrompt` executable as its thin sole-dependent entry target;
 - `RepoPromptAgentCore` exists as a library target at `Sources/RepoPromptAgentCore` and declares no `@main`;
 - `RepoPromptPlatform` exists as a library target at `Sources/RepoPromptPlatform` and declares no `@main`;

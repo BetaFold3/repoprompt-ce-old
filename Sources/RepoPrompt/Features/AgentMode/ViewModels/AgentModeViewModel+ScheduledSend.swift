@@ -16,8 +16,10 @@ import RepoPromptAgentCore
 // Props inputs: `TabSession.scheduledSend`, `scheduledSendPendingFinalization`,
 // `scheduledSendBusyState(tabID:)`, `canScheduleSend(tabID:session:)`,
 // `scheduleTargetIsNewSessionStart(tabID:session:)`.
-// Message marker: `AgentChatItem.scheduledSend` is stamped only after provider acceptance
-// (`startAgentRun` outcome `.sent` / `.queuedFallback`), so a non-nil provenance always means "Sent".
+// Message marker: `AgentChatItem.scheduledSend` is stamped when the schedule hands off its input.
+// Its `kind` says what that proves (R9): only `providerAccepted` means "Sent"; `savedInQueue` is
+// saved input owned by a durable recovery intent, and `legacyUnknown` (old data, or the inactive
+// path's `didSend` heuristic) proves neither.
 //
 // Persistence rules: the ordinary session save never mutates the on-disk schedule members of an
 // existing file. Every schedule change goes through `AgentSessionDataService.mutateScheduledSend`
@@ -137,6 +139,15 @@ extension AgentModeViewModel {
                     syncComposerUIState(tabID: session.tabID)
                 }
             }
+        scheduledSendDispositionObserver = NotificationCenter.default
+            .publisher(for: .agentScheduledSendDispositionDidChange, object: coordinator)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] notification in
+                guard let self, let sessionID = notification.userInfo?["sessionID"] as? UUID else { return }
+                for session in sessions.values where session.activeAgentSessionID == sessionID {
+                    syncComposerUIState(tabID: session.tabID)
+                }
+            }
         scheduledSendDeletionObserver = NotificationCenter.default.publisher(for: .agentSessionDeletionDidCommit)
             .receive(on: RunLoop.main)
             .sink { [weak self] notification in
@@ -145,6 +156,27 @@ extension AgentModeViewModel {
                 // projection of that durable session; no schedule writer may recreate the file.
                 for session in sessions.values where session.activeAgentSessionID == sessionID {
                     handleDurableSessionDeleted(session, sessionID: sessionID)
+                }
+            }
+        // Late delivery evidence (written after the run went inactive) wakes an awaiting hold.
+        scheduledSendDeliveryEvidenceObserver = NotificationCenter.default.publisher(for: .agentRecoveryDeliveryEvidenceDidSettle)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] notification in
+                guard let self, let lane = notification.object as? AgentRecoverySessionLane else { return }
+                // A retired predecessor's late no-handoff settlement (F1) also wakes its successor owner.
+                for session in sessions.values where session.recoveryLane?.sessionID == lane.sessionID {
+                    recheckScheduledSendTransferAwaitingEvidence(for: session)
+                }
+            }
+        // F-10: a transfer whose repair gave up while startup was closed or failed (then Retry
+        // succeeded) is repaired once admission opens; the repair is CAS-exact and idempotent.
+        scheduledSendStartupAdmissionObserver = NotificationCenter.default
+            .publisher(for: .agentScheduledSendStartupAdmissionDidChange, object: coordinator)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                guard let self, scheduledSendCoordinator === coordinator, coordinator.isStartupAdmissionOpen else { return }
+                for session in sessions.values {
+                    retryScheduledSendTransferIfNeeded(for: session)
                 }
             }
         // Presentation of process-retained attempts is rebuilt from coordinator-owned values.
@@ -167,6 +199,12 @@ extension AgentModeViewModel {
         scheduledSendDeletionObserver = nil
         scheduledSendPendingConfirmationObserver?.cancel()
         scheduledSendPendingConfirmationObserver = nil
+        scheduledSendDispositionObserver?.cancel()
+        scheduledSendDispositionObserver = nil
+        scheduledSendDeliveryEvidenceObserver?.cancel()
+        scheduledSendDeliveryEvidenceObserver = nil
+        scheduledSendStartupAdmissionObserver?.cancel()
+        scheduledSendStartupAdmissionObserver = nil
     }
 
     func notifyScheduledSendRunStateChanged(for session: AgentTabSession) {
@@ -182,6 +220,7 @@ extension AgentModeViewModel {
             state: session.runState
         )
         notifyScheduledSendBusyStateMayHaveChanged(tabIDs: [session.tabID])
+        recheckScheduledSendTransferAwaitingEvidence(for: session)
     }
 
     func notifyScheduledSendHydrationCompleted(for session: AgentTabSession) {
@@ -369,6 +408,7 @@ extension AgentModeViewModel {
         let target = claim.attempt.target
         let sourceSession = claim.sourceSession
         guard composerSubmitClaimIsCurrent(claim) else {
+            logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "schedule_claim_not_current", persistent: true)
             return .blocked(message: Self.staleComposerSubmitTargetMessage)
         }
         defer {
@@ -381,14 +421,17 @@ extension AgentModeViewModel {
         switch target.route {
         case .existingAgentSession:
             guard let preparedSession = try? await ensureSessionReady(tabID: target.tabID) else {
+                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "schedule_session_not_ready", persistent: true)
                 return .blocked(message: Self.composeTabRemovalInProgressMessage)
             }
             guard preparedSession === sourceSession,
                   composerSubmitClaimIsCurrent(claim)
             else {
+                logRejectedSubmitTarget(target, session: preparedSession, reason: "schedule_prepared_session_or_claim_changed", persistent: true)
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
             }
             if let blockedMessage = newWorkBlockedMessage(for: preparedSession) {
+                logRejectedSubmitTarget(target, session: preparedSession, reason: "schedule_new_work_blocked", persistent: true)
                 return .blocked(message: blockedMessage)
             }
             if let rejectionReason = submitTargetRejectionReason(
@@ -396,7 +439,7 @@ extension AgentModeViewModel {
                 session: preparedSession,
                 validateSubmissionToken: false
             ) {
-                logRejectedSubmitTarget(target, session: preparedSession, reason: rejectionReason)
+                logRejectedSubmitTarget(target, session: preparedSession, reason: rejectionReason, persistent: true)
                 resyncAfterRejectedSubmitTarget(target)
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
             }
@@ -442,6 +485,7 @@ extension AgentModeViewModel {
                       sourceSnapshot.matches(sessions[target.tabID]),
                       Self.pendingUserTurnState(from: preparedSession) == pendingState
                 else {
+                    logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "schedule_state_changed_during_location_preparation", persistent: true)
                     return .blocked(message: Self.staleComposerSubmitTargetMessage)
                 }
                 preparedSession.pendingInitialStartLocation = .local
@@ -450,6 +494,7 @@ extension AgentModeViewModel {
                 }
             } else {
                 guard preparedSession.pendingInitialStartLocation == .local else {
+                    logRejectedSubmitTarget(target, session: preparedSession, reason: "schedule_initial_start_location_pending", persistent: true)
                     return .blocked(message: Self.staleComposerSubmitTargetMessage)
                 }
             }
@@ -504,6 +549,7 @@ extension AgentModeViewModel {
                   sourceSnapshot.matches(sessions[target.tabID]),
                   destinationTabID != target.tabID
             else {
+                logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "schedule_state_changed_after_destination_created", persistent: true)
                 await discardFreshFirstSendDestinationIfPossible(destinationTabID)
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
             }
@@ -554,6 +600,7 @@ extension AgentModeViewModel {
                       sourceSnapshot.matches(sessions[target.tabID]),
                       Self.pendingUserTurnState(from: destinationSession) == pendingState
                 else {
+                    logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "schedule_state_changed_during_destination_preparation", persistent: true)
                     clearPendingUserTurnState(on: destinationSession)
                     return .blocked(message: Self.staleComposerSubmitTargetMessage)
                 }
@@ -650,7 +697,7 @@ extension AgentModeViewModel {
         } else {
             resolvedSlashSkillInvocations(in: trimmedText).first?.definition.asBubbleWorkflowDefinition()
         }
-        let consumesInterviewFirst = interviewFirst && Self.sessionQualifiesForInterviewFirst(session)
+        let consumesInterviewFirst = effectiveInterviewFirst(for: session) && Self.sessionQualifiesForInterviewFirst(session)
         let now = Date()
         let record = AgentScheduledSendPersist(
             id: UUID(),
@@ -679,7 +726,7 @@ extension AgentModeViewModel {
             selectedWorkflow = nil
         }
         if consumesInterviewFirst {
-            interviewFirst = false
+            setInterviewFirst(false, for: session)
         }
         session.scheduledSend = .v1(record)
         session.scheduledSendWorkspaceID = workspaceID
@@ -706,7 +753,7 @@ extension AgentModeViewModel {
                 selectedWorkflow = selectedWorkflowSnapshot
             }
             if consumesInterviewFirst {
-                interviewFirst = true
+                setInterviewFirst(true, for: session)
             }
             updateBindingsFromSession(session)
             syncComposerUIState(tabID: tabID)
@@ -919,13 +966,63 @@ extension AgentModeViewModel {
                 syncComposerUIState(tabID: tabID)
                 return Self.scheduledSendConfirmationChangedMessage
             }
-            coordinator.confirmAndSendNow(
+            let disposition = coordinator.confirmAndSendNow(
                 scheduleID: scheduleID,
                 runAlongsideOtherSessions: runAlongsideOtherSessions,
                 committedRevision: committedRevision
             )
             syncComposerUIState(tabID: tabID)
-            return nil
+            switch disposition {
+            case let .rejected(refusal):
+                return Self.scheduledSendNowRefusalMessage(refusal)
+            case .blocked, .progressing:
+                // Consent is recorded; a recovery blocker is shown persistently in the banner.
+                return nil
+            }
+        }
+    }
+
+    /// F6 / review B R1: why a due scheduled message was refused durable admission. The schedule is
+    /// then marked failed (it is not retried automatically), so every case says it was not sent.
+    static func scheduledRecoveryAdmissionRefusalMessage(_ refusal: AgentRecoveryAdmissionRefusal) -> String {
+        switch refusal {
+        case .startupNotReady:
+            "The scheduled message was not sent because RepoPrompt was still checking what was interrupted by the last restart."
+        case let .startupFailed(reason):
+            // Already plain: `AgentRecoveryStorageFailureCause.startupFailureDescription`.
+            "The scheduled message was not sent. \(reason)"
+        case let .restricted(reason):
+            "The scheduled message was not sent: \(reason) Review it in the recovery banner."
+        case .crashHeld:
+            "The scheduled message was not sent because the previous run in this session may still have been working when RepoPrompt closed. Confirm it stopped from the recovery banner."
+        case .unsavedPredecessorInput:
+            "The scheduled message was not sent because earlier unsaved input in this session needs to be restored or discarded first (recovery banner)."
+        case .resetPreparationInProgress:
+            "The scheduled message was not sent because the conversation was being cleared."
+        case .shutdownInProgress:
+            "The scheduled message was not sent because RepoPrompt was saving this session before closing."
+        case .recoveryActionInProgress:
+            "The scheduled message was not sent because a recovery choice in this workspace was in progress."
+        case .laneRetired, .bindingMismatch:
+            "The scheduled message was not sent because the session changed before it could be saved."
+        case .composerUnavailable, .untrackedInput:
+            "The scheduled message could not be saved for recovery, so it was not sent."
+        }
+    }
+
+    /// User-facing text for a Send now that installed no consent (one per scheduler early return).
+    static func scheduledSendNowRefusalMessage(_ refusal: AgentScheduledSendNowRefusal) -> String {
+        switch refusal {
+        case .startupAdmissionClosed(.recoveryFailed):
+            "Scheduled sending is paused because the recovery check failed. Retry it, then try Send now again."
+        case .startupAdmissionClosed:
+            "RepoPrompt is still checking for interrupted work. Try Send now again in a moment."
+        case .transferHeld:
+            "The last send of this message is still being checked. It won't be sent again until that finishes."
+        case .confirmationPending:
+            scheduledSendConfirmationChangedMessage
+        case .scheduleNotFound:
+            "The scheduler can't see this message right now. Please try again."
         }
     }
 
@@ -1008,54 +1105,111 @@ extension AgentModeViewModel {
 
     /// Returns this tab's captured persistence state for `sessionID`. State enters a tab only
     /// through the paired hydration load (`applyPersistedHydration`), this owner's own commits, or
-    /// create-only preparation for a session that has never been persisted. An incarnation that
-    /// exists on disk but was not hydrated by this tab is not adoptable here, and a revoked
-    /// lifetime is never re-acquired.
+    /// durable exclusive creation of a session that has never been persisted. Creation requires
+    /// `initialSession` (the owner's full persisted payload) and commits the session file before any
+    /// state is returned; without it, a never-persisted session has no authority (`nil`). An
+    /// incarnation that exists on disk but was not hydrated by this tab is not adoptable here, and a
+    /// revoked lifetime is never re-acquired.
     func ensurePersistenceState(
         for session: AgentTabSession,
         sessionID: UUID,
         workspace: WorkspaceModel,
-        context: SessionPersistenceContext? = nil
+        context: SessionPersistenceContext? = nil,
+        initialSession: AgentSession? = nil,
+        trustedCanonicalItemCount: Int? = nil
     ) async -> AgentSessionPersistenceState? {
+        await acquirePersistenceState(
+            for: session,
+            sessionID: sessionID,
+            workspace: workspace,
+            context: context,
+            initialSession: initialSession,
+            trustedCanonicalItemCount: trustedCanonicalItemCount
+        ).state
+    }
+
+    /// `ensurePersistenceState` plus whether this call durably created the session file from
+    /// `initialSession`. `createdDurably` is `true` even when the created authority is not returned
+    /// for the current save (context no longer current, owner replaced or revoked), so the save
+    /// can report the committed snapshot honestly instead of "nothing written".
+    func acquirePersistenceState(
+        for session: AgentTabSession,
+        sessionID: UUID,
+        workspace: WorkspaceModel,
+        context: SessionPersistenceContext? = nil,
+        initialSession: AgentSession? = nil,
+        trustedCanonicalItemCount: Int? = nil
+    ) async -> (state: AgentSessionPersistenceState?, createdDurably: Bool) {
         guard context == nil || (
             context?.workspaceID == workspace.id
                 && context.map { self.sessionPersistenceContextIsCurrent($0) } == true
-        ) else { return nil }
+        ) else { return (nil, false) }
         if let state = session.persistenceState(for: sessionID), state.stamp.workspaceID == workspace.id {
-            return state
+            return (state, false)
         }
         guard session.persistenceRevokedSessionID != sessionID,
-              session.persistedIncarnationSessionID != sessionID
-        else { return nil }
+              session.persistedIncarnationSessionID != sessionID,
+              let initialSession,
+              initialSession.id == sessionID
+        else { return (nil, false) }
         #if DEBUG
             if let hook = test_initialPersistencePreparationHook {
                 await hook(session)
             }
         #endif
         guard context == nil || context.map({ self.sessionPersistenceContextIsCurrent($0) }) == true else {
-            return nil
+            return (nil, false)
         }
+        // Exact originating owner lifetime: a rebinding (even to the same ID) mints a new binding
+        // generation and acquires authority only through its own paired hydration load.
+        let originBinding = session.persistentSessionBindingIdentity
         let prepared: AgentSessionPersistenceState
         do {
-            prepared = try await dataService.prepareInitialAgentSessionPersistence(sessionID: sessionID, for: workspace)
+            prepared = try await dataService.prepareInitialAgentSessionPersistence(
+                initialSession: initialSession,
+                for: workspace,
+                preparation: .alreadyCanonicalTranscript,
+                trustedCanonicalItemCount: trustedCanonicalItemCount
+            ).persistenceState
         } catch AgentScheduledSendMutationError.sessionAlreadyExists {
-            // Not this tab's incarnation: ownership comes only from a paired hydration load.
-            return nil
+            // Not this tab's incarnation (or another creator won): ownership comes only from a
+            // paired hydration load; the winner is never adopted from here.
+            return (nil, false)
         } catch {
-            print("[AgentModeVM][Persistence] could not prepare initial persistence state: \(error)")
-            return nil
+            print("[AgentModeVM][Persistence] could not create the initial session file: \(error)")
+            return (nil, false)
         }
-        guard context == nil || context.map({ self.sessionPersistenceContextIsCurrent($0) }) == true,
-              sessions[session.tabID] === session,
+        #if DEBUG
+            if let hook = test_initialPersistenceCommittedHook {
+                await hook(session)
+            }
+        #endif
+        // The file is committed and this creator's authority is the only way to reach it again.
+        // Retain it for the exact originating owner lifetime whether or not the persistence
+        // context is still current, so a later save of the same owner never re-attempts creation
+        // (which would fail with `sessionAlreadyExists` and leave the tab unable to save). A
+        // replaced tab, a rebinding, or a revoked lifetime never adopts it. The stamp pins its own
+        // workspace, and the first guard already rejected a workspace mismatch.
+        guard sessions[session.tabID] === session,
+              session.persistentSessionBindingIdentity == originBinding,
               session.activeAgentSessionID == sessionID,
               session.persistenceRevokedSessionID != sessionID
-        else { return nil }
+        else { return (nil, true) }
+        let owned: AgentSessionPersistenceState
         if let existing = session.persistenceState(for: sessionID) {
             // A concurrent capture already established ownership; never replace it.
-            return existing
+            owned = existing
+        } else {
+            session.persistenceState = prepared
+            recoveryPersistenceStateDidChange(for: session)
+            session.persistedIncarnationSessionID = sessionID
+            owned = prepared
         }
-        session.persistenceState = prepared
-        return prepared
+        // Only this call's current-save use of the authority is context-sensitive.
+        guard context == nil || context.map({ self.sessionPersistenceContextIsCurrent($0) }) == true else {
+            return (nil, true)
+        }
+        return (owned, true)
     }
 
     // MARK: - Persistence (CAS)
@@ -1114,15 +1268,16 @@ extension AgentModeViewModel {
 
         var attemptedCreation = false
         while true {
-            // Prepared creation authority is not a persisted incarnation: until the first full
-            // save commits (`persistedIncarnationSessionID`), a schedule CAS never targets the
-            // still-missing file, and creation is retried under the same captured stamp.
+            // A never-persisted session has no CAS authority (`ensurePersistenceState` without
+            // `initialSession` returns nil): until this owner's first full save has exclusively
+            // created the file (`persistedIncarnationSessionID`), a schedule CAS never targets or
+            // creates it. A failed creation captures no authority and is retried by a later save.
             if expectedUpdatedAt == nil,
                session.persistedIncarnationSessionID != sessionID,
                session.persistenceRevokedSessionID != sessionID
             {
-                // Genuine initial creation: the first full save establishes the incarnation
-                // (create-only state) before any schedule CAS targets it.
+                // Genuine initial creation: the full save commits the file from the owner's
+                // snapshot (including this member) and adopts its authority before the CAS below.
                 guard !attemptedCreation, member != nil else {
                     return .failed("The session file could not be created.")
                 }
@@ -1135,6 +1290,14 @@ extension AgentModeViewModel {
                 let creation = await flushSaveDetailed(for: session.tabID)
                 guard creation.didWriteDurably else {
                     return .failed("The session file could not be created.")
+                }
+                // A durable creation is reported even when this owner was rebound during it; the
+                // CAS below only proceeds for the captured binding and its own incarnation, so a
+                // rebound tab rolls the schedule back instead of carrying it into another session.
+                guard session.activeAgentSessionID == sessionID,
+                      session.persistedIncarnationSessionID == sessionID
+                else {
+                    return .failed("The session changed while its file was being created.")
                 }
                 continue
             }
@@ -1158,7 +1321,9 @@ extension AgentModeViewModel {
                 postScheduledSendCommitNotification(sessionID: sessionID)
                 return .committed(committedUpdatedAt: committedUpdatedAt)
             } catch AgentScheduledSendMutationError.staleDeletionGeneration,
-                AgentScheduledSendMutationError.invalidPersistenceStamp
+                AgentScheduledSendMutationError.invalidPersistenceStamp,
+                AgentScheduledSendMutationError.sessionDeleted,
+                AgentScheduledSendMutationError.staleIncarnation
             {
                 // Committed deletion or a stale lifetime for this exact owner: never recreate the
                 // file or refresh the stamp from this tab's state.
@@ -1324,16 +1489,35 @@ extension AgentModeViewModel {
             adoptScheduledSendRecoveryProjection(for: session)
             return
         }
-        var normalized = record
-        normalized.state = .needsConfirmation
-        normalized.confirmationReason = .deliveryUnknown
-        normalized.updatedAt = Date()
+        if session.recoveryAdmissionMode == .mandatory {
+            // Lossless-restart barrier: the attempt may already have been transferred to a durable
+            // recovery intent. Project it as-is and hold it (no delivery-unknown confirmation, no
+            // dispatch) until startup reconciliation released admission and the R9 repair ran.
+            session.scheduledSend = member
+            if let attempt = record.attempt {
+                scheduledSendCoordinator?.holdTransfer(AgentScheduledSendTransferHold(
+                    sessionID: agentSession.id,
+                    scheduleID: record.id,
+                    scheduleAttemptID: attempt.attemptID,
+                    reason: .awaitingRecovery
+                ))
+            }
+            resolveScheduledSendTransfer(for: session, record: record)
+            return
+        }
+        normalizeInterruptedScheduledDispatch(record, in: session)
+    }
+
+    /// Legacy restart normalization of an unowned `.dispatching` attempt: delivery is unknown and
+    /// sending again needs explicit confirmation.
+    private func normalizeInterruptedScheduledDispatch(_ record: AgentScheduledSendPersist, in session: AgentTabSession) {
         let duplicateItemExists = record.attempt.map { attempt in
             session.items.contains { $0.id == attempt.itemID }
         } ?? false
-        normalized.lastFailureMessage = duplicateItemExists
-            ? "The app closed while this message was being sent and it may already have been delivered. Sending it again could deliver it twice."
-            : "The app closed while this message was being sent. Delivery could not be confirmed."
+        let normalized = AgentScheduledSendTransfer.deliveryUnknownNormalization(
+            of: record,
+            duplicateItemExists: duplicateItemExists
+        )
         session.scheduledSend = .v1(normalized)
         let expected = record.updatedAt
         Task { @MainActor [weak self] in
@@ -1343,6 +1527,565 @@ extension AgentModeViewModel {
                 _ = await self.commitScheduledSend(session: session, member: .v1(normalized), expectedUpdatedAt: expected)
                 self.updateLocalSessionIndexScheduledSendSummary(for: session)
             }
+        }
+    }
+
+    // MARK: - R9 receipt transfer (lossless restart, mandatory recovery only)
+
+    /// Unresolved lossless-restart recovery for `session`: an unresolved receipt transfer, an
+    /// unconfirmed crash hold, missing mandatory recovery dependencies, or an unowned
+    /// `.dispatching` attempt still awaiting repair. Reported as busy so the scheduler never admits.
+    func scheduledSendHasUnresolvedRecovery(_ session: AgentTabSession) -> Bool {
+        guard let sessionID = session.activeAgentSessionID else { return false }
+        if scheduledSendCoordinator?.transferHold(sessionID: sessionID) != nil {
+            return true
+        }
+        // An explicit recovery action of this session or its workspace is between its acquisition and
+        // its recorded outcome (review A P1-01 / B F3a). The projection comes from the app-shared
+        // coordinator hold (cross-window): automatic work waits, `runAlongsideOtherSessions`
+        // included. The action's own normal dispatch never consults this.
+        if recoveryCoordinator?.isCoveredByRecoveryAction(sessionID: sessionID) == true {
+            return true
+        }
+        if let recoveryCoordinator {
+            // Startup restrictions (unknown status, duplicate destination, unreadable workspace).
+            if recoveryCoordinator.restrictions.blocks(
+                sessionID: sessionID,
+                workspaceID: session.scheduledSendWorkspaceID ?? persistenceWorkspace?.id
+            ) {
+                return true
+            }
+            // R6: a possible other writer of its conversation, an unassociated writer or tool-only
+            // survivor on its worktree, or global ownership uncertainty keeps automatic work paused.
+            // Keys come from this session object itself (hydrated scheduler candidates included), not
+            // only from the windows hosting it.
+            if recoveryCoordinator.runtimeBlocksAutomaticWork(
+                sessionID: sessionID,
+                additionalKeys: runtimeOwnershipKeys(for: session),
+                worktreeUnresolved: runtimeWorktreeIsUnresolved(for: session)
+            ) {
+                return true
+            }
+            if let lane = session.recoveryLane, lane.sessionID == sessionID {
+                if recoveryCoordinator.blockingCrashHold(for: lane.binding) != nil {
+                    return true
+                }
+            } else if recoveryCoordinator.crashHold(for: sessionID) != nil {
+                return true
+            }
+        }
+        guard session.recoveryAdmissionMode == .mandatory else { return false }
+        // Mandatory recovery fails closed when its dependencies are missing.
+        guard recoveryCoordinator != nil, session.recoveryLane != nil else { return true }
+        if session.pendingScheduledSendRecord?.state == .dispatching,
+           !session.ownsLiveScheduledAttempt,
+           scheduledSendCoordinator?.activeAdmission(sessionID: sessionID) == nil
+        {
+            return true
+        }
+        return false
+    }
+
+    /// Re-runs the R9 repair for a mandatory-recovery session whose `.dispatching` attempt is
+    /// projected but unresolved (lane claimed later, startup retried, or a held transfer). Safe to
+    /// call repeatedly; it only acts on the exact projected attempt.
+    func retryScheduledSendTransferIfNeeded(for session: AgentTabSession) {
+        guard session.recoveryAdmissionMode == .mandatory,
+              !session.ownsLiveScheduledAttempt,
+              let record = session.pendingScheduledSendRecord,
+              record.state == .dispatching
+        else { return }
+        resolveScheduledSendTransfer(for: session, record: record)
+    }
+
+    /// Outcome of one R9 transfer repair of a session's projected `.dispatching` attempt.
+    enum ScheduledSendTransferRepairOutcome: Equatable {
+        /// Nothing to repair: no pending unowned `.dispatching` attempt, or it changed meanwhile.
+        case notApplicable
+        /// The receipt was committed and the pending schedule cleared in one CAS.
+        case completed(AgentScheduledSendProvenance)
+        /// No linked intent (or this attempt's own rollback): the legacy delivery-unknown
+        /// normalization was projected and its commit queued.
+        case normalized
+        /// Held (pending schedule and payload unchanged) until explicit resolution.
+        case held(String)
+        /// The entry's preconditions were not met; nothing was read or written.
+        case refused(String)
+    }
+
+    /// Startup-reconcile entry for the R9 transfer repair (the final activation's eager sweep).
+    /// Runs the same repair as hydration, but from inside the recovery coordinator's `Reconcile`
+    /// closure, so the transfer is decided before either barrier opens. It never awaits a startup
+    /// barrier (awaiting `awaitStartup()` from reconciliation would deadlock) and never opens one;
+    /// public hydration repair, evaluation, consent, and dispatch stay blocked until they open.
+    ///
+    /// Authority is the foundation lane, not the barriers. Refused (nothing read or written) unless:
+    /// - the scheduler's startup admission is `.awaitingRecovery` (this entry exists only before the
+    ///   gates open; after that, hydration repair and `retryScheduledSendTransferIfNeeded` apply);
+    /// - the recovery coordinator is `.loading` (its reconciliation is running);
+    /// - the session is mandatory, hydrated, not stale-reset, and its lane was claimed through this
+    ///   coordinator's DataService gate (same store), is not retired, and binds its active session.
+    /// The outcome is decided inside the session's serialized schedule action.
+    func repairScheduledSendTransferForRecoveryStartup(
+        for session: AgentTabSession
+    ) async -> ScheduledSendTransferRepairOutcome {
+        guard let scheduler = scheduledSendCoordinator,
+              case .awaitingRecovery = scheduler.startupAdmission
+        else {
+            return .refused("The scheduler is not waiting for recovery startup.")
+        }
+        guard let recoveryCoordinator, recoveryCoordinator.startupState == .loading else {
+            return .refused("Recovery reconciliation is not running.")
+        }
+        guard session.recoveryAdmissionMode == .mandatory,
+              session.hasLoadedPersistedState,
+              session.staleResetRecovery == nil,
+              let sessionID = session.activeAgentSessionID,
+              let lane = session.recoveryLane,
+              !lane.isRetired,
+              lane.sessionID == sessionID,
+              lane.store === recoveryCoordinator.store
+        else {
+            return .refused("The session has no current recovery lane.")
+        }
+        guard let record = session.pendingScheduledSendRecord,
+              record.state == .dispatching,
+              !session.ownsLiveScheduledAttempt
+        else {
+            return .notApplicable
+        }
+        // Hydration normally installed this already; the hold must exist before any read.
+        holdScheduledSendTransfer(sessionID: sessionID, record: record, reason: .awaitingRecovery)
+        return await runScheduledSendAction(on: session) {
+            await self.performScheduledSendTransferRepair(session: session, sessionID: sessionID, record: record)
+        }
+    }
+
+    /// Bounded wait for the dispatch that installed an `.awaitingProviderEvidence` hold to release its
+    /// in-flight ownership. Delivery evidence itself is never polled: the lane's settle signal wakes
+    /// the re-check when a late evidence write lands.
+    static let scheduledEvidenceRecheckAttempts = 40
+    static let scheduledEvidenceRecheckDelay: Duration = .milliseconds(50)
+
+    /// Re-runs the R9 repair once for an `.awaitingProviderEvidence` hold of `session` while its run is
+    /// not active, after every delivery-evidence write tracked by the session's lane has landed
+    /// (accepted → `providerAccepted`, settled back → `savedInQueue`, uncertain → unresolved hold).
+    /// A still-`dispatching` intent stays held (fail-safe) until the next trigger: a run-state
+    /// change, or `agentRecoveryDeliveryEvidenceDidSettle` for the lane. Never confirms, retries
+    /// delivery, or releases attachments.
+    func recheckScheduledSendTransferAwaitingEvidence(for session: AgentTabSession) {
+        guard session.recoveryAdmissionMode == .mandatory,
+              !session.runState.isActive,
+              let sessionID = session.activeAgentSessionID,
+              let hold = scheduledSendCoordinator?.transferHold(sessionID: sessionID),
+              hold.reason == .awaitingProviderEvidence
+        else { return }
+        Task { @MainActor [weak self, weak session] in
+            for attempt in 0 ..< Self.scheduledEvidenceRecheckAttempts {
+                if attempt > 0 {
+                    try? await Task.sleep(for: Self.scheduledEvidenceRecheckDelay)
+                }
+                // Evidence enqueued so far lands first; later writes wake a new re-check.
+                await session?.recoveryLane?.deliveryEvidenceWritesSettled()
+                guard let self, let session,
+                      !session.runState.isActive,
+                      session.activeAgentSessionID == sessionID,
+                      let current = scheduledSendCoordinator?.transferHold(scheduleID: hold.scheduleID),
+                      current.scheduleAttemptID == hold.scheduleAttemptID,
+                      current.reason == .awaitingProviderEvidence
+                else { return }
+                // The dispatch that installed the hold may still be finishing (in-flight ownership).
+                guard !session.ownsLiveScheduledAttempt,
+                      scheduledSendCoordinator?.activeAdmission(sessionID: sessionID) == nil
+                else { continue }
+                guard let record = session.pendingScheduledSendRecord,
+                      record.id == hold.scheduleID,
+                      record.attempt?.attemptID == hold.scheduleAttemptID,
+                      record.state == .dispatching
+                else { return }
+                await runScheduledSendAction(on: session) {
+                    // F1: a run-start handoff still owned by its runner is never decided here.
+                    switch await self.settleScheduledDeferredHandoffIfNeeded(session: session, sessionID: sessionID, record: record) {
+                    case .notDeferred:
+                        _ = await self.performScheduledSendTransferRepair(session: session, sessionID: sessionID, record: record)
+                    case .pending, .undecided, .resolved:
+                        break
+                    }
+                }
+                // Still awaiting evidence: the lane's settle signal (or a run-state change) re-checks.
+                return
+            }
+        }
+    }
+
+    private enum ScheduledDeferredHandoffSettlement {
+        /// Read succeeded and no deferred run-start handoff owns the linked intent (no registry entry,
+        /// or the intent already has a delivery attempt): the R9 repair decides.
+        case notDeferred
+        /// Its runner still owes the commit or a no-handoff settlement: keep holding.
+        case pending
+        /// Nothing could be read safely (owner not current; lane unavailable, retired, or another
+        /// session's; record read failed): decide nothing.
+        case undecided
+        /// The handoff's proven no-handoff was applied (or the release failed and is held).
+        case resolved
+    }
+
+    /// F1: an `.awaitingProviderEvidence` hold whose linked intent is carried by a deferred run-start
+    /// handoff (adopted plan §5). While that handoff is pending nothing is decided: a `queued` intent
+    /// is not proof of non-handoff, and the R9 repair would read it as saved input. Only the handoff's
+    /// own no-handoff settlement, with the intent still `queued` and no delivery attempt, withdraws
+    /// the intent, removes the scheduled bubble, and fails the schedule with the scheduled
+    /// explanation (the handoff's own reason is logged). A committed handoff is left to the R9
+    /// repair (acceptance evidence, never the commit, is Sent). The settlement is read from the
+    /// coordinator's registry, so a successor owner sees its predecessor's pending handoff.
+    private func settleScheduledDeferredHandoffIfNeeded(
+        session: AgentTabSession,
+        sessionID: UUID,
+        record: AgentScheduledSendPersist
+    ) async -> ScheduledDeferredHandoffSettlement {
+        guard scheduledSendTransferOwnerIsCurrent(session, sessionID: sessionID, record: record),
+              let attempt = record.attempt,
+              let lane = session.recoveryLane,
+              !lane.isRetired,
+              lane.sessionID == sessionID,
+              case let .success(recoveryRecord) = await lane.readRecord()
+        else { return .undecided }
+        guard let intentID = AgentScheduledSendTransfer.linkedIntentID(record: record, recoveryRecord: recoveryRecord),
+              let state = lane.deferredRunStartHandoffState(intentID: intentID),
+              AgentScheduledSendTransfer.intentNeverDispatched(intentID: intentID, in: recoveryRecord)
+        else { return .notDeferred }
+        guard case let .notHandedOff(message) = state else { return .pending }
+        guard scheduledSendTransferOwnerIsCurrent(session, sessionID: sessionID, record: record),
+              session.recoveryLane === lane
+        else { return .undecided }
+        // The handoff's own settlement is consumed here, whatever the release outcome.
+        lane.clearDeferredRunStartHandoff(intentID: intentID)
+        guard case .success = await lane.withdraw(intentID: intentID) else {
+            holdScheduledSendTransfer(
+                sessionID: sessionID,
+                record: record,
+                reason: .unresolved("This scheduled message's saved copy could not be released.")
+            )
+            syncComposerUIState(tabID: session.tabID)
+            return .resolved
+        }
+        lane.clearHeldIntent(intentID)
+        removeUnsentScheduledUserItem(id: attempt.itemID, from: session)
+        // The banner always shows the scheduled explanation; the handoff's own reason is logged.
+        AgentDeliveryRecordDiagnostics.scheduledNotHandedOff(scheduleID: record.id, sourceMessage: message)
+        // The failed record is committed before the hold is released: releasing re-evaluates the
+        // scheduler, which must never see this attempt as an unowned `.dispatching` record. A failed
+        // commit keeps an unresolved hold, so the scheduler never re-reads the attempt.
+        let dispatchingMember = session.scheduledSend
+        let wasDirty = session.isDirty
+        guard await markScheduledSendFailed(session: session, record: record, message: Self.scheduledNotHandedOffMessage) else {
+            // Memory agrees with the hold and with disk (still `.dispatching`); a later save never
+            // persists the unsaved failure behind the hold.
+            session.scheduledSend = dispatchingMember
+            session.isDirty = wasDirty
+            updateLocalSessionIndexScheduledSendSummary(for: session)
+            holdScheduledSendTransfer(
+                sessionID: sessionID,
+                record: record,
+                reason: .unresolved("This scheduled message was not sent, but its status could not be saved.")
+            )
+            syncComposerUIState(tabID: session.tabID)
+            return .resolved
+        }
+        releaseScheduledSendTransferHold(record: record)
+        notifyScheduledSendRecordChanged()
+        return .resolved
+    }
+
+    static let scheduledNotHandedOffMessage = "The scheduled message was not sent: its run ended before the message was handed off."
+
+    /// Waits for the scheduler barrier and recovery startup, then repairs, holds, or normalizes the
+    /// exact projected attempt inside the session's serialized schedule action.
+    func resolveScheduledSendTransfer(for session: AgentTabSession, record: AgentScheduledSendPersist) {
+        guard let sessionID = session.activeAgentSessionID else { return }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            // Without a scheduler there is no barrier authority: stay projected and held (busy).
+            guard let coordinator = scheduledSendCoordinator,
+                  await coordinator.awaitStartupAdmission()
+            else { return }
+            guard let recoveryCoordinator, await recoveryCoordinator.awaitStartup() == .ready else {
+                holdScheduledSendTransfer(
+                    sessionID: sessionID,
+                    record: record,
+                    reason: .unresolved("Recovery startup has not completed.")
+                )
+                return
+            }
+            await runScheduledSendAction(on: session) {
+                guard record.attempt != nil,
+                      recoveryCoordinator.hasDeferredRunStartHandoff(sessionID: sessionID)
+                else {
+                    // No attempt, or no deferred run-start handoff of this session exists in this
+                    // process (Codex, restart): nothing can be pending, so the R9 repair decides as before.
+                    _ = await self.performScheduledSendTransferRepair(session: session, sessionID: sessionID, record: record)
+                    return
+                }
+                // F1: a successor owner (tab replaced or reopened) never reads a predecessor's still
+                // pending run-start handoff as saved input; it waits for that handoff's settlement.
+                switch await self.settleScheduledDeferredHandoffIfNeeded(session: session, sessionID: sessionID, record: record) {
+                case .notDeferred:
+                    _ = await self.performScheduledSendTransferRepair(session: session, sessionID: sessionID, record: record)
+                case .pending:
+                    self.holdScheduledSendTransfer(sessionID: sessionID, record: record, reason: .awaitingProviderEvidence)
+                    self.syncComposerUIState(tabID: session.tabID)
+                case .undecided:
+                    // Its own guards hold (lane or record unavailable) or skip (owner changed); a
+                    // pending handoff could not be ruled out, so it never decides from disk here.
+                    if self.scheduledSendTransferOwnerIsCurrent(session, sessionID: sessionID, record: record) {
+                        _ = self.holdScheduledSendTransferForRepair(
+                            session: session,
+                            sessionID: sessionID,
+                            record: record,
+                            message: "The recovery record for this session is not available yet."
+                        )
+                    }
+                case .resolved:
+                    break
+                }
+            }
+        }
+    }
+
+    private func holdScheduledSendTransfer(
+        sessionID: UUID,
+        record: AgentScheduledSendPersist,
+        reason: AgentScheduledSendTransferHoldReason
+    ) {
+        guard let attempt = record.attempt else { return }
+        scheduledSendCoordinator?.holdTransfer(AgentScheduledSendTransferHold(
+            sessionID: sessionID,
+            scheduleID: record.id,
+            scheduleAttemptID: attempt.attemptID,
+            reason: reason
+        ))
+    }
+
+    private func releaseScheduledSendTransferHold(record: AgentScheduledSendPersist) {
+        guard let attempt = record.attempt else { return }
+        scheduledSendCoordinator?.releaseTransferHold(scheduleID: record.id, scheduleAttemptID: attempt.attemptID)
+    }
+
+    private func scheduledSendTransferOwnerIsCurrent(
+        _ session: AgentTabSession,
+        sessionID: UUID,
+        record: AgentScheduledSendPersist
+    ) -> Bool {
+        sessions[session.tabID] === session
+            && session.activeAgentSessionID == sessionID
+            && session.pendingScheduledSendRecord == record
+            && !session.ownsLiveScheduledAttempt
+            && scheduledSendCoordinator?.activeAdmission(sessionID: sessionID) == nil
+    }
+
+    /// Hydrated-owner R9 repair: delegates the decision and its commit to the shared gate-held
+    /// DataService repair (the same one startup uses for closed sessions), then adopts the
+    /// authoritative schedule only while this owner still projects the exact attempt. A
+    /// delivery-unknown normalization is committed before `.normalized` is returned.
+    private func performScheduledSendTransferRepair(
+        session: AgentTabSession,
+        sessionID: UUID,
+        record: AgentScheduledSendPersist
+    ) async -> ScheduledSendTransferRepairOutcome {
+        guard scheduledSendTransferOwnerIsCurrent(session, sessionID: sessionID, record: record) else { return .notApplicable }
+        if record.attempt != nil {
+            // An attempt can be linked only through this session's recovery record.
+            guard let lane = session.recoveryLane, !lane.isRetired, lane.sessionID == sessionID else {
+                return holdScheduledSendTransferForRepair(
+                    session: session,
+                    sessionID: sessionID,
+                    record: record,
+                    message: "The recovery record for this session is not available yet."
+                )
+            }
+        }
+        guard let workspace = scheduledSendPersistenceWorkspace(for: session),
+              let persistenceState = await ensurePersistenceState(for: session, sessionID: sessionID, workspace: workspace)
+        else {
+            return holdScheduledSendTransferForRepair(
+                session: session,
+                sessionID: sessionID,
+                record: record,
+                message: "The scheduled message's session is not available yet."
+            )
+        }
+        guard scheduledSendTransferOwnerIsCurrent(session, sessionID: sessionID, record: record) else { return .notApplicable }
+        let outcome = await dataService.repairScheduledSendTransfer(
+            sessionID: sessionID,
+            for: workspace,
+            persistenceStamp: persistenceState.stamp,
+            expectedRecord: record
+        )
+        switch outcome {
+        case .notApplicable:
+            // The durable schedule moved (or the session is gone): adopt disk; the hold applies
+            // only while this exact attempt is projected.
+            await resyncScheduledSendFromDisk(session: session)
+            if session.pendingScheduledSendRecord?.attempt?.attemptID != record.attempt?.attemptID {
+                releaseScheduledSendTransferHold(record: record)
+            }
+            return .notApplicable
+        case .normalized:
+            releaseScheduledSendTransferHold(record: record)
+            await adoptRepairedScheduledSend(session: session, sessionID: sessionID)
+            return .normalized
+        case .cancelled:
+            // R10: a committed cancellation was finished; the pending schedule is gone.
+            releaseScheduledSendTransferHold(record: record)
+            await adoptRepairedScheduledSend(session: session, sessionID: sessionID)
+            return .notApplicable
+        case let .completed(receipt):
+            releaseScheduledSendTransferHold(record: record)
+            await adoptRepairedScheduledSend(session: session, sessionID: sessionID)
+            if session.activeAgentSessionID == sessionID,
+               let itemID = receipt.queueLink?.userItemID ?? record.attempt?.itemID
+            {
+                stampScheduledSendProvenance(receipt, onItemID: itemID, in: session)
+            }
+            return .completed(receipt)
+        case let .held(message):
+            // Evidence this process is still expected to write (its own provider handoff, intent
+            // still `dispatching`) keeps waiting; anything else is unresolved until explicit action.
+            var awaitsOwnEvidence = false
+            if scheduledSendCoordinator?.transferHold(scheduleID: record.id)?.reason == .awaitingProviderEvidence,
+               let lane = session.recoveryLane,
+               case let .success(recoveryRecord) = await lane.readRecord()
+            {
+                awaitsOwnEvidence = AgentScheduledSendTransfer.linkedIntentDeliveryState(
+                    record: record,
+                    recoveryRecord: recoveryRecord
+                ) == .dispatching
+            }
+            holdScheduledSendTransfer(
+                sessionID: sessionID,
+                record: record,
+                reason: awaitsOwnEvidence ? .awaitingProviderEvidence : .unresolved(message)
+            )
+            syncComposerUIState(tabID: session.tabID)
+            return .held(message)
+        }
+    }
+
+    private func holdScheduledSendTransferForRepair(
+        session: AgentTabSession,
+        sessionID: UUID,
+        record: AgentScheduledSendPersist,
+        message: String
+    ) -> ScheduledSendTransferRepairOutcome {
+        holdScheduledSendTransfer(sessionID: sessionID, record: record, reason: .unresolved(message))
+        syncComposerUIState(tabID: session.tabID)
+        return .held(message)
+    }
+
+    /// R10 "Cancel pending schedule" for this owner's held transfer: the DataService commits the
+    /// cancellation decision on the linked intent and then clears that exact schedule (no receipt).
+    /// Only after that clear succeeds is the hold released and the held-transfer restriction lifted.
+    /// The linked input stays visible with its own (uncertain) delivery evidence; nothing is resent.
+    /// Returns a user-facing failure, or `nil` on success.
+    func cancelHeldScheduledSendTransfer(session: AgentTabSession, sessionID: UUID) async -> String? {
+        guard let record = session.pendingScheduledSendRecord, record.state == .dispatching,
+              scheduledSendTransferOwnerIsCurrent(session, sessionID: sessionID, record: record)
+        else { return "The scheduled message's status changed. Review it again." }
+        guard let workspace = scheduledSendPersistenceWorkspace(for: session),
+              let persistenceState = await ensurePersistenceState(for: session, sessionID: sessionID, workspace: workspace)
+        else { return "The scheduled message's session is not available yet." }
+        guard scheduledSendTransferOwnerIsCurrent(session, sessionID: sessionID, record: record) else {
+            return "The scheduled message's status changed. Review it again."
+        }
+        switch await dataService.cancelScheduledSendTransfer(
+            sessionID: sessionID,
+            for: workspace,
+            persistenceStamp: persistenceState.stamp,
+            expectedRecord: record
+        ) {
+        case .cancelled:
+            releaseScheduledSendTransferHold(record: record)
+            await adoptRepairedScheduledSend(session: session, sessionID: sessionID)
+            syncComposerUIState(tabID: session.tabID)
+            return nil
+        case let .held(message):
+            return message
+        case .notApplicable, .normalized, .completed:
+            await resyncScheduledSendFromDisk(session: session)
+            return "The scheduled message's status changed. Review it again."
+        }
+    }
+
+    /// Adopts a committed R9 repair (resync re-validates the owner) and lifts the session's
+    /// startup held-transfer restriction.
+    private func adoptRepairedScheduledSend(session: AgentTabSession, sessionID: UUID) async {
+        await resyncScheduledSendFromDisk(session: session)
+        recoveryCoordinator?.noteScheduleTransferResolved(sessionID: sessionID)
+    }
+
+    /// R9 step 3: one CAS writes the schedule receipt and clears the pending schedule. Attachment
+    /// files are never released here: ownership moves with the recovery intent, and cleanup is
+    /// owned by the shared attachment-ownership check. Returns `true` when the transfer committed.
+    @discardableResult
+    private func completeScheduledSendTransfer(
+        session: AgentTabSession,
+        sessionID: UUID,
+        record: AgentScheduledSendPersist,
+        receipt: AgentScheduledSendProvenance
+    ) async -> Bool {
+        let outcome = await commitScheduledSendDetailed(
+            session: session,
+            member: nil,
+            expectedUpdatedAt: record.updatedAt,
+            completedDispatch: receipt
+        )
+        switch outcome {
+        case .committed:
+            if session.activeAgentSessionID == sessionID {
+                if session.pendingScheduledSendRecord == record {
+                    session.scheduledSend = nil
+                    session.scheduledSendWorkspaceID = nil
+                }
+                session.lastScheduledDispatch = receipt
+                if let itemID = receipt.queueLink?.userItemID ?? record.attempt?.itemID {
+                    stampScheduledSendProvenance(receipt, onItemID: itemID, in: session)
+                }
+            }
+            releaseScheduledSendTransferHold(record: record)
+            updateLocalSessionIndexScheduledSendSummary(for: session)
+            syncComposerUIState(tabID: session.tabID)
+            notifyScheduledSendRecordChanged()
+            return true
+        case .destinationDeleted:
+            releaseScheduledSendTransferHold(record: record)
+            return false
+        case .conflict:
+            // Disk moved (resynced): the hold applies only while this exact attempt is projected.
+            if session.pendingScheduledSendRecord?.attempt?.attemptID != record.attempt?.attemptID {
+                releaseScheduledSendTransferHold(record: record)
+            } else {
+                holdScheduledSendTransfer(
+                    sessionID: sessionID,
+                    record: record,
+                    reason: .unresolved("The scheduled message changed while its transfer was being saved.")
+                )
+            }
+            return false
+        case .unavailable:
+            holdScheduledSendTransfer(
+                sessionID: sessionID,
+                record: record,
+                reason: .unresolved("The scheduled message's transfer could not be saved yet.")
+            )
+            return false
+        case let .failed(message):
+            holdScheduledSendTransfer(
+                sessionID: sessionID,
+                record: record,
+                reason: .unresolved("The scheduled message's transfer could not be saved: \(message)")
+            )
+            return false
         }
     }
 
@@ -1463,6 +2206,23 @@ extension AgentModeViewModel {
         let outcome: CodexAgentModeCoordinator.NativeSendOutcome?
         /// The appended user item exactly as prepared (pre-marker), retained as the accepted snapshot.
         let userItem: AgentChatItem?
+        /// F1: a non-Codex start whose `nil` outcome means a runner owns the input and owes its
+        /// handoff's settlement (`AgentModeRunService.startRun`). Codex keeps its own `nil` meaning.
+        /// Every start computes it the same way (`selectedAgent != .codexExec`, captured before the
+        /// start's await); results that never started a run pass `false`.
+        let runnerOwnsInputOnNil: Bool
+    }
+
+    /// F1: before a runner may own the scheduled intent, its owner marks it awaited, so the
+    /// runner's no-handoff settlement is kept for the hold (`finishMandatoryScheduledDispatch`
+    /// clears the mark on every exit that is not that hold).
+    private func noteScheduledRunStartAwaited(
+        _ identity: AgentQueuedInputIdentity?,
+        in session: AgentTabSession,
+        runnerOwnsInputOnNil: Bool
+    ) {
+        guard runnerOwnsInputOnNil, let intentID = identity?.intentID else { return }
+        session.recoveryLane?.noteDeferredRunStartHandoffAwaitedByOwner(intentID: intentID)
     }
 
     private func submitScheduledUserTurn(
@@ -1470,12 +2230,14 @@ extension AgentModeViewModel {
         session: AgentTabSession,
         record: AgentScheduledSendPersist,
         attempt: AgentScheduledSendPersist.Attempt,
+        recoveryIdentity: AgentQueuedInputIdentity?,
         providerHandoffAuthorization: @escaping @MainActor () -> Bool
     ) async -> ScheduledSubmitResult {
         guard !session.runState.isActive, session.remoteHost == nil else {
             return ScheduledSubmitResult(
                 outcome: .stale(reason: "The session became busy before the scheduled message could start."),
-                userItem: nil
+                userItem: nil,
+                runnerOwnsInputOnNil: false
             )
         }
         let trimmedText = record.rawText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1487,7 +2249,9 @@ extension AgentModeViewModel {
             taggedFilesToSend: record.taggedFileAttachments,
             activeWorkflow: record.workflow,
             nativePreparedTurn: nil,
-            inputSource: .scheduled(record: record, attempt: attempt)
+            inputSource: .scheduled(record: record, attempt: attempt),
+            preassignedUserItemID: nil,
+            admittedInterviewFirst: nil
         )
         let wrappedText = prepared.wrappedText
 
@@ -1496,21 +2260,35 @@ extension AgentModeViewModel {
             guard providerHandoffAuthorization() else {
                 return ScheduledSubmitResult(
                     outcome: .stale(reason: AgentModeRunService.providerHandoffRevokedReason),
-                    userItem: prepared.userItem
+                    userItem: prepared.userItem,
+                    runnerOwnsInputOnNil: false
                 )
             }
+            let runnerOwnsInputOnNil = session.selectedAgent != .codexExec
+            noteScheduledRunStartAwaited(recoveryIdentity, in: session, runnerOwnsInputOnNil: runnerOwnsInputOnNil)
             let outcome = await scheduledDispatchRunStarter(tabID, wrappedText, record.attachments, record.taggedFileAttachments)
-            return ScheduledSubmitResult(outcome: outcome, userItem: prepared.userItem)
+            return ScheduledSubmitResult(outcome: outcome, userItem: prepared.userItem, runnerOwnsInputOnNil: runnerOwnsInputOnNil)
         }
         if session.selectedAgent == .codexExec {
+            // Mandatory recovery carries the linked intent's durable identity (queue ID == intent ID);
+            // untracked identities exist only while recovery is inactive and fail closed otherwise.
+            guard let identity = recoveryIdentity
+                ?? AgentQueuedInputIdentity.untracked(userItemID: prepared.userItem.id, in: session)
+            else {
+                return ScheduledSubmitResult(
+                    outcome: .stale(reason: Self.durableQueueAdmissionRequiredMessage),
+                    userItem: prepared.userItem,
+                    runnerOwnsInputOnNil: false
+                )
+            }
             let dispatchTicket = session.codexDispatchSerialGate.issueTicket()
             let fallbackContext = AgentTabSession.CodexFallbackSubmissionContext(
-                queueID: UUID(),
+                queueID: identity.intentID ?? UUID(),
                 providerText: wrappedText,
                 images: record.attachments,
                 taggedFileAttachments: record.taggedFileAttachments,
                 draftText: trimmedText,
-                optimisticUserItemID: prepared.userItem.id,
+                identity: identity,
                 origin: .manual,
                 dispatchTicket: dispatchTicket
             )
@@ -1519,24 +2297,39 @@ extension AgentModeViewModel {
                 initialMessage: wrappedText,
                 attachments: record.attachments,
                 taggedFileAttachments: record.taggedFileAttachments,
+                // Codex carries its identity in the fallback context.
+                inputConstituents: nil,
                 codexFallbackContext: fallbackContext,
                 providerHandoffAuthorization: providerHandoffAuthorization
             )
-            return ScheduledSubmitResult(outcome: outcome, userItem: prepared.userItem)
+            return ScheduledSubmitResult(outcome: outcome, userItem: prepared.userItem, runnerOwnsInputOnNil: false)
+        }
+        // The linked intent's durable identity (mandatory recovery), or untracked while inactive.
+        guard let identity = recoveryIdentity
+            ?? AgentQueuedInputIdentity.untracked(userItemID: prepared.userItem.id, in: session)
+        else {
+            return ScheduledSubmitResult(
+                outcome: .stale(reason: Self.durableQueueAdmissionRequiredMessage),
+                userItem: prepared.userItem,
+                runnerOwnsInputOnNil: false
+            )
         }
         _ = enqueueUserTurnTokenEstimate(
             wrappedText: wrappedText,
             attachments: record.attachments,
             session: session
         )
+        let runnerOwnsInputOnNil = session.selectedAgent != .codexExec
+        noteScheduledRunStartAwaited(identity, in: session, runnerOwnsInputOnNil: runnerOwnsInputOnNil)
         let outcome = await startAgentRun(
             tabID: tabID,
             initialMessage: wrappedText,
             attachments: record.attachments,
             taggedFileAttachments: record.taggedFileAttachments,
+            inputConstituents: [identity],
             providerHandoffAuthorization: providerHandoffAuthorization
         )
-        return ScheduledSubmitResult(outcome: outcome, userItem: prepared.userItem)
+        return ScheduledSubmitResult(outcome: outcome, userItem: prepared.userItem, runnerOwnsInputOnNil: runnerOwnsInputOnNil)
     }
 
     /// Releases a persisted `.dispatching` attempt that never reached the provider: the record
@@ -1563,9 +2356,14 @@ extension AgentModeViewModel {
     }
 
     /// Undoes the run-preparation side effects of a handoff that was revoked before any provider
-    /// work: staged handoff payload injection and the enqueued non-Codex token estimate.
+    /// work: staged handoff payload injection and the enqueued non-Codex token estimate. An
+    /// identity-scoped stage (or a delivery/recovery hold) is never touched here: the start tail
+    /// settles exactly the stage its own text carried, and a hold outlives a revoked attempt.
     private func rollBackRevokedHandoffPreparation(session: AgentTabSession) {
-        if session.pendingHandoff.isStagedForSend {
+        if session.pendingHandoff.isStagedForSend,
+           session.pendingHandoff.stage == nil,
+           session.pendingHandoff.deliveryHold == nil
+        {
             session.pendingHandoff.isStagedForSend = false
         }
         if session.selectedAgent != .codexExec {
@@ -1586,14 +2384,16 @@ extension AgentModeViewModel {
         session.replaceItem(at: index, with: item)
     }
 
+    /// Returns whether the failure is durable (or there is nothing left to mark: deleted session).
+    @discardableResult
     private func markScheduledSendFailed(
         session: AgentTabSession,
         record: AgentScheduledSendPersist,
         message: String
-    ) async {
+    ) async -> Bool {
         // The durable session was explicitly deleted while this attempt was in flight: there is
         // nothing to mark and no file may be recreated.
-        guard session.scheduledSend != nil else { return }
+        guard session.scheduledSend != nil else { return true }
         var failed = record
         failed.state = .failed
         failed.lastFailureMessage = message
@@ -1602,9 +2402,10 @@ extension AgentModeViewModel {
         let expected = session.scheduledSendPersistedUpdatedAt
         session.scheduledSend = .v1(failed)
         session.isDirty = true
-        _ = await commitScheduledSend(session: session, member: .v1(failed), expectedUpdatedAt: expected)
+        let committed = await commitScheduledSend(session: session, member: .v1(failed), expectedUpdatedAt: expected)
         updateLocalSessionIndexScheduledSendSummary(for: session)
         syncComposerUIState(tabID: session.tabID)
+        return committed
     }
 
     // MARK: - Recovery projection (coordinator-owned persistence)
@@ -1704,7 +2505,12 @@ extension AgentModeViewModel {
         guard session.activeAgentSessionID == sessionID else { return }
         // Ownership of the deleted incarnation is revoked for good: no fresh stamp for this ID.
         session.persistenceState = nil
+        recoveryPersistenceStateDidChange(for: session)
         session.persistenceRevokedSessionID = sessionID
+        // A deleted destination has no transfer left to repair; its hold is released.
+        if let hold = scheduledSendCoordinator?.transferHold(sessionID: sessionID) {
+            scheduledSendCoordinator?.releaseTransferHold(scheduleID: hold.scheduleID, scheduleAttemptID: hold.scheduleAttemptID)
+        }
         guard session.scheduledSend != nil
             || session.scheduledSendPendingFinalization != nil
             || session.scheduledSendPersistedUpdatedAt != nil
@@ -1835,6 +2641,9 @@ extension AgentModeViewModel: AgentScheduledSendCoordinatorHost {
             || session.pendingMCPElicitationRequest != nil
             || session.mcpControlContext != nil
             || isMCPControlled(tabID: tabID)
+            // Two-stage shutdown froze this session: a due schedule waits (never fails) and is
+            // re-evaluated when a cancelled Stage A reopens admission.
+            || isRecoveryShutdownFrozen(session)
         return AgentScheduledSendBusyState(
             runID: session.runID,
             runState: session.runState,
@@ -1844,8 +2653,83 @@ extension AgentModeViewModel: AgentScheduledSendCoordinatorHost {
             hasPendingPermissionsRequest: session.pendingPermissionsRequest != nil,
             hasPendingInstructions: hasQueuedInstructions,
             cancellationIsSettling: cancellationIsSettling,
-            hasStartOrDispatchReservation: hasReservation
+            hasStartOrDispatchReservation: hasReservation,
+            hasUnresolvedRecovery: scheduledSendHasUnresolvedRecovery(session)
         )
+    }
+
+    /// R6 ownership keys of `session`: its durable session, each native conversation it knows (Codex
+    /// thread, Claude/ACP session) and its effective worktree; the session and worktree alone before
+    /// any conversation is known. The Codex thread field is Codex's by construction; the generic
+    /// provider session ID records no provider of its own (the selected agent may have changed
+    /// since), so it keeps an unknown provider, which overlaps every runtime (conservative).
+    /// Whether `session`'s effective worktree cannot be resolved (its lookup throws); a session with
+    /// no worktree at all is resolved. R6 automatic work treats an unresolved worktree as blocked.
+    func runtimeWorktreeIsUnresolved(for session: AgentTabSession) -> Bool {
+        do {
+            _ = try effectiveWorkspacePath(for: session)
+            return false
+        } catch {
+            return true
+        }
+    }
+
+    func runtimeOwnershipKeys(for session: AgentTabSession) -> [AgentRuntimeOwnershipKeys] {
+        let worktree = (try? effectiveWorkspacePath(for: session)) ?? nil
+        let sessionID = session.activeAgentSessionID
+        func trimmed(_ value: String?) -> String? {
+            guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else { return nil }
+            return value
+        }
+        var conversations: [(id: String, provider: AgentRuntimeProvider?)] = []
+        if let codexThread = trimmed(session.codexConversationID) {
+            conversations.append((codexThread, .codex))
+        }
+        if let providerSession = trimmed(session.providerSessionID) {
+            conversations.append((providerSession, nil))
+        }
+        guard !conversations.isEmpty else {
+            return [AgentRuntimeOwnershipKeys(sessionID: sessionID, conversationID: nil, worktreePath: worktree)]
+        }
+        return conversations.map {
+            AgentRuntimeOwnershipKeys(sessionID: sessionID, conversationID: $0.id, provider: $0.provider, worktreePath: worktree)
+        }
+    }
+
+    /// The single predicate behind `hasUnresolvedRecoverySession`, itemized so the schedule banner
+    /// can say what a new-session start waits for (lossless restart F2).
+    func scheduledSendRecoveryBlocker(
+        inWorkspace workspaceID: UUID,
+        excluding sessionID: UUID
+    ) -> AgentScheduledSendRecoveryBlocker? {
+        var blocker = AgentScheduledSendRecoveryBlocker()
+        if let recoveryCoordinator {
+            // App-scoped startup results cover closed sessions too (every window shares the coordinator).
+            let summary = recoveryCoordinator.unresolvedSessionSummary(inWorkspace: workspaceID, excluding: sessionID)
+            blocker.interruptedSessionIDs = summary.crashHeldSessionIDs
+            blocker.restrictedSessionIDs = summary.restrictedSessionIDs
+            blocker.workspaceRestriction = summary.workspaceRestriction
+            // Review A P1-01: an explicit recovery action held anywhere in this workspace (any window).
+            blocker.recoveryActionInProgress = recoveryCoordinator.hasRecoveryAction(inWorkspace: workspaceID, excluding: sessionID)
+        }
+        if persistenceWorkspace?.id == workspaceID {
+            // R6: a surviving runtime on this workspace's worktree keeps new-session starts paused.
+            blocker.runtimeOwnershipUnresolved = recoveryCoordinator?.runtimeBlocksAutomaticWork(
+                worktreePath: workspacePathProvider()
+            ) == true
+            // Same membership as the pre-F2 predicate: every other open tab counts, bound or not. An
+            // unbound tab cannot report unresolved recovery today, but would block unattributed.
+            for session in sessions.values
+                where session.activeAgentSessionID != sessionID && scheduledSendHasUnresolvedRecovery(session)
+            {
+                if let openSessionID = session.activeAgentSessionID {
+                    blocker.unresolvedOpenSessionIDs.insert(openSessionID)
+                } else {
+                    blocker.unattributed = true
+                }
+            }
+        }
+        return blocker.isBlocking ? blocker : nil
     }
 
     func hasBusySession(inWorkspace workspaceID: UUID, excluding sessionID: UUID) -> Bool {
@@ -1927,6 +2811,11 @@ extension AgentModeViewModel: AgentScheduledSendCoordinatorHost {
               session.activeAgentSessionID == request.sessionID,
               session.staleResetRecovery == nil
         else {
+            return .unavailable
+        }
+        // An unresolved R9 transfer is never rewritten into a confirmation (or anything else) by
+        // the scheduler; only the transfer repair decides it.
+        guard scheduledSendCoordinator?.transferHold(scheduleID: request.scheduleID) == nil else {
             return .unavailable
         }
         guard session.hasLoadedPersistedState else {
@@ -2019,6 +2908,15 @@ extension AgentModeViewModel: AgentScheduledSendCoordinatorHost {
             await markScheduledSendFailed(session: session, record: record, message: failureMessage)
             return .failedBeforeHandoff
         }
+        // Mandatory lossless-restart recovery: every dependency of durable admission and provider
+        // evidence must exist before an attempt is written; nothing falls back to legacy sending.
+        let recoveryMandatory = session.recoveryAdmissionMode == .mandatory
+        if recoveryMandatory,
+           let failureMessage = scheduledRecoveryAdmissionPreflightFailure(record: record, session: session)
+        {
+            await markScheduledSendFailed(session: session, record: record, message: failureMessage)
+            return .failedBeforeHandoff
+        }
 
         // At-most-once: persist the attempt before the optimistic item exists anywhere.
         let startedAt = Date()
@@ -2085,6 +2983,45 @@ extension AgentModeViewModel: AgentScheduledSendCoordinatorHost {
             attemptID: attempt.attemptID
         )
 
+        // R9 step 2 (mandatory recovery): the linked durable intent is committed `queued` before any
+        // handoff, so a fallback queue entry or a crash leaves exactly one durable owner.
+        var recoveryAdmission: (identity: AgentQueuedInputIdentity, lane: AgentRecoverySessionLane)?
+        if recoveryMandatory {
+            switch await admitScheduledRecoveryIntent(session: session, record: dispatching, attempt: attempt) {
+            case let .admitted(identity, lane):
+                recoveryAdmission = (identity, lane)
+            case let .notAdmitted(message):
+                await markScheduledSendFailed(session: session, record: dispatching, message: message)
+                notifyScheduledSendRecordChanged()
+                return .failedBeforeHandoff
+            case .committedButStale:
+                holdScheduledSendTransfer(
+                    sessionID: lease.sessionID,
+                    record: dispatching,
+                    reason: .unresolved("The session changed while this scheduled message was being saved.")
+                )
+                return .heldForRecovery
+            }
+            // Revalidate the exact owner and admission after the store await, before any handoff.
+            guard recoveryAdmission != nil,
+                  sessions[tabID] === session,
+                  session.activeAgentSessionID == lease.sessionID,
+                  session.pendingScheduledSendRecord == dispatching,
+                  coordinator.finalHandoffValidator(for: lease) == handoffValidator
+            else {
+                if let recoveryAdmission {
+                    return await rollBackScheduledRecoveryAdmission(
+                        recoveryAdmission,
+                        record: record,
+                        dispatching: dispatching,
+                        session: session,
+                        lease: lease
+                    )
+                }
+                return .failedBeforeHandoff
+            }
+        }
+
         // Re-drive of a failed attempt reuses the item id; drop any stale unsent bubble first.
         removeUnsentScheduledUserItem(id: attempt.itemID, from: session)
         // The captured coordinator (never a later `self.scheduledSendCoordinator` read) owns the
@@ -2094,11 +3031,31 @@ extension AgentModeViewModel: AgentScheduledSendCoordinatorHost {
             session: session,
             record: dispatching,
             attempt: attempt,
+            recoveryIdentity: recoveryAdmission?.identity,
             providerHandoffAuthorization: { [coordinator, handoffValidator, recoveryContext, attempt] in
                 coordinator.authorizeProviderHandoff(handoffValidator, context: recoveryContext, attempt: attempt)
             }
         )
         let outcome = submitResult.outcome
+
+        if let recoveryAdmission {
+            return await finishMandatoryScheduledDispatch(
+                ScheduledRecoveryDispatchContext(
+                    tabID: tabID,
+                    session: session,
+                    record: record,
+                    dispatching: dispatching,
+                    attempt: attempt,
+                    lease: lease,
+                    coordinator: coordinator,
+                    recoveryKey: recoveryKey,
+                    recoveryContext: recoveryContext,
+                    identity: recoveryAdmission.identity,
+                    lane: recoveryAdmission.lane
+                ),
+                submitResult: submitResult
+            )
+        }
 
         if Self.scheduledHandoffWasRevoked(outcome) {
             // The process-wide gate closed during run preparation: nothing reached the provider.
@@ -2109,79 +3066,469 @@ extension AgentModeViewModel: AgentScheduledSendCoordinatorHost {
             return .deferredBusy
         }
 
+        if case let .deliveryUnknown(message)? = outcome {
+            // Durable-input outcome (not expected while admission is inactive): fail closed by holding
+            // the attempt with its payload and bubble. Never a pre-handoff failure or a retry.
+            coordinator.reportProviderOutcomeNotAccepted(key: recoveryKey)
+            holdScheduledSendTransfer(
+                sessionID: lease.sessionID,
+                record: dispatching,
+                reason: .unresolved(message.isEmpty ? "Delivery of this scheduled message could not be confirmed." : message)
+            )
+            return .heldForRecovery
+        }
+
         if Self.scheduledProviderAccepted(outcome: outcome, agent: session.selectedAgent, runState: session.runState) {
+            // Recovery inactive: the legacy heuristic (`didSend` / launched run state) still drives
+            // finalization exactly as before, but it is not acceptance evidence, so its receipt
+            // records `legacyUnknown`. Mandatory recovery never takes this path.
             let receipt = AgentScheduledSendProvenance(
-                scheduleID: record.id,
+                scheduleID: dispatching.id,
                 attemptID: attempt.attemptID,
                 scheduledFor: dispatching.notBefore,
                 sentAt: Date()
             )
-            stampScheduledSendProvenance(receipt, onItemID: attempt.itemID, in: session)
-            // Immutable accepted snapshot: the exact prepared item, stamped with the receipt.
-            var acceptedItem = session.items.first(where: { $0.id == attempt.itemID && $0.kind == .user })
-                ?? submitResult.userItem
-                ?? AgentChatItem.user(
-                    Self.userBubbleText(
-                        trimmedText: dispatching.rawText.trimmingCharacters(in: .whitespacesAndNewlines),
-                        attachments: dispatching.attachments,
-                        taggedFiles: dispatching.taggedFileAttachments,
-                        workflow: dispatching.workflow
-                    ),
-                    id: attempt.itemID,
-                    attachments: dispatching.attachments,
-                    taggedFileAttachments: dispatching.taggedFileAttachments,
-                    workflow: dispatching.workflow
-                )
-            acceptedItem.scheduledSend = receipt
-            // Synchronous ownership transfer: the immutable payload and the single persistence
-            // worker belong to the process coordinator before any further suspension. Tab,
-            // workspace, registration, or cancellation state never gates this transfer.
-            coordinator.reportAcceptance(
-                key: recoveryKey,
-                payload: AgentScheduledSendAcceptedPayload(
-                    context: recoveryContext,
-                    attempt: attempt,
-                    receipt: receipt,
-                    acceptedItem: acceptedItem,
-                    expectedUpdatedAt: dispatching.updatedAt
-                )
+            return await adoptScheduledProviderAcceptance(
+                tabID: tabID,
+                session: session,
+                lease: lease,
+                coordinator: coordinator,
+                recoveryKey: recoveryKey,
+                recoveryContext: recoveryContext,
+                dispatching: dispatching,
+                attempt: attempt,
+                submitResult: submitResult,
+                receipt: receipt
             )
-            // Read the coordinator's current state after reporting: the attempt may already have
-            // settled (explicit deletion during the provider await) in which case no projection
-            // is installed and the file is adopted instead.
-            if let status = coordinator.recoveryStatus(sessionID: lease.sessionID), status.key == recoveryKey {
-                session.scheduledSendPendingFinalization = AgentScheduledSendPendingFinalization(
-                    key: recoveryKey,
-                    lease: lease,
-                    attempt: attempt,
-                    receipt: receipt,
-                    acceptedItem: acceptedItem,
-                    status: status.phase
-                )
-                syncComposerUIState(tabID: tabID)
-            } else {
-                await adoptSettledScheduledSendState(session: session, attempt: attempt, receipt: receipt)
-            }
-            // Durable commitment is reported by the coordinator; registration alone is not acceptance.
-            return .unknownAfterHandoff
         }
 
         coordinator.reportProviderOutcomeNotAccepted(key: recoveryKey)
-        let failureMessage: String = switch outcome {
+        let failureMessage = Self.scheduledNotAcceptedMessage(outcome)
+        removeUnsentScheduledUserItem(id: attempt.itemID, from: session)
+        await markScheduledSendFailed(session: session, record: dispatching, message: failureMessage)
+        notifyScheduledSendRecordChanged()
+        return .failedBeforeHandoff
+    }
+
+    private static func scheduledNotAcceptedMessage(_ outcome: CodexAgentModeCoordinator.NativeSendOutcome?) -> String {
+        switch outcome {
         case let .failed(message):
             message
         case let .stale(reason):
             reason
         case .cancelled:
             "The run was cancelled before the scheduled message was sent."
+        case let .deliveryUnknown(message):
+            message
         case .sent, .queuedFallback:
             "The scheduled message could not be sent."
         case nil:
             "The agent runtime changed before the scheduled message could be sent."
         }
-        removeUnsentScheduledUserItem(id: attempt.itemID, from: session)
-        await markScheduledSendFailed(session: session, record: dispatching, message: failureMessage)
-        notifyScheduledSendRecordChanged()
-        return .failedBeforeHandoff
+    }
+
+    /// Acceptance evidence for this exact attempt: the immutable payload and its persistence move
+    /// to the process coordinator synchronously (existing ownership-transfer contract).
+    private func adoptScheduledProviderAcceptance(
+        tabID: UUID,
+        session: AgentTabSession,
+        lease: AgentScheduledSendAdmissionLease,
+        coordinator: AgentScheduledSendCoordinator,
+        recoveryKey: AgentScheduledSendRecoveryKey,
+        recoveryContext: AgentScheduledSendRecoveryContext,
+        dispatching: AgentScheduledSendPersist,
+        attempt: AgentScheduledSendPersist.Attempt,
+        submitResult: ScheduledSubmitResult,
+        receipt: AgentScheduledSendProvenance
+    ) async -> ScheduledDispatchOutcome {
+        stampScheduledSendProvenance(receipt, onItemID: attempt.itemID, in: session)
+        // Immutable accepted snapshot: the exact prepared item, stamped with the receipt.
+        var acceptedItem = session.items.first(where: { $0.id == attempt.itemID && $0.kind == .user })
+            ?? submitResult.userItem
+            ?? AgentChatItem.user(
+                Self.userBubbleText(
+                    trimmedText: dispatching.rawText.trimmingCharacters(in: .whitespacesAndNewlines),
+                    attachments: dispatching.attachments,
+                    taggedFiles: dispatching.taggedFileAttachments,
+                    workflow: dispatching.workflow
+                ),
+                id: attempt.itemID,
+                attachments: dispatching.attachments,
+                taggedFileAttachments: dispatching.taggedFileAttachments,
+                workflow: dispatching.workflow
+            )
+        acceptedItem.scheduledSend = receipt
+        // Synchronous ownership transfer: the immutable payload and the single persistence
+        // worker belong to the process coordinator before any further suspension. Tab,
+        // workspace, registration, or cancellation state never gates this transfer.
+        coordinator.reportAcceptance(
+            key: recoveryKey,
+            payload: AgentScheduledSendAcceptedPayload(
+                context: recoveryContext,
+                attempt: attempt,
+                receipt: receipt,
+                acceptedItem: acceptedItem,
+                expectedUpdatedAt: dispatching.updatedAt
+            )
+        )
+        // Read the coordinator's current state after reporting: the attempt may already have
+        // settled (explicit deletion during the provider await) in which case no projection
+        // is installed and the file is adopted instead.
+        if let status = coordinator.recoveryStatus(sessionID: lease.sessionID), status.key == recoveryKey {
+            session.scheduledSendPendingFinalization = AgentScheduledSendPendingFinalization(
+                key: recoveryKey,
+                lease: lease,
+                attempt: attempt,
+                receipt: receipt,
+                acceptedItem: acceptedItem,
+                status: status.phase
+            )
+            syncComposerUIState(tabID: tabID)
+        } else {
+            await adoptSettledScheduledSendState(session: session, attempt: attempt, receipt: receipt)
+        }
+        // Durable commitment is reported by the coordinator; registration alone is not acceptance.
+        return .unknownAfterHandoff
+    }
+
+    // MARK: Mandatory recovery dispatch (R2/R9)
+
+    /// Everything a mandatory-recovery scheduled dispatch carries past the provider await.
+    private struct ScheduledRecoveryDispatchContext {
+        let tabID: UUID
+        let session: AgentTabSession
+        /// Pre-attempt record (rollback target).
+        let record: AgentScheduledSendPersist
+        let dispatching: AgentScheduledSendPersist
+        let attempt: AgentScheduledSendPersist.Attempt
+        let lease: AgentScheduledSendAdmissionLease
+        let coordinator: AgentScheduledSendCoordinator
+        let recoveryKey: AgentScheduledSendRecoveryKey
+        let recoveryContext: AgentScheduledSendRecoveryContext
+        let identity: AgentQueuedInputIdentity
+        /// Lane that admitted the intent; its evidence reads stay valid after retirement.
+        let lane: AgentRecoverySessionLane
+    }
+
+    private enum ScheduledRecoveryAdmissionResult {
+        case admitted(AgentQueuedInputIdentity, AgentRecoverySessionLane)
+        /// Nothing durable was admitted; no handoff may happen.
+        case notAdmitted(String)
+        /// The intent was committed but its lane retired during the await (stale-target hold).
+        case committedButStale
+    }
+
+    /// Fails closed before any attempt is written when durable admission is unavailable. Every
+    /// provider route carries the linked identity to its boundary (Codex in its fallback context,
+    /// every other route as `startAgentRun(inputConstituents:)`), so no provider is refused here.
+    private func scheduledRecoveryAdmissionPreflightFailure(
+        record: AgentScheduledSendPersist,
+        session: AgentTabSession
+    ) -> String? {
+        guard recoveryCoordinator != nil,
+              let lane = session.recoveryLane,
+              !lane.isRetired,
+              lane.sessionID == session.activeAgentSessionID
+        else {
+            return "Scheduled sending is paused until this session's recovery record is available."
+        }
+        guard scheduledRecoveryContent(record, lane: lane) != nil else {
+            return "An attached image could not be saved for recovery, so the scheduled message was not sent."
+        }
+        return nil
+    }
+
+    /// Original scheduled input (raw text, managed images, tagged files, captured workflow,
+    /// interview choice). `nil` when an image is not in managed recovery storage.
+    private func scheduledRecoveryContent(
+        _ record: AgentScheduledSendPersist,
+        lane: AgentRecoverySessionLane
+    ) -> AgentRecoveryInputContent? {
+        var images: [AgentRecoveryImageReference] = []
+        for attachment in record.attachments {
+            guard let reference = lane.store.existingImageReference(for: attachment, sessionID: lane.sessionID) else {
+                return nil
+            }
+            images.append(reference)
+        }
+        return AgentRecoveryInputContent(
+            text: record.rawText,
+            images: images,
+            taggedFiles: record.taggedFileAttachments.map(AgentRecoveryTaggedFileReference.init),
+            workflow: record.workflow.map(AgentRecoveryWorkflowSnapshot.init),
+            interviewFirst: record.interviewFirst
+        )
+    }
+
+    /// Commits the linked `queued` intent (origin `.scheduled`, deterministic item, schedule
+    /// reference) and issues its queue receipt. Never reports queue success to the user.
+    private func admitScheduledRecoveryIntent(
+        session: AgentTabSession,
+        record: AgentScheduledSendPersist,
+        attempt: AgentScheduledSendPersist.Attempt
+    ) async -> ScheduledRecoveryAdmissionResult {
+        guard let lane = session.recoveryLane, !lane.isRetired,
+              let content = scheduledRecoveryContent(record, lane: lane)
+        else {
+            return .notAdmitted("Scheduled sending is paused until this session's recovery record is available.")
+        }
+        // The exact pending-handoff prefix this send prepends is committed with the intent, before
+        // any queue acknowledgement or handoff can clear it.
+        let pendingHandoff: AgentRecoveryPendingHandoffSnapshot?
+        switch await capturePendingHandoffForAdmission(session: session) {
+        case let .captured(snapshot):
+            pendingHandoff = snapshot
+        case let .blocked(message):
+            return .notAdmitted(message)
+        }
+        guard session.recoveryLane === lane, !lane.isRetired else {
+            return .notAdmitted("Scheduled sending is paused until this session's recovery record is available.")
+        }
+        let admission = AgentRecoveryAdmission(
+            binding: lane.binding,
+            userItemID: attempt.itemID,
+            origin: .scheduled,
+            target: .session,
+            original: content,
+            scheduleReference: AgentScheduledSendTransfer.recoveryScheduleReference(scheduleID: record.id, attempt: attempt),
+            pendingHandoff: pendingHandoff
+        )
+        switch await lane.admitQueued(admission) {
+        case let .success(admitted):
+            return .admitted(AgentQueuedInputIdentity(receipt: admitted.receipt), lane)
+        case let .failure(.refused(refusal)):
+            // F6: a refusal is not a save failure, and its raw case is never shown. `.notAdmitted`
+            // marks the schedule failed (final; nothing retries it), so no text promises a resume.
+            AgentRecoveryFailureDiagnostics.presentationFailure(
+                site: "scheduled_admission_refused_\(refusal.diagnosticName)",
+                failure: refusal
+            )
+            return .notAdmitted(Self.scheduledRecoveryAdmissionRefusalMessage(refusal))
+        case let .failure(.commitFailed(failure)):
+            AgentRecoveryFailureDiagnostics.presentationFailure(site: "scheduled_admission_commit_failed", failure: failure)
+            return .notAdmitted("The scheduled message could not be saved for recovery (\(Self.recoveryListDescription(of: failure))).")
+        case .failure(.staleAfterCommit), .failure(.dispatchStaleAfterCommit):
+            // `dispatchStaleAfterCommit` is dispatch-only; admission never reports it.
+            return .committedButStale
+        }
+    }
+
+    /// Withdraws this attempt's own never-dispatched intent, then rolls the schedule back to its
+    /// pre-attempt revision. If withdrawal cannot be proven, the attempt is held instead so the
+    /// input never has two owners.
+    private func rollBackScheduledRecoveryAdmission(
+        _ admission: (identity: AgentQueuedInputIdentity, lane: AgentRecoverySessionLane),
+        record: AgentScheduledSendPersist,
+        dispatching: AgentScheduledSendPersist,
+        session: AgentTabSession,
+        lease: AgentScheduledSendAdmissionLease
+    ) async -> ScheduledDispatchOutcome {
+        guard let intentID = admission.identity.intentID,
+              case .success = await admission.lane.withdraw(intentID: intentID)
+        else {
+            holdScheduledSendTransfer(
+                sessionID: lease.sessionID,
+                record: dispatching,
+                reason: .unresolved("This scheduled message's saved copy could not be released.")
+            )
+            return .heldForRecovery
+        }
+        await revertDispatchingAttempt(record: record, dispatching: dispatching, session: session, lease: lease)
+        return .deferredBusy
+    }
+
+    /// Maps the provider outcome to durable evidence only: a matching store-issued queue receipt
+    /// with the intent still `queued` (`savedInQueue`) or recorded affirmative acceptance
+    /// (`providerAccepted`). `didSend`, fallback reasons, and a launched run are never acceptance.
+    /// Ambiguity (`.deliveryUnknown`, an unconfirmed `.sent`, unreadable or conflicting evidence)
+    /// is held with the schedule, its payload, and the bubble kept: never a pre-handoff failure,
+    /// confirmation, or automatic retry.
+    private func finishMandatoryScheduledDispatch(
+        _ context: ScheduledRecoveryDispatchContext,
+        submitResult: ScheduledSubmitResult
+    ) async -> ScheduledDispatchOutcome {
+        let session = context.session
+        let outcome = submitResult.outcome
+        let coordinator = context.coordinator
+        guard let intentID = context.identity.intentID else {
+            coordinator.reportProviderOutcomeNotAccepted(key: context.recoveryKey)
+            holdScheduledSendTransfer(
+                sessionID: context.lease.sessionID,
+                record: context.dispatching,
+                reason: .unresolved("The scheduled message has no durable identity.")
+            )
+            return .heldForRecovery
+        }
+
+        if Self.scheduledHandoffWasRevoked(outcome) {
+            // The process-wide gate closed during run preparation: nothing reached the provider.
+            coordinator.reportProviderOutcomeNotAccepted(key: context.recoveryKey)
+            removeUnsentScheduledUserItem(id: context.attempt.itemID, from: session)
+            rollBackRevokedHandoffPreparation(session: session)
+            context.lane.clearDeferredRunStartHandoff(intentID: intentID)
+            return await rollBackScheduledRecoveryAdmission(
+                (context.identity, context.lane),
+                record: context.record,
+                dispatching: context.dispatching,
+                session: session,
+                lease: context.lease
+            )
+        }
+
+        if case let .deliveryUnknown(message)? = outcome {
+            // The handoff began but its result is not proven (or its evidence could not be written):
+            // the intent stays `dispatching`/`deliveryUnknown`. Keep the schedule, payload, and bubble.
+            coordinator.reportProviderOutcomeNotAccepted(key: context.recoveryKey)
+            context.lane.clearDeferredRunStartHandoff(intentID: intentID)
+            holdScheduledSendTransfer(
+                sessionID: context.lease.sessionID,
+                record: context.dispatching,
+                reason: .unresolved(message.isEmpty ? "Delivery of this scheduled message could not be confirmed." : message)
+            )
+            return .heldForRecovery
+        }
+
+        if outcome == nil, submitResult.runnerOwnsInputOnNil {
+            // F1: a runner owns this input and owes its handoff's settlement; the non-Codex dispatch
+            // commit is deferred to it, so the intent may still be `queued` here. Neither `nil` nor a
+            // record read proves non-delivery: hold the schedule, payload, intent, and bubble. The
+            // hold resolves only on the handoff's own settlement (committed evidence → the R9
+            // transfer after acceptance; a proven no-handoff of the still-queued intent → failed).
+            coordinator.reportProviderOutcomeNotAccepted(key: context.recoveryKey)
+            holdScheduledSendTransfer(
+                sessionID: context.lease.sessionID,
+                record: context.dispatching,
+                reason: .awaitingProviderEvidence
+            )
+            recheckScheduledSendTransferAwaitingEvidence(for: session)
+            return .heldForRecovery
+        }
+        // An explicit outcome: no runner owns this input, so no deferred settlement will be consumed.
+        context.lane.clearDeferredRunStartHandoff(intentID: intentID)
+
+        let queueReceiptMatches: Bool = if case .queuedFallback? = outcome {
+            outcome?.durableQueueReceipt?.intent.intentID == intentID
+        } else {
+            false
+        }
+        let recoveryRecord: AgentRecoveryRecordState
+        switch await context.lane.readRecord() {
+        case let .success(state):
+            recoveryRecord = state
+        case let .failure(failure):
+            AgentRecoveryFailureDiagnostics.presentationFailure(site: "scheduled_delivery_evidence_unreadable", failure: failure)
+            coordinator.reportProviderOutcomeNotAccepted(key: context.recoveryKey)
+            holdScheduledSendTransfer(
+                sessionID: context.lease.sessionID,
+                record: context.dispatching,
+                reason: .unresolved("Delivery evidence could not be read (\(Self.recoveryListDescription(of: failure))).")
+            )
+            return .heldForRecovery
+        }
+
+        // Our own intent never began a delivery attempt and no queue took it: verified no handoff.
+        let neverDispatched = AgentScheduledSendTransfer.intentNeverDispatched(intentID: intentID, in: recoveryRecord)
+        let outcomeIsNonDelivery = switch outcome {
+        case .failed?, .stale?, .cancelled?, nil:
+            true
+        case .sent?, .queuedFallback?, .deliveryUnknown?:
+            false
+        }
+        if neverDispatched, outcomeIsNonDelivery {
+            // An explicit pre-runner `.failed`/`.stale`/`.cancelled` (or Codex's `nil`): nothing was handed off.
+            coordinator.reportProviderOutcomeNotAccepted(key: context.recoveryKey)
+            removeUnsentScheduledUserItem(id: context.attempt.itemID, from: session)
+            guard case .success = await context.lane.withdraw(intentID: intentID) else {
+                holdScheduledSendTransfer(
+                    sessionID: context.lease.sessionID,
+                    record: context.dispatching,
+                    reason: .unresolved("This scheduled message's saved copy could not be released.")
+                )
+                return .heldForRecovery
+            }
+            await markScheduledSendFailed(
+                session: session,
+                record: context.dispatching,
+                message: Self.scheduledNotAcceptedMessage(outcome)
+            )
+            notifyScheduledSendRecordChanged()
+            return .failedBeforeHandoff
+        }
+        // A queue entry must be proven by its store receipt; a provider send must be proven by the
+        // intent's recorded evidence. Anything else (`.sent` with no attempt evidence, a fallback
+        // without a matching receipt) is held as uncertain.
+        if neverDispatched, !queueReceiptMatches {
+            coordinator.reportProviderOutcomeNotAccepted(key: context.recoveryKey)
+            holdScheduledSendTransfer(
+                sessionID: context.lease.sessionID,
+                record: context.dispatching,
+                reason: .unresolved("Delivery of this scheduled message could not be confirmed.")
+            )
+            return .heldForRecovery
+        }
+
+        switch AgentScheduledSendTransfer.resolve(record: context.dispatching, recoveryRecord: recoveryRecord, sentAt: Date()) {
+        case let .completeTransfer(receipt) where receipt.isProviderAccepted:
+            return await adoptScheduledProviderAcceptance(
+                tabID: context.tabID,
+                session: session,
+                lease: context.lease,
+                coordinator: coordinator,
+                recoveryKey: context.recoveryKey,
+                recoveryContext: context.recoveryContext,
+                dispatching: context.dispatching,
+                attempt: context.attempt,
+                submitResult: submitResult,
+                receipt: receipt
+            )
+        case let .completeTransfer(receipt):
+            // Saved input owned by the linked intent, which is durably `queued` (fallback queue, or
+            // settled back after a proven non-handoff). Never provider acceptance.
+            coordinator.reportProviderOutcomeNotAccepted(key: context.recoveryKey)
+            let committed = await completeScheduledSendTransfer(
+                session: session,
+                sessionID: context.lease.sessionID,
+                record: context.dispatching,
+                receipt: receipt
+            )
+            // A failed transfer commit is held by `completeScheduledSendTransfer`.
+            return committed ? .accepted : .heldForRecovery
+        case .noLinkedIntent, .rolledBack:
+            coordinator.reportProviderOutcomeNotAccepted(key: context.recoveryKey)
+            holdScheduledSendTransfer(
+                sessionID: context.lease.sessionID,
+                record: context.dispatching,
+                reason: .unresolved("The saved copy of this scheduled message is missing.")
+            )
+            return .heldForRecovery
+        case .cancelTransfer:
+            // A cancellation decision for this exact attempt: held until the repair finishes it.
+            coordinator.reportProviderOutcomeNotAccepted(key: context.recoveryKey)
+            holdScheduledSendTransfer(
+                sessionID: context.lease.sessionID,
+                record: context.dispatching,
+                reason: .unresolved("This scheduled message's pending schedule was cancelled.")
+            )
+            return .heldForRecovery
+        case let .hold(message):
+            // A still-`dispatching` intent is this process's own handoff whose affirmative evidence
+            // follows dispatch (non-Codex routes accept on the provider's response or turn
+            // completion): it waits for that evidence and is re-checked when the run settles.
+            // `deliveryUnknown`, `failed`, and withdrawn-after-attempt evidence are unresolved.
+            coordinator.reportProviderOutcomeNotAccepted(key: context.recoveryKey)
+            let awaitsEvidence = AgentScheduledSendTransfer.linkedIntentDeliveryState(
+                record: context.dispatching,
+                recoveryRecord: recoveryRecord
+            ) == .dispatching
+            holdScheduledSendTransfer(
+                sessionID: context.lease.sessionID,
+                record: context.dispatching,
+                reason: awaitsEvidence ? .awaitingProviderEvidence : .unresolved(message)
+            )
+            if awaitsEvidence {
+                recheckScheduledSendTransferAwaitingEvidence(for: session)
+            }
+            return .heldForRecovery
+        }
     }
 }

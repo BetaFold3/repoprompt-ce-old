@@ -117,7 +117,8 @@ final class AgentSessionCleanupOriginTests: XCTestCase {
                 MCPServerViewModel.RequestMetadata(
                     connectionID: nil,
                     clientName: "cleanup-origin-tests",
-                    windowID: window.windowID
+                    windowID: window.windowID,
+                    actorRoutedRunTab: nil
                 )
             },
             requireTargetWindow: { window },

@@ -1,6 +1,9 @@
 import RepoPromptAgentCore
 import RepoPromptUI
 import SwiftUI
+#if DEBUG
+    import OSLog
+#endif
 
 struct AgentModelSelectionHUDView: View {
     @ObservedObject var viewModel: AgentModelSelectionHUDViewModel
@@ -68,7 +71,14 @@ struct AgentModelSelectionHUDView: View {
                 hostingWindowReference.window = window
             }
         )
-        .onAppear(perform: assertQueryFocusEdge)
+        .onAppear {
+            traceFocus("appear")
+            assertQueryFocusEdge()
+        }
+        .onDisappear { traceFocus("disappear") }
+        .onChange(of: queryFocused) { _, _ in
+            traceFocus("focus-binding")
+        }
         .onChange(of: viewModel.focusAssertionEpoch) { _, _ in
             assertQueryFocusEdge()
         }
@@ -318,7 +328,25 @@ struct AgentModelSelectionHUDView: View {
         suppressHoverSelectionUntil = Date().addingTimeInterval(0.28)
     }
 
+    private func traceFocus(_ event: String) {
+        #if DEBUG
+            let hudTraceID = viewModel.debugTraceID
+            let modeName = viewModel.mode.rawValue
+            let epoch = viewModel.focusAssertionEpoch
+            let presented = viewModel.isPresented
+            let focusedMirror = queryFocused
+            let window = hostingWindowReference.window
+            let windowNumber = window?.windowNumber ?? -1
+            // Responder class only (never contents): tells the composer text view from the field editor.
+            let firstResponderClass = window?.firstResponder.map { String(String(describing: type(of: $0)).prefix(80)) } ?? "nil"
+            Logger(subsystem: "com.repoprompt.app", category: "hud-routing").debug(
+                "query event=\(event, privacy: .public) hud=\(hudTraceID, privacy: .public) mode=\(modeName, privacy: .public) epoch=\(epoch, privacy: .public) presented=\(presented, privacy: .public) focusedMirror=\(focusedMirror, privacy: .public) window=\(windowNumber, privacy: .public) firstResponder=\(firstResponderClass, privacy: .public)"
+            )
+        #endif
+    }
+
     private func assertQueryFocusEdge() {
+        traceFocus("assert-edge")
         var transaction = Transaction()
         transaction.disablesAnimations = true
         withTransaction(transaction) {
@@ -331,6 +359,7 @@ struct AgentModelSelectionHUDView: View {
                   viewModel.focusAssertionEpoch == epoch,
                   viewModel.phase != .committing
             else {
+                traceFocus("assert-edge-bailed")
                 return
             }
             var focusTransaction = Transaction()
@@ -338,6 +367,7 @@ struct AgentModelSelectionHUDView: View {
             withTransaction(focusTransaction) {
                 queryFocused = true
             }
+            traceFocus("assert-edge-ran")
         }
     }
 

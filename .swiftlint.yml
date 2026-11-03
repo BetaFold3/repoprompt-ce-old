@@ -94,5 +94,36 @@ custom_rules:
       - identifier
     message: "Use .hoverTooltip(...) instead of .help(...)."
     severity: error
+  no_generic_task_sleep_in_mcp_helper:
+    name: "Generic Task.sleep in MCP helper"
+    included:
+      - 'Packages/RepoPromptCore/Sources/RepoPromptMCPCore/.*\.swift$'
+    regex: '\.sleep\s*\(\s*(for|until)\s*:'
+    excluded_match_kinds:
+      - comment
+      - comment.mark
+      - comment.url
+      - doccomment
+      - doccomment.field
+      - string
+    message: "Use Task.sleep(nanoseconds:) in the MCP helper: the generic Task.sleep(for:) specialization aborts in swift_task_dealloc (swiftlang/swift#86204, Swift 6.3.x)."
+    severity: error
+  no_hardcoded_workspaces_store_path:
+    name: "Hardcoded Workspaces store path"
+    included:
+      - 'Sources/.*\.swift$'
+      - 'Packages/[^/]+/Sources/.*\.swift$'
+    excluded:
+      # The one owner of the store location (production, XCTest-isolated, and override roots).
+      - 'Sources/RepoPromptWorkspace/Persistence/WorkspaceStorageRoot\.swift$'
+    regex: '(appendingPathComponent\s*\(|appending\s*\(\s*(path|component)\s*:)\s*"Workspaces(/[^"\n]*)?"|"[^"\n]*/Workspaces(/[^"\n]*)?"'
+    excluded_match_kinds:
+      - comment
+      - comment.mark
+      - comment.url
+      - doccomment
+      - doccomment.field
+    message: "Resolve the Workspaces store through WorkspaceStorageRoot (or WorkspaceStoragePaths.defaultRoot); a hardcoded join bypasses XCTest isolation and writes into the live store."
+    severity: error
 
 reporter: "xcode"

@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentCore
 
 enum AppQuitRequestPhase: Equatable {
     case idle
@@ -17,6 +18,29 @@ struct AppQuitConfirmation: Equatable {
     let message: String
     let cancelButtonTitle: String
     let confirmButtonTitle: String
+}
+
+/// The reason of exactly one app termination request (review A P1-09). Restart safely arms it
+/// immediately before its own `NSApp.terminate`; the termination entry takes it once, first thing,
+/// whatever happens next (a quit confirmation the user cancels, a request that joins one already in
+/// progress, or R4 itself), and Restart safely disarms it again after `terminate` returns. A later
+/// ordinary Quit therefore never restarts.
+struct AppShutdownReasonLatch: Equatable {
+    private(set) var pending: AgentRecoveryShutdownReason = .appQuit
+
+    mutating func armSafeRestart() {
+        pending = .safeRestart
+    }
+
+    mutating func disarm() {
+        pending = .appQuit
+    }
+
+    /// The reason of the termination request that starts now; the latch is disarmed.
+    mutating func take() -> AgentRecoveryShutdownReason {
+        defer { pending = .appQuit }
+        return pending
+    }
 }
 
 enum AppQuitPolicy {

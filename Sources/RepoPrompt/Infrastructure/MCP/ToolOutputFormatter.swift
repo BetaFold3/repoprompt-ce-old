@@ -3569,6 +3569,7 @@ extension ToolOutputFormatter {
             || (codeStructure.omittedTotal ?? 0) > 0
             || (codeStructure.tokenBudgetOmittedCount ?? 0) > 0
             || codeStructure.tokenBudgetHit == true
+            || codeStructure.automaticCodemapIssues?.isEmpty == false
     }
 
     private static func selectedCodeStructureDiagnosticLines(
@@ -3599,6 +3600,14 @@ extension ToolOutputFormatter {
         }
         if codeStructure.tokenBudgetHit == true {
             lines.append("\(summaryPrefix)Token budget hit\(summarySuffix)")
+        }
+        if let automaticIssues = codeStructure.automaticCodemapIssues, !automaticIssues.isEmpty {
+            lines.append(
+                "\(summaryPrefix)Automatic codemaps unavailable\(summarySuffix): \(automaticIssues.count) root(s)"
+            )
+            for issue in automaticIssues {
+                lines.append("\(bulletIndent)- \(issue.message)")
+            }
         }
         return lines
     }
@@ -5498,6 +5507,7 @@ extension ToolOutputFormatter {
         formatAgentControlRun(
             args: args,
             value: value,
+            toolName: MCPWindowToolName.agentRun,
             title: "Agent run",
             operationFallback: "run",
             multiPollTitle: "Agent run · Poll (multiple)",
@@ -5509,6 +5519,7 @@ extension ToolOutputFormatter {
         formatAgentControlRun(
             args: args,
             value: value,
+            toolName: MCPWindowToolName.agentExplore,
             title: "Agent explore",
             operationFallback: "explore",
             multiPollTitle: "Agent explore · Poll (multiple)",
@@ -5520,6 +5531,7 @@ extension ToolOutputFormatter {
     private static func formatAgentControlRun(
         args: [String: Value],
         value: Value,
+        toolName: String,
         title: String,
         operationFallback: String,
         multiPollTitle: String,
@@ -5617,6 +5629,8 @@ extension ToolOutputFormatter {
                 lines.append("- Result: **timed out** (no session reached interesting state)")
             case "expired":
                 lines.append("- Result: **session expired**")
+            case "interrupted_by_steering":
+                lines.append("- Result: **wait interrupted by steering** (the wait ended early; this is not a session result)")
             default:
                 lines.append("- Result: `\(waitResult)`")
             }
@@ -5706,6 +5720,7 @@ extension ToolOutputFormatter {
                 lines.append("agent_explore does not support respond. Cancel this explore run or start a new explore run with clearer instructions.")
             }
         }
+        lines.append(contentsOf: steeringInterruptedWaitContinuationLines(object, toolName: toolName))
         // A structured ask_user question derives its prompt from its questions, so the full
         // question block replaces the prompt instead of repeating it.
         let structuredQuestionLines = interaction.map(structuredQuestionContentLines) ?? []
@@ -5941,6 +5956,78 @@ extension ToolOutputFormatter {
             ))
         }
         return [.text(lines.joined(separator: "\n"))]
+    }
+
+    /// Model-directed continuation after a parent steering wake ended a child wait early
+    /// (`wait.result == "interrupted_by_steering"`). Presentation only: the service's canonical
+    /// note is `agent_run`-specific and single-session, so this renders a tool-correct, explicit
+    /// `op=wait` target instead. Immediate rewait targets exclude snapshots that are already
+    /// terminal or awaiting input; multi-wait targets come from `pending_session_ids` (order
+    /// preserved, deduplicated), never from the top-level representative alone. When no eligible
+    /// target remains, only a ready-results hint (explicit `op=poll`) survives. Empty for every
+    /// other result.
+    private static func steeringInterruptedWaitContinuationLines(
+        _ object: [String: Value],
+        toolName: String
+    ) -> [String] {
+        guard let wait = object["wait"]?.objectValue,
+              wait["result"]?.stringValue == "interrupted_by_steering"
+        else { return [] }
+
+        func needsHandlingNow(_ snapshot: [String: Value]) -> Bool {
+            let status = snapshot["status"]?.stringValue ?? ""
+            return ["completed", "failed", "cancelled", "expired", "waiting_for_input"].contains(status)
+                || snapshot["interaction"]?.objectValue != nil
+        }
+
+        let doNotRestart = "Do not `start` a new session or `steer` just to resume waiting."
+        guard wait["mode"]?.stringValue == "any" else {
+            guard !needsHandlingNow(object),
+                  let sessionID = object["session_id"]?.stringValue, !sessionID.isEmpty
+            else { return [] }
+            return [
+                "",
+                "### Resume waiting",
+                "After answering the user, if you still need this session's result, call `\(toolName)` with `op=wait` and `session_id=\"\(sessionID)\"` to keep waiting on the same session. \(doNotRestart)"
+            ]
+        }
+
+        let snapshots = (object["snapshots"]?.arrayValue ?? []).compactMap(\.objectValue)
+        func sessionTarget(_ ids: [String]) -> String {
+            ids.count == 1
+                ? "`session_id=\"\(ids[0])\"`"
+                : "`session_ids=[\(ids.map { "\"\($0)\"" }.joined(separator: ", "))]`"
+        }
+
+        var readyIDs: [String] = []
+        var readyLabels: [String] = []
+        for snapshot in snapshots {
+            guard needsHandlingNow(snapshot), let id = snapshot["session_id"]?.stringValue, !id.isEmpty,
+                  !readyIDs.contains(id)
+            else { continue }
+            readyIDs.append(id)
+            let status = prettifiedAgentStatus(snapshot["status"]?.stringValue) ?? "Unknown"
+            readyLabels.append("`\(id)` (\(status))")
+        }
+        var seen = Set<String>()
+        let targets = (wait["pending_session_ids"]?.arrayValue ?? []).compactMap(\.stringValue).filter {
+            !$0.isEmpty && !readyIDs.contains($0) && seen.insert($0).inserted
+        }
+        let readyLine = readyIDs.isEmpty ? nil : [
+            "Handle \(targets.isEmpty ? "these" : "these first") (finished or needs input): \(readyLabels.joined(separator: ", ")).",
+            "If their results are not shown above, call `\(toolName)` with `op=poll` and \(sessionTarget(readyIDs))."
+        ].joined(separator: " ")
+
+        // With no eligible rewait target, keep only the readiness hint: no resume heading or op=wait.
+        guard !targets.isEmpty else {
+            return readyLine.map { ["", "### Ready results", $0] } ?? []
+        }
+        var lines = ["", "### Resume waiting"]
+        if let readyLine {
+            lines.append(readyLine)
+        }
+        lines.append("After answering the user, if you still need them, call `\(toolName)` with `op=wait` and \(sessionTarget(targets)) to resume waiting on the sessions reported pending. \(doNotRestart)")
+        return lines
     }
 
     private static func formattedWaitAnyNestedRecoveryLines(

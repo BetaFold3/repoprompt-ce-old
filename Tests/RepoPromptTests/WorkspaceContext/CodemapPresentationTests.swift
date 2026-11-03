@@ -792,13 +792,24 @@ final class CodemapPresentationTests: WorkspaceFileContextStoreCodemapSeamTestSu
         XCTAssertEqual(rendered.entry.logicalPath.displayPath, "Logical/Sources/Feature.swift")
         XCTAssertEqual(rendered.entry.tokenCount, TokenCalculationService.estimateTokens(for: rendered.entry.text))
         XCTAssertFalse(rendered.entry.text.contains(root.path))
-        let ticket = try XCTUnwrap(releasedTickets.values.last)
-        let demandRetainCount = await store.codemapArtifactDemandRetainCountForTesting(ticket)
+        // Receipt resources are released, but the ready seed stays warm as an idle record instead
+        // of running demand cleanup.
+        XCTAssertTrue(releasedTickets.values.isEmpty)
+        let rootEpoch = try await WorkspaceCodemapRootEpoch(
+            rootID: loaded.id,
+            rootLifetimeID: store.rootLifetimeIDForTesting(rootID: loaded.id)
+        )
+        let demandRetainCount = await store.codemapArtifactDemandRetainCountForTesting(
+            rootEpoch: rootEpoch,
+            fileID: file.id
+        )
         let presentationRetainCount = await store.codemapPresentationRetainCountForTesting(
-            rootEpoch: ticket.rootEpoch
+            rootEpoch: rootEpoch
         )
         XCTAssertEqual(demandRetainCount, 0)
         XCTAssertEqual(presentationRetainCount, 0)
+        let idleFileIDs = await store.codemapIdleReadyDemandFileIDsForTesting(rootEpoch: rootEpoch)
+        XCTAssertEqual(idleFileIDs, [file.id])
     }
 
     func testStructureWarmPublishedArtifactBypassesDemandFreezeGraphAndGitIdentity() async throws {

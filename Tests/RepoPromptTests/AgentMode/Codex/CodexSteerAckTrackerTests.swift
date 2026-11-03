@@ -7,7 +7,46 @@ import XCTest
 
 @MainActor
 final class CodexSteerAckTrackerTests: XCTestCase {
-    func testOverlappingAttemptsAuthorizeAndResolveIndependently() async {
+    /// A real store-issued queue receipt from a temporary recovery lane (no synthetic receipts).
+    private func storeIssuedQueueReceipt(
+        _ name: String
+    ) async throws -> (fixture: RecoveryLaneFixture, receipt: AgentRecoveryQueueReceipt) {
+        let fixture = try await RecoveryLaneFixture.make(name)
+        let identity = try await fixture.queuedIdentity(name)
+        return try (fixture, XCTUnwrap(identity.queueReceipt))
+    }
+
+    func testDurableQueueAcknowledgementRequiresStoreIssuedReceipt() async throws {
+        let (fixture, storeReceipt) = try await storeIssuedQueueReceipt("codex-ack-receipt")
+        defer { fixture.tearDown() }
+
+        let outcome = CodexAgentModeCoordinator.NativeSendOutcome.queuedFallback(
+            receipt: storeReceipt,
+            reason: .activeWithoutAuthoritativeIdentity
+        )
+        XCTAssertEqual(outcome.durableQueueReceipt, storeReceipt, "The queue ack is the store receipt itself")
+        XCTAssertEqual(outcome.fallbackQueueID, storeReceipt.intent.intentID, "The queue ID is the receipt's intent ID")
+        XCTAssertTrue(outcome.didSend)
+        let state = CodexSteerAckTracker.TerminalState.durablyQueued(receipt: storeReceipt)
+        XCTAssertEqual(state.queueID, storeReceipt.intent.intentID)
+        XCTAssertTrue(state.confirmsInstructionDeliveryOrDurableQueue)
+        for unreceipted: CodexAgentModeCoordinator.NativeSendOutcome in [
+            .sent,
+            .stale(reason: "changed"),
+            .cancelled,
+            .failed(message: "nope"),
+            .deliveryUnknown(message: "maybe")
+        ] {
+            XCTAssertNil(unreceipted.durableQueueReceipt, "\(unreceipted) carries no queue receipt")
+            XCTAssertNil(unreceipted.fallbackQueueID)
+        }
+        XCTAssertFalse(CodexAgentModeCoordinator.NativeSendOutcome.deliveryUnknown(message: "maybe").didSend)
+        XCTAssertNil(CodexSteerAckTracker.TerminalState.deliveryUnknown(message: "maybe").queueID)
+    }
+
+    func testOverlappingAttemptsAuthorizeAndResolveIndependently() async throws {
+        let (fixture, queueReceipt) = try await storeIssuedQueueReceipt("codex-ack-overlap")
+        defer { fixture.tearDown() }
         let tracker = CodexSteerAckTracker()
         let first = tracker.beginAttempt()
         let second = tracker.beginAttempt()
@@ -20,7 +59,7 @@ final class CodexSteerAckTrackerTests: XCTestCase {
         XCTAssertTrue(secondAuthorized)
         XCTAssertFalse(firstDispatch.isCancelled)
 
-        tracker.resolve(attemptID: second, state: .durablyQueued(queueID: UUID()))
+        tracker.resolve(attemptID: second, state: .durablyQueued(receipt: queueReceipt))
         tracker.authorizeDispatch(attemptID: first)
         tracker.resolve(attemptID: first, state: .steerAccepted)
 
@@ -99,6 +138,119 @@ final class CodexSteerAckTrackerTests: XCTestCase {
         XCTAssertEqual(survivingState, .startAccepted)
     }
 
+    func testProductionAcknowledgementDeadlineDefaultsToTwoAndAHalfSeconds() {
+        XCTAssertEqual(CodexSteerAckTracker.defaultTimeoutSeconds, 2.5)
+        XCTAssertEqual(CodexSteerAckTracker().test_terminalStateTimeoutSeconds, 2.5)
+    }
+
+    func testDeadlineBeforeOperationStartTimesOutAndPreventsSubmission() async {
+        let tracker = CodexSteerAckTracker()
+        tracker.test_useManualDeadlines()
+        let attemptID = tracker.beginAttempt()
+        let wait = Task { await tracker.awaitTerminalState(attemptID: attemptID) }
+        await Task.yield()
+
+        tracker.test_fireDeadline(attemptID: attemptID)
+        let state = await wait.value
+        XCTAssertEqual(state, .timedOut)
+        XCTAssertFalse(tracker.markOperationStarted(attemptID: attemptID), "An expired attempt submits nothing")
+        XCTAssertEqual(
+            state.failureDescriptionForMCP,
+            "Codex did not start this instruction before the acknowledgement deadline; it was not submitted."
+        )
+    }
+
+    func testDeadlineAfterOperationStartIsUncertaintyAndKeepsDispatchAuthorization() async {
+        let tracker = CodexSteerAckTracker()
+        tracker.test_useManualDeadlines()
+        let attemptID = tracker.beginAttempt()
+        XCTAssertTrue(tracker.markOperationStarted(attemptID: attemptID))
+        let wait = Task { await tracker.awaitTerminalState(attemptID: attemptID) }
+        let dispatch = Task { await tracker.awaitDispatchAuthorization(attemptID: attemptID) }
+        await Task.yield()
+
+        tracker.test_fireDeadline(attemptID: attemptID)
+        let state = await wait.value
+        XCTAssertEqual(state, .deliveryUnknown(message: CodexSteerAckTracker.unconfirmedOutcomeMessage))
+        XCTAssertFalse(state.confirmsInstructionDeliveryOrDurableQueue)
+
+        // The admitted operation is not withdrawn by its acknowledgement deadline.
+        tracker.authorizeDispatch(attemptID: attemptID)
+        let authorized = await dispatch.value
+        XCTAssertTrue(authorized)
+        tracker.resolve(attemptID: attemptID, state: .steerAccepted)
+        let late = await tracker.awaitTerminalState(attemptID: attemptID)
+        XCTAssertEqual(late, state, "A late acceptance never changes the returned acknowledgement")
+    }
+
+    func testCancellationBeforeStartPreventsOperationAndAfterStartIsUncertainty() async {
+        let tracker = CodexSteerAckTracker()
+        tracker.test_useManualDeadlines()
+        let notStarted = tracker.beginAttempt()
+        tracker.cancel(attemptID: notStarted)
+        XCTAssertFalse(tracker.markOperationStarted(attemptID: notStarted), "Cancelled before start: zero submission")
+        let notStartedState = await tracker.awaitTerminalState(attemptID: notStarted)
+        XCTAssertEqual(notStartedState, .cancelled)
+
+        let started = tracker.beginAttempt()
+        XCTAssertTrue(tracker.markOperationStarted(attemptID: started))
+        let wait = Task { await tracker.awaitTerminalState(attemptID: started) }
+        await Task.yield()
+        wait.cancel()
+        let startedState = await wait.value
+        XCTAssertEqual(startedState, .deliveryUnknown(message: CodexSteerAckTracker.unconfirmedOutcomeMessage))
+        tracker.resolve(attemptID: started, state: .startAccepted)
+        let lateStarted = await tracker.awaitTerminalState(attemptID: started)
+        XCTAssertEqual(lateStarted, startedState)
+    }
+
+    func testSettledSuccessIsNeverDowngradedByCancellationOrDeadline() async throws {
+        let (fixture, queueReceipt) = try await storeIssuedQueueReceipt("codex-ack-no-downgrade")
+        defer { fixture.tearDown() }
+        let tracker = CodexSteerAckTracker()
+        tracker.test_useManualDeadlines()
+
+        let accepted = tracker.beginAttempt()
+        XCTAssertTrue(tracker.markOperationStarted(attemptID: accepted))
+        tracker.resolve(attemptID: accepted, state: .steerAccepted)
+        tracker.cancel(attemptID: accepted)
+        tracker.test_fireDeadline(attemptID: accepted)
+        let acceptedState = await tracker.awaitTerminalState(attemptID: accepted)
+        XCTAssertEqual(acceptedState, .steerAccepted)
+
+        // A caller-cancellation flag raised before the producer's result (its main-actor settlement
+        // still pending) does not overwrite that result.
+        let queued = tracker.beginAttempt()
+        XCTAssertTrue(tracker.markOperationStarted(attemptID: queued))
+        let wait = Task { await tracker.awaitTerminalState(attemptID: queued) }
+        await Task.yield()
+        wait.cancel()
+        tracker.resolve(attemptID: queued, state: .durablyQueued(receipt: queueReceipt))
+        let queuedState = await wait.value
+        XCTAssertEqual(queuedState, .durablyQueued(receipt: queueReceipt))
+        await Task.yield()
+        let settledQueued = await tracker.awaitTerminalState(attemptID: queued)
+        XCTAssertEqual(settledQueued, .durablyQueued(receipt: queueReceipt))
+    }
+
+    func testLateResultForSettledAttemptCannotResolveANewerAttempt() async {
+        let tracker = CodexSteerAckTracker()
+        tracker.test_useManualDeadlines()
+        let older = tracker.beginAttempt()
+        XCTAssertTrue(tracker.markOperationStarted(attemptID: older))
+        tracker.test_fireDeadline(attemptID: older)
+        let newer = tracker.beginAttempt()
+        XCTAssertTrue(tracker.markOperationStarted(attemptID: newer))
+
+        tracker.resolve(attemptID: older, state: .steerAccepted)
+        XCTAssertTrue(tracker.test_openAttemptIDs.contains(newer), "The newer attempt stays open")
+        tracker.resolve(attemptID: newer, state: .startAccepted)
+        let olderState = await tracker.awaitTerminalState(attemptID: older)
+        let newerState = await tracker.awaitTerminalState(attemptID: newer)
+        XCTAssertEqual(olderState, .deliveryUnknown(message: CodexSteerAckTracker.unconfirmedOutcomeMessage))
+        XCTAssertEqual(newerState, .startAccepted)
+    }
+
     func testCancellingMCPDispatchTombstonesItsAttemptBeforeLateProviderAcceptance() async throws {
         let gate = AckTrackerSteerGate()
         let controller = AckTrackerCodexController(gate: gate)
@@ -150,25 +302,28 @@ final class CodexSteerAckTrackerTests: XCTestCase {
             "Expected cancellation to tombstone the MCP dispatch attempt."
         )
         await gate.release()
+        // Deliberate contract (bounded-ack policy): the steer was already handed to Codex, so caller
+        // cancellation returns non-retryable uncertainty rather than a cancelled (resendable) result.
         do {
             _ = try await dispatch.value
-            XCTFail("Expected MCP dispatch cancellation")
-        } catch is CancellationError {
-            // Expected.
+            XCTFail("Expected MCP dispatch cancellation to report an unconfirmed outcome")
         } catch {
-            XCTAssertTrue(String(describing: error).contains("cancelled"), String(describing: error))
+            XCTAssertTrue(
+                String(describing: error).contains(CodexSteerAckTracker.unconfirmedOutcomeMessage),
+                String(describing: error)
+            )
         }
         let cancelledState = await session.codexSteerAckTracker.awaitTerminalState(
             attemptID: attemptID
         )
-        XCTAssertEqual(cancelledState, .cancelled)
+        XCTAssertEqual(cancelledState, .deliveryUnknown(message: CodexSteerAckTracker.unconfirmedOutcomeMessage))
 
         let providerCompleted = await gate.waitUntilCompleted()
         XCTAssertTrue(providerCompleted)
         let lateState = await session.codexSteerAckTracker.awaitTerminalState(
             attemptID: attemptID
         )
-        XCTAssertEqual(lateState, .cancelled)
+        XCTAssertEqual(lateState, cancelledState, "The late provider acceptance never rewrites the result")
     }
 
     func testActiveMCPWaiterIsNotInterruptedBeforeCodexProviderAck() async throws {
@@ -331,12 +486,24 @@ final class CodexSteerAckTrackerTests: XCTestCase {
         assertDidNotReleaseAsSteering(disposition, sessionID: sessionID)
     }
 
-    func testTerminalStateClassifiesConfirmedDeliveryAndFailureDescriptions() {
-        let queueID = UUID()
+    func testTerminalStateClassifiesConfirmedDeliveryAndFailureDescriptions() async throws {
+        let (fixture, queueReceipt) = try await storeIssuedQueueReceipt("codex-ack-classify")
+        defer { fixture.tearDown() }
+        let queueID = queueReceipt.intent.intentID
+        XCTAssertEqual(CodexSteerAckTracker.TerminalState.durablyQueued(receipt: queueReceipt).queueID, queueID)
+        XCTAssertFalse(
+            CodexSteerAckTracker.TerminalState.deliveryUnknown(message: "maybe").confirmsInstructionDeliveryOrDurableQueue,
+            "Uncertain delivery is neither accepted nor queued"
+        )
+        XCTAssertEqual(
+            CodexSteerAckTracker.TerminalState.deliveryUnknown(message: "maybe").failureDescriptionForMCP,
+            "maybe"
+        )
+        XCTAssertNotNil(CodexSteerAckTracker.TerminalState.deliveryUnknown(message: "").failureDescriptionForMCP)
         XCTAssertTrue(CodexSteerAckTracker.TerminalState.steerAccepted.confirmsInstructionDeliveryOrDurableQueue)
         XCTAssertTrue(CodexSteerAckTracker.TerminalState.startAccepted.confirmsInstructionDeliveryOrDurableQueue)
         XCTAssertTrue(CodexSteerAckTracker.TerminalState.controlAccepted.confirmsInstructionDeliveryOrDurableQueue)
-        XCTAssertTrue(CodexSteerAckTracker.TerminalState.durablyQueued(queueID: queueID).confirmsInstructionDeliveryOrDurableQueue)
+        XCTAssertTrue(CodexSteerAckTracker.TerminalState.durablyQueued(receipt: queueReceipt).confirmsInstructionDeliveryOrDurableQueue)
         XCTAssertFalse(CodexSteerAckTracker.TerminalState.failed(message: "nope").confirmsInstructionDeliveryOrDurableQueue)
         XCTAssertFalse(CodexSteerAckTracker.TerminalState.cancelled.confirmsInstructionDeliveryOrDurableQueue)
         XCTAssertFalse(CodexSteerAckTracker.TerminalState.stale(reason: "changed").confirmsInstructionDeliveryOrDurableQueue)

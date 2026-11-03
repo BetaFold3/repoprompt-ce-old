@@ -193,12 +193,16 @@ package final class AgentModeProviderBindingService {
                 guard let sessionModeID = runtime.acpSessionModeID,
                       session.runState.isActive,
                       let controller = session.acpController else { continue }
+                // R6 owner capture: this permission change belongs to the run active now.
+                let runtimeOwner = session.runtimeSessionScope
                 Task { @MainActor in
                     let providerName = session.selectedAgent.displayName
                     if AgentRuntimeProviderService.enableDebugLogging { print("[ACP-Runner] tab=\(session.tabID) applying \(providerName) session mode=\(sessionModeID)") }
                     do {
                         await controller.setAutoApproveAllToolPermissions(runtime.autoApproveAllACPToolPermissions)
-                        try await controller.setSessionMode(sessionModeID)
+                        try await AgentRuntimeOperationOwner.$session.withValue(runtimeOwner) {
+                            try await controller.setSessionMode(sessionModeID)
+                        }
                         if runtime.acceptsPendingACPApprovalWhenActivated, let pendingApproval = session.pendingApproval {
                             await controller.respondToPermissionRequest(id: pendingApproval.requestID.displayValue, decision: .acceptForSession)
                         }

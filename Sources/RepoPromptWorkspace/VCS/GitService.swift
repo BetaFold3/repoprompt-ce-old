@@ -6940,6 +6940,112 @@ package actor GitService {
             }
     }
 
+    private static let gitIndexEntriesDigestDomain = Data("codemap-index-entries-v1\0".utf8)
+
+    /// Digest of every index entry the codemap pipeline reads: hex SHA-256 of a domain prefix plus the
+    /// raw `ls-files --stage -v -z` output for the whole index (mode, object ID, stage, path, and the
+    /// assume-unchanged/skip-worktree tag per entry). Stat data, extensions, and the index checksum are
+    /// not in that output, so a metadata-only index rewrite keeps the digest. Same command and
+    /// admission settings as `gitBlobIndexEntries`, without a pathspec.
+    /// Returns `nil` when stdout exceeds `maximumOutputByteCount`. Throws on a non-zero exit or output
+    /// that fails `validateIndexEntriesOutput`; the digest covers the original raw bytes.
+    func gitIndexEntriesDigest(
+        at repositoryRoot: URL,
+        objectFormat: GitObjectFormat,
+        maximumOutputByteCount: Int
+    ) async throws -> String? {
+        let stdout: Data
+        let stderr: Data
+        let exitCode: Int32
+        do {
+            (stdout, stderr, exitCode) = try await runGitData(
+                ["ls-files", "--stage", "-v", "-z"],
+                at: repositoryRoot,
+                env: ["GIT_LITERAL_PATHSPECS": "1"],
+                stdoutByteLimit: maximumOutputByteCount,
+                admissionPriority: .codemapDemand,
+                commandFamily: .codemapAuthority
+            )
+        } catch GitProcessCaptureError.stdoutByteLimitExceeded {
+            return nil
+        }
+        guard exitCode == 0 else {
+            throw GitError(
+                message: "git ls-files for index entries failed: \(String(decoding: stderr, as: UTF8.self))"
+            )
+        }
+        try Self.validateIndexEntriesOutput(stdout, objectFormat: objectFormat)
+        var digestInput = Self.gitIndexEntriesDigestDomain
+        digestInput.append(stdout)
+        return Self.sha256Hex(digestInput)
+    }
+
+    /// Structural check of full-index `ls-files --stage -v -z` output, byte by byte without copying:
+    /// every record is `<tag letter> <octal mode> <hex object ID of the format's length> <stage 0-3>\t
+    /// <non-empty path>\0`. Empty output (an empty index) is valid. Stricter than the inline parser
+    /// in `gitBlobIndexEntries` (octal mode, object-ID length and hex), which is left unchanged.
+    nonisolated static func validateIndexEntriesOutput(
+        _ output: Data,
+        objectFormat: GitObjectFormat
+    ) throws {
+        guard !output.isEmpty else { return }
+        guard output.last == 0 else {
+            throw GitBlobIdentityError.malformedGitOutput("unterminated ls-files record")
+        }
+        let space = UInt8(ascii: " ")
+        let tab = UInt8(ascii: "\t")
+        let oidHexCount = objectFormat.oidHexCount
+        try output.withUnsafeBytes { (buffer: UnsafeRawBufferPointer) in
+            let end = buffer.count
+            var index = 0
+            func reject(_ reason: String) -> GitBlobIdentityError {
+                .malformedGitOutput("invalid ls-files index record: \(reason)")
+            }
+            while index < end {
+                let tag = buffer[index]
+                guard (UInt8(ascii: "A") ... UInt8(ascii: "Z")).contains(tag) ||
+                    (UInt8(ascii: "a") ... UInt8(ascii: "z")).contains(tag)
+                else { throw reject("tag") }
+                index += 1
+                guard index < end, buffer[index] == space else { throw reject("tag separator") }
+                index += 1
+                let modeStart = index
+                while index < end, (UInt8(ascii: "0") ... UInt8(ascii: "7")).contains(buffer[index]) {
+                    index += 1
+                }
+                guard index > modeStart, index < end, buffer[index] == space else { throw reject("mode") }
+                index += 1
+                let oidStart = index
+                while index < end, Self.isASCIIHexDigit(buffer[index]) {
+                    index += 1
+                }
+                guard index - oidStart == oidHexCount, index < end, buffer[index] == space else {
+                    throw reject("object ID")
+                }
+                index += 1
+                guard index < end, (UInt8(ascii: "0") ... UInt8(ascii: "3")).contains(buffer[index]) else {
+                    throw reject("stage")
+                }
+                index += 1
+                guard index < end, buffer[index] == tab else { throw reject("path separator") }
+                index += 1
+                let pathStart = index
+                while index < end, buffer[index] != 0 {
+                    index += 1
+                }
+                // The output ends with NUL, so `index < end` here; only an empty path is rejected.
+                guard index > pathStart else { throw reject("path") }
+                index += 1
+            }
+        }
+    }
+
+    private nonisolated static func isASCIIHexDigit(_ byte: UInt8) -> Bool {
+        (UInt8(ascii: "0") ... UInt8(ascii: "9")).contains(byte) ||
+            (UInt8(ascii: "a") ... UInt8(ascii: "f")).contains(byte) ||
+            (UInt8(ascii: "A") ... UInt8(ascii: "F")).contains(byte)
+    }
+
     func gitBlobStatusRecords(
         at repositoryRoot: URL,
         repositoryRelativePaths: [String]

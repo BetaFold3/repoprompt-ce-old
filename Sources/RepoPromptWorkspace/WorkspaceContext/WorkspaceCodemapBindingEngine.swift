@@ -276,6 +276,23 @@ actor WorkspaceCodemapBindingEngine {
         case budget(WorkspaceCodemapProjectionBudget)
     }
 
+    /// The exact single-issuance inputs a batch-prefetched source authority was issued for. A
+    /// candidate uses the prefetched issuance only while these still equal its current inputs.
+    private struct ProjectionSourceAuthorityInputs: Equatable {
+        let sessionID: UUID
+        let capability: GitCodemapRootCapability
+        let repositoryAuthority: WorkspaceCodemapRepositoryAuthorityToken
+        let repositoryRelativePath: String
+        let pathGeneration: UInt64
+        let observedIngressGeneration: UInt64
+        let currentIngressGeneration: UInt64
+    }
+
+    private struct ProjectionPrefetchedSourceAuthority {
+        let inputs: ProjectionSourceAuthorityInputs
+        let issuance: WorkspaceCodemapSourceAuthorityIssuance
+    }
+
     private enum ProjectionBatchResult {
         case checkpointed
         case complete
@@ -378,6 +395,8 @@ actor WorkspaceCodemapBindingEngine {
     private let sourceReader: WorkspaceCodemapValidatedSourceReaderClient
     private let catalogClient: WorkspaceCodemapBindingCatalogClient
     private let overlay: WorkspaceCodemapLiveOverlay
+    /// The artifact-store lease admission this engine's completions draw on.
+    nonisolated let artifactLeaseAdmissionIdentity: ObjectIdentifier
     private let policy: WorkspaceCodemapBindingEnginePolicy
     private let hooks: WorkspaceCodemapBindingEngineHooks
     private let uptimeNanoseconds: @Sendable () -> UInt64
@@ -385,7 +404,27 @@ actor WorkspaceCodemapBindingEngine {
     private var roots: [WorkspaceCodemapRootEpoch: RootRecord] = [:]
     private var activeRequests: [UUID: ActiveRequest] = [:]
     private var drainingRequestTasks: [UUID: Task<Void, Never>] = [:]
+    #if DEBUG
+        /// Runs inside an admitted request, after its artifact resolves and before the overlay
+        /// accepts it, so tests can hold admitted work deterministically.
+        private var beforeResolutionPublicationHookForTesting: (@Sendable (
+            WorkspaceCodemapRootEpoch,
+            String
+        ) async -> Void)?
+    #endif
     private var queuedRequests: [UUID: QueuedRequest] = [:]
+    /// Lease or byte capacity refusal of a ready completion (artifact-store lease admission or
+    /// overlay acceptance), by public owner, until the owner's caller takes it. `demand(_:)` cannot carry it without widening its result type.
+    private var completionCapacityBusyByOwner: [WorkspaceCodemapLiveDemandOwner: WorkspaceCodemapCompletionCapacityBusy] = [:]
+    /// Owners whose admitted-aware release found nothing outstanding, by root. The owner's next
+    /// `demand(_:)` is rejected as cancelled instead of registering: it is a submission that lost
+    /// the race with the release and would otherwise run with no holder. Consumed by that
+    /// rejection; cleared by `cancel(owner:)`, `clearReleasedOwnerFence(_:)`, root unload, and
+    /// shutdown.
+    private var releasedOwnerFences: [WorkspaceCodemapLiveDemandOwner: WorkspaceCodemapRootEpoch] = [:]
+    #if DEBUG
+        private var releasedOwnerFenceRejectionCount = 0
+    #endif
     private var queueOrder: [UUID] = []
     private var nextQueueOrdinal: UInt64 = 1
     private var nextAdmissionOrdinal: UInt64 = 1
@@ -477,6 +516,7 @@ actor WorkspaceCodemapBindingEngine {
         self.sourceReader = sourceReader
         self.catalogClient = catalogClient
         self.overlay = overlay
+        artifactLeaseAdmissionIdentity = runtime.artifactStore.leaseAdmissionIdentity
         self.policy = policy
         self.hooks = hooks
         nextQueueOrdinal = max(1, initialQueueOrdinal)
@@ -845,6 +885,13 @@ actor WorkspaceCodemapBindingEngine {
     }
 
     func demand(_ demand: WorkspaceCodemapBindingDemand) async -> WorkspaceCodemapBindingDemandResult {
+        completionCapacityBusyByOwner.removeValue(forKey: demand.owner)
+        if releasedOwnerFences.removeValue(forKey: demand.owner) != nil {
+            #if DEBUG
+                releasedOwnerFenceRejectionCount += 1
+            #endif
+            return .cancelled
+        }
         let requestID = UUID()
         let cancellation = DemandCancellationState()
         return await withTaskCancellationHandler {
@@ -967,8 +1014,18 @@ actor WorkspaceCodemapBindingEngine {
         ))
     }
 
+    /// Takes the lease or byte capacity refusal behind the owner's last non-ready demand result:
+    /// `.busy` from overlay acceptance, or `.unavailable(.transient)` from store lease admission.
+    func takeCompletionCapacityBusy(
+        owner: WorkspaceCodemapLiveDemandOwner
+    ) -> WorkspaceCodemapCompletionCapacityBusy? {
+        completionCapacityBusyByOwner.removeValue(forKey: owner)
+    }
+
     @discardableResult
     func cancel(owner: WorkspaceCodemapLiveDemandOwner) async -> Int {
+        completionCapacityBusyByOwner.removeValue(forKey: owner)
+        releasedOwnerFences.removeValue(forKey: owner)
         let requestIDs = queuedRequests.values
             .filter { $0.demand.owner == owner }
             .map(\.id) + activeRequests.values.filter { $0.publicOwner == owner }.map(\.id)
@@ -976,6 +1033,48 @@ actor WorkspaceCodemapBindingEngine {
         await cancelOverlayAssociations(cancellationBatch.overlayCancellations)
         recordCancellationTelemetry(cancellationBatch.cancelledRequestCount)
         return cancellationBatch.cancelledRequestCount
+    }
+
+    /// Releases an owner's demand without discarding admitted work. In one actor turn: queued
+    /// requests are cancelled (they hold no overlay demand, so nothing advances the contribution
+    /// generation) and an admitted request is left running to completion. Explicit cancellation
+    /// keeps using `cancel(owner:)`.
+    ///
+    /// With nothing outstanding the owner is fenced: its demand either already finished or has
+    /// not registered yet, and a later registration must not run unheld. The fence rejects the
+    /// owner's next `demand(_:)`; a finished result is unaffected.
+    func releaseOwnerKeepingAdmitted(
+        _ owner: WorkspaceCodemapLiveDemandOwner,
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) async -> WorkspaceCodemapOwnerReleaseDisposition {
+        let queuedRequestIDs = queuedRequests.values
+            .filter { $0.demand.owner == owner }
+            .map(\.id)
+        let hasAdmittedRequest = activeRequests.values.contains {
+            $0.publicOwner == owner && !$0.cancelled
+        }
+        guard !queuedRequestIDs.isEmpty || hasAdmittedRequest else {
+            releasedOwnerFences[owner] = rootEpoch
+            return .nothingOutstanding
+        }
+        let cancellationBatch = synchronouslyCancelRequests(queuedRequestIDs)
+        recordCancellationTelemetry(cancellationBatch.cancelledRequestCount)
+        let disposition: WorkspaceCodemapOwnerReleaseDisposition
+        if hasAdmittedRequest {
+            disposition = .admittedContinues
+        } else {
+            completionCapacityBusyByOwner.removeValue(forKey: owner)
+            disposition = .cancelledQueued
+        }
+        // Queued requests never reached overlay admission; this is empty in practice and runs
+        // after the decision above, so it cannot change it.
+        await cancelOverlayAssociations(cancellationBatch.overlayCancellations)
+        return disposition
+    }
+
+    /// Drops the owner's release fence once its holder knows no further submission will come.
+    func clearReleasedOwnerFence(_ owner: WorkspaceCodemapLiveDemandOwner) {
+        releasedOwnerFences.removeValue(forKey: owner)
     }
 
     @discardableResult
@@ -1033,6 +1132,7 @@ actor WorkspaceCodemapBindingEngine {
 
     func unloadRoot(rootEpoch: WorkspaceCodemapRootEpoch) async {
         revokeProjectionDemands(rootEpoch: rootEpoch, status: .cancelled)
+        releasedOwnerFences = releasedOwnerFences.filter { $0.value != rootEpoch }
         #if DEBUG
             debugCapabilityResolutionsByRootEpoch.removeValue(forKey: rootEpoch)
             debugRepositoryAuthorityChangesByRootEpoch.removeValue(forKey: rootEpoch)
@@ -1087,6 +1187,7 @@ actor WorkspaceCodemapBindingEngine {
         }
 
         isShuttingDown = true
+        releasedOwnerFences.removeAll()
         #if DEBUG
             for hold in debugProjectionAdmissionHolds.values {
                 hold.expiryTask.cancel()
@@ -1192,6 +1293,40 @@ actor WorkspaceCodemapBindingEngine {
             requestGeneration: requestGeneration
         )
     }
+
+    #if DEBUG
+        @discardableResult
+        func evictOverlayEntryForCapacityForTesting(rootEpoch: WorkspaceCodemapRootEpoch) async -> Bool {
+            await overlay.evictEntryForCapacityForTesting(rootEpoch: rootEpoch)
+        }
+
+        func setOverlayPolicyForTesting(_ policy: WorkspaceCodemapLiveOverlayPolicy) async {
+            await overlay.setPolicyForTesting(policy)
+        }
+
+        func overlayAccountingForTesting() async -> WorkspaceCodemapLiveOverlayAccounting {
+            await overlay.accounting()
+        }
+
+        func overlayDemandEventCountsForTesting() async -> WorkspaceCodemapLiveOverlayDemandEventCounts {
+            await overlay.demandEventCountsForTesting()
+        }
+
+        /// Demands rejected by a release fence, and fences still standing.
+        func releasedOwnerFenceCountsForTesting() -> (rejections: Int, standing: Int) {
+            (releasedOwnerFenceRejectionCount, releasedOwnerFences.count)
+        }
+
+        func setBeforeResolutionPublicationHookForTesting(
+            _ hook: (@Sendable (WorkspaceCodemapRootEpoch, String) async -> Void)?
+        ) {
+            beforeResolutionPublicationHookForTesting = hook
+        }
+
+        func setArtifactStoreActiveLeaseCountLimitForTesting(_ maximumCount: Int?) async {
+            await runtime.artifactStore.setActiveLeaseCountLimitForTesting(maximumCount)
+        }
+    #endif
 
     @discardableResult
     func revokeReadyArtifact(
@@ -1318,6 +1453,27 @@ actor WorkspaceCodemapBindingEngine {
         return true
     }
 
+    /// Identity of the current session's retained superseded projection job, if one fences the root.
+    func retainedSupersededProjectionJobID(rootEpoch: WorkspaceCodemapRootEpoch) -> UUID? {
+        retainedSupersededProjectionJob(rootEpoch: rootEpoch)?.id
+    }
+
+    /// A superseded job retained with no worker for the current, non-latched session.
+    /// `scheduleProjectionPreload` refuses it and no restart path revives it; only root
+    /// invalidation or unload removes it. Authority-latched sessions keep their own repair path.
+    private func retainedSupersededProjectionJob(
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) -> ProjectionPreloadJob? {
+        guard case let .eligible(session)? = roots[rootEpoch],
+              session.projectionAuthorityFailure == nil,
+              let job = projectionJobs[rootEpoch],
+              job.phase == .superseded,
+              job.task == nil,
+              job.sessionID == session.id
+        else { return nil }
+        return job
+    }
+
     func waitForCurrentProjectionCoverage(
         rootEpoch: WorkspaceCodemapRootEpoch
     ) async -> Bool {
@@ -1378,6 +1534,10 @@ actor WorkspaceCodemapBindingEngine {
                 retry: preload.retry
             ) {
                 return provisional
+            }
+            // A retained dead fence is terminal for this session, not pending work.
+            if retainedSupersededProjectionJob(rootEpoch: request.rootEpoch)?.id == preload.id {
+                return .unavailable(.projectionSuperseded)
             }
             if preload.phase == .suspendedBusy {
                 return .busy(
@@ -1882,6 +2042,48 @@ actor WorkspaceCodemapBindingEngine {
                 debugCapabilityResolutionsByRootEpoch[rootEpoch] ?? 0,
                 debugRepositoryAuthorityChangesByRootEpoch[rootEpoch] ?? 0
             )
+        }
+
+        /// Installs the retained-superseded fence (no worker, no proof) for the current session when
+        /// the root has no projection job. Store-level tests use it where the real catalog cannot
+        /// deterministically supersede; the engine-level regression drives the real stale path.
+        func debugInstallRetainedSupersededProjectionJobForTesting(
+            rootEpoch: WorkspaceCodemapRootEpoch
+        ) -> UUID? {
+            guard case let .eligible(session)? = roots[rootEpoch],
+                  session.projectionAuthorityFailure == nil,
+                  projectionJobs[rootEpoch] == nil
+            else { return nil }
+            let jobID = UUID()
+            projectionJobs[rootEpoch] = ProjectionPreloadJob(
+                id: jobID,
+                rootEpoch: rootEpoch,
+                sessionID: session.id,
+                sessionGeneration: session.generation,
+                invalidationGeneration: session.invalidationGeneration,
+                repositoryAuthority: session.capability.repositoryAuthority,
+                catalogGeneration: session.registration.catalogGeneration,
+                ingressGeneration: session.registration.ingressGeneration,
+                phase: .superseded,
+                generation: nil,
+                cursor: nil,
+                lastProcessedCursor: nil,
+                progress: projectionProgress(.notStarted, phase: .superseded),
+                nextSegmentSequence: 0,
+                pipelineScopes: [:],
+                resources: .zero,
+                pendingManifestMutationCount: 0,
+                retryAttempt: 0,
+                retry: nil,
+                budget: nil,
+                checkpoint: nil,
+                coverageProof: nil,
+                coverageCompletedUptimeNanoseconds: nil,
+                task: nil,
+                isQueuedForAdmission: false,
+                isActiveBatch: false
+            )
+            return jobID
         }
 
         func debugProjectionContributionObservation(
@@ -2688,6 +2890,13 @@ actor WorkspaceCodemapBindingEngine {
             guard updateProjectionPhase(jobID: jobID, rootEpoch: rootEpoch, phase: .resolvingArtifacts) else {
                 return .cancelled
             }
+            let prefetchedSourceAuthorities = await prefetchProjectionSourceAuthorities(
+                jobID: jobID,
+                rootEpoch: rootEpoch,
+                misses: misses,
+                pipelineByFileID: pipelineByFileID,
+                classificationsByPath: classificationsByPath
+            )
             for candidate in misses {
                 guard let pipelineIdentity = pipelineByFileID[candidate.identity.fileID],
                       let classification = classificationsByPath[
@@ -2699,7 +2908,8 @@ actor WorkspaceCodemapBindingEngine {
                     rootEpoch: rootEpoch,
                     candidate: candidate,
                     pipelineIdentity: pipelineIdentity,
-                    classification: classification
+                    classification: classification,
+                    prefetchedSourceAuthority: prefetchedSourceAuthorities[candidate.identity.fileID]
                 )
                 guard currentProjectionJob(jobID: jobID, rootEpoch: rootEpoch) != nil else {
                     return .cancelled
@@ -3239,12 +3449,119 @@ actor WorkspaceCodemapBindingEngine {
         roots[rootEpoch] = .eligible(session)
     }
 
+    /// Issues source authority for every authority-requiring miss of one batch in shared
+    /// repository capture windows. Candidates the resolve guard would reject are skipped; each
+    /// result records the inputs it was issued for so resolution can detect a stale prefetch.
+    private func prefetchProjectionSourceAuthorities(
+        jobID: UUID,
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        misses: [WorkspaceCodemapProjectionCatalogCandidate],
+        pipelineByFileID: [UUID: CodeMapPipelineIdentity],
+        classificationsByPath: [String: GitBlobIdentityClassification]
+    ) async -> [UUID: ProjectionPrefetchedSourceAuthority] {
+        guard let job = currentProjectionJob(jobID: jobID, rootEpoch: rootEpoch),
+              case let .eligible(session)? = roots[rootEpoch],
+              session.id == job.sessionID
+        else { return [:] }
+        var fileIDs: [UUID] = []
+        var inputs: [ProjectionSourceAuthorityInputs] = []
+        for candidate in misses {
+            guard let pipelineIdentity = pipelineByFileID[candidate.identity.fileID],
+                  session.pipelines[pipelineIdentity] != nil,
+                  let classification = classificationsByPath[candidate.identity.standardizedRelativePath],
+                  let candidateInputs = projectionSourceAuthorityInputs(
+                      job: job,
+                      session: session,
+                      candidate: candidate,
+                      classification: classification
+                  )
+            else { continue }
+            switch classification.outcome {
+            case .oidEligible, .requiresValidatedWorktreeBytes:
+                fileIDs.append(candidate.identity.fileID)
+                inputs.append(candidateInputs)
+            case .securityExcluded, .unsupported, .unavailable:
+                continue
+            }
+        }
+        guard !inputs.isEmpty else { return [:] }
+        let issuances = await capabilityService.makeSourceAuthorities(
+            capability: session.capability,
+            observedRootEpoch: rootEpoch,
+            observedRepositoryAuthority: job.repositoryAuthority,
+            observedIngressGeneration: job.ingressGeneration,
+            currentIngressGeneration: session.registration.ingressGeneration,
+            requests: inputs.map {
+                WorkspaceCodemapSourceAuthorityRequest(
+                    candidateRepositoryRelativePath: $0.repositoryRelativePath,
+                    observedPathGeneration: $0.pathGeneration,
+                    currentPathGeneration: $0.pathGeneration
+                )
+            }
+        )
+        guard issuances.count == inputs.count else { return [:] }
+        var prefetched: [UUID: ProjectionPrefetchedSourceAuthority] = [:]
+        for index in inputs.indices {
+            prefetched[fileIDs[index]] = ProjectionPrefetchedSourceAuthority(
+                inputs: inputs[index],
+                issuance: issuances[index]
+            )
+        }
+        return prefetched
+    }
+
+    /// Whether a prefetched issuance is the outcome a fresh single issuance would also produce.
+    /// Issued tokens, root-wide authority changes, and candidate-local path rejections are final.
+    /// Every window-instability outcome is retried with a fresh single issuance, as before
+    /// batching: one shared `.gitattributes` edit marks every candidate in the window
+    /// attribute-unstable, and a fresh window either succeeds or latches the root-wide change.
+    /// Capture failures, an inactive capability, and cancellation are retried the same way.
+    private static func prefetchedSourceAuthorityIsFinal(
+        _ issuance: WorkspaceCodemapSourceAuthorityIssuance
+    ) -> Bool {
+        guard let failure = issuance.failure else { return true }
+        switch failure {
+        case .repositoryAuthorityChanged, .repositoryBindingChanged, .repositoryLayoutChanged,
+             .candidatePathRejected, .candidateNotRegularFile, .tokenInvalid:
+            return true
+        case .capabilityInactive, .unstableWindow(.repository), .unstableWindow(.capability),
+             .unstableWindow(.attributes), .unstableWindow(.pathFingerprint),
+             .captureFailed, .cancelled:
+            return false
+        }
+    }
+
+    private func projectionSourceAuthorityInputs(
+        job: ProjectionPreloadJob,
+        session: Session,
+        candidate: WorkspaceCodemapProjectionCatalogCandidate,
+        classification: GitBlobIdentityClassification
+    ) -> ProjectionSourceAuthorityInputs? {
+        guard classification.relativePath == candidate.identity.standardizedRelativePath,
+              let repositoryRelativePath = classification.repositoryRelativePath,
+              repositoryRelativePath == repositoryPath(
+                  loadedRootRelativePath: candidate.identity.standardizedRelativePath,
+                  prefix: session.capability.repositoryRelativeLoadedRootPrefix
+              )
+        else { return nil }
+        return ProjectionSourceAuthorityInputs(
+            sessionID: session.id,
+            capability: session.capability,
+            repositoryAuthority: job.repositoryAuthority,
+            repositoryRelativePath: repositoryRelativePath,
+            pathGeneration: candidate.pathGeneration,
+            observedIngressGeneration: job.ingressGeneration,
+            currentIngressGeneration: session.registration.ingressGeneration
+        )
+    }
+
     private func resolveProjectionCandidate(
         jobID: UUID,
         rootEpoch: WorkspaceCodemapRootEpoch,
         candidate: WorkspaceCodemapProjectionCatalogCandidate,
         pipelineIdentity: CodeMapPipelineIdentity,
-        classification: GitBlobIdentityClassification
+        classification: GitBlobIdentityClassification,
+        prefetchedSourceAuthority: ProjectionPrefetchedSourceAuthority? = nil
     ) async -> ProjectionCandidateResolution {
         guard let job = currentProjectionJob(jobID: jobID, rootEpoch: rootEpoch),
               case let .eligible(session)? = roots[rootEpoch],
@@ -3288,16 +3605,38 @@ actor WorkspaceCodemapBindingEngine {
             break
         }
 
-        let issuance = await capabilityService.makeSourceAuthority(
-            capability: session.capability,
-            observedRootEpoch: rootEpoch,
-            observedRepositoryAuthority: job.repositoryAuthority,
-            candidateRepositoryRelativePath: repositoryRelativePath,
-            observedPathGeneration: candidate.pathGeneration,
-            currentPathGeneration: candidate.pathGeneration,
-            observedIngressGeneration: job.ingressGeneration,
-            currentIngressGeneration: session.registration.ingressGeneration
-        )
+        guard let currentInputs = projectionSourceAuthorityInputs(
+            job: job,
+            session: session,
+            candidate: candidate,
+            classification: classification
+        ) else { return .transient }
+        // Defense in depth. The job is current here (checked above, no suspension since), which
+        // pins the session, ingress generation, and repository authority; a session's capability
+        // is immutable; and `pathGeneration` comes from the same candidate value. So prefetched
+        // inputs of a current job always equal the current inputs.
+        #if DEBUG
+            if let prefetchedSourceAuthority, prefetchedSourceAuthority.inputs != currentInputs {
+                assertionFailure("Prefetched source-authority inputs diverged while the projection job is current.")
+            }
+        #endif
+        let issuance = if let prefetchedSourceAuthority,
+                          prefetchedSourceAuthority.inputs == currentInputs,
+                          Self.prefetchedSourceAuthorityIsFinal(prefetchedSourceAuthority.issuance)
+        {
+            prefetchedSourceAuthority.issuance
+        } else {
+            await capabilityService.makeSourceAuthority(
+                capability: session.capability,
+                observedRootEpoch: rootEpoch,
+                observedRepositoryAuthority: job.repositoryAuthority,
+                candidateRepositoryRelativePath: repositoryRelativePath,
+                observedPathGeneration: candidate.pathGeneration,
+                currentPathGeneration: candidate.pathGeneration,
+                observedIngressGeneration: job.ingressGeneration,
+                currentIngressGeneration: session.registration.ingressGeneration
+            )
+        }
         guard !Task.isCancelled else { return .transient }
         if let failure = issuance.failure {
             // Fence before recording: a worker whose job or session was replaced during the
@@ -6197,6 +6536,14 @@ actor WorkspaceCodemapBindingEngine {
         isClean: Bool
     ) async throws -> WorkspaceCodemapBindingDemandResult {
         try Task.checkCancellation()
+        #if DEBUG
+            if let hook = beforeResolutionPublicationHookForTesting,
+               let gatedRequest = currentRequest(requestID)
+            {
+                await hook(gatedRequest.rootEpoch, gatedRequest.relativePath)
+                try Task.checkCancellation()
+            }
+        #endif
         guard let request = currentRequest(requestID) else { throw CancellationError() }
         if resolved.performedBuild {
             incrementCounter(\.builds)
@@ -6229,7 +6576,22 @@ actor WorkspaceCodemapBindingEngine {
             )
         }
         guard let completion else { return .rejected(.staleCompletion) }
-        let lease = try await runtime.coordinator.acquireLease(for: resolved.resolution)
+        let lease: CodeMapArtifactLease
+        do {
+            lease = try await runtime.coordinator.acquireLease(for: resolved.resolution)
+        } catch let CodeMapArtifactLeaseError.busy(limit)
+            where limit == .activeLeaseCountLimit || limit == .activeLeaseByteLimit
+        {
+            // The artifact store's process-wide active-lease budget is full. Every ready overlay
+            // entry holds one of these leases, so the caller may release an idle one and retry.
+            // The failure itself still surfaces as before.
+            completionCapacityBusyByOwner[request.publicOwner] = WorkspaceCodemapCompletionCapacityBusy(
+                reason: limit == .activeLeaseCountLimit ? .leaseLimit : .artifactByteLimit,
+                rootEpoch: request.rootEpoch,
+                scope: .artifactLeaseAdmission(artifactLeaseAdmissionIdentity)
+            )
+            throw CodeMapArtifactLeaseError.busy(limit)
+        }
         try Task.checkCancellation()
         guard currentRequest(requestID) != nil else {
             await lease.close()
@@ -6291,7 +6653,18 @@ actor WorkspaceCodemapBindingEngine {
             }
             guard currentRequest(requestID) != nil else { throw CancellationError() }
             return .unavailable(.terminalArtifact(outcome))
-        case .busy:
+        case let .busy(reason):
+            if reason == .leaseLimit || reason == .artifactByteLimit {
+                let isRootLimited = await overlay.completionCapacityIsRootLimited(
+                    rootEpoch: request.rootEpoch,
+                    candidateBytes: lease.handle.estimatedResidentByteCount
+                )
+                completionCapacityBusyByOwner[request.publicOwner] = WorkspaceCodemapCompletionCapacityBusy(
+                    reason: reason,
+                    rootEpoch: request.rootEpoch,
+                    scope: isRootLimited ? .overlayRoot : .overlayProcess
+                )
+            }
             await lease.close()
             recordBusy(request.rootEpoch)
             return .busy(retryAfterMilliseconds: nil)
@@ -6336,6 +6709,9 @@ actor WorkspaceCodemapBindingEngine {
         }
         if cancelOverlay, let owner = request.overlayOwner, let ticket = request.ticket {
             _ = await overlay.cancelDemand(owner: owner, ticket: ticket)
+        }
+        if request.cancelled || request.continuation == nil {
+            completionCapacityBusyByOwner.removeValue(forKey: request.publicOwner)
         }
         request.continuation?.resume(returning: request.cancelled ? .cancelled : result)
         scheduleQueuedRequests()

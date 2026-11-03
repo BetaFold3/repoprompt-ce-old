@@ -60,11 +60,15 @@ package struct PendingWorktreeMergeReview: Identifiable, Equatable {
     }
 }
 
+/// `reject` and `cancelled` are explicit withdrawals by the reviewer (card or MCP decision).
+/// `timeout` and `preserved` end the request without a decision (Step 5c): the review is kept as
+/// read-only history. `preserved` is issued only by lifecycle ends (run end, reset, replacement).
 package enum WorktreeMergeReviewDecision: Equatable {
     case accept
     case reject(reason: String)
     case timeout
     case cancelled(reason: String)
+    case preserved(reason: String)
 
     package var cancelledReason: String? {
         switch self {
@@ -75,6 +79,8 @@ package enum WorktreeMergeReviewDecision: Equatable {
         case .timeout:
             "Timed out while waiting for worktree merge approval."
         case let .cancelled(reason):
+            reason
+        case let .preserved(reason):
             reason
         }
     }

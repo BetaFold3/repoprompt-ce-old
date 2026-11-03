@@ -529,7 +529,8 @@ final class AgentManageMCPToolServiceResumeTests: XCTestCase {
                 MCPServerViewModel.RequestMetadata(
                     connectionID: connectionID,
                     clientName: "resume-ownership-regression",
-                    windowID: window.windowID
+                    windowID: window.windowID,
+                    actorRoutedRunTab: nil
                 )
             },
             requireTargetWindow: { window },

@@ -647,6 +647,26 @@ package struct AgentRequestUserInputQuestionDraft: Hashable {
     }
 }
 
+/// Session-owned partial answers of one native user-input request (see
+/// `AgentTabSession.pendingUserInputDrafts`).
+package struct AgentRequestUserInputDraftState: Hashable {
+    package let requestID: UUID
+    package var draftsByQuestionID: [String: AgentRequestUserInputQuestionDraft]
+
+    package init(requestID: UUID, draftsByQuestionID: [String: AgentRequestUserInputQuestionDraft] = [:]) {
+        self.requestID = requestID
+        self.draftsByQuestionID = draftsByQuestionID
+    }
+}
+
+package extension AgentRequestUserInputQuestionDraft {
+    /// Any answer at all (a selection or typed text): for a secret question, content that would be
+    /// lost by shutdown and is never persisted.
+    var hasContent: Bool {
+        selectedOptionIndex != nil || !note.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+}
+
 package struct AgentRequestUserInputResponse: Hashable {
     let answersByQuestionID: [String: [String]]
 
@@ -674,6 +694,9 @@ package struct AgentRequestUserInputRequest: Identifiable, Hashable {
     let itemID: String
     package let askedAt: Date
     package let questions: [AgentRequestUserInputQuestion]
+    /// R6: the issuing Codex transport's immutable receipt; the reply routes by it (never by the
+    /// wire ID alone). Nil for requests that did not come from a Codex transport.
+    package var codexReceipt: CodexServerRequestReceipt?
 
     init(
         id: UUID? = nil,
@@ -747,6 +770,8 @@ package struct AgentMCPElicitationRequest: Identifiable, Hashable {
     let threadID: String
     let turnID: String
     let itemID: String
+    /// R6: the issuing Codex transport's immutable receipt (see `AgentRequestUserInputRequest`).
+    package var codexReceipt: CodexServerRequestReceipt?
     package let serverName: String?
     package let toolName: String?
     package let title: String
@@ -756,6 +781,9 @@ package struct AgentMCPElicitationRequest: Identifiable, Hashable {
     let defaultContentJSON: String?
     let rawParamsJSON: String
     package let details: [AgentApprovalDetail]
+    /// When the request was received (stamped once at creation, like the other question requests),
+    /// so a durable snapshot's ask time never changes between captures.
+    package let askedAt: Date
 
     init(
         id: UUID? = nil,
@@ -773,7 +801,8 @@ package struct AgentMCPElicitationRequest: Identifiable, Hashable {
         schemaJSON: String? = nil,
         defaultContentJSON: String? = nil,
         rawParamsJSON: String,
-        details: [AgentApprovalDetail] = []
+        details: [AgentApprovalDetail] = [],
+        askedAt: Date = Date()
     ) {
         self.id = id ?? Self.stableID(
             requestID: requestID,
@@ -797,6 +826,7 @@ package struct AgentMCPElicitationRequest: Identifiable, Hashable {
         self.defaultContentJSON = defaultContentJSON
         self.rawParamsJSON = rawParamsJSON
         self.details = details
+        self.askedAt = askedAt
     }
 
     static func stableID(
@@ -920,6 +950,8 @@ package struct AgentPermissionsRequest: Identifiable, Hashable {
     let threadID: String
     let turnID: String
     let itemID: String
+    /// R6: the issuing Codex transport's immutable receipt (see `AgentRequestUserInputRequest`).
+    package var codexReceipt: CodexServerRequestReceipt?
     package let cwd: String
     package let reason: String?
     package let permissionsJSON: String
@@ -986,6 +1018,8 @@ package struct AgentApprovalRequest: Identifiable, Hashable {
     package let requestID: AgentApprovalRequestID
     package let method: String
     package let kind: AgentApprovalKind
+    /// R6: the issuing Codex transport's immutable receipt (see `AgentRequestUserInputRequest`).
+    package var codexReceipt: CodexServerRequestReceipt?
     let threadID: String
     let turnID: String
     let itemID: String

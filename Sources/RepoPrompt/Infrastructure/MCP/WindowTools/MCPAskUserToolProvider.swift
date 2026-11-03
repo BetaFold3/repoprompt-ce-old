@@ -174,7 +174,12 @@ final class MCPAskUserToolProvider: MCPWindowToolProviding {
         guard await networkManager.clientIdentifier(forConnection: controllerConnectionID) != nil else {
             return .unverified
         }
-        _ = await networkManager.rehydrateRunTabContextForConnectionIfPossible(controllerConnectionID)
+        // Request-originated: never takes the run's window mapping from a different holder. A
+        // yield still applies the run policy, so an Agent Mode controller stays `.unverified`.
+        _ = await networkManager.rehydrateRunTabContextForConnectionIfPossible(
+            controllerConnectionID,
+            displacesHolder: false
+        )
         guard await networkManager.runPurpose(for: controllerConnectionID) == .unknown,
               await networkManager.runIDForConnection(controllerConnectionID) == nil
         else {

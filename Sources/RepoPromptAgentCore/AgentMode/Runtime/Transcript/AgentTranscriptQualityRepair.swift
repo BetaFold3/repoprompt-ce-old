@@ -26,7 +26,8 @@ package enum AgentTranscriptQualityRepair {
         terminalState: AgentSessionRunState,
         context: Context,
         maxSequenceIndexExclusive: Int? = nil,
-        nonToolBoundary: Int
+        nonToolBoundary: Int,
+        protectedItemIDs: Set<UUID> = []
     ) -> Int {
         guard terminalState != .idle, !terminalState.isActive else { return 0 }
         return AgentTranscriptIO.finalizePendingToolCalls(
@@ -34,7 +35,8 @@ package enum AgentTranscriptQualityRepair {
             terminalState: terminalState,
             includeExplicitRepoPromptToolCalls: shouldFinalizeExplicitRepoPromptTools(context: context),
             maxSequenceIndexExclusive: maxSequenceIndexExclusive,
-            nonToolBoundary: nonToolBoundary
+            nonToolBoundary: nonToolBoundary,
+            protectedItemIDs: protectedItemIDs
         )
     }
 

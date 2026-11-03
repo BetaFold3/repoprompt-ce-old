@@ -773,7 +773,11 @@ extension MCPServerViewModel {
         guard collections.codeMapUsage != .none else { return nil }
 
         let files = SelectionReplyAssembler.codemapDiagnosticFiles(for: collections)
-        guard !files.isEmpty else { return nil }
+        let automaticIssues = await SelectionReplyAssembler.automaticCodemapIssues(
+            presentation: collections.codemapPresentation,
+            store: promptVM.workspaceFileContextStore
+        )
+        guard !files.isEmpty || automaticIssues != nil else { return nil }
 
         let formatter = PathFormatter(
             format: display,
@@ -788,7 +792,7 @@ extension MCPServerViewModel {
             await formatter.displayPath(for: file)
         }
 
-        guard !diagnostics.isEmpty else { return nil }
+        guard !diagnostics.isEmpty || automaticIssues != nil else { return nil }
 
         return ToolResultDTOs.SelectedCodeStructureDTO(
             fileCount: 0,
@@ -796,7 +800,8 @@ extension MCPServerViewModel {
             unmappedPaths: diagnostics.unmappedPaths.isEmpty ? nil : diagnostics.unmappedPaths,
             pendingPaths: diagnostics.pendingPaths.isEmpty ? nil : diagnostics.pendingPaths,
             omittedCount: nil,
-            worktreeScope: ToolResultDTOs.WorktreeScopeDTO.sessionBound(from: projection)
+            worktreeScope: ToolResultDTOs.WorktreeScopeDTO.sessionBound(from: projection),
+            automaticCodemapIssues: automaticIssues
         )
     }
 }

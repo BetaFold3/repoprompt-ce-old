@@ -78,7 +78,7 @@ final class HistoryTestFixture {
     }
 
     func makeScanner() -> HistorySessionScanner {
-        HistorySessionScanner(fileManager: fileManager, applicationSupportRoot: tempDir)
+        HistorySessionScanner(fileManager: fileManager, workspacesRoot: workspacesRoot)
     }
 
     func createWorkspace(

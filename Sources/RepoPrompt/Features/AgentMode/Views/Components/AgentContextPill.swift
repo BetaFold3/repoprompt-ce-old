@@ -118,9 +118,10 @@ struct AgentContextPill: View {
             lines.append("Selection: \(AgentContextIndicator.formatTokens(selectionTokens)) tokens")
         }
 
-        // Separate labelled line; the popover carries the full scope/coverage explanation.
+        // Separate labelled lines; the popover carries the full scope/coverage explanation.
         let usage = providerUsagePresentation
-        lines.append("\(usage.title): \(usage.readoutText)")
+        lines.append(usage.cacheHitRatioLine)
+        lines.append(usage.costEstimateLine)
 
         return lines.joined(separator: "\n")
     }

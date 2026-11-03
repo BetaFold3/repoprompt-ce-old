@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-unset RPCE_OPTIMIZED_DIAGNOSTICS  # optimized-diagnostics manifest gate; never in a release build
+unset RPCE_OPTIMIZED_DIAGNOSTICS RPCE_OPTIMIZED_INCREMENTAL  # optimized Dev lane manifest gates; never in a release build
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="${REPOPROMPT_RELEASE_SOURCE_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"

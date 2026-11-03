@@ -381,6 +381,51 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
         XCTAssertTrue(text.contains("  - `Project/README.md`"), text)
     }
 
+    func testCodeMapsShowRootScopedAutomaticCodemapIssueWithoutPaths() throws {
+        let issue = ToolResultDTOs.AutomaticCodemapIssueDTO(
+            rootID: UUID().uuidString,
+            reason: "projection_superseded",
+            message: "Automatic codemaps are unavailable for root 'Project': continue without them."
+        )
+        let codeStructure = ToolResultDTOs.SelectedCodeStructureDTO(
+            fileCount: 0,
+            content: "",
+            automaticCodemapIssues: [issue]
+        )
+        let selection = ToolResultDTOs.SelectionReply(
+            files: [],
+            totalTokens: 0,
+            status: "ok",
+            codeStructure: codeStructure
+        )
+
+        let selectionText = try Self.onlyText(
+            ToolOutputFormatter.formatManageSelection(args: [:], value: Self.value(selection))
+        )
+        XCTAssertTrue(selectionText.contains("Code Maps: 0 files"), selectionText)
+        XCTAssertTrue(selectionText.contains("Automatic codemaps unavailable: 1 root(s)"), selectionText)
+        XCTAssertTrue(selectionText.contains("  - \(issue.message)"), selectionText)
+        XCTAssertFalse(selectionText.contains("Pending codemaps"), selectionText)
+
+        let context = ToolResultDTOs.PromptContextDTO(
+            prompt: "",
+            selection: nil,
+            fileBlocks: nil,
+            codeStructure: codeStructure,
+            fileTree: nil,
+            tokenStats: nil,
+            userTokenStats: nil,
+            tokenStatsNote: nil,
+            copyPreset: nil,
+            copyPresets: nil,
+            worktreeScope: nil
+        )
+        let contextText = try Self.onlyText(ToolOutputFormatter.formatPromptState(value: Self.value(context)))
+        XCTAssertTrue(contextText.contains("### Code Maps"), contextText)
+        XCTAssertTrue(contextText.contains("- **Automatic codemaps unavailable**: 1 root(s)"), contextText)
+        XCTAssertTrue(contextText.contains(issue.message), contextText)
+    }
+
     func testManageSelectionIncompleteZeroTokensShowsPendingAccounting() throws {
         let dto = ToolResultDTOs.SelectionReply(
             files: [

@@ -28,7 +28,8 @@ package enum CodexProviderHelpers {
     /// and model polling because failures become sticky across otherwise unrelated work.
     package static func makeOwnedNonAgentAppServerClient(mcpHost: any AgentMCPHosting) -> CodexAppServerClient {
         let _ = MCPIntegrationHelper.ensureCodexServerForDiscovery()
-        return CodexAppServerClient(mcpHost: mcpHost)
+        // Model, auth, health and chat work is not an Agent Mode session: explicitly sessionless (R6).
+        return CodexAppServerClient(mcpHost: mcpHost, defaultRuntimeSession: .sessionless)
     }
 
     package struct CodexExecutableResolution: Equatable {

@@ -19,7 +19,7 @@ Send me a Telegram message when a root Agent Mode session I drive needs me — a
 - Focused tests pass against a stubbed HTTP client; then, with my approval, I confirm one real completion and one real question on my phone.
 
 ## Non-goals
-Remote-control link and Telegram replies/buttons (later contract); Codex native `requestUserInput`, tool/edit approvals, instruction waits; gateway Web Push changes or a gateway-hosted sink; a generic webhook framework; delivery while the app is not running; Markdown/HTML formatting.
+Remote-control link and Telegram replies/buttons (separate contract; the implemented paired-browser link is documented in [Telegram paired-browser remote](../telegram-paired-browser-remote.md)); Codex native `requestUserInput`, tool/edit approvals, instruction waits; gateway Web Push changes or a gateway-hosted sink; a generic webhook framework; delivery while the app is not running; Markdown/HTML formatting.
 
 ## Boundaries (need my approval)
 Any real Telegram send; visible app launch/relaunch; push; wider event coverage or message content; changes to delegation lineage, question audience, terminal-commit ordering, or gateway/remote contracts; any new macOS permission prompt.

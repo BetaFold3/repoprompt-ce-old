@@ -148,4 +148,78 @@ final class GatewayConfigurationTests: XCTestCase {
         )
         XCTAssertTrue(viaEnvironment.allowStaticTokenAuth)
     }
+
+    func testPasskeyPolicyVersionFlagAcceptsOnlyTheSupportedVersion() throws {
+        // Remote passkey unlock, Step 3 (decision 4): this gateway understands the passkey policy
+        // wire. The flag is a COMPATIBILITY GUARD, not an opt-in — the gateway defaults to the
+        // supported version when it is absent, accepts an explicit `=1`, and fails fast on any other
+        // value (string or environment), before any listener binds.
+        let withoutFlag = try GatewayConfiguration.parse(arguments: [], environment: [:])
+        XCTAssertEqual(withoutFlag.passkeyPolicyVersion, GatewayConfiguration.supportedPasskeyPolicyVersion)
+
+        let viaArgument = try GatewayConfiguration.parse(
+            arguments: ["--passkey-policy-version=1"],
+            environment: [:]
+        )
+        XCTAssertEqual(viaArgument.passkeyPolicyVersion, 1)
+
+        let viaSeparateValue = try GatewayConfiguration.parse(
+            arguments: ["--passkey-policy-version", "1"],
+            environment: [:]
+        )
+        XCTAssertEqual(viaSeparateValue.passkeyPolicyVersion, 1)
+
+        let viaEnvironment = try GatewayConfiguration.parse(
+            arguments: [],
+            environment: [GatewayConfiguration.EnvironmentKey.passkeyPolicyVersion: "1"]
+        )
+        XCTAssertEqual(viaEnvironment.passkeyPolicyVersion, 1)
+
+        for invalid in ["2", "0", "abc", "-1"] {
+            XCTAssertThrowsError(try GatewayConfiguration.parse(
+                arguments: ["--passkey-policy-version=\(invalid)"],
+                environment: [:]
+            ), invalid) { error in
+                XCTAssertEqual(error as? GatewayConfigurationError, .unsupportedPasskeyPolicyVersion(invalid), invalid)
+            }
+        }
+    }
+
+    func testBrowserOriginIsOptionalHTTPSWithExplicitPortAndBecomesTheExtraHostAuthority() throws {
+        XCTAssertNil(try GatewayConfiguration.parse(arguments: [], environment: [:]).browserOriginAuthority)
+        XCTAssertNil(
+            try GatewayConfiguration.parse(
+                arguments: [],
+                environment: [GatewayConfiguration.EnvironmentKey.browserOrigin: ""]
+            ).browserOriginAuthority,
+            "The app passes an empty value when the port is unset"
+        )
+
+        let viaEnvironment = try GatewayConfiguration.parse(
+            arguments: [],
+            environment: [GatewayConfiguration.EnvironmentKey.browserOrigin: "https://Mac.Example.ts.net:8443"]
+        )
+        XCTAssertEqual(viaEnvironment.browserOriginAuthority, "mac.example.ts.net:8443")
+        let viaArgument = try GatewayConfiguration.parse(
+            arguments: ["--browser-origin", "https://mac.example.ts.net:9443/"],
+            environment: [GatewayConfiguration.EnvironmentKey.browserOrigin: "https://other.example.ts.net:8443"]
+        )
+        XCTAssertEqual(viaArgument.browserOriginAuthority, "mac.example.ts.net:9443")
+
+        for invalid in [
+            "http://mac.example.ts.net:8443",
+            "https://mac.example.ts.net",
+            "https://mac.example.ts.net:8443/path",
+            "https://mac.example.ts.net:8443/?q=1",
+            "https://user@mac.example.ts.net:8443",
+            "not a url"
+        ] {
+            XCTAssertThrowsError(
+                try GatewayConfiguration.parse(arguments: ["--browser-origin", invalid], environment: [:]),
+                invalid
+            ) { error in
+                XCTAssertEqual(error as? GatewayConfigurationError, .invalidBrowserOrigin(invalid), invalid)
+            }
+        }
+    }
 }

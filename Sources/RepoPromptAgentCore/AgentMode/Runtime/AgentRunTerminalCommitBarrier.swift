@@ -12,6 +12,9 @@ package struct AgentRunTerminalCommitRevision: Equatable {
     package let ownership: AgentRunOwnership
     package let terminalState: AgentSessionRunState
     package let expectedRunID: UUID?
+    /// The effective terminal cause (`AgentRunTerminalCause.effective`), recorded with recovery
+    /// terminal evidence.
+    package let cause: AgentRunTerminalCause
     let sourceItemsRevision: Int
     let assistantDeltaFlushGeneration: UInt64
     let providerDrainGeneration: UInt64
@@ -37,6 +40,8 @@ package final class AgentRunTerminalCommitBarrier {
         let expectedRunID: UUID?
         let terminalState: AgentSessionRunState
         let source: String
+        /// The runner's requested cause; the commit records the effective one.
+        let cause: AgentRunTerminalCause
         let completion: AgentModeRunService.CancellationCompletion
         let errorText: String?
         let attachmentReservationID: UUID?
@@ -65,6 +70,7 @@ package final class AgentRunTerminalCommitBarrier {
             expectedRunID: UUID?,
             terminalState: AgentSessionRunState,
             source: String,
+            cause: AgentRunTerminalCause,
             completion: AgentModeRunService.CancellationCompletion = .terminalPublished,
             errorText: String? = nil,
             attachmentReservationID: UUID? = nil,
@@ -86,6 +92,7 @@ package final class AgentRunTerminalCommitBarrier {
             self.expectedRunID = expectedRunID
             self.terminalState = terminalState
             self.source = source
+            self.cause = cause
             self.completion = completion
             self.errorText = errorText
             self.attachmentReservationID = attachmentReservationID
@@ -237,7 +244,11 @@ package final class AgentRunTerminalCommitBarrier {
             recordRejection("provider_buffers_pending", request: request)
             return nil
         }
-        let terminalTurnID = session.items.last(where: { $0.kind == .user })?.id
+        // The terminal user item's execution turn: its own ID, or the distinct destination turn a
+        // relocated saved input runs in (O11), never the historical envelope sharing that ID.
+        let terminalTurnID = Self.terminalUserItemID(for: request.ownership, in: session).map {
+            session.transcript.executionTurnID(forUserItemID: $0)
+        }
 
         session.terminalCommitInProgress = true
         recordTerminalBarrierState(true, request: request)
@@ -334,6 +345,20 @@ package final class AgentRunTerminalCommitBarrier {
                 for: session
             )
         }
+        let cause = AgentRunTerminalCause.effective(
+            requested: request.cause,
+            terminalState: request.terminalState,
+            lifecycleTeardown: session.lifecycleTeardownCause
+        )
+        if let terminalTurnID {
+            Self.stampLiveInterruption(
+                cause: cause,
+                terminalState: request.terminalState,
+                turnID: terminalTurnID,
+                runAttemptID: request.ownership.attemptID,
+                session: session
+            )
+        }
 
         let successorKind: AgentRunEpochTransitionKind? = if queuedInstruction != nil {
             .relatedFollowUp
@@ -345,6 +370,7 @@ package final class AgentRunTerminalCommitBarrier {
             ownership: request.ownership,
             terminalState: request.terminalState,
             expectedRunID: request.expectedRunID,
+            cause: cause,
             sourceItemsRevision: session.sourceItemsRevision,
             assistantDeltaFlushGeneration: session.assistantDeltaFlushGeneration,
             providerDrainGeneration: request.providerDrainGeneration,
@@ -359,6 +385,14 @@ package final class AgentRunTerminalCommitBarrier {
         )
         session.lastTerminalCommitRevision = revision
         session.lastTerminalPublicationResult = nil
+        // Recovery terminal evidence does not depend on MCP publication (local runs have no
+        // envelope). Recorded only for the lane bound to this run's persistent session. The turn
+        // the process run was retained in completes a missing turn join (R08).
+        if let lane = session.recoveryLane,
+           request.ownership.binding.persistentSessionID == lane.sessionID
+        {
+            lane.recordTerminalEvidence(revision, transcriptTurnID: terminalTurnID)
+        }
 
         hooks.updateBindings(session)
         var attentionCapture: AttentionNotificationCapture?
@@ -439,6 +473,51 @@ package final class AgentRunTerminalCommitBarrier {
         return revision
     }
 
+    /// The user item a terminal commit is attributed to (F1). A run attempt whose runner named its
+    /// own input is bound to that item: a later queued user item never takes its outcome, and when
+    /// the item is gone (a withdrawn scheduled bubble) nothing is attributed, never an earlier turn.
+    /// Attempts without a named input (Codex, pre-runner startup failures) keep the last user item.
+    static func terminalUserItemID(for ownership: AgentRunOwnership, in session: AgentTabSession) -> UUID? {
+        if let attribution = session.runAttemptInputAttribution, attribution.attemptID == ownership.attemptID {
+            return session.items.contains { $0.id == attribution.userItemID && $0.kind == .user }
+                ? attribution.userItemID
+                : nil
+        }
+        return session.items.last(where: { $0.kind == .user })?.id
+    }
+
+    /// Live R5 stamp: a non-completed terminal whose effective cause is an interruption (quit,
+    /// window close, provider process loss) records it on the terminal turn once, so a warm
+    /// session presents the same state cold restore would. A user cancel or an ordinary terminal
+    /// is never stamped, and an existing interruption (cold restore, an earlier commit) is kept.
+    static func stampLiveInterruption(
+        cause: AgentRunTerminalCause,
+        terminalState: AgentSessionRunState,
+        turnID: UUID,
+        runAttemptID: UUID,
+        session: AgentTabSession,
+        now: Date = Date()
+    ) {
+        guard terminalState != .completed,
+              let reason = cause.interruptionReason,
+              // Review B R1-F1: the turn containing the terminal user item (its own turn, its
+              // request, or a mid-turn user activity), not only a turn with that exact ID.
+              let turnIndex = session.transcript.turns.lastIndex(where: { $0.containsUserItem(turnID) }),
+              session.transcript.turns[turnIndex].interruption == nil
+        else { return }
+        let turn = session.transcript.turns[turnIndex]
+        let lastActivity = turn.lastActivityAt
+            ?? turn.responseSpans.compactMap(\.lastActivityAt).max()
+        session.transcript.turns[turnIndex].interruption = AgentTranscriptTurnInterruption(
+            reason: reason,
+            observedAt: now,
+            lastConfirmedActivityAt: lastActivity,
+            runAttemptID: runAttemptID,
+            providerConversationID: session.providerSessionID
+        )
+        session.isDirty = true
+    }
+
     /// Returns true only when the provider explicitly declined its successor after an accepted
     /// publication (an observation for attention notifications; consumption is unchanged).
     @discardableResult
@@ -470,7 +549,7 @@ package final class AgentRunTerminalCommitBarrier {
         session: AgentTabSession,
         revision: AgentRunTerminalCommitRevision,
         publicationResult: AgentRunTerminalPublicationResult?
-    ) -> String? {
+    ) -> AgentPendingInstruction? {
         guard revision.successorKind != nil,
               revision.providerSuccessorID == nil,
               let publicationResult
@@ -488,7 +567,9 @@ package final class AgentRunTerminalCommitBarrier {
             return nil
         case .stale:
             session.terminalFollowUpTakenCommitID = revision.commitID
-            if !session.pendingInstructions.isEmpty {
+            // Untracked input keeps the legacy drop. A durable input is never silently discarded:
+            // it stays queued for a later boundary or explicit user action.
+            if let head = session.pendingInstructions.first, !head.isDurable {
                 session.pendingInstructions.removeFirst()
             }
             session.mcpFollowUpRunPending = false

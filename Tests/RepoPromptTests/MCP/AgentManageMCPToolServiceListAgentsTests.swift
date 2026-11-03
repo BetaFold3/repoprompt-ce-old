@@ -190,7 +190,8 @@ final class AgentManageMCPToolServiceListAgentsTests: XCTestCase {
                 MCPServerViewModel.RequestMetadata(
                     connectionID: nil,
                     clientName: "list-agents-shape-tests",
-                    windowID: window.windowID
+                    windowID: window.windowID,
+                    actorRoutedRunTab: nil
                 )
             },
             requireTargetWindow: { window },

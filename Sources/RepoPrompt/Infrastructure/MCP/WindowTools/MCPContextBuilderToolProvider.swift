@@ -391,7 +391,9 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                 workspaceID: resolvedIdentity.workspaceID,
                 windowID: targetWindow.windowID
             ),
-            explicitWindowRoutingHint: metadata.explicitWindowRoutingHint
+            explicitWindowRoutingHint: metadata.explicitWindowRoutingHint,
+            // The request's own actor-side run tab, only for the request's own connection.
+            actorRoutedRunTab: connectionID == nil || connectionID == metadata.connectionID ? metadata.actorRoutedRunTab : nil
         )
         guard await dependencies.drainReadFileAutoSelection(
             targetMetadata,

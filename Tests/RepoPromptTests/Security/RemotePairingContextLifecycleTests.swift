@@ -177,7 +177,8 @@ final class RemotePairingContextLifecycleTests: XCTestCase {
         let metadata = MCPServerViewModel.RequestMetadata(
             connectionID: connectionID,
             clientName: "repoprompt-gateway",
-            windowID: nil
+            windowID: nil,
+            actorRoutedRunTab: nil
         )
         let dependencies = MCPRemotePairingToolProvider.ExecutionDependencies(
             captureRequestMetadata: { metadata },

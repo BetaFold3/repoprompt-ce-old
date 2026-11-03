@@ -153,7 +153,8 @@ package struct CursorACPControllerModelDiscoveryClient: CursorACPModelDiscoveryC
             workspacePath: workspacePath,
             resumeSessionID: nil,
             attachments: [],
-            taskLabelKind: nil
+            taskLabelKind: nil,
+            runtimeSession: .sessionless
         )
 
         guard let provider = providerFactory(.cursor, preferredModel) else {

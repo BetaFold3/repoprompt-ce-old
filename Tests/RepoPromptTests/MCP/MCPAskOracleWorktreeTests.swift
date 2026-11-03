@@ -1749,7 +1749,8 @@ import XCTest
                             windowStateIdentity: ObjectIdentifier(window),
                             serverViewModelIdentity: ObjectIdentifier(window.mcpServer),
                             provenance: .hiddenWindowArgument
-                        )
+                        ),
+                        actorRoutedRunTab: nil
                     ))
                     XCTAssertEqual(
                         window.mcpServer.connectionBindingSnapshot(forConnection: startConnectionID).bindingKind,
@@ -2063,7 +2064,8 @@ import XCTest
                         connectionID: connectionID,
                         clientName: "public-agent-run-explicit",
                         windowID: window.windowID,
-                        runPurpose: .unknown
+                        runPurpose: .unknown,
+                        actorRoutedRunTab: nil
                     ))
                     var targetRunID: UUID?
                     window.mcpServer.setAgentRunDispatchOverrideForTesting {
@@ -2463,7 +2465,8 @@ import XCTest
                                     windowStateIdentity: ObjectIdentifier(window),
                                     serverViewModelIdentity: ObjectIdentifier(window.mcpServer),
                                     provenance: .hiddenWindowArgument
-                                )
+                                ),
+                                actorRoutedRunTab: nil
                             ))
                             XCTAssertEqual(
                                 window.mcpServer.connectionBindingSnapshot(forConnection: startConnectionID).bindingKind,
@@ -2519,7 +2522,8 @@ import XCTest
                                 connectionID: startConnectionID,
                                 clientName: sourceClientName,
                                 windowID: window.windowID,
-                                runPurpose: .agentModeRun
+                                runPurpose: .agentModeRun,
+                                actorRoutedRunTab: nil
                             ))
                         }
 
@@ -2669,7 +2673,8 @@ import XCTest
                                 connectionID: connectionID,
                                 clientName: childOracleClientName,
                                 windowID: window.windowID,
-                                runPurpose: .agentModeRun
+                                runPurpose: .agentModeRun,
+                                actorRoutedRunTab: nil
                             ))
                         }
                     }

@@ -50,7 +50,8 @@ final class OpenCodeACPHeadlessAgentProvider: HeadlessAgentProvider {
                     resumeSessionID: message.resumeSessionID,
                     attachments: [],
                     taskLabelKind: nil,
-                    sessionModeID: config.sessionModeID
+                    sessionModeID: config.sessionModeID,
+                    runtimeSession: message.runtimeSession
                 )
             },
             makeController: controllerFactory,

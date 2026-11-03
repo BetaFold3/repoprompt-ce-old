@@ -685,11 +685,13 @@ struct AgentWorkspaceRootsSectionView: View {
         let tint: Color = switch attention.kind {
         case .conflicted: .orange
         case .awaitingApproval: .purple
+        case .historicalReview: .secondary
         case .awaitingCommit: .yellow
         }
         let glyph = switch attention.kind {
         case .conflicted: "exclamationmark.triangle.fill"
         case .awaitingApproval: "arrow.triangle.merge"
+        case .historicalReview: "clock.arrow.circlepath"
         case .awaitingCommit: "checkmark.circle"
         }
         return HStack(spacing: fontPreset.scaledClamped(3, max: 4)) {

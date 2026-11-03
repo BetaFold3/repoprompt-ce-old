@@ -46,6 +46,8 @@ package final class AgentModeRunService {
             var testOMPQualificationProviderBootstrapEntry: () -> Void = {}
             var ompQualificationStartupProbes = ACPIntegratedAgentModeRunner.OMPQualificationStartupProbes()
             var testOMPQualificationLeaseCreated: (MCPBootstrapLease) -> Void = { _ in }
+            /// Replaces the lease's proven-route policy releaser (runner-level early-release tests).
+            var testProvenRoutePolicyReleaser: ((MCPBootstrapLeaseSpec, pid_t) async -> Bool)?
         #endif
 
         #if DEBUG
@@ -170,6 +172,11 @@ package final class AgentModeRunService {
         case replaceIfEmpty
         /// Always prepend the restored text, even if the user has started typing.
         case prependAlways
+        /// A recovery continuation that wasn't sent, appended after the message box's text and a
+        /// blank line. `result` is the message box's full text the view model just stored; the
+        /// composer shows exactly it (unchanged when it already does). A later event in the same
+        /// turn carries a result that includes every earlier one, so coalesced events lose nothing.
+        case appendAfterBlankLine(result: String)
     }
 
     package struct Hooks {
@@ -220,22 +227,36 @@ package final class AgentModeRunService {
         /// started, refused, or failed). Synchronous, never throws, and claims nothing about the outcome.
         package typealias FollowUpStartObservation = @MainActor () -> Void
         /// Starts a follow-up run. A non-nil `afterStart` is invoked once, after the start returns.
-        let startFollowUpRun: (_ tabID: UUID, _ text: String, _ afterStart: FollowUpStartObservation?) -> Void
+        let startFollowUpRun: (_ tabID: UUID, _ instruction: AgentPendingInstruction, _ afterStart: FollowUpStartObservation?) -> Void
         /// Restore queued steering draft text back to the composer.
         let restoreDraftText: (_ tabID: UUID, _ text: String, _ message: String, _ strategy: DraftRestorationStrategy) -> Void
-        /// Augment queued steering text with skill context, tagged files, and attachment rendering before submit.
+        /// Augment queued steering text with skill context, tagged files, and attachment rendering before
+        /// submit; reports the exact pending-handoff stage the assembly created. For durable `carriers`
+        /// a new stage rides on the text only once its snapshot is attached to the carrier intent,
+        /// before the dispatch commit (R03).
         let augmentUserMessageForProviderSend: (
             _ text: String,
             _ attachments: [AgentImageAttachment],
             _ taggedFileAttachments: [AgentTaggedFileAttachment],
-            _ session: AgentTabSession?
-        ) async -> String
+            _ session: AgentTabSession?,
+            _ carriers: [AgentQueuedInputIdentity]
+        ) async -> AgentStagedProviderText
         /// Stages a transcript handoff for fresh-session resume recovery.
         let stageResumeRecoveryHandoffIfNeeded: (_ session: AgentTabSession) async -> Void
-        /// Prepends a staged handoff payload to provider-facing text.
-        let prependPendingHandoffIfNeeded: (_ text: String, _ session: AgentTabSession) -> String
-        /// Records whether a staged handoff payload was accepted by the provider send attempt.
-        let recordPendingHandoffSendOutcome: (_ session: AgentTabSession, _ didSend: Bool) -> Void
+        /// Prepends a staged handoff payload to provider-facing text, reporting the stage it created.
+        let prependPendingHandoffIfNeeded: (_ text: String, _ session: AgentTabSession) -> AgentStagedProviderText
+        /// Durable form for a deferred dispatch: stages the payload and returns its exact snapshot
+        /// (payload ID saved first) to attach before the dispatch commit.
+        let stagePendingHandoffForDurableDispatch: (_ text: String, _ session: AgentTabSession) async
+            -> AgentPendingHandoffDispatchStaging
+        /// Settles exactly `stage` of the pending-handoff payload with its stage-delivery outcome
+        /// (`.sent` consumes it, `.notSent` releases it, `.deliveryUnknown` holds it). A nil or
+        /// superseded stage is a no-op.
+        let recordPendingHandoffSendOutcome: (
+            _ session: AgentTabSession,
+            _ stage: AgentPendingHandoffStage?,
+            _ disposition: AgentStagedInputDisposition
+        ) -> Void
         /// Wakes MCP waiters once a steering instruction has actually been delivered to the provider.
         let signalMCPInstructionDelivered: (_ session: AgentTabSession) async -> Void
         /// Commits or rolls back exactly the delegated child-question notices staged into this
@@ -245,7 +266,7 @@ package final class AgentModeRunService {
         var recordDelegatedQuestionNoticeSendOutcome: (
             _ session: AgentTabSession,
             _ stageID: UUID?,
-            _ didSend: Bool
+            _ disposition: AgentStagedInputDisposition
         ) -> Void = { _, _, _ in }
         /// Attention notifications only (App/Notifications): reads the completed attempt and its
         /// final assistant text at terminal commit. Never mutates run state; nil skips the event.
@@ -289,6 +310,10 @@ package final class AgentModeRunService {
             _ sourceID: UUID,
             _ session: AgentTabSession
         ) -> Void = { _, _ in }
+        /// A queue head was put back while the run is active: if the agent is already parked in its
+        /// instruction wait, hand it the head under the live-wait contract (prepared text, dispatch
+        /// commit, exact revalidation, atomic claim). Any failure keeps the head queued.
+        var deliverRequeuedHeadToLiveInstructionWait: (_ session: AgentTabSession) -> Void = { _ in }
 
         package init(
             estimateRuntimeTokens: @escaping (String) -> Int,
@@ -334,22 +359,29 @@ package final class AgentModeRunService {
                 AgentRunTerminalCommitRevision,
                 AgentRunEpochTransitionKind?
             ) async -> AgentRunTerminalPublicationResult,
-            startFollowUpRun: @escaping (_ tabID: UUID, _ text: String, _ afterStart: FollowUpStartObservation?) -> Void,
+            startFollowUpRun: @escaping (_ tabID: UUID, _ instruction: AgentPendingInstruction, _ afterStart: FollowUpStartObservation?) -> Void,
             restoreDraftText: @escaping (_ tabID: UUID, _ text: String, _ message: String, _ strategy: DraftRestorationStrategy) -> Void,
             augmentUserMessageForProviderSend: @escaping (
                 _ text: String,
                 _ attachments: [AgentImageAttachment],
                 _ taggedFileAttachments: [AgentTaggedFileAttachment],
-                _ session: AgentTabSession?
-            ) async -> String,
+                _ session: AgentTabSession?,
+                _ carriers: [AgentQueuedInputIdentity]
+            ) async -> AgentStagedProviderText,
             stageResumeRecoveryHandoffIfNeeded: @escaping (_ session: AgentTabSession) async -> Void,
-            prependPendingHandoffIfNeeded: @escaping (_ text: String, _ session: AgentTabSession) -> String,
-            recordPendingHandoffSendOutcome: @escaping (_ session: AgentTabSession, _ didSend: Bool) -> Void,
+            prependPendingHandoffIfNeeded: @escaping (_ text: String, _ session: AgentTabSession) -> AgentStagedProviderText,
+            stagePendingHandoffForDurableDispatch: @escaping (_ text: String, _ session: AgentTabSession) async
+                -> AgentPendingHandoffDispatchStaging,
+            recordPendingHandoffSendOutcome: @escaping (
+                _ session: AgentTabSession,
+                _ stage: AgentPendingHandoffStage?,
+                _ disposition: AgentStagedInputDisposition
+            ) -> Void,
             signalMCPInstructionDelivered: @escaping (_ session: AgentTabSession) async -> Void,
             recordDelegatedQuestionNoticeSendOutcome: @escaping (
                 _ session: AgentTabSession,
                 _ stageID: UUID?,
-                _ didSend: Bool
+                _ disposition: AgentStagedInputDisposition
             ) -> Void = { _, _, _ in },
             captureAttentionTurnCompletion: @escaping (
                 _ session: AgentTabSession,
@@ -374,8 +406,10 @@ package final class AgentModeRunService {
             endBackgroundNativeMessage: @escaping (
                 _ sourceID: UUID,
                 _ session: AgentTabSession
-            ) -> Void = { _, _ in }
+            ) -> Void = { _, _ in },
+            deliverRequeuedHeadToLiveInstructionWait: @escaping (_ session: AgentTabSession) -> Void = { _ in }
         ) {
+            self.deliverRequeuedHeadToLiveInstructionWait = deliverRequeuedHeadToLiveInstructionWait
             self.estimateRuntimeTokens = estimateRuntimeTokens
             self.addUserInputTokensToActiveNonCodexTurn = addUserInputTokensToActiveNonCodexTurn
             self.startNonCodexTurnAccountingIfNeeded = startNonCodexTurnAccountingIfNeeded
@@ -410,6 +444,7 @@ package final class AgentModeRunService {
             self.augmentUserMessageForProviderSend = augmentUserMessageForProviderSend
             self.stageResumeRecoveryHandoffIfNeeded = stageResumeRecoveryHandoffIfNeeded
             self.prependPendingHandoffIfNeeded = prependPendingHandoffIfNeeded
+            self.stagePendingHandoffForDurableDispatch = stagePendingHandoffForDurableDispatch
             self.recordPendingHandoffSendOutcome = recordPendingHandoffSendOutcome
             self.signalMCPInstructionDelivered = signalMCPInstructionDelivered
             self.recordDelegatedQuestionNoticeSendOutcome = recordDelegatedQuestionNoticeSendOutcome
@@ -503,6 +538,30 @@ package final class AgentModeRunService {
     /// immediately before the provider runner would be invoked. No run state is mutated.
     package static let providerHandoffRevokedReason = "scheduled_provider_handoff_revoked"
 
+    /// Reason carried by the `.stale` outcome when the durable dispatch of the run's input was
+    /// refused before any run state was mutated (recovery barrier, crash hold, retired lane,
+    /// untracked input under mandatory admission). The input's intent is untouched.
+    package static let recoveryDispatchRefusedReason = "recovery_dispatch_refused"
+
+    /// Reason carried by the `.stale` outcome when the session changed while the dispatch commit
+    /// was awaited. The same intents were settled back to `queued` (no handoff).
+    package static let recoveryDispatchTargetChangedReason = "recovery_dispatch_target_changed"
+
+    /// Reason carried by the `.stale` outcome of a DEBUG Oh My Pi qualification start refused before
+    /// any runner owned its input (generation or context identity mismatch).
+    package static let qualificationStartRefusedReason = "omp_qualification_start_refused"
+
+    /// Starts a run for `initialUserMessage`.
+    ///
+    /// Outcome contract (F1): `nil` means only that a runner owns this input and owes its handoff's
+    /// settlement (dispatch commit and provider evidence, or a no-handoff settlement). Every exit
+    /// before a runner owns the input returns an explicit `.failed` or `.stale`, for every provider.
+    ///
+    /// `inputConstituents` are the immutable identities of the user input this run delivers, in
+    /// order (captured at admission, never re-derived from the composer). For every non-Codex
+    /// route their dispatch is committed here before any runner is admitted; the runner attaches
+    /// its run attempt and reports the provider's evidence. Codex routes own their own dispatch
+    /// evidence (`codexFallbackContext`).
     @discardableResult
     package func startRun(
         tabID: UUID,
@@ -510,12 +569,41 @@ package final class AgentModeRunService {
         initialUserMessage: String,
         initialMessageForRun: String,
         attachments: [AgentImageAttachment],
+        inputConstituents: [AgentQueuedInputIdentity],
         codexFallbackContext: AgentTabSession.CodexFallbackSubmissionContext? = nil,
         providerHandoffAuthorization: (@MainActor () -> Bool)? = nil,
-        delegatedQuestionStageID: UUID? = nil
+        delegatedQuestionStageID: UUID? = nil,
+        pendingHandoffStage: AgentPendingHandoffStage? = nil
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome? {
         assert(session.tabID == tabID, "AgentModeRunService.startRun requires the originating tab ID to match the TabSession tab ID")
         let selectedAgent = session.selectedAgent
+        // Staged input riding on `initialMessageForRun`. Every exit before a runner owns the input
+        // provably handed nothing off and releases exactly these stages.
+        let stagedInput = AgentCarriedStagedInput(
+            pendingHandoffStage: pendingHandoffStage,
+            delegatedQuestionStageID: delegatedQuestionStageID
+        )
+        var runnerOwnsStagedInput = false
+        defer {
+            if !runnerOwnsStagedInput, !stagedInput.isEmpty {
+                hooks.recordStagedInputOutcome(session, stagedInput, .notSent)
+            }
+        }
+        // Review R1 B N2: a non-Codex start that returns before any runner owns its input (a
+        // startup failure before dispatch — knowledge-profile provider, workspace or worktree
+        // resolution, a DEBUG qualification mismatch — or a refused or revoked dispatch) handed
+        // nothing off and returns an explicit `.failed`/`.stale` (F1: `nil` means a runner owns the
+        // input). An explicit recovery action carried by the input ends its submission here.
+        // Fenced: it settles only while the action has no committed attempt and no commit in flight
+        // (`settleRecoveryActionIfFenced`); it never guesses from elapsed time.
+        defer {
+            if selectedAgent != .codexExec, !runnerOwnsStagedInput,
+               let action = inputConstituents.lazy.compactMap(\.actionAuthorization).first
+            {
+                (session.recoveryLane?.recoveryCoordinator ?? session.recoveryCoordinator)?
+                    .noteRecoveryActionSubmissionEnded(action)
+            }
+        }
         #if DEBUG
             let ompQualificationStartContext = session.ompQualificationStartContext
             let invocationOMPQualificationStartContext = dependencies.ompQualificationInvocationContext(session)
@@ -540,28 +628,28 @@ package final class AgentModeRunService {
                         .denied,
                         startupFailureReason: "start_invocation_generation_mismatch"
                     )
-                    return nil
+                    return .stale(reason: Self.qualificationStartRefusedReason)
                 }
                 guard let ompQualificationStartContext,
                       let invocationOMPQualificationStartContext
                 else {
                     let message = "Oh My Pi qualification state is incomplete or is not bound to this session and workspace."
-                    await failBeforeProviderStartup(session: session, message: message)
-                    return nil
+                    await failBeforeProviderStartup(session: session, message: message, stagedInput: stagedInput)
+                    return .failed(message: message)
                 }
                 guard ompQualificationStartContext === invocationOMPQualificationStartContext else {
                     invocationOMPQualificationStartContext.authorizationReceipt.resolve(
                         .denied,
                         startupFailureReason: "qualification_context_identity_mismatch"
                     )
-                    return nil
+                    return .stale(reason: Self.qualificationStartRefusedReason)
                 }
                 guard session.mcpControlContext?.sessionID == ompQualificationStartContext.transaction.sessionID,
                       dependencies.ompQualificationActiveWorkspaceID() == ompQualificationStartContext.expectedWorkspaceID
                 else {
                     let message = "Oh My Pi qualification state is incomplete or is not bound to this session and workspace."
-                    await failBeforeProviderStartup(session: session, message: message)
-                    return nil
+                    await failBeforeProviderStartup(session: session, message: message, stagedInput: stagedInput)
+                    return .failed(message: message)
                 }
             }
         #endif
@@ -569,8 +657,8 @@ package final class AgentModeRunService {
            !KnowledgeSessionPolicy.supportedProviders.contains(selectedAgent)
         {
             let message = "Knowledge sessions currently support Claude Code and Codex only."
-            await failBeforeProviderStartup(session: session, message: message)
-            return selectedAgent == .codexExec ? .failed(message: message) : nil
+            await failBeforeProviderStartup(session: session, message: message, stagedInput: stagedInput)
+            return .failed(message: message)
         }
         let selectedModelString = session.selectedModelRaw == AgentModel.defaultModel.rawValue
             ? nil
@@ -581,26 +669,64 @@ package final class AgentModeRunService {
             workspacePath = try dependencies.workspacePathProvider(session)
         } catch {
             let message = Self.providerStartupFailureMessage(for: error)
-            await failBeforeProviderStartup(session: session, message: message)
-            return selectedAgent == .codexExec ? .failed(message: message) : nil
+            await failBeforeProviderStartup(session: session, message: message, stagedInput: stagedInput)
+            return .failed(message: message)
+        }
+
+        // Validate the run's input for dispatch before any runner is admitted and before any run
+        // state is mutated. The durable dispatch commit itself is deferred to the runner
+        // (`AgentProviderHandoff.commitDispatch`), after provider preparation that can create a
+        // pending-handoff prefix (adopted plan §5). Codex routes record their own dispatch evidence.
+        var handoff: AgentProviderHandoff?
+        if selectedAgent != .codexExec {
+            let preDispatchRunID = session.runID
+            let preDispatchRunAttemptID = session.activeRunAttemptID
+            let preDispatchRunState = session.runState
+            switch AgentProviderHandoff.prepareRunStart(session: session, constituents: inputConstituents) {
+            case let .failure(failure):
+                AgentDeliveryRecordDiagnostics.runStartRefused(failure)
+                if case let .commitFailed(controllerFailure) = failure {
+                    return .failed(message: AgentProviderHandoff.deliveryNotRecordedText(controllerFailure))
+                }
+                return .stale(reason: Self.recoveryDispatchRefusedReason)
+            case let .success(prepared):
+                handoff = prepared
+                hooks.carryStagedInput(stagedInput, on: prepared, session: session)
+            }
+            // Revalidate: the same session target, nothing started or replaced meanwhile.
+            guard session.selectedAgent == selectedAgent,
+                  session.runID == preDispatchRunID,
+                  session.activeRunAttemptID == preDispatchRunAttemptID,
+                  session.runState == preDispatchRunState
+            else {
+                handoff?.noteNoHandoff(message: Self.recoveryDispatchTargetChangedReason)
+                return .stale(reason: Self.recoveryDispatchTargetChangedReason)
+            }
         }
 
         // Final authorization immediately before any provider runner is invoked: every
         // asynchronous preparation above has completed and no run state has been mutated yet.
         if let providerHandoffAuthorization, !providerHandoffAuthorization() {
+            handoff?.noteNoHandoff(message: Self.providerHandoffRevokedReason)
             return .stale(reason: Self.providerHandoffRevokedReason)
         }
 
         if selectedAgent == .codexExec {
+            runnerOwnsStagedInput = true
             return await codexRunner.startRun(
                 tabID: tabID,
                 session: session,
                 initialMessageForRun: initialMessageForRun,
                 attachments: attachments,
                 fallbackContext: codexFallbackContext,
-                delegatedQuestionStageID: delegatedQuestionStageID
+                stagedInput: stagedInput
             )
         }
+        // Every non-Codex route prepared a handoff above; without one no runner may own the input.
+        guard let handoff else { return .stale(reason: Self.recoveryDispatchRefusedReason) }
+        // The handoff carries the staged input from here: its runner reports the outcome, and its
+        // end-of-scope settlement classifies anything left unreported.
+        runnerOwnsStagedInput = true
 
         let acpRunRequest: ACPRunRequest? = if selectedAgent.acpProviderID != nil {
             ACPRunRequest(
@@ -616,7 +742,9 @@ package final class AgentModeRunService {
                     exactWireModelID: selectedModelString,
                     selections: session.ohMyPiThinkingSelections
                 ),
-                autoApproveAllToolPermissions: runtimePermission.autoApproveAllACPToolPermissions
+                autoApproveAllToolPermissions: runtimePermission.autoApproveAllACPToolPermissions,
+                // Bound by the ACP runner to the run attempt it begins (lifecycle, attempt, process run).
+                runtimeSession: .unavailable
             )
         } else {
             nil
@@ -650,12 +778,18 @@ package final class AgentModeRunService {
                 runHasNativeShell: runHasNativeShell,
                 codeModeEligibility: codeModeEligibility
             )
+            #if DEBUG
+                let provenRoutePolicyReleaser = self.dependencies.testProvenRoutePolicyReleaser
+            #else
+                let provenRoutePolicyReleaser: ((MCPBootstrapLeaseSpec, pid_t) async -> Bool)? = nil
+            #endif
             let lease = MCPBootstrapLease(
                 spec: leaseSpec,
                 runCoordinator: runCoordinator,
                 mcpServerEnabler: mcpServerEnabler,
                 policyInstaller: MCPBootstrapLease.agentModePolicyInstaller(connectionPolicyInstaller),
-                expectedPIDPolicyArmer: expectedPIDPolicyArmer
+                expectedPIDPolicyArmer: expectedPIDPolicyArmer,
+                provenRoutePolicyReleaser: provenRoutePolicyReleaser
             )
             #if DEBUG
                 self.dependencies.testOMPQualificationLeaseCreated(lease)
@@ -669,8 +803,8 @@ package final class AgentModeRunService {
                 initialUserMessage: initialUserMessage,
                 initialMessageForRun: initialMessageForRun,
                 attachments: attachments,
-                makeLease: makeLease,
-                delegatedQuestionStageID: delegatedQuestionStageID
+                handoff: handoff,
+                makeLease: makeLease
             )
             return nil
         }
@@ -758,12 +892,12 @@ package final class AgentModeRunService {
                 initialUserMessage: initialUserMessage,
                 initialMessageForRun: initialMessageForRun,
                 attachments: attachments,
+                handoff: handoff,
                 runRequest: acpRunRequest,
                 makeLease: makeLease,
                 providerStartAuthorizer: providerStartAuthorizer,
                 providerStartBoundaryReporter: providerStartBoundaryReporter,
-                providerStartBootstrapObserver: providerStartBootstrapObserver,
-                delegatedQuestionStageID: delegatedQuestionStageID
+                providerStartBootstrapObserver: providerStartBootstrapObserver
             )
             return nil
         }
@@ -773,8 +907,8 @@ package final class AgentModeRunService {
             initialUserMessage: initialUserMessage,
             initialMessageForRun: initialMessageForRun,
             attachments: attachments,
-            makeLease: makeLease,
-            delegatedQuestionStageID: delegatedQuestionStageID
+            handoff: handoff,
+            makeLease: makeLease
         )
         return nil
     }
@@ -787,8 +921,15 @@ package final class AgentModeRunService {
         attachments: [AgentImageAttachment],
         targetRunID: UUID?,
         targetRunAttemptID: UUID?,
-        targetController: ACPAgentSessionController
+        targetController: ACPAgentSessionController,
+        handoff: AgentProviderHandoff
     ) async -> Bool {
+        // Every return before the runner's `session/prompt` call is proven no-handoff.
+        defer {
+            if !handoff.handoffStarted {
+                handoff.noteNoHandoff()
+            }
+        }
         let selectedAgent = session.selectedAgent
         let selectedModelString = session.selectedModelRaw == AgentModel.defaultModel.rawValue
             ? nil
@@ -809,7 +950,8 @@ package final class AgentModeRunService {
             workspacePath = try dependencies.workspacePathProvider(session)
         } catch {
             let message = Self.providerStartupFailureMessage(for: error)
-            await failBeforeProviderStartup(session: session, message: message)
+            // Staged input rides `handoff`; the caller settles it from the handoff's evidence.
+            await failBeforeProviderStartup(session: session, message: message, stagedInput: AgentCarriedStagedInput())
             return false
         }
         let runRequest = ACPRunRequest(
@@ -825,7 +967,9 @@ package final class AgentModeRunService {
                 exactWireModelID: selectedModelString,
                 selections: session.ohMyPiThinkingSelections
             ),
-            autoApproveAllToolPermissions: runtimePermission.autoApproveAllACPToolPermissions
+            autoApproveAllToolPermissions: runtimePermission.autoApproveAllACPToolPermissions,
+            // The active run attempt this steering prompt joins.
+            runtimeSession: session.runtimeSessionScope
         )
         let sent = await acpRunner.submitActivePrompt(
             session: session,
@@ -834,7 +978,8 @@ package final class AgentModeRunService {
             runRequest: runRequest,
             targetRunID: targetRunID,
             targetRunAttemptID: targetRunAttemptID,
-            targetController: targetController
+            targetController: targetController,
+            handoff: handoff
         )
         steeringDebugLog("[AgentRunSteeringWake] ACP active submit runner returned sent=\(sent) agent=\(selectedAgent.rawValue) model=\(selectedModelString ?? "default") runID=\(String(describing: targetRunID)) attempt=\(String(describing: targetRunAttemptID))")
         return sent
@@ -861,8 +1006,9 @@ package final class AgentModeRunService {
 
     /// `code_mode` eligibility for the run's MCP lease, captured once from the final launch
     /// configuration beside `resolveRunHasNativeShell` and immutable for the run. Only official
-    /// Claude Code resolves it (from the coordinator's launch facts); every other provider —
-    /// including Codex, whose read-only companion is deferred — is `.native`.
+    /// Claude Code resolves it (from the coordinator's launch facts); every other provider on this
+    /// path is `.native`. Codex leases are built by `CodexAgentModeCoordinator`, which derives its
+    /// own eligibility from the launched read-only companion (`codexCodeModeEligibility`).
     private func resolveCodeModeEligibility(
         selectedAgent: AgentProviderKind,
         session: AgentTabSession
@@ -992,29 +1138,109 @@ package final class AgentModeRunService {
                     : hooks.estimateRuntimeTokens(providerTextForSend)
                 hooks.addUserInputTokensToActiveNonCodexTurn(steeringUserInputTokens, session)
 
-                let augmentedSteeringText = await hooks.augmentUserMessageForProviderSend(
+                let augmentedSteering = await hooks.augmentUserMessageForProviderSend(
                     providerTextForSend,
                     steeringBatch.flatMap(\.attachments),
                     steeringBatch.flatMap(\.taggedFileAttachments),
-                    session
+                    session,
+                    steeringBatch.map(\.identity)
                 )
+                let augmentedSteeringText = augmentedSteering.text
+                // Staged input in this text: released by every exit before a handoff carries it, then
+                // settled from that handoff's evidence (exactly once).
+                let steeringStagedInput = AgentCarriedStagedInput(pendingHandoffStage: augmentedSteering.pendingHandoffStage)
+                var steeringHandoff: AgentProviderHandoff?
+                defer {
+                    if let steeringHandoff {
+                        steeringHandoff.settleStagedInput(sent: false)
+                    } else if !steeringStagedInput.isEmpty {
+                        hooks.recordStagedInputOutcome(session, steeringStagedInput, .notSent)
+                    }
+                }
+                // Returns the dequeued batch, unsent and in order, ahead of the remaining queue.
+                let unsentUserInputTokens = dequeuedUserInputTokens
+                let restoreUnsentBatch = {
+                    releaseSupersedingProtectionIfUnused()
+                    session.pendingACPSteeringInstructions.insert(contentsOf: steeringBatch, at: 0)
+                    if !unsentUserInputTokens.isEmpty {
+                        session.pendingNonCodexUserInputTokenQueue.insert(contentsOf: unsentUserInputTokens, at: 0)
+                    }
+                }
+                if let blockedReason = augmentedSteering.blockedReason {
+                    // Its handoff prefix could not be saved with it: never sent without it (stays saved).
+                    restoreUnsentBatch()
+                    requeueAllQueuedACPSteeringAsFollowUp(tabID: tabID, session: session, reason: blockedReason)
+                    return
+                }
+                // Commit every constituent's dispatch atomically, in order, against this exact run
+                // attempt, then revalidate before the combined handoff.
+                guard let ownership = session.activeRunOwnership,
+                      ownership.attemptID == runAttemptID,
+                      isCurrentACPSteeringAttempt(session: session, runID: runID, runAttemptID: runAttemptID, controller: controller)
+                else {
+                    restoreUnsentBatch()
+                    requeueAllQueuedACPSteeringAsFollowUp(
+                        tabID: tabID,
+                        session: session,
+                        reason: "stale ACP steering attempt before dispatch"
+                    )
+                    return
+                }
+                let handoff: AgentProviderHandoff
+                switch await AgentProviderHandoff.begin(
+                    session: session,
+                    constituents: steeringBatch.map(\.identity),
+                    ownership: ownership,
+                    processRunID: runID
+                ) {
+                case .failure:
+                    // Nothing moved to dispatching; nothing was handed off.
+                    restoreUnsentBatch()
+                    requeueAllQueuedACPSteeringAsFollowUp(
+                        tabID: tabID,
+                        session: session,
+                        reason: "ACP steering dispatch was not recorded"
+                    )
+                    return
+                case let .success(begun):
+                    handoff = begun
+                    hooks.carryStagedInput(steeringStagedInput, on: begun, session: session)
+                    steeringHandoff = begun
+                }
+                guard isCurrentACPSteeringAttempt(session: session, runID: runID, runAttemptID: runAttemptID, controller: controller) else {
+                    handoff.noteNoHandoff()
+                    restoreUnsentBatch()
+                    requeueAllQueuedACPSteeringAsFollowUp(
+                        tabID: tabID,
+                        session: session,
+                        reason: "stale ACP steering attempt after dispatch commit"
+                    )
+                    return
+                }
                 let sent = await submitActiveACPPromptIfSupported(
                     session: session,
                     messageForRun: augmentedSteeringText,
                     attachments: steeringBatch.flatMap(\.attachments),
                     targetRunID: runID,
                     targetRunAttemptID: runAttemptID,
-                    targetController: controller
+                    targetController: controller,
+                    handoff: handoff
                 )
-                hooks.recordPendingHandoffSendOutcome(session, sent)
+                // An uncertain durable delivery neither replays nor consumes staged input.
+                hooks.recordStagedInputSendOutcome(handoff: handoff, sent: sent)
                 if sent {
                     await hooks.signalMCPInstructionDelivered(session)
                 }
                 if !sent {
-                    releaseSupersedingProtectionIfUnused()
-                    session.pendingACPSteeringInstructions.insert(contentsOf: steeringBatch, at: 0)
-                    if !dequeuedUserInputTokens.isEmpty {
-                        session.pendingNonCodexUserInputTokenQueue.insert(contentsOf: dequeuedUserInputTokens, at: 0)
+                    if handoff.isDurable,
+                       handoff.observation != .notHandedOff,
+                       handoff.observation != .rejected
+                    {
+                        // Ambiguous handoff: the batch's intents stay delivery-unknown and are never
+                        // re-queued for automatic redelivery. Later steering still drains as usual.
+                        releaseSupersedingProtectionIfUnused()
+                    } else {
+                        restoreUnsentBatch()
                     }
                     requeueAllQueuedACPSteeringAsFollowUp(
                         tabID: tabID,
@@ -1056,15 +1282,21 @@ package final class AgentModeRunService {
         return description.isEmpty ? String(describing: error) : description
     }
 
-    private func failBeforeProviderStartup(session: AgentTabSession, message: String) async {
+    private func failBeforeProviderStartup(
+        session: AgentTabSession,
+        message: String,
+        stagedInput: AgentCarriedStagedInput
+    ) async {
         let ownership = session.activeRunOwnership ?? session.beginRunAttempt(source: "runService.startupFailure")
-        hooks.recordPendingHandoffSendOutcome(session, false)
+        // Nothing reached a provider: release exactly the staged input of this start.
+        hooks.recordStagedInputOutcome(session, stagedInput, .notSent)
         await terminalCommitBarrier.commit(.init(
             session: session,
             ownership: ownership,
             expectedRunID: session.runID,
             terminalState: .failed,
             source: "runService.startupFailure",
+            cause: .ordinary,
             errorText: message,
             attachmentDisposition: .deleteFiles,
             finalizeNonCodexUsage: session.selectedAgent != .codexExec,
@@ -1179,23 +1411,25 @@ package final class AgentModeRunService {
         session: AgentTabSession,
         reason: String
     ) {
-        var providerTexts = [coalescedACPProviderText(for: instructions)]
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-        guard !providerTexts.isEmpty else { return }
+        let providerText = coalescedACPProviderText(for: instructions)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        // One follow-up delivers every source input, in order (separate bubbles already exist).
+        guard !providerText.isEmpty,
+              let followUp = AgentPendingInstruction(
+                  coalescedText: providerText,
+                  constituents: instructions.map(\.identity)
+              )
+        else { return }
         if session.runState == .completed, session.acpController != nil {
-            let first = providerTexts.removeFirst()
-            if !providerTexts.isEmpty {
-                session.pendingInstructions.insert(contentsOf: providerTexts, at: 0)
-            }
             session.mcpFollowUpRunPending = true
-            hooks.startFollowUpRun(tabID, first, hooks.beginAttentionFollowUpObservation(session))
+            hooks.startFollowUpRun(tabID, followUp, hooks.beginAttentionFollowUpObservation(session))
             return
         }
-        session.pendingInstructions.insert(contentsOf: providerTexts, at: 0)
+        session.pendingInstructions.insert(followUp, at: 0)
         session.isDirty = true
         hooks.updateBindings(session)
         hooks.scheduleSave(tabID)
+        hooks.deliverRequeuedHeadToLiveInstructionWait(session)
     }
 
     /// Claims superseding protection for the currently outstanding Claude turn when
@@ -1403,28 +1637,117 @@ package final class AgentModeRunService {
                     return session.pendingNonCodexUserInputTokenQueue.removeFirst()
                 }()
 
-                let augmentedSteeringText = await hooks.augmentUserMessageForProviderSend(
+                let augmentedSteering = await hooks.augmentUserMessageForProviderSend(
                     steering.providerText,
                     steering.attachments,
                     steering.taggedFileAttachments,
-                    session
+                    session,
+                    [steering.identity]
                 )
+                let augmentedSteeringText = augmentedSteering.text
+                // Staged input in this text: released by every exit before a handoff carries it, then
+                // settled from that handoff's evidence (exactly once).
+                let steeringStagedInput = AgentCarriedStagedInput(pendingHandoffStage: augmentedSteering.pendingHandoffStage)
+                var steeringHandoff: AgentProviderHandoff?
+                defer {
+                    if let steeringHandoff {
+                        steeringHandoff.settleStagedInput(sent: false)
+                    } else if !steeringStagedInput.isEmpty {
+                        hooks.recordStagedInputOutcome(session, steeringStagedInput, .notSent)
+                    }
+                }
+                let restoreUnsentSteering = {
+                    session.pendingClaudeSteeringInstructions.insert(steering, at: 0)
+                    if let dequeuedUserInputTokens {
+                        session.pendingNonCodexUserInputTokenQueue.insert(dequeuedUserInputTokens, at: 0)
+                    }
+                }
+                if augmentedSteering.blockedReason != nil {
+                    // Its handoff prefix could not be saved with it: never sent without it. Handled
+                    // like a refused dispatch commit (nothing dispatched; the input stays saved).
+                    restoreUnsentSteering()
+                    restoreAllQueuedClaudeSteeringDrafts(tabID: tabID, session: session, strategy: .prependAlways)
+                    await cancelClaudeRunStrandedBySteeringFailureIfNeeded(
+                        tabID: tabID,
+                        session: session,
+                        runID: runID,
+                        runAttemptID: runAttemptID
+                    )
+                    return
+                }
+                // Commit this steering input's dispatch against this exact run attempt, then
+                // revalidate before the controller send.
+                guard let ownership = session.activeRunOwnership,
+                      ownership.attemptID == runAttemptID,
+                      isCurrentClaudeSteeringAttempt(session: session, runID: runID, runAttemptID: runAttemptID)
+                else {
+                    restoreUnsentSteering()
+                    restoreQueuedClaudeSteeringDrafts(
+                        tabID: tabID,
+                        session: session,
+                        strategy: .prependAlways,
+                        matching: { $0.targetRunID == runID && $0.targetRunAttemptID == runAttemptID }
+                    )
+                    return
+                }
+                let handoff: AgentProviderHandoff
+                switch await AgentProviderHandoff.begin(
+                    session: session,
+                    constituents: [steering.identity],
+                    ownership: ownership,
+                    processRunID: runID
+                ) {
+                case .failure:
+                    // Nothing moved to dispatching; nothing was handed off.
+                    restoreUnsentSteering()
+                    restoreAllQueuedClaudeSteeringDrafts(tabID: tabID, session: session, strategy: .prependAlways)
+                    await cancelClaudeRunStrandedBySteeringFailureIfNeeded(
+                        tabID: tabID,
+                        session: session,
+                        runID: runID,
+                        runAttemptID: runAttemptID
+                    )
+                    return
+                case let .success(begun):
+                    handoff = begun
+                    hooks.carryStagedInput(steeringStagedInput, on: begun, session: session)
+                    steeringHandoff = begun
+                }
+                guard isCurrentClaudeSteeringAttempt(session: session, runID: runID, runAttemptID: runAttemptID) else {
+                    handoff.noteNoHandoff()
+                    restoreUnsentSteering()
+                    restoreQueuedClaudeSteeringDrafts(
+                        tabID: tabID,
+                        session: session,
+                        strategy: .prependAlways,
+                        matching: { $0.targetRunID == runID && $0.targetRunAttemptID == runAttemptID }
+                    )
+                    return
+                }
                 steeringDebugLog("[AgentRunSteeringWake] Claude flush sending native interrupt id=\(steering.id) tab=\(tabID) runID=\(runID) attempt=\(runAttemptID)")
                 let sent = await dependencies.claudeCoordinator.sendClaudeNativeMessage(
                     session: session,
                     text: augmentedSteeringText,
-                    attachments: []
+                    attachments: [],
+                    handoff: handoff
                 )
                 steeringDebugLog("[AgentRunSteeringWake] Claude flush send completed id=\(steering.id) tab=\(tabID) runID=\(runID) attempt=\(runAttemptID) sent=\(sent)")
-                hooks.recordPendingHandoffSendOutcome(session, sent)
+                // An uncertain durable delivery neither replays nor consumes staged input.
+                hooks.recordStagedInputSendOutcome(handoff: handoff, sent: sent)
                 if sent {
                     await hooks.signalMCPInstructionDelivered(session)
                 }
                 if !sent {
-                    // Re-insert the failed instruction so it's included in the restore
-                    session.pendingClaudeSteeringInstructions.insert(steering, at: 0)
-                    if let dequeuedUserInputTokens {
-                        session.pendingNonCodexUserInputTokenQueue.insert(dequeuedUserInputTokens, at: 0)
+                    if handoff.isDurable,
+                       handoff.observation != .notHandedOff,
+                       handoff.observation != .rejected
+                    {
+                        // Ambiguous handoff: the intent stays delivery-unknown and is never
+                        // re-queued or restored as a retryable draft.
+                        releaseUnconsumedClaudeSupersedingProtection(for: [steering], session: session)
+                    } else {
+                        // Re-insert the failed instruction so it's included in the restore
+                        restoreUnsentSteering()
                     }
                     // Restore ALL remaining queued drafts (including the one that failed)
                     restoreAllQueuedClaudeSteeringDrafts(tabID: tabID, session: session, strategy: .prependAlways)
@@ -1474,7 +1797,7 @@ package final class AgentModeRunService {
         case .running:
             steeringDebugLog("[AgentRunSteeringWake] Claude flush cancelling stranded run tab=\(tabID) runID=\(runID) attempt=\(runAttemptID)")
             session.claudeSteeringFlushTask = nil
-            await cancelRun(tabID: tabID, session: session)
+            await cancelRun(tabID: tabID, session: session, cause: .ordinary)
         case .failed:
             steeringDebugLog("[AgentRunSteeringWake] Claude flush committing stranded send failure tab=\(tabID) runID=\(runID) attempt=\(runAttemptID)")
             session.claudeSteeringFlushTask = nil
@@ -1487,6 +1810,7 @@ package final class AgentModeRunService {
                 expectedRunID: runID,
                 terminalState: .failed,
                 source: "runService.claudeSteeringSendFailure",
+                cause: .ordinary,
                 attachmentDisposition: .deleteFiles,
                 finalizeNonCodexUsage: true,
                 supportsFollowUp: false,
@@ -1526,7 +1850,12 @@ package final class AgentModeRunService {
         matching shouldRestore: (AgentTabSession.ClaudeSteeringInstruction) -> Bool
     ) {
         let instructions = session.pendingClaudeSteeringInstructions.filter(shouldRestore)
+        // Preserve disposition: a durable input keeps its recovery intent and is never also
+        // restored as a composer draft (that would duplicate it after a restart); it is presented
+        // as held input instead of disappearing until a restart.
+        holdRemovedDurableInputs(instructions.map(\.identity), session: session, reason: Self.steeringTargetEndedHoldReason)
         let drafts = instructions
+            .filter { !$0.identity.isDurable }
             .map(\.draftText)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
@@ -1545,12 +1874,30 @@ package final class AgentModeRunService {
         let instructions = Array(session.pendingClaudeSteeringInstructions.prefix(while: shouldRestore))
         guard !instructions.isEmpty else { return }
         session.pendingClaudeSteeringInstructions.removeFirst(instructions.count)
+        holdRemovedDurableInputs(instructions.map(\.identity), session: session, reason: Self.steeringTargetEndedHoldReason)
         let drafts = instructions
+            .filter { !$0.identity.isDurable }
             .map(\.draftText)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
         releaseUnconsumedClaudeSupersedingProtection(for: instructions, session: session)
         restoreClaudeSteeringDrafts(drafts, tabID: tabID, strategy: strategy)
+    }
+
+    /// Held-input reasons for durable queued input whose queue entry was removed (F5).
+    static let steeringTargetEndedHoldReason = "The run it was queued for ended before it was sent, so it is no longer queued."
+    static let runStoppedHoldReason = "The run was stopped before it was sent, so it is no longer queued."
+
+    /// Durable inputs whose live queue entry is being removed without a replacement are presented
+    /// as held input through the session's recovery lane; untracked input records nothing.
+    private func holdRemovedDurableInputs(
+        _ identities: [AgentQueuedInputIdentity],
+        session: AgentTabSession,
+        reason: String
+    ) {
+        let intentIDs = identities.compactMap(\.intentID)
+        guard !intentIDs.isEmpty, let lane = session.recoveryLane else { return }
+        lane.noteProjectionRemoved(intentIDs: intentIDs, reason: reason)
     }
 
     private func restoreClaudeSteeringDrafts(
@@ -1568,10 +1915,12 @@ package final class AgentModeRunService {
         session: AgentTabSession,
         strategy: DraftRestorationStrategy
     ) {
+        // Preserve disposition: durable inputs keep their recovery intents; only untracked drafts
+        // return to the composer.
         let drafts = (
-            session.pendingClaudeSteeringInstructions.map(\.draftText)
-                + session.pendingACPSteeringInstructions.map(\.draftText)
-                + session.pendingInstructions
+            session.pendingClaudeSteeringInstructions.filter { !$0.identity.isDurable }.map(\.draftText)
+                + session.pendingACPSteeringInstructions.filter { !$0.identity.isDurable }.map(\.draftText)
+                + session.pendingInstructions.filter { !$0.isDurable }.map(\.text)
         )
         .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
         .filter { !$0.isEmpty }
@@ -1596,6 +1945,7 @@ package final class AgentModeRunService {
     package func cancelRun(
         tabID: UUID,
         session: AgentTabSession,
+        cause: AgentRunTerminalCause,
         intent: CancellationIntent = .userStop,
         completion: CancellationCompletion = .terminalPublished
     ) async {
@@ -1640,6 +1990,13 @@ package final class AgentModeRunService {
         let hadPendingInstructions = !session.pendingInstructions.isEmpty
             || !session.pendingClaudeSteeringInstructions.isEmpty
             || !session.pendingACPSteeringInstructions.isEmpty
+        holdRemovedDurableInputs(
+            session.pendingInstructions.flatMap(\.constituents)
+                + session.pendingClaudeSteeringInstructions.map(\.identity)
+                + session.pendingACPSteeringInstructions.map(\.identity),
+            session: session,
+            reason: Self.runStoppedHoldReason
+        )
         session.pendingNonCodexUserInputTokenQueue.removeAll()
         session.activeNonCodexTurnTokenAccumulator = nil
         session.pendingInstructions.removeAll()
@@ -1685,6 +2042,10 @@ package final class AgentModeRunService {
                 expectedRunID: expectedRunID
             )
             : nil
+        // O49: before the run detaches, so run end settles a started Claude turn as accepted and a
+        // started ACP prompt failing from this teardown reports receipt.
+        dependencies.claudeCoordinator.noteRepoPromptTeardownRequested(session)
+        acpController?.noteRepoPromptTeardownRequested()
         session.agentTask?.cancel()
 
         if session.selectedAgent == .codexExec {
@@ -1697,6 +2058,7 @@ package final class AgentModeRunService {
             expectedRunID: expectedRunID,
             terminalState: .cancelled,
             source: "runService.cancel",
+            cause: cause,
             completion: effectiveCompletion,
             attachmentDisposition: session.selectedAgent == .codexExec ? .restoreToPending : .deleteFiles,
             finalizeNonCodexUsage: session.selectedAgent != .codexExec,

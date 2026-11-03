@@ -369,6 +369,20 @@ extension AgentModeViewModel {
         syncStatusPillsUIState()
     }
 
+    /// The session's interview-first choice. The active session also honours a choice made before
+    /// that session object was bound to the tab (the projected `interviewFirst`).
+    func effectiveInterviewFirst(for session: AgentTabSession) -> Bool {
+        session.interviewFirst || (session === activeSession && interviewFirst)
+    }
+
+    /// Sets one session's interview-first choice, keeping the active-tab projection in step.
+    func setInterviewFirst(_ enabled: Bool, for session: AgentTabSession) {
+        session.interviewFirst = enabled
+        if session === activeSession, interviewFirst != enabled {
+            interviewFirst = enabled
+        }
+    }
+
     func toggleInterviewFirst() {
         setInterviewFirst(!interviewFirst)
     }

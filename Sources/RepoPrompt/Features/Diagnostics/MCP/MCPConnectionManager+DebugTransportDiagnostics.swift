@@ -332,6 +332,10 @@ import RepoPromptWorkspace
                 "op": op,
                 "connections": snapshot.connections.map { entry in
                     let rawIngress = debugQualificationRawIngressSnapshot(connectionID: entry.id)
+                    // One read per row: the run ID comes only from `runIDByConnectionID` and the
+                    // helper fields from a single snapshot binding, so a row is internally consistent.
+                    let runID = debugCachedRunID(for: entry.id)
+                    let helperSnapshot = debugHelperPeerProcessSnapshot(connectionID: entry.id)
                     return [
                         "id": entry.id.uuidString,
                         "client_name": entry.clientName.isEmpty ? NSNull() : entry.clientName,
@@ -348,6 +352,9 @@ import RepoPromptWorkspace
                         "non_bookkeeping_tool_call_count": rawIngress.nonBookkeepingCalls,
                         "non_bookkeeping_tool_names": rawIngress.nonBookkeepingToolNames,
                         "helper_peer_pid": debugHelperPeerPID(connectionID: entry.id) ?? NSNull(),
+                        "run_id": runID?.uuidString ?? NSNull(),
+                        "helper_process_start": helperSnapshot?.peer.startDescription ?? NSNull(),
+                        "helper_ancestor_pids": helperSnapshot.map { $0.ancestorPIDs.map(Int.init) as Any } ?? NSNull(),
                         "active_tool_name": entry.activeToolName ?? NSNull(),
                         "active_tool_window_id": entry.activeToolWindowID.map { $0 as Any } ?? NSNull(),
                         "active_tool_scope_count": entry.activeToolScopeCount,
@@ -567,6 +574,112 @@ import RepoPromptWorkspace
                 "op": op,
                 "connection_id": targetID.uuidString,
                 "removed": existed
+            ])
+        }
+
+        /// Shared guards for destructive single-connection fault injection: `allow_destructive=true`
+        /// and a `connection_id` UUID other than the caller's.
+        private func debugDestructiveTargetConnectionID(
+            op: String,
+            callerConnectionID: UUID,
+            arguments: [String: Value]
+        ) -> Result<UUID, DebugDestructiveTargetError> {
+            guard debugBool(arguments, "allow_destructive") == true else {
+                return .failure(DebugDestructiveTargetError(message: "\(op) requires allow_destructive=true."))
+            }
+            guard let targetString = debugString(arguments, "connection_id"),
+                  let targetID = UUID(uuidString: targetString)
+            else {
+                return .failure(DebugDestructiveTargetError(message: "connection_id must be a UUID string."))
+            }
+            guard targetID != callerConnectionID else {
+                return .failure(DebugDestructiveTargetError(message: "Refusing to target the calling connection."))
+            }
+            return .success(targetID)
+        }
+
+        struct DebugDestructiveTargetError: Error {
+            let message: String
+        }
+
+        /// Live acceptance: drives the production execution-watchdog abort (terminal commit, run
+        /// connection-loss delivery, helper `terminatedByServer` exit) for another connection.
+        func debugForceExecutionWatchdogAbortPayload(
+            op: String,
+            connectionID: UUID,
+            arguments: [String: Value]
+        ) async -> CallTool.Result {
+            let targetID: UUID
+            switch debugDestructiveTargetConnectionID(op: op, callerConnectionID: connectionID, arguments: arguments) {
+            case let .success(id):
+                targetID = id
+            case let .failure(error):
+                return debugDiagnosticsError(op: op, code: "invalid_params", message: error.message)
+            }
+            var callTimeRunID: UUID?
+            if let rawRunID = debugString(arguments, "run_id") {
+                guard let runID = UUID(uuidString: rawRunID) else {
+                    return debugDiagnosticsError(op: op, code: "invalid_params", message: "run_id must be a UUID string.")
+                }
+                callTimeRunID = runID
+            }
+            let toolName = debugString(arguments, "tool_name") ?? "debug_forced_watchdog"
+            let existed = debugConnectionIsRegistered(connectionID: targetID)
+            let alreadyTerminal = debugIsExecutionWatchdogTerminal(connectionID: targetID)
+            let helperPeerPID = debugHelperPeerPID(connectionID: targetID)
+            var aborted = false
+            if existed, !alreadyTerminal {
+                await debugAbortConnectionForExecutionWatchdog(
+                    connectionID: targetID,
+                    toolName: toolName,
+                    callTimeRunID: callTimeRunID
+                )
+                aborted = debugIsExecutionWatchdogTerminal(connectionID: targetID)
+            }
+            return debugDiagnosticsResult([
+                "ok": true,
+                "op": op,
+                "connection_id": targetID.uuidString,
+                "tool_name": toolName,
+                "existed": existed,
+                "already_terminal": alreadyTerminal,
+                "aborted": aborted,
+                "helper_peer_pid": helperPeerPID ?? NSNull()
+            ])
+        }
+
+        /// Live acceptance negative control: soft-disconnects another connection (no kill signal,
+        /// no session cooldown). Its helper keeps its session token and must reconnect, so no run
+        /// connection loss may fire. `reason` defaults to `idle_timeout`, a watched close reason.
+        func debugSoftDisconnectConnectionPayload(
+            op: String,
+            connectionID: UUID,
+            arguments: [String: Value]
+        ) async -> CallTool.Result {
+            let targetID: UUID
+            switch debugDestructiveTargetConnectionID(op: op, callerConnectionID: connectionID, arguments: arguments) {
+            case let .success(id):
+                targetID = id
+            case let .failure(error):
+                return debugDiagnosticsError(op: op, code: "invalid_params", message: error.message)
+            }
+            let rawReason = debugString(arguments, "reason") ?? TerminationReason.idleTimeout.rawValue
+            guard let reason = TerminationReason(rawValue: rawReason) else {
+                return debugDiagnosticsError(op: op, code: "invalid_params", message: "reason must be a TerminationReason raw value.")
+            }
+            let existed = debugConnectionIsRegistered(connectionID: targetID)
+            let helperPeerPID = debugHelperPeerPID(connectionID: targetID)
+            if existed {
+                await debugSoftDisconnectConnection(connectionID: targetID, reason: reason)
+            }
+            return debugDiagnosticsResult([
+                "ok": true,
+                "op": op,
+                "connection_id": targetID.uuidString,
+                "reason": reason.rawValue,
+                "existed": existed,
+                "disconnected": existed && !debugConnectionIsRegistered(connectionID: targetID),
+                "helper_peer_pid": helperPeerPID ?? NSNull()
             ])
         }
 

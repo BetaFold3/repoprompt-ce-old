@@ -13,6 +13,15 @@ enum MCPToolExecutionHandlerPhase: String, Equatable {
     case fileActionsPostMutationCatalog = "file_actions.post_mutation_catalog"
     case fileActionsPostMutationSelection = "file_actions.post_mutation_selection"
     case fileActionsReplyConstruction = "file_actions.reply_construction"
+    case historyInventoryWait = "history.inventory_wait"
+    case historyInventoryEnumeration = "history.inventory_enumeration"
+    case historyInventoryIndexScan = "history.inventory_index_scan"
+    case historyFiltering = "history.filtering"
+    case historySorting = "history.sorting"
+    case historyTranscriptLoad = "history.transcript_load"
+    case historyTranscriptTraversal = "history.transcript_traversal"
+    case historyAggregation = "history.aggregation"
+    case historyReplyConstruction = "history.reply_construction"
 }
 
 enum MCPToolExecutionHandlerPhaseTransition: String, Equatable {
@@ -32,14 +41,17 @@ final class MCPToolExecutionHandlerPhaseRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private let origin: Duration
     private let now: @Sendable () async -> Duration
+    private let synchronousNow: (@Sendable () -> Duration)?
     private var latest: MCPToolExecutionHandlerPhaseSnapshot?
 
     init(
         origin: Duration,
-        now: @escaping @Sendable () async -> Duration
+        now: @escaping @Sendable () async -> Duration,
+        synchronousNow: (@Sendable () -> Duration)? = nil
     ) {
         self.origin = origin
         self.now = now
+        self.synchronousNow = synchronousNow
     }
 
     func report(
@@ -52,6 +64,28 @@ final class MCPToolExecutionHandlerPhaseRecorder: @unchecked Sendable {
             transition: transition,
             elapsedMilliseconds: max(0, current.mcpMilliseconds - origin.mcpMilliseconds)
         ))
+    }
+
+    /// Non-suspending report for handlers that must record progress from synchronous
+    /// code (e.g. inside an actor's critical section). Stamps with the watchdog clock's
+    /// synchronous reader when the environment provides one; otherwise it keeps the
+    /// previous snapshot's elapsed time (the phase is still current and ordered).
+    func reportSynchronously(
+        _ phase: MCPToolExecutionHandlerPhase,
+        transition: MCPToolExecutionHandlerPhaseTransition
+    ) {
+        lock.lock()
+        defer { lock.unlock() }
+        let elapsed: Double = if let synchronousNow {
+            max(0, synchronousNow().mcpMilliseconds - origin.mcpMilliseconds)
+        } else {
+            latest?.elapsedMilliseconds ?? 0
+        }
+        latest = MCPToolExecutionHandlerPhaseSnapshot(
+            phase: phase,
+            transition: transition,
+            elapsedMilliseconds: elapsed
+        )
     }
 
     func snapshot() -> MCPToolExecutionHandlerPhaseSnapshot? {

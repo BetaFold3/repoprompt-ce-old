@@ -2,7 +2,7 @@ import Foundation
 import Logging
 import RepoPromptPlatform
 
-package enum ClaudeCodeRuntimeVariant: String {
+package enum ClaudeCodeRuntimeVariant: String, CaseIterable {
     case standard
     case glm
     case kimi
@@ -281,7 +281,12 @@ package final class AgentRuntimeProviderService {
             )
             let processConfig = Self.claudeProcessConfiguration(for: config)
             let runner = CLIProcessRunner(config: processConfig)
-            let wrappedProvider = ClaudeCodeAgentProvider(runner: runner, config: config, mcpHost: mcpHost)
+            let wrappedProvider = ClaudeCodeAgentProvider(
+                runner: runner,
+                config: config,
+                mcpHost: mcpHost,
+                worktreePath: workspacePath
+            )
             let runtimeConfig = ClaudeCompatiblePluginBridge.runtimeConfig(from: config, mode: .discovery)
             if Self.enableDebugLogging {
                 Self.logger.debug("Created ClaudeCompatibleHeadlessProviderAdapter")
@@ -307,7 +312,12 @@ package final class AgentRuntimeProviderService {
             if Self.enableDebugLogging {
                 Self.logger.debug("Created CodexExecAgentProvider")
             }
-            return CodexExecAgentProvider(runner: runner, config: config, mcpHost: mcpHost)
+            return CodexExecAgentProvider(
+                runner: runner,
+                config: config,
+                mcpHost: mcpHost,
+                worktreePath: workspacePath
+            )
         case .openCode:
             let config = OpenCodeAgentConfig(
                 modelString: modelString,

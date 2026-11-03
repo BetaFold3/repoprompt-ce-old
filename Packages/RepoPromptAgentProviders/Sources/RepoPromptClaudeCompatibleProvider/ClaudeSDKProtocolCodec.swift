@@ -186,7 +186,9 @@ public enum ClaudeSDKProtocolCodec {
         return try JSONSerialization.data(withJSONObject: payload, options: [])
     }
 
-    public static func encodeUserMessage(text: String, sessionID: String?) throws -> Data {
+    /// `messageUUID` (default `nil`: the legacy bytes exactly) adds the streamed user message's
+    /// top-level caller `uuid`, encoded lowercase.
+    public static func encodeUserMessage(text: String, sessionID: String?, messageUUID: UUID? = nil) throws -> Data {
         var payload: [String: Any] = [
             "type": "user",
             "message": [
@@ -202,6 +204,9 @@ public enum ClaudeSDKProtocolCodec {
         ]
         if let sessionID, !sessionID.isEmpty {
             payload["session_id"] = sessionID
+        }
+        if let messageUUID {
+            payload["uuid"] = messageUUID.uuidString.lowercased()
         }
         return try JSONSerialization.data(withJSONObject: payload, options: [])
     }

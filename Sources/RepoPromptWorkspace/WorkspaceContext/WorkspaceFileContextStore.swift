@@ -215,6 +215,75 @@ package struct WorkspaceSessionRootLifetimeSnapshot: @unchecked Sendable {
     }
 }
 
+/// Weak index of objects plus a release clock. `WorkspaceFileContextStore` keeps one process-wide
+/// instance for stores holding idle ready codemap demands: idle records hold artifact-store leases
+/// from an admission every window's store may share, so under lease pressure any store can find
+/// and evict the least recently released one, wherever it lives, and the clock orders records
+/// across stores.
+///
+/// No strong reference to a registered object is created or released while `lock` is held: an
+/// object's `deinit` unregisters, which takes `lock`, so dropping a last reference inside it would
+/// deadlock. `liveObjects()` copies the weak boxes under the lock and resolves them outside it.
+final class WorkspaceCodemapWeakObjectRegistry<Object: AnyObject>: @unchecked Sendable {
+    private struct WeakBox {
+        weak var object: Object?
+    }
+
+    private let lock = NSLock()
+    private var boxes: [ObjectIdentifier: WeakBox] = [:]
+    private var lastReleaseSerial: UInt64 = 0
+    #if DEBUG
+        private var afterSnapshotHookForTesting: (() -> Void)?
+    #endif
+
+    init() {}
+
+    func nextReleaseSerial() -> UInt64 {
+        lock.withLock {
+            lastReleaseSerial &+= 1
+            return lastReleaseSerial
+        }
+    }
+
+    func register(_ object: Object) {
+        let id = ObjectIdentifier(object)
+        let box = WeakBox(object: object)
+        lock.withLock { boxes[id] = box }
+    }
+
+    /// Called from the object's `deinit`; destroyed objects leave no entry behind.
+    func unregister(_ id: ObjectIdentifier) {
+        _ = lock.withLock { boxes.removeValue(forKey: id) }
+    }
+
+    func liveObjects() -> [Object] {
+        let snapshot = lock.withLock { Array(boxes.values) }
+        #if DEBUG
+            let hook = lock.withLock { afterSnapshotHookForTesting }
+            hook?()
+        #endif
+        return snapshot.compactMap(\.object)
+    }
+
+    #if DEBUG
+        var registeredCountForTesting: Int {
+            lock.withLock { boxes.count }
+        }
+
+        /// Runs between `liveObjects()` taking its snapshot and resolving it.
+        func setAfterSnapshotHookForTesting(_ hook: (() -> Void)?) {
+            lock.withLock { afterSnapshotHookForTesting = hook }
+        }
+    #endif
+}
+
+/// An idle ready record offered for process-wide eviction under lease pressure.
+struct WorkspaceCodemapIdleReadyEvictionCandidate {
+    let releaseSerial: UInt64
+    let rootEpoch: WorkspaceCodemapRootEpoch
+    let fileID: UUID
+}
+
 package actor WorkspaceFileContextStore {
     private static let maximumRetainedCodemapProjectionDemands = 256
     private static let maximumRetainedCodemapProjectionDemandMetadataBytes: UInt64 = 4 * 1024 * 1024
@@ -285,6 +354,15 @@ package actor WorkspaceFileContextStore {
 
     private static let maximumRetainedCodemapPresentationRecordsPerRoot = 64
     private static let maximumCodemapPresentationRequestsPerBundle = 4096
+    /// Ready demand records whose last holder released them stay warm (unretained, not revoked)
+    /// so a later request can join them without a new overlay demand. Each idle record keeps one
+    /// live overlay ready entry, which counts against both the per-root entry limit and the
+    /// per-root lease limit (`acceptCompletion` rejects at the lease limit instead of evicting),
+    /// so the cap is half of the smaller of the two: idle records never crowd out active demands.
+    static let maximumIdleReadyCodemapDemandsPerRoot = min(
+        WorkspaceCodemapLiveOverlayPolicy.default.maximumEntryCountPerRoot,
+        WorkspaceCodemapLiveOverlayPolicy.default.maximumLeaseCountPerRoot
+    ) / 2
 
     private struct RootState {
         let lifetimeID: UUID
@@ -398,14 +476,110 @@ package actor WorkspaceFileContextStore {
         case unload
     }
 
+    /// Least-recently-released order of idle ready demands with O(1) insert and removal and
+    /// amortized O(1) oldest lookup: a serial per file plus an append-only queue whose stale
+    /// entries (removed or re-released files) are skipped lazily and compacted.
+    private struct CodemapIdleReadyDemandLRU {
+        private var serialsByFileID: [UUID: UInt64] = [:]
+        private var queue: [(serial: UInt64, fileID: UUID)] = []
+        private var queueHead = 0
+
+        var count: Int {
+            serialsByFileID.count
+        }
+
+        func contains(_ fileID: UUID) -> Bool {
+            serialsByFileID[fileID] != nil
+        }
+
+        func serial(of fileID: UUID) -> UInt64? {
+            serialsByFileID[fileID]
+        }
+
+        /// Marks the file most recently released. `serial` comes from the process-wide release
+        /// clock, so the oldest entries of different roots and stores can be compared.
+        mutating func touch(_ fileID: UUID, serial: UInt64) {
+            serialsByFileID[fileID] = serial
+            queue.append((serial, fileID))
+            compactIfNeeded()
+        }
+
+        mutating func remove(_ fileID: UUID) {
+            serialsByFileID.removeValue(forKey: fileID)
+            if serialsByFileID.isEmpty {
+                queue.removeAll(keepingCapacity: true)
+                queueHead = 0
+            }
+        }
+
+        /// The least recently released file, without removing it.
+        mutating func oldest() -> UUID? {
+            oldestEntry()?.fileID
+        }
+
+        /// The least recently released file and its store-wide release serial.
+        mutating func oldestEntry() -> (serial: UInt64, fileID: UUID)? {
+            while queueHead < queue.count {
+                let entry = queue[queueHead]
+                if serialsByFileID[entry.fileID] == entry.serial {
+                    return entry
+                }
+                queueHead += 1
+            }
+            return nil
+        }
+
+        /// Files in least-recently-released order.
+        var orderedFileIDs: [UUID] {
+            queue[queueHead...].compactMap { entry in
+                serialsByFileID[entry.fileID] == entry.serial ? entry.fileID : nil
+            }
+        }
+
+        private mutating func compactIfNeeded() {
+            guard queue.count > 64, queue.count > serialsByFileID.count * 2 else { return }
+            queue = orderedFileIDs.map { (serialsByFileID[$0] ?? 0, $0) }
+            queueHead = 0
+        }
+    }
+
+    /// A revoking cleanup (idle eviction or a ready cancellation) still in flight for one file.
+    /// A new demand for the file at the same request generation waits for it, so the
+    /// generation-keyed revoke can never reach that successor's ready artifact. A successor at a
+    /// different generation is outside the revoke and does not wait.
+    private struct CodemapRevokingCleanup {
+        let id: UUID
+        let requestGeneration: UInt64
+        let task: Task<Void, Never>
+    }
+
     private struct CodemapDemandRecord {
-        let ticket: WorkspaceCodemapArtifactDemandTicket
+        var ticket: WorkspaceCodemapArtifactDemandTicket
         let identity: WorkspaceCodemapArtifactBindingIdentity
         let language: LanguageType
         let owner: WorkspaceCodemapLiveDemandOwner
         var retainIDs: Set<UUID>
         var result: WorkspaceCodemapArtifactDemandResult
         var task: Task<Void, Never>?
+        /// Set when an opted-in release left this record's admitted work running; a rejoin clears
+        /// it. Only such records are settled (parked or dropped) when their demand task ends.
+        var releasedKeepingAdmittedWork = false
+        /// In-flight release resolution; requests for the file await it before deciding.
+        var releaseResolution: CodemapReleaseResolution?
+        /// Set when the release resolution found nothing outstanding in the engine: the demand
+        /// either finished unpublished or has not registered yet, and the engine fences the
+        /// owner's next submission. Such a pending record is never joined; the fence is cleared
+        /// when the record settles.
+        var releaseFoundNothingOutstanding = false
+        #if DEBUG
+            /// Counted in `releasedOrphaned` and not yet counted by one of its outcomes.
+            var orphanOutcomePendingForTesting = false
+        #endif
+    }
+
+    private struct CodemapReleaseResolution {
+        let id: UUID
+        let task: Task<Void, Never>
     }
 
     private struct CodemapPublishedStructureCapture {
@@ -454,6 +628,9 @@ package actor WorkspaceFileContextStore {
         var desiredKey: WorkspaceCodemapSelectionGraphRuntimeKey?
         var pendingSnapshot: WorkspaceCodemapLiveGraphSnapshot?
         var publishedSummary: WorkspaceCodemapSelectionGraphRuntimePublishedSummary?
+        /// The desired key a structure query last signalled publication for while the summary
+        /// was withdrawn with no publication active; bounds that signal to once per key.
+        var withdrawnSummarySignalKey: WorkspaceCodemapSelectionGraphRuntimeKey?
         var lastRebuildDisposition: WorkspaceCodemapSelectionGraphRuntimeRebuildDisposition?
         var workerID: UUID?
         var workerTask: Task<Void, Never>?
@@ -583,6 +760,10 @@ package actor WorkspaceFileContextStore {
         var markerReadinessByFileID: [UUID: WorkspaceCodemapMarkerReadinessChange] = [:]
         var markerReadinessRevision: UInt64 = 0
         var demandsByFileID: [UUID: CodemapDemandRecord] = [:]
+        /// Idle ready demands in release order. Invariant: every ID has a record in
+        /// `demandsByFileID` with empty `retainIDs` and a `.ready` result. Mutate only through
+        /// the idle-demand helpers and `removeCodemapDemandRecord`.
+        var idleReadyDemands = CodemapIdleReadyDemandLRU()
         var bundlesByRequestID: [UUID: WorkspaceCodemapLiveOverlayBundle] = [:]
         var presentationRecordsByID: [
             WorkspaceCodemapFrozenPresentationBundleID: CodemapPresentationRecord
@@ -1481,6 +1662,52 @@ package actor WorkspaceFileContextStore {
         ) async -> WorkspaceCodemapBindingEngineAccounting? {
             guard let owner = debugCodemapBindingEngine(rootID: rootID) else { return nil }
             return await owner.engine.accounting()
+        }
+
+        /// Mirrors a real dead fence: the engine's first catalog read publishes the authoritative
+        /// projection shard, a later stale read supersedes the job, and its worker exits.
+        func installRetainedSupersededCodemapProjectionForTesting(rootID: UUID) async -> UUID? {
+            guard let owner = debugCodemapBindingEngine(rootID: rootID),
+                  let authority = codemapSessionsByRootEpoch[owner.rootEpoch]?.authority,
+                  await ensureCodemapProjectionCatalogShard(authority: authority)
+            else { return nil }
+            return await owner.engine.debugInstallRetainedSupersededProjectionJobForTesting(
+                rootEpoch: owner.rootEpoch
+            )
+        }
+
+        func retainedSupersededCodemapProjectionIDForTesting(rootID: UUID) async -> UUID? {
+            guard let owner = debugCodemapBindingEngine(rootID: rootID) else { return nil }
+            return await owner.engine.retainedSupersededProjectionJobID(rootEpoch: owner.rootEpoch)
+        }
+
+        /// Read-only: the projection catalog token the root's newest engine-backed session would
+        /// observe now, or nil without a current session, authority, or published catalog shard.
+        func codemapProjectionCatalogTokenForTesting(rootID: UUID) -> WorkspaceCodemapProjectionCatalogToken? {
+            guard let owner = debugCodemapBindingEngine(rootID: rootID),
+                  let authority = codemapSessionsByRootEpoch[owner.rootEpoch]?.authority
+            else { return nil }
+            return codemapProjectionCatalogShardAndToken(authority: authority)?.token
+        }
+
+        /// Applied-index batches classified projection-neutral for the root in this root lifetime.
+        func codemapProjectionNeutralBatchCountForTesting(rootID: UUID) -> UInt64 {
+            codemapProjectionNeutralBatchCountsByRootID[rootID] ?? 0
+        }
+
+        /// The root's raw applied-index generation, which every published batch advances.
+        func appliedIndexGenerationForTesting(rootID: UUID) -> UInt64? {
+            appliedIndexGenerationsByRootID[rootID]
+        }
+
+        /// The raw topology generation of the root's published catalog shard, if one is published.
+        func publishedRootCatalogShardTopologyGenerationForTesting(rootID: UUID) -> UInt64? {
+            publishedRootCatalogShardsByRootID[rootID]?.key.topologyGeneration
+        }
+
+        /// The ordered projection file IDs of the root's published catalog shard, if one is published.
+        func publishedRootCatalogShardProjectionFileIDsForTesting(rootID: UUID) -> [UUID]? {
+            publishedRootCatalogShardsByRootID[rootID]?.projectionFiles.map(\.file.id)
         }
 
         private func debugCodemapBindingEngine(
@@ -2391,6 +2618,13 @@ package actor WorkspaceFileContextStore {
     }
 
     private var codemapSessionsByRootEpoch: [WorkspaceCodemapRootEpoch: CodemapRootSession] = [:]
+    /// Stores holding idle ready demands, process-wide, with the release clock that orders them.
+    private static let codemapIdleReadyEvictionRegistry = WorkspaceCodemapWeakObjectRegistry<WorkspaceFileContextStore>()
+    /// Whether this store is in the process-wide idle eviction registry (joined on first idle record).
+    private var codemapRegisteredForIdleReadyEviction = false
+    private var codemapRevokingCleanupsBySlot: [
+        WorkspaceCodemapRootScopedFileSlot: CodemapRevokingCleanup
+    ] = [:]
     private var codemapEligibilityFlightsByRootEpoch: [
         WorkspaceCodemapRootEpoch: CodemapEligibilityFlight
     ] = [:]
@@ -2444,6 +2678,19 @@ package actor WorkspaceFileContextStore {
         private var codemapPresentationFreezeRequestCountForTesting = 0
         private var codemapSetupTaskCreationCountForTesting = 0
         private var codemapDemandTaskCreationCountForTesting = 0
+        private var codemapIdleReadyDemandEvictionCountStorageForTesting = 0
+        private var codemapDemandFlowCountsStorageForTesting = CodemapDemandFlowCountsForTesting()
+        /// Runs inside an opted-in release resolution, before it asks the engine.
+        private var codemapReleaseResolutionHookForTesting: (@Sendable (
+            WorkspaceCodemapArtifactDemandTicket
+        ) async -> Void)?
+        /// Runs in a demand task after its pre-submit checks, before each engine submission.
+        private var codemapBeforeEngineSubmissionHookForTesting: (@Sendable (
+            WorkspaceCodemapArtifactDemandTicket
+        ) async -> Void)?
+        /// Files whose ready records are treated as not reusable, without changing currentness.
+        private var codemapIdleReadyNonReusableFileIDsForTesting: Set<UUID> = []
+        private var idleReadyCodemapDemandCapacityOverrideForTesting: Int?
         private var codemapTargetedReadyFreezeCountForTesting = 0
         private var codemapFullRootGraphFreezeCountForTesting = 0
         private var codemapGraphBatchSignalCountForTesting = 0
@@ -2459,6 +2706,8 @@ package actor WorkspaceFileContextStore {
             (@Sendable (WorkspaceCodemapRootEpoch, Int) async -> Void)?
         private var codemapProjectionRecoveryObserverWillWaitHandlerForTesting:
             (@Sendable (WorkspaceCodemapRootEpoch) async -> Void)?
+        private var codemapIdleRejoinValidationHookForTesting:
+            (@Sendable (WorkspaceCodemapArtifactDemandTicket) async -> Void)?
         private var codemapPathInvalidationStageHandlerForTesting:
             (@Sendable (WorkspaceCodemapRootEpoch, UUID, CodemapPathInvalidationStage) async -> Void)?
     #endif
@@ -2491,6 +2740,18 @@ package actor WorkspaceFileContextStore {
     private var fileSystemDeltaContinuations: [UUID: AsyncStream<WorkspaceFileSystemDeltaEvent>.Continuation] = [:]
     private var appliedIndexContinuations: [UUID: AsyncStream<WorkspaceAppliedIndexBatchEvent>.Continuation] = [:]
     private var appliedIndexGenerationsByRootID: [UUID: UInt64] = [:]
+    /// Projection-relevant applied-index stamp per root. It follows `appliedIndexGenerationsByRootID`
+    /// except across batches that change no projection candidate (`isCodemapProjectionNeutral`), so
+    /// the projection catalog token stays current through folder-only batches instead of
+    /// terminalizing a running or completed projection that nothing reschedules.
+    private var codemapProjectionAppliedIndexGenerationsByRootID: [UUID: UInt64] = [:]
+    /// Projection-relevant topology stamp per root. It follows `catalogGenerationsByRootID` only
+    /// across non-neutral batches (`isCodemapProjectionNeutral`), for the same reason as above.
+    private var codemapProjectionTopologyGenerationsByRootID: [UUID: UInt64] = [:]
+    #if DEBUG
+        /// Applied-index batches classified projection-neutral per root (test observability only).
+        private var codemapProjectionNeutralBatchCountsByRootID: [UUID: UInt64] = [:]
+    #endif
     private var sliceRebaseSourceEntries: [SliceRebaseSourceCacheKey: SliceRebaseSourceCacheEntry] = [:]
     private var sliceRebaseSourceEstimatedBytes = 0
     private var sliceRebaseSourceAccessOrdinal: UInt64 = 0
@@ -2695,6 +2956,7 @@ package actor WorkspaceFileContextStore {
     #endif
 
     deinit {
+        Self.codemapIdleReadyEvictionRegistry.unregister(ObjectIdentifier(self))
         #if os(macOS)
             searchContentMemoryPressureSource.cancel()
         #endif
@@ -4962,6 +5224,8 @@ package actor WorkspaceFileContextStore {
                 rootLoadConfigurationsByPath[pending.standardizedPath] = pending.loadConfiguration
                 rootLoadOrder.append(root.id)
                 appliedIndexGenerationsByRootID[root.id] = 0
+                codemapProjectionAppliedIndexGenerationsByRootID[root.id] = 0
+                codemapProjectionTopologyGenerationsByRootID[root.id] = 0
                 catalogGenerationsByRootID[root.id] = 0
                 publishedRootCatalogShardsByRootID[root.id] = pending.preparedShard
                 rootCatalogShardDeltaStatesByRootID[root.id] = RootCatalogShardDeltaState(
@@ -7270,6 +7534,11 @@ package actor WorkspaceFileContextStore {
         if event.isRootUnload {
             publishedRootCatalogShardsByRootID.removeValue(forKey: event.rootID)
             rootCatalogShardDeltaStatesByRootID.removeValue(forKey: event.rootID)
+            codemapProjectionAppliedIndexGenerationsByRootID.removeValue(forKey: event.rootID)
+            codemapProjectionTopologyGenerationsByRootID.removeValue(forKey: event.rootID)
+            #if DEBUG
+                codemapProjectionNeutralBatchCountsByRootID.removeValue(forKey: event.rootID)
+            #endif
             return
         }
 
@@ -7280,6 +7549,17 @@ package actor WorkspaceFileContextStore {
             publishedRootCatalogShardsByRootID.removeValue(forKey: event.rootID)
             rootCatalogShardDeltaStatesByRootID.removeValue(forKey: event.rootID)
             return
+        }
+        // Folder-only batches (adds, removes, modifications) patch only folder records and change no
+        // projection candidate; the projection stamps follow only batches with a file-level change.
+        // The catalog (topology) generation was already bumped before this event was published.
+        if !event.isCodemapProjectionNeutral {
+            codemapProjectionAppliedIndexGenerationsByRootID[event.rootID] = event.generation
+            codemapProjectionTopologyGenerationsByRootID[event.rootID] = currentKey.topologyGeneration
+        } else {
+            #if DEBUG
+                codemapProjectionNeutralBatchCountsByRootID[event.rootID, default: 0] &+= 1
+            #endif
         }
 
         guard let previousShard = publishedRootCatalogShardsByRootID[event.rootID] else {
@@ -7690,6 +7970,15 @@ package actor WorkspaceFileContextStore {
                 pathIndexChangedFileIDs.insert(oldFileID)
             }
         }
+        // A projection-neutral batch must leave `files` untouched, so the shard's projection files
+        // and projection index (pure functions of `files`) cannot change under an unmoved token.
+        #if DEBUG
+            if event.isCodemapProjectionNeutral, !touchedFileIDs.isEmpty || !pathIndexChangedFileIDs.isEmpty {
+                assertionFailure(
+                    "Projection-neutral applied-index batch touched catalog files (root \(event.rootID), generation \(event.generation))."
+                )
+            }
+        #endif
         guard removedFileIDs.isDisjoint(with: upsertedFilesByID.keys),
               removedFolderIDs.isDisjoint(with: upsertedFoldersByID.keys),
               removedFilePaths.isDisjoint(with: upsertedFilePaths),
@@ -9912,6 +10201,8 @@ package actor WorkspaceFileContextStore {
         completion.record(rootID: root.id, lifetimeID: state.lifetimeID)
         rootLoadOrder.append(root.id)
         appliedIndexGenerationsByRootID[root.id] = 0
+        codemapProjectionAppliedIndexGenerationsByRootID[root.id] = 0
+        codemapProjectionTopologyGenerationsByRootID[root.id] = 0
         catalogGenerationsByRootID[root.id] = 0
         #if DEBUG
             rootCrawlCountsByRootID[root.id, default: 0] += 1
@@ -10324,6 +10615,11 @@ package actor WorkspaceFileContextStore {
                 isRootUnload: true
             ))
             appliedIndexGenerationsByRootID.removeValue(forKey: rootID)
+            codemapProjectionAppliedIndexGenerationsByRootID.removeValue(forKey: rootID)
+            codemapProjectionTopologyGenerationsByRootID.removeValue(forKey: rootID)
+            #if DEBUG
+                codemapProjectionNeutralBatchCountsByRootID.removeValue(forKey: rootID)
+            #endif
             catalogGenerationsByRootID.removeValue(forKey: rootID)
             #if DEBUG
                 publicationInvalidationHistoryByRootID.removeValue(forKey: rootID)
@@ -11148,6 +11444,9 @@ package actor WorkspaceFileContextStore {
 
         var provisionalCandidates: [WorkspaceCodemapBindingAutomaticSelectionCatalogCandidate] = []
         var provisionalIncompleteReasons: [WorkspaceCodemapAutomaticSelectionIncompleteReason] = []
+        var retainedSupersededProjections: [
+            WorkspaceCodemapRootEpoch: (engine: WorkspaceCodemapBindingEngine, jobID: UUID)
+        ] = [:]
         for rootEpoch in orderedRootEpochs {
             guard let session = codemapSessionsByRootEpoch[rootEpoch],
                   let engine = session.engine,
@@ -11171,6 +11470,11 @@ package actor WorkspaceFileContextStore {
                     maximumMatchedCandidateCount: maximumCandidateDemandCount
                 )
             )
+            // Captured regardless of disposition: over a dead fence the engine can still return an
+            // empty provisional plan, which yields no usable fallback candidates.
+            if let jobID = await engine.retainedSupersededProjectionJobID(rootEpoch: rootEpoch) {
+                retainedSupersededProjections[rootEpoch] = (engine, jobID)
+            }
             if case let .provisional(candidates, _, progress, remainingCount, retry) = engineDisposition {
                 let remainingCapacity = maximumCandidateDemandCount - provisionalCandidates.count
                 guard candidates.count <= remainingCapacity else {
@@ -11214,6 +11518,19 @@ package actor WorkspaceFileContextStore {
             budgetPolicy: queryPolicy
         )
         await codemapAutomaticSelectionQueryHook(orderedRootEpochs[0])
+        // Reconfirm retained dead fences before the synchronous validation below, so no await
+        // separates that validation from a terminal or fallback return.
+        var reconfirmedSupersededRootEpochs = Set<WorkspaceCodemapRootEpoch>()
+        if provisionalFallbackDisposition == nil {
+            for rootEpoch in orderedRootEpochs {
+                guard let captured = retainedSupersededProjections[rootEpoch] else { continue }
+                if await captured.engine.retainedSupersededProjectionJobID(rootEpoch: rootEpoch) ==
+                    captured.jobID
+                {
+                    reconfirmedSupersededRootEpochs.insert(rootEpoch)
+                }
+            }
+        }
         guard codemapAutomaticSelectionRootScopeEpochs(rootScope) == rootScopeEpochs else {
             return .stale(.rootEpochNotCurrent(orderedRootEpochs[0]))
         }
@@ -11232,6 +11549,24 @@ package actor WorkspaceFileContextStore {
                   ready.ticket.requestGeneration == capturedTicket.requestGeneration,
                   codemapDemandIsCurrent(capturedTicket)
             else { return .stale(.sourceStateChanged(source)) }
+        }
+
+        let supersededRootEpochs = reconfirmedSupersededRootEpochs
+        /// Graph coverage that cannot advance because this root's projection is a retained dead
+        /// fence is terminal, not pending. Provisional results stay usable, and other roots'
+        /// reasons are untouched. The job was reconfirmed before validation; the same engine
+        /// must still own the root session.
+        func retainedSupersededDisposition(
+            rootEpoch: WorkspaceCodemapRootEpoch
+        ) -> WorkspaceCodemapAutomaticSelectionCandidatePlanDisposition? {
+            guard supersededRootEpochs.contains(rootEpoch),
+                  let captured = retainedSupersededProjections[rootEpoch],
+                  codemapSessionsByRootEpoch[rootEpoch]?.engine === captured.engine
+            else { return nil }
+            return .unavailable(.graph(.definitionUniverse(
+                rootEpoch: rootEpoch,
+                reason: .projectionSuperseded
+            )))
         }
 
         switch disposition {
@@ -11272,10 +11607,25 @@ package actor WorkspaceFileContextStore {
                 coverageProofs: coverageProofs
             ))
         case let .incomplete(reason):
+            if case let .definitionUniverse(rootEpoch, _, _, _) = reason,
+               let terminal = retainedSupersededDisposition(rootEpoch: rootEpoch)
+            {
+                return terminal
+            }
             return provisionalFallbackDisposition ?? .incomplete([.graph(reason)])
         case let .busy(reason):
+            if case let .definitionUniverse(rootEpoch, _, _) = reason,
+               let terminal = retainedSupersededDisposition(rootEpoch: rootEpoch)
+            {
+                return terminal
+            }
             return provisionalFallbackDisposition ?? .busy(reason)
         case let .unavailable(reason):
+            if case let .notActivated(rootEpoch) = reason,
+               let terminal = retainedSupersededDisposition(rootEpoch: rootEpoch)
+            {
+                return terminal
+            }
             return .unavailable(.graph(reason))
         case let .stale(reason):
             return .stale(.graph(reason))
@@ -14087,7 +14437,7 @@ package actor WorkspaceFileContextStore {
                 ownership: .notAcquired
             )
         }
-        session.demandsByFileID.removeValue(forKey: ticket.fileID)
+        Self.removeCodemapDemandRecord(fileID: ticket.fileID, from: &session)
         let bundle = session.bundlesByRequestID.removeValue(forKey: ticket.requestID)
         codemapSessionsByRootEpoch[ticket.rootEpoch] = session
         bundle?.close()
@@ -14293,13 +14643,147 @@ package actor WorkspaceFileContextStore {
             }
         }
 
+        // The retained bundle's own lease keeps an idle record's handle resolvable after overlay
+        // capacity eviction removed the live entry, so confirm the entry before rejoining; a
+        // missing entry makes the record non-reusable and the request acquires fresh.
+        if let session = codemapSessionsByRootEpoch[rootEpoch],
+           let engine = session.engine,
+           let existing = session.demandsByFileID[file.id],
+           existing.retainIDs.isEmpty,
+           case .ready = existing.result,
+           codemapIdleReadyDemandIsReusable(existing)
+        {
+            #if DEBUG
+                let validationHook = codemapIdleRejoinValidationHookForTesting
+                await validationHook?(existing.ticket)
+            #endif
+            let liveEntry = await engine.freezeReadyArtifact(
+                rootEpoch: rootEpoch,
+                fileID: file.id,
+                requestGeneration: existing.ticket.requestGeneration
+            )
+            liveEntry?.close()
+            guard !Task.isCancelled else {
+                return .init(result: .unavailable(.cancelled), ownership: .notAcquired)
+            }
+            if liveEntry == nil,
+               let current = codemapSessionsByRootEpoch[rootEpoch]?.demandsByFileID[file.id],
+               current.ticket.requestID == existing.ticket.requestID,
+               current.retainIDs.isEmpty,
+               case .ready = current.result
+            {
+                #if DEBUG
+                    codemapDemandFlowCountsStorageForTesting.nonReusableIdleRejoinEvictions += 1
+                #endif
+                evictIdleReadyCodemapDemand(fileID: file.id, rootEpoch: rootEpoch)
+                return await requestCodemapArtifactWithOwnership(forFileID: fileID, priority: priority)
+            }
+        }
+
+        // A revoking cleanup for this file (overflow or stale idle eviction, or a ready
+        // cancellation that outlived its release deadline) revokes by request generation. An
+        // unchanged file's next demand reuses that generation, so it must not start until the
+        // revoke has run. This is the last check before the join or a fresh demand, with no
+        // suspension after it: an eviction that ran during any earlier await (the live-entry
+        // check above) is observed here.
+        let revokingSlot = WorkspaceCodemapRootScopedFileSlot(rootEpoch: rootEpoch, fileID: file.id)
+        let nextRequestGeneration = codemapSessionsByRootEpoch[rootEpoch]?
+            .pathGenerationsByRelativePath[file.standardizedRelativePath] ?? authority.ingressGeneration
+        if let revokingCleanup = codemapRevokingCleanupsBySlot[revokingSlot],
+           revokingCleanup.requestGeneration == nextRequestGeneration
+        {
+            await revokingCleanup.task.value
+            if codemapRevokingCleanupsBySlot[revokingSlot]?.id == revokingCleanup.id {
+                codemapRevokingCleanupsBySlot.removeValue(forKey: revokingSlot)
+            }
+            guard !Task.isCancelled else {
+                return .init(result: .unavailable(.cancelled), ownership: .notAcquired)
+            }
+            return await requestCodemapArtifactWithOwnership(forFileID: fileID, priority: priority)
+        }
+
+        // An opted-in release is resolving whether this file's demand was queued (cancelled) or
+        // admitted (kept running). Decide only after it applies, so a joiner never joins a record
+        // that the resolution is about to cancel. Like the fence above, no suspension follows.
+        if let resolution = codemapSessionsByRootEpoch[rootEpoch]?
+            .demandsByFileID[file.id]?.releaseResolution
+        {
+            #if DEBUG
+                codemapDemandFlowCountsStorageForTesting.releaseResolutionFenceWaits += 1
+            #endif
+            await resolution.task.value
+            guard !Task.isCancelled else {
+                return .init(result: .unavailable(.cancelled), ownership: .notAcquired)
+            }
+            return await requestCodemapArtifactWithOwnership(forFileID: fileID, priority: priority)
+        }
+
+        // An unretained pending record whose ticket is no longer current is a dead orphan, and one
+        // whose release found nothing outstanding may never run (the engine fences its late
+        // submission): cancel it through the release tail and start fresh rather than join work
+        // that cannot publish. The tail counts the orphan's outcome.
+        if let existing = codemapSessionsByRootEpoch[rootEpoch]?.demandsByFileID[file.id],
+           existing.retainIDs.isEmpty,
+           case .pending = existing.result,
+           existing.releaseFoundNothingOutstanding || !codemapDemandIsCurrent(existing.ticket)
+        {
+            startCancellingUnretainedCodemapDemand(
+                existing.ticket,
+                rootEpoch: rootEpoch,
+                shouldRevokeReadyArtifact: false
+            )
+            return await requestCodemapArtifactWithOwnership(forFileID: fileID, priority: priority)
+        }
+
+        if let session = codemapSessionsByRootEpoch[rootEpoch],
+           let existing = session.demandsByFileID[file.id],
+           existing.retainIDs.isEmpty,
+           case .ready = existing.result,
+           !codemapIdleReadyDemandIsReusable(existing)
+        {
+            // A warm record that is no longer current is evicted (revoked as before); the
+            // revoking-cleanup fence above holds the fresh demand until the revoke has run.
+            #if DEBUG
+                codemapDemandFlowCountsStorageForTesting.nonReusableIdleRejoinEvictions += 1
+            #endif
+            evictIdleReadyCodemapDemand(fileID: file.id, rootEpoch: rootEpoch)
+            return await requestCodemapArtifactWithOwnership(forFileID: fileID, priority: priority)
+        }
+
         if var session = codemapSessionsByRootEpoch[rootEpoch],
            var existing = session.demandsByFileID[file.id]
         {
             switch existing.result {
             case .pending, .ready:
+                // Joining an idle ready record reuses it with a fresh retain ID: no overlay
+                // demand, contribution advance, or projection scheduling.
+                session.idleReadyDemands.remove(file.id)
                 let joinedTicket = retainedCodemapTicket(for: existing.ticket)
+                #if DEBUG
+                    if case .pending = existing.result {
+                        codemapDemandFlowCountsStorageForTesting.pendingJoins += 1
+                    } else if existing.retainIDs.isEmpty {
+                        codemapDemandFlowCountsStorageForTesting.idleReadyRejoins += 1
+                    } else {
+                        codemapDemandFlowCountsStorageForTesting.retainedReadyJoins += 1
+                    }
+                #endif
+                if existing.retainIDs.isEmpty, case .ready = existing.result {
+                    // The released holder's ticket must not keep standing for the warm record:
+                    // re-key the same request to the rejoining holder so retain-scoped checks
+                    // (source receipts, publication) refer to a live retain.
+                    existing.ticket = joinedTicket
+                    existing.result = codemapDemandResult(existing.result, for: joinedTicket)
+                }
                 existing.retainIDs.insert(joinedTicket.retainID)
+                // A rejoined orphan is held again; its completion publishes to the holder.
+                existing.releasedKeepingAdmittedWork = false
+                #if DEBUG
+                    if existing.orphanOutcomePendingForTesting {
+                        existing.orphanOutcomePendingForTesting = false
+                        codemapDemandFlowCountsStorageForTesting.releasedRejoined += 1
+                    }
+                #endif
                 session.demandsByFileID[file.id] = existing
                 codemapSessionsByRootEpoch[rootEpoch] = session
                 return .init(
@@ -14358,10 +14842,11 @@ package actor WorkspaceFileContextStore {
         codemapSessionsByRootEpoch[rootEpoch]?.demandsByFileID[file.id] = record
         #if DEBUG
             codemapDemandTaskCreationCountForTesting += 1
+            codemapDemandFlowCountsStorageForTesting.freshDemands += 1
         #endif
         let demandTask = Task { [weak self] in
             guard let self else { return }
-            await performCodemapDemand(
+            await runCodemapDemand(
                 ticket: ticket,
                 priority: priority,
                 setupTask: setupTask
@@ -14652,7 +15137,7 @@ package actor WorkspaceFileContextStore {
         guard record.retainIDs.count == 1 else {
             return codemapDemandResult(record.result, for: ticket)
         }
-        session.demandsByFileID.removeValue(forKey: ticket.fileID)
+        Self.removeCodemapDemandRecord(fileID: ticket.fileID, from: &session)
         let bundle = session.bundlesByRequestID.removeValue(forKey: ticket.requestID)
         codemapSessionsByRootEpoch[ticket.rootEpoch] = session
         bundle?.close()
@@ -14677,7 +15162,7 @@ package actor WorkspaceFileContextStore {
               case .unavailable(.rejected(rejection)) = record.result
         else { return nil }
 
-        session.demandsByFileID.removeValue(forKey: ticket.fileID)
+        Self.removeCodemapDemandRecord(fileID: ticket.fileID, from: &session)
         let bundle = session.bundlesByRequestID.removeValue(forKey: ticket.requestID)
         codemapSessionsByRootEpoch[ticket.rootEpoch] = session
         record.task?.cancel()
@@ -14833,6 +15318,25 @@ package actor WorkspaceFileContextStore {
             guard let graphState = session.selectionGraph,
                   let desiredKey = graphState.desiredKey
             else { return .unavailable(.graphNotBuilt(rootEpoch)) }
+            if graphState.publishedSummary?.key != desiredKey {
+                // A ready publication withdraws the summary until the graph republishes. Wait
+                // while publication work is active. Warm joins never signal, so with nothing
+                // active signal once per desired key; if that publication still leaves the
+                // summary withdrawn, fall back to capture and revalidation.
+                let publicationActive = session.graphPublicationFlight != nil ||
+                    session.projectionRecoveryObserver != nil ||
+                    graphState.workerTask != nil ||
+                    graphState.pendingSnapshot != nil
+                if publicationActive {
+                    return .pending(.graphRebuilding(rootEpoch))
+                }
+                if graphState.withdrawnSummarySignalKey != desiredKey {
+                    codemapSessionsByRootEpoch[rootEpoch]?.selectionGraph?
+                        .withdrawnSummarySignalKey = desiredKey
+                    signalCodemapGraphPublication(rootEpoch: rootEpoch)
+                    return .pending(.graphRebuilding(rootEpoch))
+                }
+            }
             captures.append(CodemapGraphQueryCapture(
                 authority: session.authority,
                 graphStateID: graphState.id,
@@ -15927,9 +16431,15 @@ package actor WorkspaceFileContextStore {
         return await cancelCodemapArtifactDemand(ticket, deadline: deadline)
     }
 
+    /// Releases one holder's retain on a codemap artifact demand. The last holder of a current
+    /// ready record parks it idle; otherwise the request is cancelled. With
+    /// `keepingAdmittedWork` (ordinary completion of optional automatic enrichment only), the last
+    /// holder of a pending demand cancels it only if the engine has not admitted it yet; an
+    /// admitted request runs on, and its result is parked idle or dropped when it settles.
     func cancelCodemapArtifactDemand(
         _ ticket: WorkspaceCodemapArtifactDemandTicket,
-        deadline: ContinuousClock.Instant? = nil
+        deadline: ContinuousClock.Instant? = nil,
+        keepingAdmittedWork: Bool = false
     ) async -> Bool {
         guard codemapDemandIsCurrent(ticket),
               var session = codemapSessionsByRootEpoch[ticket.rootEpoch],
@@ -15940,11 +16450,74 @@ package actor WorkspaceFileContextStore {
             return false
         }
         if !record.retainIDs.isEmpty {
+            if ticket.retainID == record.ticket.retainID,
+               case .ready = record.result,
+               let remainingRetainID = record.retainIDs.first
+            {
+                // The record's own ticket must keep naming a live retain: retain-scoped checks
+                // (automatic source receipts) read it. Only ready records are re-keyed; a pending
+                // record's ticket is the demand task's completion fence.
+                let rekeyedTicket = codemapTicket(record.ticket, retainID: remainingRetainID)
+                record.ticket = rekeyedTicket
+                record.result = codemapDemandResult(record.result, for: rekeyedTicket)
+            }
             session.demandsByFileID[ticket.fileID] = record
             codemapSessionsByRootEpoch[ticket.rootEpoch] = session
             return true
         }
         if case .unavailable(.cancelled) = record.result {
+            session.demandsByFileID[ticket.fileID] = record
+            codemapSessionsByRootEpoch[ticket.rootEpoch] = session
+            return true
+        }
+        if case .ready = record.result, codemapIdleReadyDemandIsReusable(record) {
+            // Releasing the last holder of a current ready artifact is not a source mutation:
+            // keep the record warm without revoking, cleanup, or touching root-wide graph state.
+            for id in codemapPresentationRecordIDs(requestID: ticket.requestID, in: session) {
+                session.presentationRecordsByID.removeValue(forKey: id)
+            }
+            session.demandsByFileID[ticket.fileID] = record
+            codemapSessionsByRootEpoch[ticket.rootEpoch] = session
+            parkIdleReadyCodemapDemand(fileID: ticket.fileID, rootEpoch: ticket.rootEpoch)
+            return true
+        }
+        if keepingAdmittedWork,
+           case .pending = record.result,
+           record.task != nil,
+           let engine = session.engine
+        {
+            // Ask the engine, in one actor turn, whether this demand was admitted. Queued work is
+            // cancelled with no overlay change; admitted work runs on and settles when its demand
+            // task ends. The pending ticket stays unchanged: it is the demand task's completion
+            // fence. Requests for the file wait on the resolution (see the request path).
+            for id in codemapPresentationRecordIDs(requestID: ticket.requestID, in: session) {
+                session.presentationRecordsByID.removeValue(forKey: id)
+            }
+            let demandTicket = record.ticket
+            let owner = record.owner
+            let resolutionID = UUID()
+            #if DEBUG
+                let resolutionHook = codemapReleaseResolutionHookForTesting
+            #endif
+            let resolution = Task { [weak self] in
+                #if DEBUG
+                    await resolutionHook?(demandTicket)
+                #endif
+                let disposition = await engine.releaseOwnerKeepingAdmitted(
+                    owner,
+                    rootEpoch: demandTicket.rootEpoch
+                )
+                await self?.applyCodemapReleaseResolution(
+                    disposition,
+                    ticket: demandTicket,
+                    resolutionID: resolutionID
+                )
+            }
+            record.releasedKeepingAdmittedWork = true
+            record.releaseResolution = CodemapReleaseResolution(id: resolutionID, task: resolution)
+            session.demandsByFileID[ticket.fileID] = record
+            codemapSessionsByRootEpoch[ticket.rootEpoch] = session
+            _ = await waitForCodemapSharedTask(resolution, deadline: deadline)
             return true
         }
         let shouldRevokeReadyArtifact = if case .ready = record.result {
@@ -15953,56 +16526,510 @@ package actor WorkspaceFileContextStore {
             false
         }
 
+        #if DEBUG
+            if case .pending = record.result {
+                codemapDemandFlowCountsStorageForTesting.pendingLastHolderCancels += 1
+            } else if shouldRevokeReadyArtifact {
+                codemapDemandFlowCountsStorageForTesting.readyLastHolderRevokes += 1
+            }
+        #endif
+        session.demandsByFileID[ticket.fileID] = record
+        codemapSessionsByRootEpoch[ticket.rootEpoch] = session
+        guard let cleanupTask = startCancellingUnretainedCodemapDemand(
+            ticket,
+            rootEpoch: ticket.rootEpoch,
+            shouldRevokeReadyArtifact: shouldRevokeReadyArtifact
+        ) else { return true }
+        _ = await waitForCodemapSharedTask(cleanupTask, deadline: deadline)
+        return true
+    }
+
+    /// The release cancel tail. Per-request cancellation only: root-wide graph state (publication
+    /// flight, recovery observer, graph worker, published summary) is retired by session detach,
+    /// root release, or shutdown; a real overlay change reaches it through publication signals.
+    /// Returns the shared cleanup task, or nil when the record no longer shares the demand.
+    @discardableResult
+    private func startCancellingUnretainedCodemapDemand(
+        _ ticket: WorkspaceCodemapArtifactDemandTicket,
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        shouldRevokeReadyArtifact: Bool
+    ) -> Task<Void, Never>? {
+        guard var session = codemapSessionsByRootEpoch[rootEpoch],
+              var record = session.demandsByFileID[ticket.fileID],
+              codemapTicketsShareDemand(record.ticket, ticket)
+        else { return nil }
         record.task?.cancel()
-        let presentationIDs = session.presentationRecordsByID.compactMap { id, presentation in
-            presentation.requestIDs.contains(ticket.requestID) ? id : nil
-        }
-        for id in presentationIDs {
+        for id in codemapPresentationRecordIDs(requestID: ticket.requestID, in: session) {
             session.presentationRecordsByID.removeValue(forKey: id)
         }
         let retainedBundle = session.bundlesByRequestID.removeValue(forKey: ticket.requestID)
-        let graphPublicationTask = session.graphPublicationFlight?.task
-        graphPublicationTask?.cancel()
-        session.graphPublicationFlight = nil
-        let projectionRecoveryObserverTask = session.projectionRecoveryObserver?.task
-        projectionRecoveryObserverTask?.cancel()
-        session.projectionRecoveryObserver = nil
-        if var selectionGraph = session.selectionGraph {
-            selectionGraph.workerTask?.cancel()
-            selectionGraph.pendingSnapshot = nil
-            selectionGraph.publishedSummary = nil
-            selectionGraph.lastRebuildDisposition = nil
-            selectionGraph.workerID = nil
-            selectionGraph.workerTask = nil
-            session.selectionGraph = selectionGraph
-        }
         record.result = .unavailable(.cancelled)
         record.task = nil
+        record.releasedKeepingAdmittedWork = false
+        // The cleanup's `cancel(owner:)` also drops any release fence on the owner.
+        record.releaseFoundNothingOutstanding = false
+        #if DEBUG
+            if record.orphanOutcomePendingForTesting {
+                record.orphanOutcomePendingForTesting = false
+                codemapDemandFlowCountsStorageForTesting.releasedDroppedCancelled += 1
+            }
+        #endif
+        session.demandsByFileID[ticket.fileID] = record
+        codemapSessionsByRootEpoch[rootEpoch] = session
+        retainedBundle?.close()
+        return startCodemapCancellationCleanup(
+            ticket,
+            record: record,
+            engine: session.engine,
+            shouldRevokeReadyArtifact: shouldRevokeReadyArtifact
+        )
+    }
+
+    /// Parks an unretained, current ready record in the idle LRU as released now, then enforces
+    /// the per-root idle capacity. The caller has already written the record.
+    private func parkIdleReadyCodemapDemand(fileID: UUID, rootEpoch: WorkspaceCodemapRootEpoch) {
+        guard var session = codemapSessionsByRootEpoch[rootEpoch] else { return }
+        session.idleReadyDemands.touch(
+            fileID,
+            serial: Self.codemapIdleReadyEvictionRegistry.nextReleaseSerial()
+        )
+        if !codemapRegisteredForIdleReadyEviction {
+            codemapRegisteredForIdleReadyEviction = true
+            Self.codemapIdleReadyEvictionRegistry.register(self)
+        }
+        codemapSessionsByRootEpoch[rootEpoch] = session
+        #if DEBUG
+            codemapDemandFlowCountsStorageForTesting.idleReadyParks += 1
+        #endif
+        let capacity = idleReadyCodemapDemandCapacity
+        while (codemapSessionsByRootEpoch[rootEpoch]?.idleReadyDemands.count ?? 0) > capacity,
+              let oldest = codemapSessionsByRootEpoch[rootEpoch]?.idleReadyDemands.oldest()
+        {
+            evictIdleReadyCodemapDemand(fileID: oldest, rootEpoch: rootEpoch)
+        }
+    }
+
+    /// Applies the engine's answer to an opted-in release, then settles the record.
+    private func applyCodemapReleaseResolution(
+        _ disposition: WorkspaceCodemapOwnerReleaseDisposition,
+        ticket: WorkspaceCodemapArtifactDemandTicket,
+        resolutionID: UUID
+    ) {
+        guard var session = codemapSessionsByRootEpoch[ticket.rootEpoch],
+              var record = session.demandsByFileID[ticket.fileID],
+              codemapTicketsShareDemand(record.ticket, ticket),
+              record.releaseResolution?.id == resolutionID
+        else { return }
+        record.releaseResolution = nil
+        guard record.releasedKeepingAdmittedWork else {
+            // The cancel tail took the record over while the resolution was in flight; its cleanup
+            // owns the engine side. Only retire the resolution (requests for the file wait on it)
+            // and drop a fence the release set after the tail's `cancel(owner:)` ran.
+            session.demandsByFileID[ticket.fileID] = record
+            codemapSessionsByRootEpoch[ticket.rootEpoch] = session
+            if case .nothingOutstanding = disposition, let engine = session.engine {
+                let owner = record.owner
+                Task { await engine.clearReleasedOwnerFence(owner) }
+            }
+            return
+        }
+        switch disposition {
+        case .cancelledQueued:
+            session.demandsByFileID[ticket.fileID] = record
+            codemapSessionsByRootEpoch[ticket.rootEpoch] = session
+            let resultIsReady = if case .ready = record.result { true } else { false }
+            if record.retainIDs.isEmpty, !resultIsReady {
+                startCancellingUnretainedCodemapDemand(
+                    record.ticket,
+                    rootEpoch: ticket.rootEpoch,
+                    shouldRevokeReadyArtifact: false
+                )
+                #if DEBUG
+                    codemapDemandFlowCountsStorageForTesting.releasedDroppedCancelledQueued += 1
+                #endif
+            }
+        case .admittedContinues, .nothingOutstanding:
+            // Either way the record's outcome is decided when its demand task ends. With nothing
+            // outstanding, the engine fenced the owner: a submission that had not registered is
+            // rejected as cancelled, and a finished result still publishes and settles.
+            if case .nothingOutstanding = disposition {
+                record.releaseFoundNothingOutstanding = true
+            }
+            #if DEBUG
+                codemapDemandFlowCountsStorageForTesting.releasedOrphaned += 1
+                record.orphanOutcomePendingForTesting = true
+            #endif
+            session.demandsByFileID[ticket.fileID] = record
+            codemapSessionsByRootEpoch[ticket.rootEpoch] = session
+        }
+        settleReleasedCodemapDemand(ticket)
+    }
+
+    /// Runs one artifact demand and then finishes its record on the same isolation turn.
+    private func runCodemapDemand(
+        ticket: WorkspaceCodemapArtifactDemandTicket,
+        priority: CodeMapArtifactBuildPriority,
+        setupTask: Task<CodemapSetupDisposition, Never>?
+    ) async {
+        await performCodemapDemand(ticket: ticket, priority: priority, setupTask: setupTask)
+        finishCodemapDemandTask(ticket)
+        #if DEBUG
+            codemapDemandFlowCountsStorageForTesting.demandTasksFinished += 1
+        #endif
+    }
+
+    private func finishCodemapDemandTask(_ ticket: WorkspaceCodemapArtifactDemandTicket) {
+        guard var session = codemapSessionsByRootEpoch[ticket.rootEpoch],
+              var record = session.demandsByFileID[ticket.fileID],
+              codemapTicketsShareDemand(record.ticket, ticket)
+        else { return }
+        record.task = nil
+        if case .ready = record.result,
+           !record.retainIDs.contains(record.ticket.retainID),
+           let remainingRetainID = record.retainIDs.first
+        {
+            // The pending ticket's holder released while another holder joined: once the demand
+            // task no longer fences on it, re-key the ready record to a live retain, as a
+            // creator-first release of a ready record does.
+            let rekeyedTicket = codemapTicket(record.ticket, retainID: remainingRetainID)
+            record.ticket = rekeyedTicket
+            record.result = codemapDemandResult(record.result, for: rekeyedTicket)
+        }
         session.demandsByFileID[ticket.fileID] = record
         codemapSessionsByRootEpoch[ticket.rootEpoch] = session
+        settleReleasedCodemapDemand(ticket)
+    }
+
+    /// Settles a record released with its admitted work kept running, once nothing is in flight:
+    /// a current ready result parks idle; a ready result that is no longer current is evicted
+    /// (revoked); any other outcome removes the record and closes its bundle. A no-op while the
+    /// record is held, resolving, or still running, and for records released any other way.
+    private func settleReleasedCodemapDemand(_ ticket: WorkspaceCodemapArtifactDemandTicket) {
+        guard var session = codemapSessionsByRootEpoch[ticket.rootEpoch],
+              var record = session.demandsByFileID[ticket.fileID],
+              codemapTicketsShareDemand(record.ticket, ticket),
+              record.releasedKeepingAdmittedWork,
+              record.retainIDs.isEmpty,
+              record.releaseResolution == nil,
+              record.task == nil
+        else { return }
+        record.releasedKeepingAdmittedWork = false
+        if record.releaseFoundNothingOutstanding {
+            // The demand task has ended, so no submission can follow: drop the engine's fence.
+            record.releaseFoundNothingOutstanding = false
+            if let engine = session.engine {
+                let owner = record.owner
+                Task { await engine.clearReleasedOwnerFence(owner) }
+            }
+        }
+        #if DEBUG
+            let countsOutcome = record.orphanOutcomePendingForTesting
+            record.orphanOutcomePendingForTesting = false
+            func countOutcome(_ keyPath: WritableKeyPath<CodemapDemandFlowCountsForTesting, Int>) {
+                if countsOutcome { codemapDemandFlowCountsStorageForTesting[keyPath: keyPath] += 1 }
+            }
+        #endif
+        switch record.result {
+        case .ready:
+            session.demandsByFileID[ticket.fileID] = record
+            codemapSessionsByRootEpoch[ticket.rootEpoch] = session
+            if codemapIdleReadyDemandIsReusable(record) {
+                #if DEBUG
+                    countOutcome(\.releasedParked)
+                #endif
+                parkIdleReadyCodemapDemand(fileID: ticket.fileID, rootEpoch: ticket.rootEpoch)
+            } else {
+                #if DEBUG
+                    countOutcome(\.releasedDroppedNotCurrent)
+                #endif
+                evictIdleReadyCodemapDemand(fileID: ticket.fileID, rootEpoch: ticket.rootEpoch)
+            }
+        case let .unavailable(reason):
+            #if DEBUG
+                switch reason {
+                case .busy, .demandUnavailable(.transient):
+                    // Overlay byte/lease refusals publish busy; artifact-store lease admission
+                    // refusals publish transient.
+                    countOutcome(\.releasedDroppedBusy)
+                case .cancelled:
+                    countOutcome(\.releasedDroppedCancelled)
+                case .staleCurrentness, .rejected:
+                    countOutcome(\.releasedDroppedNotCurrent)
+                default:
+                    countOutcome(\.releasedDroppedUnavailable)
+                }
+            #endif
+            Self.removeCodemapDemandRecord(fileID: ticket.fileID, from: &session)
+            session.bundlesByRequestID.removeValue(forKey: record.ticket.requestID)?.close()
+            codemapSessionsByRootEpoch[ticket.rootEpoch] = session
+        case .pending:
+            // The demand task ended without publishing: its ticket stopped being current.
+            #if DEBUG
+                countOutcome(\.releasedDroppedNotCurrent)
+            #endif
+            Self.removeCodemapDemandRecord(fileID: ticket.fileID, from: &session)
+            session.bundlesByRequestID.removeValue(forKey: record.ticket.requestID)?.close()
+            codemapSessionsByRootEpoch[ticket.rootEpoch] = session
+        }
+    }
+
+    private func codemapPresentationRecordIDs(
+        requestID: UUID,
+        in session: CodemapRootSession
+    ) -> [WorkspaceCodemapFrozenPresentationBundleID] {
+        session.presentationRecordsByID.compactMap { id, presentation in
+            presentation.requestIDs.contains(requestID) ? id : nil
+        }
+    }
+
+    /// Removes a demand record and keeps the idle-ready invariant: an idle ID never outlives
+    /// its record.
+    @discardableResult
+    private static func removeCodemapDemandRecord(
+        fileID: UUID,
+        from session: inout CodemapRootSession
+    ) -> CodemapDemandRecord? {
+        session.idleReadyDemands.remove(fileID)
+        return session.demandsByFileID.removeValue(forKey: fileID)
+    }
+
+    /// An unretained ready record may be reused only while its ticket is current and its
+    /// overlay artifact handle still resolves to the published artifact.
+    private func codemapIdleReadyDemandIsReusable(_ record: CodemapDemandRecord) -> Bool {
+        #if DEBUG
+            if codemapIdleReadyNonReusableFileIDsForTesting.contains(record.ticket.fileID) { return false }
+        #endif
+        guard case let .ready(ready) = record.result,
+              codemapTicketsShareDemand(ready.ticket, record.ticket),
+              codemapDemandIsCurrent(record.ticket),
+              let artifactKey = try? ready.handle.artifactKey()
+        else { return false }
+        return artifactKey == ready.snapshot.artifactKey
+    }
+
+    /// Evicts one idle ready record: the only release-related path that still revokes a ready
+    /// artifact. Returns the shared cleanup task; callers never cancel it.
+    @discardableResult
+    private func evictIdleReadyCodemapDemand(
+        fileID: UUID,
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) -> Task<Void, Never>? {
+        guard var session = codemapSessionsByRootEpoch[rootEpoch] else { return nil }
+        session.idleReadyDemands.remove(fileID)
+        guard var record = session.demandsByFileID[fileID],
+              record.retainIDs.isEmpty,
+              case .ready = record.result
+        else {
+            codemapSessionsByRootEpoch[rootEpoch] = session
+            return nil
+        }
+        let ticket = record.ticket
+        for id in codemapPresentationRecordIDs(requestID: ticket.requestID, in: session) {
+            session.presentationRecordsByID.removeValue(forKey: id)
+        }
+        let retainedBundle = session.bundlesByRequestID.removeValue(forKey: ticket.requestID)
+        record.result = .unavailable(.cancelled)
+        record.task = nil
+        session.demandsByFileID[fileID] = record
+        codemapSessionsByRootEpoch[rootEpoch] = session
         retainedBundle?.close()
-        let cleanupTask = Task { [weak self] in
-            await self?.finishCancelledCodemapArtifactDemand(
+        #if DEBUG
+            codemapIdleReadyDemandEvictionCountStorageForTesting += 1
+        #endif
+        return startCodemapCancellationCleanup(
+            ticket,
+            record: record,
+            engine: session.engine,
+            shouldRevokeReadyArtifact: true
+        )
+    }
+
+    /// Results that a lease or byte capacity refusal produces: `.busy` from overlay acceptance,
+    /// `.unavailable(.transient)` from artifact-store lease admission.
+    private static func codemapBindingDemandResultMayBeCapacityRefusal(
+        _ result: WorkspaceCodemapBindingDemandResult
+    ) -> Bool {
+        switch result {
+        case .busy, .unavailable(.transient):
+            true
+        case .ready, .alreadyReady, .unavailable, .rejected, .cancelled:
+            false
+        }
+    }
+
+    /// Evicts the least recently released idle ready demand to make room for a completion
+    /// refused for lease or byte capacity, and returns the eviction's revoking cleanup, or nil when
+    /// no idle record can be released:
+    /// - overlay per-root budget: the oldest in the requester's root;
+    /// - overlay process budget: the oldest across this store's roots;
+    /// - artifact-store lease admission: the oldest in the requester's root, else the oldest across
+    ///   this store's roots on the admission, else the oldest across every store sharing it.
+    private func evictIdleReadyCodemapDemandForCompletionCapacity(
+        _ busy: WorkspaceCodemapCompletionCapacityBusy,
+        requester: WorkspaceCodemapArtifactDemandTicket
+    ) async -> Task<Void, Never>? {
+        switch busy.scope {
+        case let .artifactLeaseAdmission(admission):
+            // Prefer victims whose revoke disturbs the least: the requester's root advances its
+            // contribution generation anyway, then the requester's other roots on the admission,
+            // and only then another store's roots.
+            if let cleanup = evictStoreIdleReadyCodemapDemand(roots: [busy.rootEpoch], requester: requester) {
+                return cleanup
+            }
+            let storeRoots = codemapSessionsByRootEpoch.compactMap { rootEpoch, session in
+                session.engine?.artifactLeaseAdmissionIdentity == admission ? rootEpoch : nil
+            }
+            if let cleanup = evictStoreIdleReadyCodemapDemand(roots: storeRoots, requester: requester) {
+                return cleanup
+            }
+            return await evictProcessWideIdleReadyCodemapDemand(leaseAdmission: admission, requester: requester)
+        case .overlayRoot:
+            return evictStoreIdleReadyCodemapDemand(roots: [busy.rootEpoch], requester: requester)
+        case .overlayProcess:
+            return evictStoreIdleReadyCodemapDemand(roots: Array(codemapSessionsByRootEpoch.keys), requester: requester)
+        }
+    }
+
+    private func evictStoreIdleReadyCodemapDemand(
+        roots candidateRoots: [WorkspaceCodemapRootEpoch],
+        requester: WorkspaceCodemapArtifactDemandTicket
+    ) -> Task<Void, Never>? {
+        while true {
+            var victim: (serial: UInt64, rootEpoch: WorkspaceCodemapRootEpoch, fileID: UUID)?
+            for rootEpoch in candidateRoots {
+                guard let entry = codemapSessionsByRootEpoch[rootEpoch]?.idleReadyDemands.oldestEntry(),
+                      !(rootEpoch == requester.rootEpoch && entry.fileID == requester.fileID)
+                else { continue }
+                if victim.map({ entry.serial < $0.serial }) ?? true {
+                    victim = (entry.serial, rootEpoch, entry.fileID)
+                }
+            }
+            guard let victim else { return nil }
+            if let cleanup = evictIdleReadyCodemapDemand(fileID: victim.fileID, rootEpoch: victim.rootEpoch) {
+                return cleanup
+            }
+            // `evictIdleReadyCodemapDemand` dropped a stale LRU entry; try the next oldest.
+        }
+    }
+
+    /// Asks every registered store (this one included) for its oldest idle record on the
+    /// admission, then has the owner evict the globally oldest through its own eviction path and
+    /// fence. A candidate that changed in between (rejoined, re-released, already evicted) is
+    /// declined by its owner and the search repeats, a bounded number of times.
+    private func evictProcessWideIdleReadyCodemapDemand(
+        leaseAdmission: ObjectIdentifier,
+        requester: WorkspaceCodemapArtifactDemandTicket
+    ) async -> Task<Void, Never>? {
+        for _ in 0 ..< 4 {
+            var best: (store: WorkspaceFileContextStore, candidate: WorkspaceCodemapIdleReadyEvictionCandidate)?
+            for store in Self.codemapIdleReadyEvictionRegistry.liveObjects() {
+                let candidate = if store === self {
+                    oldestIdleReadyCodemapDemand(leaseAdmission: leaseAdmission, excluding: requester)
+                } else {
+                    await store.oldestIdleReadyCodemapDemand(leaseAdmission: leaseAdmission, excluding: nil)
+                }
+                guard let candidate else { continue }
+                if best.map({ candidate.releaseSerial < $0.candidate.releaseSerial }) ?? true {
+                    best = (store, candidate)
+                }
+            }
+            guard let best else { return nil }
+            let cleanup = if best.store === self {
+                evictIdleReadyCodemapDemandForLeasePressure(best.candidate)
+            } else {
+                await best.store.evictIdleReadyCodemapDemandForLeasePressure(best.candidate)
+            }
+            if let cleanup { return cleanup }
+        }
+        return nil
+    }
+
+    /// This store's least recently released idle record whose root draws on `leaseAdmission`.
+    func oldestIdleReadyCodemapDemand(
+        leaseAdmission: ObjectIdentifier,
+        excluding requester: WorkspaceCodemapArtifactDemandTicket?
+    ) -> WorkspaceCodemapIdleReadyEvictionCandidate? {
+        var best: WorkspaceCodemapIdleReadyEvictionCandidate?
+        for rootEpoch in Array(codemapSessionsByRootEpoch.keys) {
+            guard codemapSessionsByRootEpoch[rootEpoch]?.engine?.artifactLeaseAdmissionIdentity == leaseAdmission,
+                  let entry = codemapSessionsByRootEpoch[rootEpoch]?.idleReadyDemands.oldestEntry(),
+                  !(rootEpoch == requester?.rootEpoch && entry.fileID == requester?.fileID)
+            else { continue }
+            if best.map({ entry.serial < $0.releaseSerial }) ?? true {
+                best = WorkspaceCodemapIdleReadyEvictionCandidate(
+                    releaseSerial: entry.serial,
+                    rootEpoch: rootEpoch,
+                    fileID: entry.fileID
+                )
+            }
+        }
+        return best
+    }
+
+    /// Evicts `candidate` through the normal idle eviction if it is still idle with the same
+    /// release serial; returns its revoking cleanup, or nil when the record moved on.
+    func evictIdleReadyCodemapDemandForLeasePressure(
+        _ candidate: WorkspaceCodemapIdleReadyEvictionCandidate
+    ) -> Task<Void, Never>? {
+        guard codemapSessionsByRootEpoch[candidate.rootEpoch]?.idleReadyDemands
+            .serial(of: candidate.fileID) == candidate.releaseSerial
+        else { return nil }
+        return evictIdleReadyCodemapDemand(fileID: candidate.fileID, rootEpoch: candidate.rootEpoch)
+    }
+
+    /// Starts the shared cleanup of a cancelled demand. A revoking cleanup is registered per file
+    /// until it finishes so new demands for the file wait for its revoke.
+    private func startCodemapCancellationCleanup(
+        _ ticket: WorkspaceCodemapArtifactDemandTicket,
+        record: CodemapDemandRecord,
+        engine: WorkspaceCodemapBindingEngine?,
+        shouldRevokeReadyArtifact: Bool
+    ) -> Task<Void, Never> {
+        let cleanupID = UUID()
+        let slot = WorkspaceCodemapRootScopedFileSlot(rootEpoch: ticket.rootEpoch, fileID: ticket.fileID)
+        let task = Task { [weak self] in
+            guard let self else { return }
+            await finishCancelledCodemapArtifactDemand(
                 ticket,
                 record: record,
-                engine: session.engine,
-                shouldRevokeReadyArtifact: shouldRevokeReadyArtifact,
-                graphPublicationTask: graphPublicationTask,
-                projectionRecoveryObserverTask: projectionRecoveryObserverTask
+                engine: engine,
+                shouldRevokeReadyArtifact: shouldRevokeReadyArtifact
             )
-            return ()
+            await finishCodemapRevokingCleanup(id: cleanupID, slot: slot)
         }
-        _ = await waitForCodemapSharedTask(cleanupTask, deadline: deadline)
-        return true
+        if shouldRevokeReadyArtifact {
+            codemapRevokingCleanupsBySlot[slot] = CodemapRevokingCleanup(
+                id: cleanupID,
+                requestGeneration: ticket.requestGeneration,
+                task: task
+            )
+        }
+        return task
+    }
+
+    private func finishCodemapRevokingCleanup(
+        id: UUID,
+        slot: WorkspaceCodemapRootScopedFileSlot
+    ) {
+        if codemapRevokingCleanupsBySlot[slot]?.id == id {
+            codemapRevokingCleanupsBySlot.removeValue(forKey: slot)
+        }
+    }
+
+    private var idleReadyCodemapDemandCapacity: Int {
+        #if DEBUG
+            if let override = idleReadyCodemapDemandCapacityOverrideForTesting {
+                return override
+            }
+        #endif
+        return Self.maximumIdleReadyCodemapDemandsPerRoot
     }
 
     private func finishCancelledCodemapArtifactDemand(
         _ ticket: WorkspaceCodemapArtifactDemandTicket,
         record: CodemapDemandRecord,
         engine: WorkspaceCodemapBindingEngine?,
-        shouldRevokeReadyArtifact: Bool,
-        graphPublicationTask: Task<Void, Never>?,
-        projectionRecoveryObserverTask: Task<Void, Never>?
+        shouldRevokeReadyArtifact: Bool
     ) async {
         if let engine {
             await codemapCancellationCleanupHook(ticket)
@@ -16015,19 +17042,13 @@ package actor WorkspaceFileContextStore {
                 )
             }
         }
-        if let graphPublicationTask {
-            await graphPublicationTask.value
-        }
-        if let projectionRecoveryObserverTask {
-            await projectionRecoveryObserverTask.value
-        }
         if var currentSession = codemapSessionsByRootEpoch[ticket.rootEpoch],
            let currentRecord = currentSession.demandsByFileID[ticket.fileID],
            codemapTicketsShareDemand(currentRecord.ticket, ticket),
            currentRecord.retainIDs.isEmpty,
            case .unavailable(.cancelled) = currentRecord.result
         {
-            currentSession.demandsByFileID.removeValue(forKey: ticket.fileID)
+            Self.removeCodemapDemandRecord(fileID: ticket.fileID, from: &currentSession)
             codemapSessionsByRootEpoch[ticket.rootEpoch] = currentSession
         }
         if codemapSessionsByRootEpoch[ticket.rootEpoch]?
@@ -16041,6 +17062,102 @@ package actor WorkspaceFileContextStore {
     }
 
     #if DEBUG
+        /// Cumulative artifact-demand request-path and release counts; integers only.
+        struct CodemapDemandFlowCountsForTesting: Equatable {
+            var freshDemands = 0
+            var pendingJoins = 0
+            var idleReadyRejoins = 0
+            var retainedReadyJoins = 0
+            var nonReusableIdleRejoinEvictions = 0
+            var idleReadyParks = 0
+            var pendingLastHolderCancels = 0
+            var readyLastHolderRevokes = 0
+            /// Opted-in releases whose outcome waits for the demand task: `.admittedContinues`,
+            /// or `.nothingOutstanding` (finished unpublished, or a late submission the engine
+            /// fences). Each is counted by exactly one outcome below (parked, rejoined, or a
+            /// drop) unless its whole root session is detached first.
+            var releasedOrphaned = 0
+            /// Orphans that settled ready and current and were parked idle.
+            var releasedParked = 0
+            /// Orphans a request rejoined before they settled.
+            var releasedRejoined = 0
+            var releasedDroppedBusy = 0
+            var releasedDroppedNotCurrent = 0
+            var releasedDroppedUnavailable = 0
+            /// Orphans that ended cancelled: through the cancel tail (dead-orphan or
+            /// nothing-outstanding request guard, invalidation, cleanup) or a cancelled result.
+            var releasedDroppedCancelled = 0
+            /// Releases whose queued demand the engine cancelled (`.cancelledQueued`); not orphans.
+            var releasedDroppedCancelledQueued = 0
+            /// Requests that waited on an in-flight release resolution before deciding.
+            var releaseResolutionFenceWaits = 0
+            /// Artifact-demand tasks that have run to their end (finished and settled).
+            var demandTasksFinished = 0
+        }
+
+        func codemapDemandFlowCountsForTesting() -> CodemapDemandFlowCountsForTesting {
+            codemapDemandFlowCountsStorageForTesting
+        }
+
+        func codemapOverlayDemandEventCountsForTesting(
+            rootEpoch: WorkspaceCodemapRootEpoch
+        ) async -> WorkspaceCodemapLiveOverlayDemandEventCounts? {
+            guard let engine = codemapSessionsByRootEpoch[rootEpoch]?.engine else { return nil }
+            return await engine.overlayDemandEventCountsForTesting()
+        }
+
+        /// Holds every admitted demand request after its artifact resolves and before the overlay
+        /// accepts it. Returns false when the root has no engine yet.
+        @discardableResult
+        func setCodemapBindingEngineBeforeResolutionPublicationHookForTesting(
+            rootEpoch: WorkspaceCodemapRootEpoch,
+            _ hook: (@Sendable (WorkspaceCodemapRootEpoch, String) async -> Void)?
+        ) async -> Bool {
+            guard let engine = codemapSessionsByRootEpoch[rootEpoch]?.engine else { return false }
+            await engine.setBeforeResolutionPublicationHookForTesting(hook)
+            return true
+        }
+
+        func setCodemapReleaseResolutionHookForTesting(
+            _ hook: (@Sendable (WorkspaceCodemapArtifactDemandTicket) async -> Void)?
+        ) {
+            codemapReleaseResolutionHookForTesting = hook
+        }
+
+        func setCodemapBeforeEngineSubmissionHookForTesting(
+            _ hook: (@Sendable (WorkspaceCodemapArtifactDemandTicket) async -> Void)?
+        ) {
+            codemapBeforeEngineSubmissionHookForTesting = hook
+        }
+
+        func setCodemapIdleReadyNonReusableForTesting(fileID: UUID, _ nonReusable: Bool) {
+            if nonReusable {
+                codemapIdleReadyNonReusableFileIDsForTesting.insert(fileID)
+            } else {
+                codemapIdleReadyNonReusableFileIDsForTesting.remove(fileID)
+            }
+        }
+
+        func codemapBindingEngineReleasedOwnerFenceCountsForTesting(
+            rootEpoch: WorkspaceCodemapRootEpoch
+        ) async -> (rejections: Int, standing: Int)? {
+            guard let engine = codemapSessionsByRootEpoch[rootEpoch]?.engine else { return nil }
+            return await engine.releasedOwnerFenceCountsForTesting()
+        }
+
+        /// Calls the engine's admitted-aware release for the record's owner directly, without the
+        /// store's release handling, so tests can observe each disposition.
+        func codemapReleaseOwnerKeepingAdmittedForTesting(
+            _ ticket: WorkspaceCodemapArtifactDemandTicket
+        ) async -> WorkspaceCodemapOwnerReleaseDisposition? {
+            guard let session = codemapSessionsByRootEpoch[ticket.rootEpoch],
+                  let engine = session.engine,
+                  let record = session.demandsByFileID[ticket.fileID],
+                  codemapTicketsShareDemand(record.ticket, ticket)
+            else { return nil }
+            return await engine.releaseOwnerKeepingAdmitted(record.owner, rootEpoch: ticket.rootEpoch)
+        }
+
         struct CodemapPresentationOperationCounts: Equatable {
             let structureSeedAdmissionRequests: Int
             let selectedMetadataResolutionRequests: Int
@@ -16075,6 +17192,13 @@ package actor WorkspaceFileContextStore {
             _ handler: (@Sendable (WorkspaceCodemapRootEpoch, Int) async -> Void)?
         ) {
             codemapGraphPublicationWillFlushHandlerForTesting = handler
+        }
+
+        /// Runs inside an idle rejoin's live-entry validation, before its overlay await.
+        func setCodemapIdleRejoinValidationHookForTesting(
+            _ hook: (@Sendable (WorkspaceCodemapArtifactDemandTicket) async -> Void)?
+        ) {
+            codemapIdleRejoinValidationHookForTesting = hook
         }
 
         func setCodemapProjectionRecoveryObserverWillWaitHandlerForTesting(
@@ -16200,6 +17324,112 @@ package actor WorkspaceFileContextStore {
             fileID: UUID
         ) -> Int {
             codemapSessionsByRootEpoch[rootEpoch]?.demandsByFileID[fileID]?.retainIDs.count ?? 0
+        }
+
+        func codemapIdleReadyDemandFileIDsForTesting(
+            rootEpoch: WorkspaceCodemapRootEpoch
+        ) -> [UUID] {
+            codemapSessionsByRootEpoch[rootEpoch]?.idleReadyDemands.orderedFileIDs ?? []
+        }
+
+        /// Runs one production overlay capacity eviction for the root epoch's session engine.
+        @discardableResult
+        func evictCodemapOverlayEntryForCapacityForTesting(rootEpoch: WorkspaceCodemapRootEpoch) async -> Bool {
+            guard let engine = codemapSessionsByRootEpoch[rootEpoch]?.engine else { return false }
+            return await engine.evictOverlayEntryForCapacityForTesting(rootEpoch: rootEpoch)
+        }
+
+        /// Replaces the root engine's live-overlay capacity policy.
+        @discardableResult
+        func setCodemapOverlayPolicyForTesting(
+            rootEpoch: WorkspaceCodemapRootEpoch,
+            policy: WorkspaceCodemapLiveOverlayPolicy
+        ) async -> Bool {
+            guard let engine = codemapSessionsByRootEpoch[rootEpoch]?.engine else { return false }
+            await engine.setOverlayPolicyForTesting(policy)
+            return true
+        }
+
+        /// Lowers the root engine's artifact-store active-lease count limit (shared by every
+        /// root on that runtime); nil restores the policy limit.
+        @discardableResult
+        func setCodemapArtifactStoreActiveLeaseCountLimitForTesting(
+            rootEpoch: WorkspaceCodemapRootEpoch,
+            maximumCount: Int?
+        ) async -> Bool {
+            guard let engine = codemapSessionsByRootEpoch[rootEpoch]?.engine else { return false }
+            await engine.setArtifactStoreActiveLeaseCountLimitForTesting(maximumCount)
+            return true
+        }
+
+        func codemapOverlayRootAccountingForTesting(
+            rootEpoch: WorkspaceCodemapRootEpoch
+        ) async -> WorkspaceCodemapLiveOverlayRootAccounting? {
+            guard let engine = codemapSessionsByRootEpoch[rootEpoch]?.engine else { return nil }
+            return await engine.overlayAccountingForTesting().roots.first { $0.rootEpoch == rootEpoch }
+        }
+
+        /// Withdraws the store's published graph summary without starting publication work,
+        /// leaving the state a publication flight that retired without publishing leaves.
+        @discardableResult
+        func withdrawCodemapPublishedGraphSummaryForTesting(rootEpoch: WorkspaceCodemapRootEpoch) -> Bool {
+            guard codemapSessionsByRootEpoch[rootEpoch]?.selectionGraph?.publishedSummary != nil else {
+                return false
+            }
+            codemapSessionsByRootEpoch[rootEpoch]?.selectionGraph?.publishedSummary = nil
+            return true
+        }
+
+        /// The demand record's own ticket and its ready result's ticket, if any.
+        func codemapDemandRecordTicketsForTesting(
+            rootEpoch: WorkspaceCodemapRootEpoch,
+            fileID: UUID
+        ) -> (record: WorkspaceCodemapArtifactDemandTicket, ready: WorkspaceCodemapArtifactDemandTicket?)? {
+            guard let record = codemapSessionsByRootEpoch[rootEpoch]?.demandsByFileID[fileID] else { return nil }
+            if case let .ready(ready) = record.result {
+                return (record.ticket, ready.ticket)
+            }
+            return (record.ticket, nil)
+        }
+
+        /// Lowers the idle ready cap so steady-state tests can exceed it with a few files.
+        func setIdleReadyCodemapDemandCapacityForTesting(_ capacity: Int?) {
+            idleReadyCodemapDemandCapacityOverrideForTesting = capacity
+        }
+
+        func codemapRevokingCleanupPendingForTesting(
+            rootEpoch: WorkspaceCodemapRootEpoch,
+            fileID: UUID
+        ) -> Bool {
+            codemapRevokingCleanupsBySlot[.init(rootEpoch: rootEpoch, fileID: fileID)] != nil
+        }
+
+        func codemapIdleReadyDemandEvictionCountForTesting() -> Int {
+            codemapIdleReadyDemandEvictionCountStorageForTesting
+        }
+
+        /// Evicts every idle ready record of the root epoch through the production eviction path
+        /// and awaits each cleanup, returning the number of evicted records.
+        @discardableResult
+        func evictIdleReadyCodemapDemandsForTesting(rootEpoch: WorkspaceCodemapRootEpoch) async -> Int {
+            let fileIDs = codemapSessionsByRootEpoch[rootEpoch]?.idleReadyDemands.orderedFileIDs ?? []
+            var cleanupTasks: [Task<Void, Never>] = []
+            for fileID in fileIDs {
+                if let task = evictIdleReadyCodemapDemand(fileID: fileID, rootEpoch: rootEpoch) {
+                    cleanupTasks.append(task)
+                }
+            }
+            for task in cleanupTasks {
+                await task.value
+            }
+            return cleanupTasks.count
+        }
+
+        func codemapOverlayContributionGenerationForTesting(
+            rootEpoch: WorkspaceCodemapRootEpoch
+        ) async -> WorkspaceCodemapSelectionGraphContributionGeneration? {
+            guard let engine = codemapSessionsByRootEpoch[rootEpoch]?.engine else { return nil }
+            return await engine.snapshot(rootEpoch: rootEpoch)?.contributionGeneration
         }
 
         struct CodemapArtifactDemandCleanupSnapshot: Equatable {
@@ -16488,7 +17718,12 @@ package actor WorkspaceFileContextStore {
             return
         }
 
-        let engineResult = await engine.demand(WorkspaceCodemapBindingDemand(
+        if refreshedRecord.releasedKeepingAdmittedWork, refreshedRecord.retainIDs.isEmpty {
+            // Released before reaching the engine: nothing was admitted, so start no work.
+            publishCodemapDemandResult(.unavailable(.cancelled), ticket: ticket)
+            return
+        }
+        let bindingDemand = WorkspaceCodemapBindingDemand(
             owner: refreshedRecord.owner,
             identity: refreshedRecord.identity,
             requestGeneration: ticket.requestGeneration,
@@ -16497,7 +17732,48 @@ package actor WorkspaceFileContextStore {
             ingressGeneration: ticket.ingressGeneration,
             priority: priority,
             language: refreshedRecord.language
-        ))
+        )
+        #if DEBUG
+            await codemapBeforeEngineSubmissionHookForTesting?(ticket)
+        #endif
+        var engineResult = await engine.demand(bindingDemand)
+        if Self.codemapBindingDemandResultMayBeCapacityRefusal(engineResult),
+           let capacityBusy = await engine.takeCompletionCapacityBusy(owner: bindingDemand.owner)
+        {
+            // Idle ready records keep their artifact leases and overlay bytes; neither the
+            // artifact store's process-wide lease admission nor the overlay evicts them. When they
+            // fill a budget, release the least recently released one (from any store, for the
+            // shared lease admission) through the normal eviction, whose revoke closes the lease,
+            // and retry once. The engine already finished this
+            // owner's request and cancelled its overlay demand, so the retry is a fresh request.
+            guard codemapDemandIsCurrent(ticket), !Task.isCancelled else { return }
+            // A released requester (admitted work kept running) never evicts idle records for
+            // capacity: it publishes busy and is dropped when it settles.
+            let requesterIsHeld = codemapSessionsByRootEpoch[ticket.rootEpoch]?
+                .demandsByFileID[ticket.fileID]
+                .map { codemapTicketsShareDemand($0.ticket, ticket) && !$0.retainIDs.isEmpty } ?? false
+            if requesterIsHeld,
+               let cleanup = await evictIdleReadyCodemapDemandForCompletionCapacity(capacityBusy, requester: ticket)
+            {
+                await cleanup.value
+                guard codemapDemandIsCurrent(ticket), !Task.isCancelled,
+                      let retryRecord = codemapSessionsByRootEpoch[ticket.rootEpoch]?.demandsByFileID[ticket.fileID],
+                      codemapTicketsShareDemand(retryRecord.ticket, ticket)
+                else { return }
+                // The last holder may have released during the eviction. A released requester
+                // keeps its refusal and does not retry; a release that lands after this check
+                // reaches the engine first and fences the retry (it returns cancelled).
+                if !retryRecord.retainIDs.isEmpty {
+                    #if DEBUG
+                        await codemapBeforeEngineSubmissionHookForTesting?(ticket)
+                    #endif
+                    engineResult = await engine.demand(bindingDemand)
+                    if Self.codemapBindingDemandResultMayBeCapacityRefusal(engineResult) {
+                        _ = await engine.takeCompletionCapacityBusy(owner: bindingDemand.owner)
+                    }
+                }
+            }
+        }
         let result = await codemapDemandResultHook(ticket, engineResult)
         guard codemapDemandIsCurrent(ticket), !Task.isCancelled else { return }
 
@@ -17645,8 +18921,10 @@ package actor WorkspaceFileContextStore {
             shard,
             WorkspaceCodemapProjectionCatalogToken(
                 rootEpoch: authority.rootEpoch,
-                topologyGeneration: shard.key.topologyGeneration,
-                appliedIndexGeneration: shard.appliedIndexGeneration,
+                // No projection-relevant batch has occurred in this root lifetime; zero is the initial
+                // projection revision, independent of the shard's current raw generations.
+                topologyGeneration: codemapProjectionTopologyGenerationsByRootID[authority.rootEpoch.rootID] ?? 0,
+                appliedIndexGeneration: codemapProjectionAppliedIndexGenerationsByRootID[authority.rootEpoch.rootID] ?? 0,
                 catalogGeneration: authority.catalogGeneration,
                 ingressGeneration: authority.ingressGeneration,
                 projectionInvalidationGeneration:
@@ -18320,8 +19598,15 @@ package actor WorkspaceFileContextStore {
     private func retainedCodemapTicket(
         for ticket: WorkspaceCodemapArtifactDemandTicket
     ) -> WorkspaceCodemapArtifactDemandTicket {
+        codemapTicket(ticket, retainID: UUID())
+    }
+
+    private func codemapTicket(
+        _ ticket: WorkspaceCodemapArtifactDemandTicket,
+        retainID: UUID
+    ) -> WorkspaceCodemapArtifactDemandTicket {
         WorkspaceCodemapArtifactDemandTicket(
-            retainID: UUID(),
+            retainID: retainID,
             requestID: ticket.requestID,
             rootEpoch: ticket.rootEpoch,
             fileID: ticket.fileID,
@@ -18570,7 +19855,7 @@ package actor WorkspaceFileContextStore {
         var affectedRecords: [CodemapDemandRecord] = []
         for (fileID, record) in session.demandsByFileID where paths.contains(record.identity.standardizedRelativePath) {
             affectedRecords.append(record)
-            session.demandsByFileID.removeValue(forKey: fileID)
+            Self.removeCodemapDemandRecord(fileID: fileID, from: &session)
             session.bundlesByRequestID.removeValue(forKey: record.ticket.requestID)?.close()
         }
         let affectedRequestIDs = Set(affectedRecords.map(\.ticket.requestID))

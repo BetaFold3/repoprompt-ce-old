@@ -108,6 +108,9 @@ struct AgentModeSessionsSidebarView: View {
             HStack(spacing: topBarSpacing) {
                 sessionSearchBox
                     .frame(maxWidth: .infinity)
+                AgentRecoveryNeedsAttentionSidebarButton(agentModeVM: agentModeVM, hitSize: collapseButtonHitSize) {
+                    agentModeVM.presentRecoveryNeedsAttention()
+                }
                 ScheduledMessagesSidebarButton(agentModeVM: agentModeVM, hitSize: collapseButtonHitSize) {
                     showingScheduledMessages = true
                 }

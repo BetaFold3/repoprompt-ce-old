@@ -1,6 +1,6 @@
 import Foundation
 
-package enum ACPProviderID: String, Hashable {
+package enum ACPProviderID: String, Hashable, CaseIterable {
     case openCode
     case cursor
     case ohMyPi
@@ -94,6 +94,10 @@ package struct ACPRunRequest {
     let sessionModeID: String?
     let additionalConfigOptionValues: [ACPConfigOptionAssignment]
     let autoApproveAllToolPermissions: Bool
+    /// The managed session (lifecycle and run attempt) this request serves, or explicit sessionless
+    /// work (polling, catalog sweeps). Fail-closed default: an Agent Mode request that never set it
+    /// is refused under runtime registration; every production construction passes it explicitly.
+    let runtimeSession: AgentRuntimeSessionScope
 
     init(
         agentKind: AgentProviderKind,
@@ -104,7 +108,8 @@ package struct ACPRunRequest {
         taskLabelKind: AgentModelCatalog.TaskLabelKind?,
         sessionModeID: String? = nil,
         additionalConfigOptionValues: [ACPConfigOptionAssignment] = [],
-        autoApproveAllToolPermissions: Bool = false
+        autoApproveAllToolPermissions: Bool = false,
+        runtimeSession: AgentRuntimeSessionScope = .unavailable
     ) {
         self.agentKind = agentKind
         self.modelString = modelString
@@ -115,6 +120,23 @@ package struct ACPRunRequest {
         self.sessionModeID = sessionModeID
         self.additionalConfigOptionValues = additionalConfigOptionValues
         self.autoApproveAllToolPermissions = autoApproveAllToolPermissions
+        self.runtimeSession = runtimeSession
+    }
+
+    /// The same request bound to `runtimeSession` (the run attempt that will send it).
+    func withRuntimeSession(_ runtimeSession: AgentRuntimeSessionScope) -> ACPRunRequest {
+        ACPRunRequest(
+            agentKind: agentKind,
+            modelString: modelString,
+            workspacePath: workspacePath,
+            resumeSessionID: resumeSessionID,
+            attachments: attachments,
+            taskLabelKind: taskLabelKind,
+            sessionModeID: sessionModeID,
+            additionalConfigOptionValues: additionalConfigOptionValues,
+            autoApproveAllToolPermissions: autoApproveAllToolPermissions,
+            runtimeSession: runtimeSession
+        )
     }
 }
 

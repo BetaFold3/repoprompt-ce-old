@@ -174,8 +174,10 @@ extension OhMyPiConnectionAvailability {
                                 tabID: session.tabID,
                                 session: session
                             )
+                            // The controlling MCP client's explicit cancellation.
                             _ = await window.agentModeViewModel.cancelAgentRun(
                                 target: target,
+                                cause: .userCancel,
                                 completion: .terminalPublished
                             )
                             break

@@ -135,21 +135,39 @@ final class ACPHeadlessAgentProviderBridge: HeadlessAgentProvider {
             do {
                 _ = try await controller.bootstrap()
                 try await Self.performPromptAfterBarrier(
-                    beforePrompt: { try await beforePrompt(controller, request, runID) },
+                    // R6: pre-prompt owner writes (requested mode) carry the request's captured scope.
+                    beforePrompt: {
+                        try await AgentRuntimeOperationOwner.$session.withValue(request.runtimeSession) {
+                            try await beforePrompt(controller, request, runID)
+                        }
+                    },
                     sendPrompt: { try await controller.prompt(message, request: request) }
                 )
                 await controller.shutdown()
                 await forwardTask.value
             } catch {
                 forwardTask.cancel()
+                let processLost = await controller.providerProcessWasLost()
                 await controller.shutdown()
-                throw await controller.normalizeError(error)
+                let normalized = await controller.normalizeError(error)
+                // Review A F06: the provider process exited under the prompt (not our shutdown).
+                if processLost, !(normalized is CancellationError) {
+                    throw HeadlessProviderProcessLostError(message: normalized.localizedDescription)
+                }
+                throw normalized
             }
         } catch is CancellationError {
             continuation.finish(throwing: CancellationError())
         } catch {
-            continuation.finish(throwing: provider.normalizeError(error))
+            continuation.finish(throwing: Self.outerStreamError(error, normalize: provider.normalizeError))
         }
+    }
+
+    /// The stream's terminal error. A typed process loss passes through unnormalized so the runner
+    /// can still attribute it (review R1, A F06 follow-up): provider normalization may rewrap it.
+    static func outerStreamError(_ error: Error, normalize: (Error) -> Error) -> Error {
+        if error is HeadlessProviderProcessLostError { return error }
+        return normalize(error)
     }
 
     static func performPromptAfterBarrier(
@@ -202,7 +220,12 @@ final class ACPHeadlessAgentProviderBridge: HeadlessAgentProvider {
             return
         }
         if let terminalError {
-            continuation.finish(throwing: AIProviderError.invalidConfiguration(detail: terminalError))
+            // Review A F06: a failure the controller reported because its process exited.
+            if await controller.providerProcessWasLost() {
+                continuation.finish(throwing: HeadlessProviderProcessLostError(message: terminalError))
+            } else {
+                continuation.finish(throwing: AIProviderError.invalidConfiguration(detail: terminalError))
+            }
         } else {
             continuation.finish()
         }

@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptAgentCore
 
 // Generic MCP tool-call argument normalization.
 // Handles JSON-string payloads, tool-name wrappers, hidden routing fields, and
@@ -70,7 +71,7 @@ enum MCPToolArgsNormalizer {
         }
 
         // Case 3: Best-effort—parse any other JSON-string subfields
-        for (k, v) in raw {
+        for (k, v) in raw where !preservesJSONString(canonicalToolName: canonicalToolName, key: k) {
             if case let .string(s) = v {
                 let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
                 if (t.first == "{" && t.last == "}") || (t.first == "[" && t.last == "]") {
@@ -239,6 +240,13 @@ enum MCPToolArgsNormalizer {
             warnings: warnings,
             encounteredRoutingKeys: encounteredRoutingKeys
         )
+    }
+
+    /// Top-level fields that Case 3 JSON-string subfield parsing leaves as their original string.
+    /// `remote_pairing` passkey completion relays the browser's WebAuthn credential as exact JSON
+    /// text; the provider requires it as an unchanged string.
+    static func preservesJSONString(canonicalToolName: String, key: String) -> Bool {
+        canonicalToolName == MCPWindowToolName.remotePairing && key == "credential"
     }
 
     /// Repair malformed edit arguments where replacement text became a property name

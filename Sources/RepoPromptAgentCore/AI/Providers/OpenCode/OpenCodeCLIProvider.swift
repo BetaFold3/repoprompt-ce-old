@@ -137,7 +137,7 @@ final class OpenCodeCLIProvider: AIProvider {
             systemPrompt: aiMessage.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines),
             userMessage: buildPrompt(from: aiMessage),
             resumeSessionID: nil
-        )
+        ).withRuntimeSession(.sessionless) // Chat (Oracle) work is not an Agent Mode session.
     }
 
     private func buildPrompt(from aiMessage: AIMessage) -> String {

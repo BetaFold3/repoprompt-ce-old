@@ -50,11 +50,45 @@ package actor PartitionStore {
         return try body()
     }
 
-    /// <AppSupport>/RepoPrompt CE/Partitions
-    private static func partitionsBaseURL() -> URL {
+    /// `<AppSupport>/RepoPrompt CE/Partitions`, the live store. Pure path computation; creates no directory.
+    package static func productionPartitionsBaseURL() -> URL {
         MCPFilesystemConstants.identity.applicationSupportRootURL()
             .appendingPathComponent("Partitions", isDirectory: true)
     }
+
+    /// The default root for stores created without an explicit `baseURL`. DEBUG builds running
+    /// under XCTest use a per-process temporary root so tests never write the live `Partitions` store.
+    package static func partitionsBaseURL() -> URL {
+        #if DEBUG
+            if NSClassFromString("XCTestCase") != nil || NSClassFromString("XCTest.XCTestCase") != nil {
+                return xctestPartitionsBaseURL
+            }
+        #endif
+        return productionPartitionsBaseURL()
+    }
+
+    #if DEBUG
+        private static let xctestPartitionsBaseURL: URL = {
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent("RepoPromptCE-XCTest", isDirectory: true)
+                .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            let directory = root.appendingPathComponent("Partitions", isDirectory: true)
+            do {
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            } catch {
+                preconditionFailure("Cannot create isolated XCTest partitions directory")
+            }
+            // Remove only this process's directory on normal exit (never another worker's).
+            let cleanup: @convention(block) () -> Void = {
+                try? FileManager.default.removeItem(at: root)
+            }
+            guard atexit_b(cleanup) == 0 else {
+                cleanup()
+                preconditionFailure("Cannot register isolated XCTest partitions cleanup")
+            }
+            return directory
+        }()
+    #endif
 
     /// repoKey = "<leafName>-<sha256(stdPath)[0..12]>"
     private func repoKey(forRoot rootPath: String) -> String {

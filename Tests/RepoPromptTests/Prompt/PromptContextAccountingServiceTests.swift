@@ -478,6 +478,687 @@ final class PromptContextAccountingServiceTests: XCTestCase {
         XCTAssertTrue(resolution.entries.allSatisfy { $0.mode == .codemap })
     }
 
+    func testResolveEntriesOmitsPendingAutomaticCodemapsAfterShortBoundedWait() async throws {
+        let fixture = try await makePendingCodemapFixture(name: #function)
+        let clock = ContinuousClock()
+        let started = clock.now
+
+        let resolution = await PromptContextAccountingService().resolveEntries(
+            selection: StoredSelection(selectedPaths: [fixture.sourcePath], codemapAutoEnabled: true),
+            store: fixture.store,
+            codeMapUsage: .auto
+        )
+
+        let elapsed = started.duration(to: clock.now)
+        XCTAssertLessThan(elapsed, Self.pendingReadinessElapsedBound, "Accounting must not wait the full readiness deadline for pending codemaps")
+        XCTAssertEqual(resolution.entries.map(\.file.standardizedRelativePath), ["Sources/Source.swift"])
+        XCTAssertFalse(resolution.entries.contains { $0.isCodemap })
+        assertPendingCodemapsOmitted(resolution.codemapPresentation)
+    }
+
+    func testWithPromptStatsOmitsPendingAutomaticCodemapsAfterShortBoundedWait() async throws {
+        let fixture = try await makePendingCodemapFixture(name: #function)
+        let clock = ContinuousClock()
+        let started = clock.now
+
+        let result = try await PromptContextAccountingService().withPromptStats(
+            request: PromptContextAccountingRequest(
+                selection: StoredSelection(selectedPaths: [fixture.sourcePath], codemapAutoEnabled: true),
+                codeMapUsage: .auto
+            ),
+            store: fixture.store,
+            lookupContext: WorkspaceLookupContext(rootScope: .allLoaded, bindingProjection: nil)
+        ) { $0 }
+
+        let elapsed = started.duration(to: clock.now)
+        XCTAssertLessThan(elapsed, Self.pendingReadinessElapsedBound, "Prompt stats must not wait the full readiness deadline for pending codemaps")
+        XCTAssertEqual(result.resolvedEntries.map(\.file.standardizedRelativePath), ["Sources/Source.swift"])
+        XCTAssertTrue(result.codemapFileIDsUsed.isEmpty)
+        assertPendingCodemapsOmitted(result.codemapPresentation)
+    }
+
+    func testResolveEntriesIncludesAlreadyReadySelectedCodemap() async throws {
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositories.makeRepository(
+            named: "repository",
+            files: ["Sources/Ready.swift": "struct ReadyAccounting { func readyAccountingSymbol() {} }\n"]
+        )
+        let codemapFixture = try CodemapStoreFixture(name: #function)
+        addTeardownBlock {
+            await codemapFixture.shutdown()
+            repositories.cleanup()
+        }
+        let store = codemapFixture.makeStore(codemapProjectionPreloadLaunchPolicy: .disabled)
+        let loaded = try await store.loadRoot(path: root.path)
+        let files = await store.files(inRoot: loaded.id)
+        let file = try XCTUnwrap(files.first)
+        let ready = try await readyCodemapDemand(store: store, fileID: file.id)
+        addTeardownBlock {
+            _ = await store.cancelCodemapArtifactDemand(ready.ticket)
+        }
+
+        let resolution = await PromptContextAccountingService().resolveEntries(
+            selection: StoredSelection(selectedPaths: [file.standardizedFullPath], codemapAutoEnabled: false),
+            store: store,
+            codeMapUsage: .selected
+        )
+
+        XCTAssertEqual(resolution.codemapPresentation.orderedEntries.map(\.fileID), [file.id])
+        XCTAssertTrue(
+            resolution.codemapPresentation.renderedEntriesByFileID[file.id]?.text.contains("readyAccountingSymbol") == true
+        )
+        let entry = try XCTUnwrap(resolution.entries.first)
+        XCTAssertTrue(entry.isCodemap)
+    }
+
+    func testWithPromptStatsIncludesAutomaticCodemapOnRecountAfterPendingCall() async throws {
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositories.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/Source.swift": "struct Source { let target: Target }\n",
+                "Sources/Target.swift": "struct Target { func convergedTargetCodemapSymbol() {} }\n"
+            ]
+        )
+        let codemapFixture = try CodemapStoreFixture(name: #function)
+        addTeardownBlock {
+            await codemapFixture.shutdown()
+            repositories.cleanup()
+        }
+        let demandsReleased = CodemapLockedCounter()
+        let store = codemapFixture.makeStore(demandResultHook: { _, result in
+            demandsReleased.value == 0 ? .busy(retryAfterMilliseconds: 1000) : result
+        })
+        _ = try await store.loadRoot(path: root.path)
+        let targetLookup = await store.lookupPath(
+            root.appendingPathComponent("Sources/Target.swift").path,
+            rootScope: .allLoaded
+        )
+        let target = try XCTUnwrap(targetLookup?.file)
+        let request = PromptContextAccountingRequest(
+            selection: StoredSelection(
+                selectedPaths: [root.appendingPathComponent("Sources/Source.swift").path],
+                codemapAutoEnabled: true
+            ),
+            codeMapUsage: .auto
+        )
+        let lookupContext = WorkspaceLookupContext(rootScope: .allLoaded, bindingProjection: nil)
+        let service = PromptContextAccountingService()
+
+        let pending = try await service.withPromptStats(
+            request: request,
+            store: store,
+            lookupContext: lookupContext
+        ) { $0 }
+        assertPendingCodemapsOmitted(pending.codemapPresentation)
+
+        demandsReleased.increment()
+        // Later recounts (as UI/MCP refreshes would issue) must eventually include the target.
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(30))
+        var included = false
+        var laterCalls = 0
+        while !included, clock.now < deadline {
+            laterCalls += 1
+            let later = try await service.withPromptStats(
+                request: request,
+                store: store,
+                lookupContext: lookupContext
+            ) { $0 }
+            included = later.codemapPresentation.renderedEntriesByFileID[target.id]?.text
+                .contains("convergedTargetCodemapSymbol") == true
+            if !included {
+                try await Task.sleep(for: .milliseconds(100))
+            }
+        }
+        XCTAssertTrue(included, "Automatic codemap never became ready after \(laterCalls) bounded-wait recounts")
+    }
+
+    func testRepeatedAutomaticPromptStatsAfterConvergenceScheduleNoProjectionWork() async throws {
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositories.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/Source.swift": "struct Source { let target: Target }\n",
+                "Sources/Target.swift": "struct Target { func steadyTargetCodemapSymbol() {} }\n"
+            ]
+        )
+        let codemapFixture = try CodemapStoreFixture(name: #function)
+        addTeardownBlock {
+            await codemapFixture.shutdown()
+            repositories.cleanup()
+        }
+        let store = codemapFixture.makeStore()
+        let loaded = try await store.loadRoot(path: root.path)
+        let rootEpoch = try await WorkspaceCodemapRootEpoch(
+            rootID: loaded.id,
+            rootLifetimeID: store.rootLifetimeIDForTesting(rootID: loaded.id)
+        )
+        let targetLookup = await store.lookupPath(
+            root.appendingPathComponent("Sources/Target.swift").path,
+            rootScope: .allLoaded
+        )
+        let target = try XCTUnwrap(targetLookup?.file)
+        let request = PromptContextAccountingRequest(
+            selection: StoredSelection(
+                selectedPaths: [root.appendingPathComponent("Sources/Source.swift").path],
+                codemapAutoEnabled: true
+            ),
+            codeMapUsage: .auto
+        )
+        let lookupContext = WorkspaceLookupContext(rootScope: .allLoaded, bindingProjection: nil)
+        let service = PromptContextAccountingService()
+        var lastCoverage = ""
+        func includesTarget() async throws -> Bool {
+            let result = try await service.withPromptStats(
+                request: request,
+                store: store,
+                lookupContext: lookupContext
+            ) { $0 }
+            lastCoverage = "\(result.codemapPresentation.coverage) \(result.codemapPresentation.issues)"
+            return result.codemapPresentation.renderedEntriesByFileID[target.id]?.text
+                .contains("steadyTargetCodemapSymbol") == true
+        }
+
+        let clock = ContinuousClock()
+        let convergenceDeadline = clock.now.advanced(by: .seconds(30))
+        var converged = false
+        while !converged, clock.now < convergenceDeadline {
+            converged = try await includesTarget()
+            if !converged {
+                try await Task.sleep(for: .milliseconds(100))
+            }
+        }
+        XCTAssertTrue(converged, "Automatic codemap never converged: \(lastCoverage)")
+        guard converged else { return }
+        // Let any recovery started by the converging call finish before measuring steady state.
+        let drainDeadline = clock.now.advanced(by: .seconds(10))
+        var drained = false
+        while !drained, clock.now < drainDeadline {
+            let state = await store.codemapGraphPublicationRecoveryStateForTesting(rootEpoch: rootEpoch)
+            drained = !state.flightActive && !state.observerActive
+            if !drained {
+                try await Task.sleep(for: .milliseconds(25))
+            }
+        }
+        XCTAssertTrue(drained, "Graph publication recovery did not drain after convergence")
+
+        let scheduledBefore = await store.codemapBindingEngineAccountingForTesting(rootID: loaded.id)?
+            .counters.projectionPreloadsScheduled
+        let generationBefore = await store.codemapOverlayContributionGenerationForTesting(rootEpoch: rootEpoch)
+        for call in 1 ... 5 {
+            let included = try await includesTarget()
+            XCTAssertTrue(included, "Steady automatic call \(call) dropped Target")
+        }
+        let scheduledAfter = await store.codemapBindingEngineAccountingForTesting(rootID: loaded.id)?
+            .counters.projectionPreloadsScheduled
+        let generationAfter = await store.codemapOverlayContributionGenerationForTesting(rootEpoch: rootEpoch)
+        XCTAssertNotNil(scheduledBefore)
+        XCTAssertEqual(scheduledAfter, scheduledBefore, "Steady automatic calls must not schedule projection work")
+        XCTAssertNotNil(generationBefore)
+        XCTAssertEqual(generationAfter, generationBefore, "Steady automatic calls must not advance the overlay")
+    }
+
+    /// A working set larger than the former 64-record idle cap must still reach steady state:
+    /// releasing it at the end of each call keeps every record warm, so repeated identical calls
+    /// evict nothing, advance no overlay contribution, and schedule no projection work. The files
+    /// are warmed through direct demands first: a cold automatic call readies only a few sources
+    /// within its bounded wait and cancels the rest, which is a separate throughput property.
+    func testRepeatedAutomaticPromptStatsOverWorkingSetLargerThanFormerIdleCapScheduleNoProjectionWork() async throws {
+        let sourceCount = 70
+        var repositoryFiles = [
+            "Sources/Target.swift": "struct Target { func wideTargetCodemapSymbol() {} }\n"
+        ]
+        for index in 0 ..< sourceCount {
+            repositoryFiles[String(format: "Sources/Source%03d.swift", index)] =
+                String(format: "struct Source%03d { let target: Target }\n", index)
+        }
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositories.makeRepository(named: "repository", files: repositoryFiles)
+        let codemapFixture = try CodemapStoreFixture(name: #function)
+        addTeardownBlock {
+            await codemapFixture.shutdown()
+            repositories.cleanup()
+        }
+        let store = codemapFixture.makeStore()
+        let loaded = try await store.loadRoot(path: root.path)
+        let rootEpoch = try await WorkspaceCodemapRootEpoch(
+            rootID: loaded.id,
+            rootLifetimeID: store.rootLifetimeIDForTesting(rootID: loaded.id)
+        )
+        let targetLookup = await store.lookupPath(
+            root.appendingPathComponent("Sources/Target.swift").path,
+            rootScope: .allLoaded
+        )
+        let target = try XCTUnwrap(targetLookup?.file)
+        // Warm every file through direct demands, then release each one into the idle cache.
+        let warmClock = ContinuousClock()
+        for file in await store.files(inRoot: loaded.id) {
+            let warmDeadline = warmClock.now.advanced(by: .seconds(15))
+            var result = await store.requestCodemapArtifact(forFileID: file.id)
+            while case let .pending(ticket) = result, warmClock.now < warmDeadline {
+                try await Task.sleep(for: .milliseconds(10))
+                result = await store.codemapArtifactDemandStatus(ticket)
+            }
+            guard case let .ready(ready) = result else {
+                return XCTFail("\(file.standardizedRelativePath) did not warm: \(result)")
+            }
+            _ = await store.cancelCodemapArtifactDemand(ready.ticket)
+        }
+        let warmedIdle = await store.codemapIdleReadyDemandFileIDsForTesting(rootEpoch: rootEpoch)
+        XCTAssertEqual(warmedIdle.count, sourceCount + 1, "Every warmed record must stay idle")
+
+        let selectedPaths = (0 ..< sourceCount).map {
+            root.appendingPathComponent(String(format: "Sources/Source%03d.swift", $0)).path
+        }
+        let request = PromptContextAccountingRequest(
+            selection: StoredSelection(selectedPaths: selectedPaths, codemapAutoEnabled: true),
+            codeMapUsage: .auto
+        )
+        let lookupContext = WorkspaceLookupContext(rootScope: .allLoaded, bindingProjection: nil)
+        let service = PromptContextAccountingService()
+        var lastCoverage = ""
+        func includesTarget() async throws -> Bool {
+            let result = try await service.withPromptStats(
+                request: request,
+                store: store,
+                lookupContext: lookupContext
+            ) { $0 }
+            lastCoverage = "\(result.codemapPresentation.coverage) \(result.codemapPresentation.issues)"
+            return result.codemapPresentation.renderedEntriesByFileID[target.id]?.text
+                .contains("wideTargetCodemapSymbol") == true
+        }
+
+        let clock = ContinuousClock()
+        let convergenceDeadline = clock.now.advanced(by: .seconds(60))
+        var converged = false
+        while !converged, clock.now < convergenceDeadline {
+            converged = try await includesTarget()
+            if !converged {
+                try await Task.sleep(for: .milliseconds(100))
+            }
+        }
+        XCTAssertTrue(converged, "Automatic codemap never converged: \(lastCoverage)")
+        guard converged else { return }
+        let drainDeadline = clock.now.advanced(by: .seconds(10))
+        var drained = false
+        while !drained, clock.now < drainDeadline {
+            let state = await store.codemapGraphPublicationRecoveryStateForTesting(rootEpoch: rootEpoch)
+            drained = !state.flightActive && !state.observerActive
+            if !drained {
+                try await Task.sleep(for: .milliseconds(25))
+            }
+        }
+        XCTAssertTrue(drained, "Graph publication recovery did not drain after convergence")
+        let idleAfterConvergence = await store.codemapIdleReadyDemandFileIDsForTesting(rootEpoch: rootEpoch)
+        XCTAssertGreaterThan(idleAfterConvergence.count, 64, "The call's working set must exceed the former cap")
+
+        let scheduledBefore = await store.codemapBindingEngineAccountingForTesting(rootID: loaded.id)?
+            .counters.projectionPreloadsScheduled
+        let generationBefore = await store.codemapOverlayContributionGenerationForTesting(rootEpoch: rootEpoch)
+        let evictionsBefore = await store.codemapIdleReadyDemandEvictionCountForTesting()
+        for call in 1 ... 2 {
+            let included = try await includesTarget()
+            XCTAssertTrue(included, "Steady automatic call \(call) dropped Target")
+        }
+        let scheduledAfter = await store.codemapBindingEngineAccountingForTesting(rootID: loaded.id)?
+            .counters.projectionPreloadsScheduled
+        let generationAfter = await store.codemapOverlayContributionGenerationForTesting(rootEpoch: rootEpoch)
+        let evictionsAfter = await store.codemapIdleReadyDemandEvictionCountForTesting()
+        XCTAssertNotNil(scheduledBefore)
+        XCTAssertEqual(scheduledAfter, scheduledBefore, "Steady automatic calls must not schedule projection work")
+        XCTAssertNotNil(generationBefore)
+        XCTAssertEqual(generationAfter, generationBefore, "Steady automatic calls must not advance the overlay")
+        XCTAssertEqual(evictionsAfter, evictionsBefore, "Steady automatic calls must not evict idle records")
+    }
+
+    /// Step 1b V4: cold repeated automatic calls converge when the demand work a call's engine has
+    /// already admitted outlives the call. Every build is gated: none completes inside a call's
+    /// bounded wait, and the gate opens only after the call has released its demands. With
+    /// admission limit C, each call admits C demands and queues the rest, so all N sources are warm
+    /// by call ceil(N/C). The shared target is demanded from call 2 on (once a ready source names
+    /// it), but competes with the selected sources for the C slots: while it loses, it is cancelled
+    /// as queued. It is admitted at the latest once the N + 1 demands have each had a slot, so the
+    /// target renders by call ceil((N + 1)/C) + 1. Steady calls then change nothing. Releasing by
+    /// cancelling admitted work (before Step 1b) never converges here.
+    func testColdAutomaticPromptStatsConvergeWhenAdmittedDemandsOutliveEachCall() async throws {
+        let sourceCount = 6
+        let admissionLimit = 2
+        var repositoryFiles = [
+            "Sources/Target.swift": "struct Target { func gatedTargetCodemapSymbol() {} }\n",
+            "Sources/Prime.swift": "struct Prime {}\n"
+        ]
+        for index in 0 ..< sourceCount {
+            repositoryFiles[String(format: "Sources/Source%03d.swift", index)] =
+                String(format: "struct Source%03d { let target: Target }\n", index)
+        }
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositories.makeRepository(named: "repository", files: repositoryFiles)
+        let codemapFixture = try CodemapStoreFixture(
+            name: #function,
+            bindingEnginePolicy: WorkspaceCodemapBindingEnginePolicy(
+                maximumConcurrentMaterializationCountPerRoot: admissionLimit
+            )
+        )
+        let gate = CodemapReopenablePublicationGate()
+        addTeardownBlock {
+            await codemapFixture.shutdown()
+            repositories.cleanup()
+        }
+        addTeardownBlock { gate.open() }
+        let store = codemapFixture.makeStore()
+        let loaded = try await store.loadRoot(path: root.path)
+        let rootEpoch = try await WorkspaceCodemapRootEpoch(
+            rootID: loaded.id,
+            rootLifetimeID: store.rootLifetimeIDForTesting(rootID: loaded.id)
+        )
+        let targetLookup = await store.lookupPath(root.appendingPathComponent("Sources/Target.swift").path, rootScope: .allLoaded)
+        let target = try XCTUnwrap(targetLookup?.file)
+        // Create the engine with an unrelated file so that no measured file starts warm, and let the
+        // root's projection preload finish: the graph's definition universe, which gates target
+        // discovery, then no longer depends on projection batches competing for the same slots.
+        let primeLookup = await store.lookupPath(root.appendingPathComponent("Sources/Prime.swift").path, rootScope: .allLoaded)
+        let prime = try XCTUnwrap(primeLookup?.file)
+        let primed = try await readyCodemapDemand(store: store, fileID: prime.id)
+        _ = await store.cancelCodemapArtifactDemand(primed.ticket)
+        try await AsyncTestWait.waitUntil("projection preload complete", timeout: 30) {
+            let accounting = await store.codemapBindingEngineAccountingForTesting(rootID: loaded.id)
+            return accounting?.projectionRoots.first { $0.rootEpoch == rootEpoch }?.phase == .complete
+        }
+        let hookInstalled = await store.setCodemapBindingEngineBeforeResolutionPublicationHookForTesting(
+            rootEpoch: rootEpoch
+        ) { _, path in
+            await gate.pass(path)
+        }
+        XCTAssertTrue(hookInstalled)
+
+        let selectedPaths = (0 ..< sourceCount).map {
+            root.appendingPathComponent(String(format: "Sources/Source%03d.swift", $0)).path
+        }
+        let request = PromptContextAccountingRequest(
+            selection: StoredSelection(selectedPaths: selectedPaths, codemapAutoEnabled: true),
+            codeMapUsage: .auto
+        )
+        let lookupContext = WorkspaceLookupContext(rootScope: .allLoaded, bindingProjection: nil)
+        let service = PromptContextAccountingService()
+        func includesTarget() async throws -> Bool {
+            let result = try await service.withPromptStats(
+                request: request,
+                store: store,
+                lookupContext: lookupContext
+            ) { $0 }
+            return result.codemapPresentation.renderedEntriesByFileID[target.id]?.text
+                .contains("gatedTargetCodemapSymbol") == true
+        }
+        func releasedSettled() async -> Bool {
+            let flow = await store.codemapDemandFlowCountsForTesting()
+            let dropped = flow.releasedDroppedBusy + flow.releasedDroppedNotCurrent +
+                flow.releasedDroppedUnavailable + flow.releasedDroppedCancelled
+            return flow.releasedOrphaned == flow.releasedParked + flow.releasedRejoined + dropped
+        }
+
+        let sourceCalls = (sourceCount + admissionLimit - 1) / admissionLimit
+        let callBound = (sourceCount + 1 + admissionLimit - 1) / admissionLimit + 1
+        var convergedCall: Int?
+        var sourcesWarmAfterCall: Int?
+        var callLog: [String] = []
+        for call in 1 ... callBound + 3 {
+            gate.close()
+            let flowBefore = await store.codemapDemandFlowCountsForTesting()
+            if try await includesTarget() {
+                convergedCall = call
+                break
+            }
+            // Only now, after the call released its demands, may the gated builds finish.
+            gate.open()
+            try await AsyncTestWait.waitUntil("call \(call) admitted work settled", timeout: 30) {
+                let accounting = await store.codemapBindingEngineAccountingForTesting(rootID: loaded.id)
+                guard accounting?.activeRequestCount == 0, accounting?.queuedRequestCount == 0 else { return false }
+                guard await releasedSettled() else { return false }
+                // Parked results reach the selection graph through publication; let it finish so
+                // the next call sees every ready source.
+                let state = await store.codemapGraphPublicationRecoveryStateForTesting(rootEpoch: rootEpoch)
+                return !state.flightActive && !state.observerActive
+            }
+            let flow = await store.codemapDemandFlowCountsForTesting()
+            let idle = await store.codemapIdleReadyDemandFileIDsForTesting(rootEpoch: rootEpoch)
+            if sourcesWarmAfterCall == nil,
+               Set(idle).subtracting([prime.id, target.id]).count == sourceCount
+            {
+                sourcesWarmAfterCall = call
+            }
+            callLog.append(
+                "call \(call): fresh=\(flow.freshDemands - flowBefore.freshDemands) " +
+                    "orphaned=\(flow.releasedOrphaned - flowBefore.releasedOrphaned) " +
+                    "parked=\(flow.releasedParked - flowBefore.releasedParked) " +
+                    "queuedCancels=\(flow.releasedDroppedCancelledQueued - flowBefore.releasedDroppedCancelledQueued) " +
+                    "admittedCancels=\(flow.pendingLastHolderCancels - flowBefore.pendingLastHolderCancels) " +
+                    "idle=\(idle.count)"
+            )
+        }
+        let converged = try XCTUnwrap(
+            convergedCall,
+            "Cold automatic calls never converged: \(callLog.joined(separator: "; "))"
+        )
+        let sourcesWarm = try XCTUnwrap(sourcesWarmAfterCall, callLog.joined(separator: "; "))
+        XCTAssertLessThanOrEqual(sourcesWarm, sourceCalls, callLog.joined(separator: "; "))
+        XCTAssertLessThanOrEqual(converged, callBound, callLog.joined(separator: "; "))
+
+        gate.open()
+        let clock = ContinuousClock()
+        let drainDeadline = clock.now.advanced(by: .seconds(10))
+        var drained = false
+        while !drained, clock.now < drainDeadline {
+            let state = await store.codemapGraphPublicationRecoveryStateForTesting(rootEpoch: rootEpoch)
+            drained = !state.flightActive && !state.observerActive
+            if !drained {
+                try await Task.sleep(for: .milliseconds(25))
+            }
+        }
+        XCTAssertTrue(drained, "Graph publication recovery did not drain after convergence")
+        let scheduledBefore = await store.codemapBindingEngineAccountingForTesting(rootID: loaded.id)?
+            .counters.projectionPreloadsScheduled
+        let generationBefore = await store.codemapOverlayContributionGenerationForTesting(rootEpoch: rootEpoch)
+        let evictionsBefore = await store.codemapIdleReadyDemandEvictionCountForTesting()
+        let freshBefore = await store.codemapDemandFlowCountsForTesting().freshDemands
+        for call in 1 ... 2 {
+            let included = try await includesTarget()
+            XCTAssertTrue(included, "Steady automatic call \(call) dropped Target")
+        }
+        let scheduledAfter = await store.codemapBindingEngineAccountingForTesting(rootID: loaded.id)?
+            .counters.projectionPreloadsScheduled
+        let generationAfter = await store.codemapOverlayContributionGenerationForTesting(rootEpoch: rootEpoch)
+        let evictionsAfter = await store.codemapIdleReadyDemandEvictionCountForTesting()
+        let freshAfter = await store.codemapDemandFlowCountsForTesting().freshDemands
+        XCTAssertNotNil(scheduledBefore)
+        XCTAssertEqual(scheduledAfter, scheduledBefore, "Steady automatic calls must not schedule projection work")
+        XCTAssertNotNil(generationBefore)
+        XCTAssertEqual(generationAfter, generationBefore, "Steady automatic calls must not advance the overlay")
+        XCTAssertEqual(evictionsAfter, evictionsBefore, "Steady automatic calls must not evict idle records")
+        XCTAssertEqual(freshAfter, freshBefore, "Steady automatic calls must not start demands")
+    }
+
+    /// Step 1b: keeping admitted work is only for ordinary completion. An automatic call that is
+    /// itself cancelled still cancels the demand work its engine already admitted.
+    func testCancelledAutomaticPromptStatsStillCancelsAdmittedDemand() async throws {
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositories.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/Source.swift": "struct Source { let target: Target }\n",
+                "Sources/Target.swift": "struct Target {}\n",
+                "Sources/Prime.swift": "struct Prime {}\n"
+            ]
+        )
+        let codemapFixture = try CodemapStoreFixture(name: #function)
+        let gate = CodemapReopenablePublicationGate()
+        addTeardownBlock {
+            await codemapFixture.shutdown()
+            repositories.cleanup()
+        }
+        addTeardownBlock { gate.open() }
+        let store = codemapFixture.makeStore()
+        let loaded = try await store.loadRoot(path: root.path)
+        let rootEpoch = try await WorkspaceCodemapRootEpoch(
+            rootID: loaded.id,
+            rootLifetimeID: store.rootLifetimeIDForTesting(rootID: loaded.id)
+        )
+        let sourceLookup = await store.lookupPath(root.appendingPathComponent("Sources/Source.swift").path, rootScope: .allLoaded)
+        let source = try XCTUnwrap(sourceLookup?.file)
+        let primeLookup = await store.lookupPath(root.appendingPathComponent("Sources/Prime.swift").path, rootScope: .allLoaded)
+        let prime = try XCTUnwrap(primeLookup?.file)
+        let primed = try await readyCodemapDemand(store: store, fileID: prime.id)
+        _ = await store.cancelCodemapArtifactDemand(primed.ticket)
+        let hookInstalled = await store.setCodemapBindingEngineBeforeResolutionPublicationHookForTesting(
+            rootEpoch: rootEpoch
+        ) { _, path in
+            await gate.pass(path)
+        }
+        XCTAssertTrue(hookInstalled)
+        let request = PromptContextAccountingRequest(
+            selection: StoredSelection(
+                selectedPaths: [root.appendingPathComponent("Sources/Source.swift").path],
+                codemapAutoEnabled: true
+            ),
+            codeMapUsage: .auto
+        )
+        let flowBefore = await store.codemapDemandFlowCountsForTesting()
+
+        let call = Task {
+            try await PromptContextAccountingService().withPromptStats(
+                request: request,
+                store: store,
+                lookupContext: WorkspaceLookupContext(rootScope: .allLoaded, bindingProjection: nil)
+            ) { $0 }
+        }
+        try await gate.waitUntilEntered("Sources/Source.swift")
+        call.cancel()
+        _ = try? await call.value
+        try await AsyncTestWait.waitUntil("cancelled call's demand removed", timeout: 10) {
+            await store.codemapDemandRecordTicketsForTesting(rootEpoch: rootEpoch, fileID: source.id) == nil
+        }
+        let flowAfter = await store.codemapDemandFlowCountsForTesting()
+        XCTAssertEqual(flowAfter.releasedOrphaned, flowBefore.releasedOrphaned, "A cancelled call keeps no work")
+        XCTAssertGreaterThan(flowAfter.pendingLastHolderCancels, flowBefore.pendingLastHolderCancels)
+
+        gate.open()
+        try await AsyncTestWait.waitUntil("cancelled admitted work drained", timeout: 10) {
+            await store.codemapBindingEngineAccountingForTesting(rootID: loaded.id)?.activeRequestCount == 0
+        }
+        let idle = await store.codemapIdleReadyDemandFileIDsForTesting(rootEpoch: rootEpoch)
+        XCTAssertFalse(idle.contains(source.id), "The cancelled build must not park")
+        let flowDrained = await store.codemapDemandFlowCountsForTesting()
+        XCTAssertEqual(flowDrained.releasedParked, flowBefore.releasedParked)
+    }
+
+    func testResolveEntriesOmitsAutomaticCodemapsWhileSelectionGraphIsUnpublishedAfterShortBoundedWait() async throws {
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositories.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/Source.swift": "struct Source { let unpublishedGraphSentinel: Target }\n",
+                "Sources/Target.swift": "struct Target { func unpublishedGraphTargetSymbol() {} }\n"
+            ]
+        )
+        // Artifact demands succeed, but selection-graph publication stays parked, so the
+        // automatic plan keeps reporting transient graph readiness.
+        let codemapFixture = try CodemapStoreFixture(name: #function)
+        let graphGate = CodemapGraphPublicationGate()
+        addTeardownBlock {
+            graphGate.release()
+            await codemapFixture.shutdown()
+            repositories.cleanup()
+        }
+        let store = codemapFixture.makeStore(graphPublicationWaiter: { rootEpoch in
+            await graphGate.enterAndWait(rootEpoch)
+        })
+        _ = try await store.loadRoot(path: root.path)
+        let clock = ContinuousClock()
+        let started = clock.now
+
+        let resolution = await PromptContextAccountingService().resolveEntries(
+            selection: StoredSelection(
+                selectedPaths: [root.appendingPathComponent("Sources/Source.swift").path],
+                codemapAutoEnabled: true
+            ),
+            store: store,
+            codeMapUsage: .auto
+        )
+
+        let elapsed = started.duration(to: clock.now)
+        XCTAssertLessThan(elapsed, Self.pendingReadinessElapsedBound, "Accounting must not wait the full readiness deadline for graph readiness")
+        let entry = try XCTUnwrap(resolution.entries.first)
+        XCTAssertEqual(resolution.entries.count, 1)
+        XCTAssertTrue(entry.loadedContent?.contains("unpublishedGraphSentinel") == true)
+        XCTAssertFalse(resolution.entries.contains { $0.isCodemap })
+        assertPendingCodemapsOmitted(resolution.codemapPresentation)
+    }
+
+    private static let pendingReadinessElapsedBound: Duration = .seconds(5)
+
+    private func makePendingCodemapFixture(
+        name: String
+    ) async throws -> (store: WorkspaceFileContextStore, sourcePath: String) {
+        let repositories = try ReviewGitRepositoryFixture(name: name)
+        let root = try repositories.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/Source.swift": "struct Source { let target: Target }\n",
+                "Sources/Target.swift": "struct Target { func pendingTargetCodemapSymbol() {} }\n"
+            ]
+        )
+        let codemapFixture = try CodemapStoreFixture(name: name)
+        addTeardownBlock {
+            await codemapFixture.shutdown()
+            repositories.cleanup()
+        }
+        // Every artifact demand stays busy, so automatic readiness can never settle.
+        let store = codemapFixture.makeStore(demandResultHook: { _, _ in
+            .busy(retryAfterMilliseconds: 1000)
+        })
+        _ = try await store.loadRoot(path: root.path)
+        return (store, root.appendingPathComponent("Sources/Source.swift").standardizedFileURL.path)
+    }
+
+    private func assertPendingCodemapsOmitted(
+        _ presentation: WorkspaceCodemapOperationPresentation,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertTrue(presentation.orderedEntries.isEmpty, file: file, line: line)
+        switch presentation.coverage {
+        case .pending, .unavailable:
+            break
+        case .complete, .partial:
+            XCTFail("Pending automatic codemaps must report typed retry coverage", file: file, line: line)
+        }
+        XCTAssertFalse(presentation.issues.isEmpty, file: file, line: line)
+    }
+
+    private func readyCodemapDemand(
+        store: WorkspaceFileContextStore,
+        fileID: UUID,
+        timeout: Duration = .seconds(60)
+    ) async throws -> WorkspaceCodemapArtifactDemandReady {
+        var result = await store.requestCodemapArtifact(forFileID: fileID)
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            switch result {
+            case let .ready(ready):
+                return ready
+            case let .pending(ticket):
+                try await Task.sleep(for: .milliseconds(25))
+                result = await store.codemapArtifactDemandStatus(ticket)
+            case let .unavailable(reason):
+                XCTFail("Expected ready codemap demand, got \(reason)")
+                throw NSError(domain: "PromptContextAccountingServiceTests", code: 1)
+            }
+        }
+        XCTFail("Timed out waiting for ready codemap demand")
+        throw NSError(domain: "PromptContextAccountingServiceTests", code: 1)
+    }
+
     private func makeTemporaryRoot(name: String) throws -> URL {
         try makeTestDirectory(name: name)
     }

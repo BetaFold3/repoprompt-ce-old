@@ -12,7 +12,7 @@ import XCTest
 /// unmeasured dispatched work, lossless persistence and the sidebar readout. Cadence assumptions
 /// are the documented rollout evidence (`total` cumulative, `last` per model response, reasoning
 /// included in output). Fixtures report an explicit cache-write count of zero (the installed
-/// schema default) unless a test is about the unknown-count case.
+/// schema default) unless a test is about the absent-count case, which prices the same way.
 @MainActor
 final class CodexUsageAccountingTests: XCTestCase {
     private typealias Counters = CodexUsageObservation.Counters
@@ -65,9 +65,10 @@ final class CodexUsageAccountingTests: XCTestCase {
         turn: String? = "t1",
         attribution: CodexUsageObservation.TurnAttribution = .notified,
         total: Counters,
-        last: Counters? = nil
+        last: Counters? = nil,
+        window: Int? = 258_400
     ) -> CodexUsageObservation {
-        .init(threadID: "thread-1", turnID: turn, turnAttribution: attribution, ordinal: ordinal, last: last ?? total, total: total, modelContextWindow: 258_400)
+        .init(threadID: "thread-1", turnID: turn, turnAttribution: attribution, ordinal: ordinal, last: last ?? total, total: total, modelContextWindow: window)
     }
 
     private func makeAccumulator(origin: CodexThreadOrigin = .fresh) -> AgentUsageAccumulator {
@@ -234,7 +235,7 @@ final class CodexUsageAccountingTests: XCTestCase {
         XCTAssertEqual(record.codexIntervals?.last?.outputTokens, 69)
         XCTAssertEqual(record.codexIntervals?.last?.estimatedCostLowerUSD, decimal("0.0013775"))
         XCTAssertFalse(record.hasUnmeasuredHistory)
-        XCTAssertEqual(accumulator.codexSessionCostEstimate, .init(lower: decimal("0.0347775"), upper: decimal("0.0347775"), currency: "USD", coverage: .complete))
+        XCTAssertEqual(accumulator.codexSessionCostEstimate, .init(amount: decimal("0.0347775"), currency: "USD", coverage: .complete))
         XCTAssertEqual(accumulator.codexCacheHitShare, .init(ratio: Decimal(20500) / Decimal(40672), coverage: .complete))
         XCTAssertEqual(accumulator.codexUnpricedIntervalCount, 0)
         XCTAssertEqual(accumulator.codexUnmeasuredWorkCount, 0)
@@ -243,7 +244,11 @@ final class CodexUsageAccountingTests: XCTestCase {
         XCTAssertEqual(projection.scope, .codex)
         XCTAssertNil(projection.unavailableReason)
         XCTAssertNil(projection.coverageDetail)
-        XCTAssertEqual(projection.presentation.readoutText, "CH 50.4% · Est. $0.035")
+        XCTAssertEqual(projection.presentation.cacheHitRatioLabel, "Cache Hit Ratio")
+        XCTAssertEqual(projection.presentation.cacheHitRatioValue, "50.4%")
+        XCTAssertEqual(projection.presentation.costEstimateLabel, "API Cost Estimates")
+        XCTAssertEqual(projection.presentation.costEstimateValue, "$0.03")
+        XCTAssertEqual(projection.presentation.readoutText, "Cache Hit Ratio: 50.4% · API Cost Estimates: $0.03")
         XCTAssertTrue(projection.presentation.detailText.contains("Standard/global list prices"))
         XCTAssertTrue(projection.presentation.detailText.contains("pricing version"))
         for forbidden in ["invoice", "subscription", "grand total", "≥"] {
@@ -288,7 +293,7 @@ final class CodexUsageAccountingTests: XCTestCase {
         XCTAssertEqual(observe(&replay, observation(4, turn: "t2", total: counters(220, 0, 0))), .accepted)
         record = try XCTUnwrap(replay.record)
         XCTAssertEqual(record.codexIntervals?.map(\.inputTokens), [100, 120], "220 counted once, not 320")
-        XCTAssertEqual(replay.codexSessionCostEstimate, .init(lower: decimal("0.000275"), upper: decimal("0.000275"), currency: "USD", coverage: .complete))
+        XCTAssertEqual(replay.codexSessionCostEstimate, .init(amount: decimal("0.000275"), currency: "USD", coverage: .complete))
         XCTAssertEqual(replay.codexCacheHitShare, .init(ratio: 0, coverage: .complete))
         XCTAssertEqual(observe(&replay, observation(5, turn: "t2", total: counters(220, 0, 0))), .accepted, "an exact duplicate of the current checkpoint is a no-op")
         XCTAssertEqual(replay.record?.codexIntervals?.count, 2)
@@ -322,7 +327,7 @@ final class CodexUsageAccountingTests: XCTestCase {
         let record = try XCTUnwrap(accumulator.record)
         XCTAssertEqual(record.codexIntervals?.map(\.inputTokens), [nil, 200, 100], "300 counted once: t1's work is inside t2's accepted interval")
         XCTAssertEqual(record.codexIntervals?.compactMap(\.inputTokens).reduce(0, +), 300)
-        XCTAssertEqual(accumulator.codexSessionCostEstimate?.lower, decimal("0.000375"))
+        XCTAssertEqual(accumulator.codexSessionCostEstimate?.amount, decimal("0.000375"))
         XCTAssertEqual(accumulator.codexSessionCostEstimate?.coverage, .partial, "t1's marker keeps coverage honest; nothing overlaps")
         XCTAssertNil(record.semanticViolation)
 
@@ -365,7 +370,7 @@ final class CodexUsageAccountingTests: XCTestCase {
         XCTAssertEqual(record.codexIntervals?.count, 2, "the late t2 report replaces its marker in place")
         XCTAssertEqual(record.codexIntervals?.map(\.inputTokens), [120, 30], "t2 is priced from the refined checkpoint; 150 counted once")
         XCTAssertEqual(accumulator.codexUnmeasuredWorkCount, 0)
-        XCTAssertEqual(accumulator.codexSessionCostEstimate, .init(lower: decimal("0.0001875"), upper: decimal("0.0001875"), currency: "USD", coverage: .complete))
+        XCTAssertEqual(accumulator.codexSessionCostEstimate, .init(amount: decimal("0.0001875"), currency: "USD", coverage: .complete))
         XCTAssertEqual(observe(&accumulator, observation(4, turn: "t1", total: counters(130, 0, 0))), .rejected(.replayedOrSynthetic), "t1 is no longer the checkpoint owner")
         XCTAssertNil(record.semanticViolation)
     }
@@ -546,7 +551,9 @@ final class CodexUsageAccountingTests: XCTestCase {
         XCTAssertNil(accumulator.record?.semanticViolation)
 
         let projection = project(accumulator)
-        XCTAssertTrue(projection.presentation.readoutText.hasSuffix(" partial"))
+        XCTAssertEqual(projection.costEstimate?.coverage, .partial)
+        XCTAssertFalse(projection.presentation.costEstimateValue.contains("partial"), "coverage lives in the details only")
+        XCTAssertTrue(projection.presentation.detailText.contains("(partial coverage)"))
         XCTAssertTrue(try XCTUnwrap(projection.coverageDetail).contains("inherited usage baseline unknown"))
         XCTAssertTrue(try XCTUnwrap(projection.coverageDetail).contains("turn identity inferred from routing state only"))
 
@@ -620,7 +627,7 @@ final class CodexUsageAccountingTests: XCTestCase {
         XCTAssertTrue(try XCTUnwrap(record.codexIntervals?[2].diagnostic).contains("rerouted to gpt-5.6-cyber"))
         XCTAssertTrue(try XCTUnwrap(record.codexIntervals?[1].diagnostic).contains("decreased"), "the prospective marker keeps its own diagnostic")
         XCTAssertEqual(record.codexIntervals?.map(\.inputTokens), [100, nil, 40, 80], "token counts stay owned")
-        XCTAssertEqual(accumulator.codexSessionCostEstimate?.lower, decimal("0.0001"), "only t2 remains priced")
+        XCTAssertEqual(accumulator.codexSessionCostEstimate?.amount, decimal("0.0001"), "only t2 remains priced")
 
         // A reroute without a turn identity withdraws the open turn and applies to the next bound turn.
         accumulator.noteCodexReroute(executionID: execution, reroute: .init(threadID: "thread-1", turnID: nil, fromModel: "gpt-5.3-codex", toModel: "gpt-x", reason: nil))
@@ -651,10 +658,11 @@ final class CodexUsageAccountingTests: XCTestCase {
         XCTAssertEqual(accumulator.codexUnmeasuredWorkCount, 1)
         XCTAssertEqual(accumulator.codexUnpricedIntervalCount, 0)
         XCTAssertEqual(accumulator.codexSessionCostEstimate?.coverage, .partial)
-        XCTAssertEqual(accumulator.codexSessionCostEstimate?.lower, decimal("0.0012375"), "accepted amounts are retained")
+        XCTAssertEqual(accumulator.codexSessionCostEstimate?.amount, decimal("0.0012375"), "accepted amounts are retained")
         XCTAssertEqual(accumulator.codexCacheHitShare?.coverage, .partial)
         var projection = project(accumulator)
-        XCTAssertTrue(projection.presentation.readoutText.hasSuffix(" partial"))
+        XCTAssertEqual(projection.costEstimate?.coverage, .partial)
+        XCTAssertEqual(projection.presentation.costEstimateValue, "<$0.01", "no partial suffix on the value")
         XCTAssertTrue(
             try XCTUnwrap(projection.sessionCostCoverageDetail)
                 .contains(AgentUsageAccumulator.codexUnmeasuredTurnDiagnostic)
@@ -725,33 +733,104 @@ final class CodexUsageAccountingTests: XCTestCase {
 
     // MARK: - Arithmetic
 
-    func testPricingArithmeticUsesProvenBandsEnvelopesAndNeverTreatsMissingRatesAsFree() throws {
+    func testPricingArithmeticUsesOneBandPerRequestAndNeverTreatsMissingRatesAsFree() throws {
         let flat = try XCTUnwrap(Self.snapshot().rates(forModelID: " GPT-5.3-Codex "))
         let flatApplied = CodexUsagePricing.estimate(.init(input: 1000, cached: 200, cacheWrite: 0, output: 10, reasoningOutput: 5), resolution: flat)
         XCTAssertEqual(flatApplied.estimate, .point(decimal("0.001125")))
         XCTAssertEqual(flatApplied.bandKind, "all")
-        XCTAssertEqual(flatApplied.appliedLowerRates, Self.flatRates)
-        XCTAssertEqual(flatApplied.appliedUpperRates, Self.flatRates)
+        XCTAssertEqual(flatApplied.appliedRates, Self.flatRates)
+        XCTAssertNil(flatApplied.assumption)
         let banded = try XCTUnwrap(Self.bandedSnapshot.rates(forModelID: "gpt-5.3-codex"))
-        let short = CodexUsagePricing.estimate(.init(input: 1000, cached: 0, cacheWrite: 0, output: 10, reasoningOutput: 0), resolution: banded)
-        XCTAssertEqual(short.estimate, .point(decimal("0.00135")))
-        XCTAssertEqual(short.bandKind, "shortContext")
-        let envelope = CodexUsagePricing.estimate(.init(input: 300_000, cached: 0, cacheWrite: 0, output: 10, reasoningOutput: 0), resolution: banded)
-        XCTAssertEqual(envelope.estimate, .range(lower: decimal("0.3751"), upper: decimal("0.7502")))
-        XCTAssertEqual(envelope.bandKind, "envelope")
-        XCTAssertEqual(envelope.appliedLowerRates, Self.shortRates)
-        XCTAssertEqual(envelope.appliedUpperRates, Self.longRates)
+        let summed = CodexUsagePricing.Delta(input: 300_000, cached: 0, cacheWrite: 0, output: 10, reasoningOutput: 0)
+        let small = CodexUsagePricing.Delta(input: 1000, cached: 0, cacheWrite: 0, output: 10, reasoningOutput: 0)
+
+        // No window proof and no request size: the summed interval (300K, above the threshold)
+        // never decides the band; standard-context rates apply and the assumption is named.
+        for missing: Int64? in [nil, 0, -1] {
+            let unknown = CodexUsagePricing.estimate(summed, requestContextTokens: missing, resolution: banded)
+            XCTAssertEqual(unknown.estimate, .point(decimal("0.3751")), "request size \(String(describing: missing)) is missing")
+            XCTAssertEqual(unknown.bandKind, "shortContext")
+            XCTAssertEqual(unknown.appliedRates, Self.shortRates)
+            XCTAssertEqual(unknown.assumption, "latest request size unavailable; standard-context rates applied")
+        }
+
+        // The latest request decides; the summed interval made of small requests stays short.
+        let perRequest = CodexUsagePricing.estimate(summed, requestContextTokens: 100_000, resolution: banded)
+        XCTAssertEqual(perRequest.estimate, .point(decimal("0.3751")))
+        XCTAssertEqual(perRequest.bandKind, "shortContext")
+        XCTAssertNil(perRequest.assumption)
+        let long = CodexUsagePricing.estimate(summed, requestContextTokens: 300_000, resolution: banded)
+        XCTAssertEqual(long.estimate, .point(decimal("0.7502")))
+        XCTAssertEqual(long.bandKind, "longContext")
+        XCTAssertEqual(long.appliedRates, Self.longRates)
+        XCTAssertNil(long.assumption)
+        let belowThreshold = CodexUsagePricing.estimate(small, requestContextTokens: 271_999, resolution: banded)
+        XCTAssertEqual(belowThreshold.bandKind, "shortContext")
+        XCTAssertEqual(belowThreshold.estimate, .point(decimal("0.00135")))
+        let atThreshold = CodexUsagePricing.estimate(small, requestContextTokens: 272_000, resolution: banded)
+        XCTAssertEqual(atThreshold.bandKind, "longContext", "a request at the threshold is long-context even when the interval delta is small")
+        XCTAssertEqual(atThreshold.estimate, .point(decimal("0.0027")))
+
+        // A context window below the threshold proves the short band whatever the request says.
+        let windowProof = CodexUsagePricing.estimate(summed, requestContextTokens: 1_000_000, modelContextWindow: 258_400, resolution: banded)
+        XCTAssertEqual(windowProof.bandKind, "shortContext")
+        XCTAssertEqual(windowProof.estimate, .point(decimal("0.3751")))
+        XCTAssertNil(windowProof.assumption)
+        XCTAssertEqual(
+            CodexUsagePricing.estimate(summed, modelContextWindow: 258_400, resolution: banded).assumption,
+            nil,
+            "the window proof needs no request size"
+        )
+        XCTAssertEqual(
+            CodexUsagePricing.estimate(summed, requestContextTokens: 300_000, modelContextWindow: 1_000_000, resolution: banded).bandKind,
+            "longContext",
+            "a window at or above the threshold proves nothing; the request decides"
+        )
+        // A turn already priced long never drops back to the short band.
+        let floored = CodexUsagePricing.estimate(summed, requestContextTokens: 100_000, minimumBand: .longContext, resolution: banded)
+        XCTAssertEqual(floored.bandKind, "longContext")
+        XCTAssertEqual(floored.estimate, .point(decimal("0.7502")))
+
         let unattributable = OpenAIModelPricing(modelID: "m", bands: [.init(kind: .shortContext, rates: Self.shortRates), .init(kind: .longContext, rates: Self.longRates)], contextThresholdTokens: nil)
         let unattributableResolution = try XCTUnwrap(OpenAIPricingSnapshot(catalog: .init(models: [unattributable], aliases: []), sourceKind: .bundledSeed, capturedAt: Date(timeIntervalSince1970: 0), validatedAt: Date(timeIntervalSince1970: 0), isStale: false).rates(forModelID: "m"))
+        let unstated = CodexUsagePricing.estimate(
+            .init(input: 10, cached: 0, cacheWrite: 0, output: 0, reasoningOutput: 0),
+            requestContextTokens: 1_000_000,
+            resolution: unattributableResolution
+        )
+        XCTAssertEqual(unstated.estimate, .point(decimal("0.0000125")), "no stated threshold: standard-context rates, one point")
+        XCTAssertEqual(unstated.bandKind, "shortContext")
+        XCTAssertEqual(unstated.assumption, "long-context qualifier not stated; standard-context rates applied")
+
+        // Only a standard band and no threshold: nothing is assumed.
+        let onlyStandard = OpenAIModelPricing(modelID: "o", bands: [.init(kind: .shortContext, rates: Self.shortRates)], contextThresholdTokens: nil)
+        let onlyStandardResolution = try XCTUnwrap(OpenAIPricingSnapshot(catalog: .init(models: [onlyStandard], aliases: []), sourceKind: .bundledSeed, capturedAt: Date(timeIntervalSince1970: 0), validatedAt: Date(timeIntervalSince1970: 0), isStale: false).rates(forModelID: "o"))
+        let standardOnly = CodexUsagePricing.estimate(
+            .init(input: 10, cached: 0, cacheWrite: 0, output: 0, reasoningOutput: 0),
+            requestContextTokens: 1_000_000,
+            resolution: onlyStandardResolution
+        )
+        XCTAssertEqual(standardOnly.estimate, .point(decimal("0.0000125")))
+        XCTAssertEqual(standardOnly.bandKind, "shortContext")
+        XCTAssertNil(standardOnly.assumption)
+
+        let shortOnly = OpenAIModelPricing(modelID: "s", bands: [.init(kind: .shortContext, rates: Self.shortRates)], contextThresholdTokens: 128_000)
+        let shortOnlyResolution = try XCTUnwrap(OpenAIPricingSnapshot(catalog: .init(models: [shortOnly], aliases: []), sourceKind: .bundledSeed, capturedAt: Date(timeIntervalSince1970: 0), validatedAt: Date(timeIntervalSince1970: 0), isStale: false).rates(forModelID: "s"))
         XCTAssertEqual(
-            CodexUsagePricing.estimate(.init(input: 10, cached: 0, cacheWrite: 0, output: 0, reasoningOutput: 0), resolution: unattributableResolution).estimate,
-            .range(lower: decimal("0.0000125"), upper: decimal("0.000025")),
-            "no stated threshold: the envelope bounds both bands rather than picking the cheapest"
+            CodexUsagePricing.estimate(.init(input: 10, cached: 0, cacheWrite: 0, output: 0, reasoningOutput: 0), requestContextTokens: 128_000, resolution: shortOnlyResolution).estimate,
+            .unavailable("no listed rates for the request's context band"),
+            "an unlisted long band is unavailable, never the cheaper band"
         )
 
         let missingCached = try XCTUnwrap(Self.snapshot(bands: [.init(kind: .all, rates: .init(input: 1, cachedInput: nil, cacheWrite: nil, output: 1))]).rates(forModelID: "gpt-5.3-codex"))
         XCTAssertEqual(CodexUsagePricing.estimate(.init(input: 10, cached: 5, cacheWrite: 0, output: 1, reasoningOutput: 0), resolution: missingCached).estimate, .unavailable("cached input rate not listed"))
         XCTAssertEqual(CodexUsagePricing.estimate(.init(input: 10, cached: 0, cacheWrite: 0, output: 1, reasoningOutput: 0), resolution: missingCached).estimate, .point(decimal("0.000011")))
+        let writeWithoutCachedRate = try XCTUnwrap(Self.snapshot(bands: [.init(kind: .all, rates: .init(input: 1, cachedInput: nil, cacheWrite: 2, output: 1))]).rates(forModelID: "gpt-5.3-codex"))
+        XCTAssertEqual(
+            CodexUsagePricing.estimate(.init(input: 10, cached: 0, cacheWrite: 2, output: 1, reasoningOutput: 0), resolution: writeWithoutCachedRate).estimate,
+            .point(decimal("0.000013")),
+            "8 × 1 + 2 × 2 + 1 × 1 per million: a missing cached rate is only needed for cached tokens"
+        )
         XCTAssertEqual(CodexUsagePricing.estimate(.init(input: 10, cached: 0, cacheWrite: 2, output: 1, reasoningOutput: 0), resolution: flat).estimate, .unavailable("cache write rate not listed"))
         XCTAssertEqual(CodexUsagePricing.estimate(.init(input: 10, cached: 8, cacheWrite: 3, output: 1, reasoningOutput: 0), resolution: flat).estimate, .unavailable("cached and cache-write input exceed input"))
         XCTAssertEqual(CodexUsagePricing.estimate(.init(input: nil, cached: 0, cacheWrite: 0, output: 1, reasoningOutput: 0), resolution: flat).estimate, .unavailable("input or output count missing"))
@@ -760,81 +839,292 @@ final class CodexUsageAccountingTests: XCTestCase {
         XCTAssertNil(CodexUsagePricing.delta(from: counters(Int(Int64.min), 0, 0), to: counters(1, 0, 0)), "overflowing arithmetic is unavailable")
     }
 
-    func testUnknownCacheWriteIsBoundedWithAListedWriteRateAndPartialWithoutOne() throws {
-        // Listed write rate: W is unknown within 0...I−C, so both corners bound the estimate.
+    func testCacheWriteCountFirstReportedMidSessionUsesAZeroBaseline() throws {
+        let started = try XCTUnwrap(CodexUsagePricing.delta(from: counters(1000, 0, 10, cacheWrite: nil), to: counters(3000, 500, 30, cacheWrite: 400)))
+        XCTAssertEqual(started.cacheWrite, 400, "an absent baseline count is the schema default zero")
+        XCTAssertEqual(started.input, 2000)
+        let stopped = try XCTUnwrap(CodexUsagePricing.delta(from: counters(1000, 0, 10, cacheWrite: 100), to: counters(3000, 500, 30, cacheWrite: nil)))
+        XCTAssertNil(stopped.cacheWrite, "a currently absent count stays absent")
+        let neither = try XCTUnwrap(CodexUsagePricing.delta(from: counters(1000, 0, 10, cacheWrite: nil), to: counters(3000, 500, 30, cacheWrite: nil)))
+        XCTAssertNil(neither.cacheWrite)
+
+        // Accumulator level: the first-reported writes are priced at the write rate.
+        var accumulator = makeAccumulator()
+        dispatch(&accumulator, turn: "t1", model: "gpt-w", snapshot: Self.writeSnapshot)
+        XCTAssertEqual(observe(&accumulator, observation(1, total: counters(1000, 0, 0, cacheWrite: nil))), .accepted)
+        dispatch(&accumulator, turn: "t2", model: "gpt-w", snapshot: Self.writeSnapshot)
+        XCTAssertEqual(
+            observe(&accumulator, observation(2, turn: "t2", total: counters(2000, 0, 0, cacheWrite: 200), last: counters(1000, 0, 0, cacheWrite: 200))),
+            .accepted
+        )
+        let interval = try XCTUnwrap(accumulator.record?.codexIntervals?.last)
+        XCTAssertEqual(interval.cacheWriteInputTokens, 200)
+        XCTAssertEqual(interval.estimatedCostLowerUSD, decimal("0.0042"), "800 × 4 + 200 × 5 per million")
+        XCTAssertEqual(interval.coverage, .complete)
+    }
+
+    func testAbsentCacheWriteCountIsPricedAsOrdinaryInput() throws {
+        // The installed v2 schema defaults an absent cache-write count to zero, so I − C is
+        // ordinary input at the input rate whether or not a write rate is listed.
         let write = try XCTUnwrap(Self.writeSnapshot.rates(forModelID: "gpt-w"))
-        let bounded = CodexUsagePricing.estimate(.init(input: 1000, cached: 0, cacheWrite: nil, output: 0, reasoningOutput: 0), resolution: write)
-        XCTAssertEqual(bounded.estimate, .range(lower: decimal("0.004"), upper: decimal("0.005")))
-        XCTAssertTrue(bounded.estimate.isComplete)
+        XCTAssertEqual(
+            CodexUsagePricing.estimate(.init(input: 1000, cached: 0, cacheWrite: nil, output: 0, reasoningOutput: 0), resolution: write).estimate,
+            .point(decimal("0.004"))
+        )
         XCTAssertEqual(
             CodexUsagePricing.estimate(.init(input: 1000, cached: 1000, cacheWrite: nil, output: 0, reasoningOutput: 0), resolution: write).estimate,
-            .point(decimal("0.0004")),
-            "nothing is left to allocate when every input token is cached"
+            .point(decimal("0.0004"))
         )
         XCTAssertEqual(
-            CodexUsagePricing.estimate(.init(input: 1000, cached: 0, cacheWrite: 0, output: 0, reasoningOutput: 0), resolution: write).estimate,
-            .point(decimal("0.004")),
-            "an explicit zero is a proven point"
+            CodexUsagePricing.estimate(.init(input: 1000, cached: 0, cacheWrite: 200, output: 0, reasoningOutput: 0), resolution: write).estimate,
+            .point(decimal("0.0042")),
+            "a reported write count is priced at the write rate"
         )
 
-        // No listed write rate: the I−C remainder is not proven ordinary input, so only the
-        // independently priceable components form an explicitly partial subtotal.
         let flat = try XCTUnwrap(Self.snapshot().rates(forModelID: "gpt-5.3-codex"))
-        let partial = CodexUsagePricing.estimate(.init(input: 1000, cached: 200, cacheWrite: nil, output: 10, reasoningOutput: 0), resolution: flat)
-        XCTAssertEqual(partial.estimate, .partialSubtotal(decimal("0.000125"), unpriced: "800 input tokens (cache-write count unknown and no cache-write rate listed)"))
-        XCTAssertFalse(partial.estimate.isComplete)
+        let absent = CodexUsagePricing.estimate(.init(input: 1000, cached: 200, cacheWrite: nil, output: 10, reasoningOutput: 0), resolution: flat)
+        XCTAssertEqual(absent.estimate, .point(decimal("0.001125")), "800 × 1.25 + 200 × 0.125 + 10 × 10 per million")
         XCTAssertEqual(
-            CodexUsagePricing.estimate(.init(input: 1000, cached: 200, cacheWrite: 0, output: 10, reasoningOutput: 0), resolution: flat).estimate,
-            .point(decimal("0.001125"))
+            absent,
+            CodexUsagePricing.estimate(.init(input: 1000, cached: 200, cacheWrite: 0, output: 10, reasoningOutput: 0), resolution: flat),
+            "absent and an explicit zero price identically"
+        )
+        XCTAssertEqual(
+            CodexUsagePricing.estimate(.init(input: 1000, cached: 900, cacheWrite: 200, output: 10, reasoningOutput: 0), resolution: write).estimate,
+            .unavailable("cached and cache-write input exceed input")
         )
 
-        // Accumulator level: the partial subtotal never claims complete coverage.
+        // Accumulator level: the absent count stays absent in the record, and the interval is a
+        // complete point with no diagnostic.
         var accumulator = makeAccumulator()
         dispatch(&accumulator, turn: "t1")
         XCTAssertEqual(observe(&accumulator, observation(1, total: counters(1000, 200, 10, cacheWrite: nil))), .accepted)
         let record = try XCTUnwrap(accumulator.record)
         XCTAssertNil(record.codexIntervals?.first?.cacheWriteInputTokens)
-        XCTAssertEqual(record.codexIntervals?.first?.estimatedCostLowerUSD, decimal("0.000125"))
-        XCTAssertEqual(record.codexIntervals?.first?.estimatedCostUpperUSD, decimal("0.000125"))
-        XCTAssertEqual(record.codexIntervals?.first?.coverage, .partial)
-        XCTAssertTrue(try XCTUnwrap(record.codexIntervals?.first?.diagnostic).hasPrefix("partial subtotal: excludes 800 input tokens"))
-        XCTAssertEqual(accumulator.codexPartialSubtotalIntervalCount, 1)
-        XCTAssertEqual(accumulator.codexSessionCostEstimate?.coverage, .partial)
+        XCTAssertEqual(record.codexIntervals?.first?.estimatedCostLowerUSD, decimal("0.001125"))
+        XCTAssertEqual(record.codexIntervals?.first?.estimatedCostUpperUSD, decimal("0.001125"))
+        XCTAssertEqual(record.codexIntervals?.first?.coverage, .complete)
+        XCTAssertNil(record.codexIntervals?.first?.diagnostic)
+        XCTAssertEqual(accumulator.codexSessionCostEstimate, .init(amount: decimal("0.001125"), currency: "USD", coverage: .complete))
         let projection = project(accumulator)
-        XCTAssertEqual(projection.presentation.readoutText, "CH 20.0% · Est. $0.000125 partial")
-        XCTAssertTrue(try XCTUnwrap(projection.coverageDetail).contains("partial subtotal"))
+        XCTAssertEqual(projection.presentation.readoutText, "Cache Hit Ratio: 20.0% · API Cost Estimates: <$0.01")
         XCTAssertNil(record.semanticViolation)
 
-        var ranged = makeAccumulator()
-        dispatch(&ranged, turn: "t1", model: "gpt-w", snapshot: Self.writeSnapshot)
-        XCTAssertEqual(observe(&ranged, observation(1, total: counters(1000, 0, 0, cacheWrite: nil))), .accepted)
-        XCTAssertEqual(ranged.codexSessionCostEstimate, .init(lower: decimal("0.004"), upper: decimal("0.005"), currency: "USD", coverage: .complete))
-        XCTAssertEqual(project(ranged).presentation.readoutText, "CH 0.0% · Est. $0.004–$0.005")
+        var writeModel = makeAccumulator()
+        dispatch(&writeModel, turn: "t1", model: "gpt-w", snapshot: Self.writeSnapshot)
+        XCTAssertEqual(observe(&writeModel, observation(1, total: counters(1000, 0, 0, cacheWrite: nil))), .accepted)
+        XCTAssertEqual(writeModel.codexSessionCostEstimate, .init(amount: decimal("0.004"), currency: "USD", coverage: .complete))
+        let applied = try XCTUnwrap(writeModel.record?.codexIntervals?.first?.appliedPricing)
+        XCTAssertEqual(applied.inputRateLowerUSD, applied.inputRateUpperUSD)
+        XCTAssertEqual(applied.cacheWriteRateLowerUSD, applied.cacheWriteRateUpperUSD)
     }
 
-    func testEnvelopePricedIntervalsPresentARangeAndStayComplete() {
+    func testContextBandFollowsTheLatestRequestNotTheSummedInterval() throws {
         var accumulator = makeAccumulator()
         dispatch(&accumulator, turn: "t1", snapshot: Self.bandedSnapshot)
         XCTAssertEqual(observe(&accumulator, observation(1, total: counters(1000, 0, 10))), .accepted)
+        XCTAssertEqual(accumulator.record?.codexIntervals?.last?.estimatedCostLowerUSD, decimal("0.00135"))
+
+        // The remaining turns report a 1M context window, so the window proves nothing and the
+        // latest request decides. The summed interval (300K input) is above the 272K threshold,
+        // but the latest request's prompt (150K) is below it: the short band applies.
         dispatch(&accumulator, turn: "t2", snapshot: Self.bandedSnapshot)
-        XCTAssertEqual(observe(&accumulator, observation(2, turn: "t2", total: counters(301_000, 0, 20))), .accepted)
-        XCTAssertEqual(accumulator.codexSessionCostEstimate, .init(lower: decimal("0.37645"), upper: decimal("0.75155"), currency: "USD", coverage: .complete))
+        XCTAssertEqual(
+            observe(&accumulator, observation(2, turn: "t2", total: counters(301_000, 0, 20), last: counters(150_000, 0, 10), window: 1_000_000)),
+            .accepted
+        )
+        var interval = try XCTUnwrap(accumulator.record?.codexIntervals?.last)
+        XCTAssertEqual(interval.inputTokens, 300_000)
+        XCTAssertEqual(interval.bandKind, "shortContext")
+        XCTAssertEqual(interval.estimatedCostLowerUSD, decimal("0.3751"))
+        XCTAssertEqual(interval.estimatedCostUpperUSD, decimal("0.3751"))
+        XCTAssertEqual(interval.appliedPricing?.inputRateLowerUSD, decimal("1.25"))
+        XCTAssertEqual(interval.appliedPricing?.inputRateUpperUSD, decimal("1.25"))
+        XCTAssertEqual(interval.coverage, .complete)
+
+        // One cache-heavy 280K request (at or above the threshold) is the whole t3 interval:
+        // 10K uncached + 270K cached at long-context rates.
+        dispatch(&accumulator, turn: "t3", snapshot: Self.bandedSnapshot)
+        XCTAssertEqual(
+            observe(
+                &accumulator,
+                observation(3, turn: "t3", total: counters(581_000, 270_000, 20), last: counters(280_000, 270_000, 0), window: 1_000_000)
+            ),
+            .accepted
+        )
+        interval = try XCTUnwrap(accumulator.record?.codexIntervals?.last)
+        XCTAssertEqual(interval.inputTokens, 280_000)
+        XCTAssertEqual(interval.bandKind, "longContext")
+        XCTAssertEqual(interval.estimatedCostLowerUSD, decimal("0.0925"), "10K × 2.5 + 270K × 0.25 per million")
+
+        // Without observation.last or a window proof the summed 300K interval is not used to
+        // pick the band: standard-context rates with a named assumption, coverage still complete.
+        dispatch(&accumulator, turn: "t4", snapshot: Self.bandedSnapshot)
+        let withoutLast = CodexUsageObservation(
+            threadID: "thread-1",
+            turnID: "t4",
+            turnAttribution: .notified,
+            ordinal: 4,
+            last: nil,
+            total: counters(881_000, 270_000, 30),
+            modelContextWindow: nil
+        )
+        XCTAssertEqual(observe(&accumulator, withoutLast), .accepted)
+        interval = try XCTUnwrap(accumulator.record?.codexIntervals?.last)
+        XCTAssertEqual(interval.inputTokens, 300_000)
+        XCTAssertEqual(interval.bandKind, "shortContext")
+        XCTAssertEqual(interval.estimatedCostLowerUSD, decimal("0.3751"))
+        XCTAssertEqual(interval.coverage, .complete)
+        XCTAssertEqual(interval.diagnostic, "latest request size unavailable; standard-context rates applied")
+
+        XCTAssertEqual(accumulator.codexSessionCostEstimate, .init(amount: decimal("0.84405"), currency: "USD", coverage: .complete))
         let projection = project(accumulator)
-        XCTAssertEqual(projection.presentation.readoutText, "CH 0.0% · Est. $0.376–$0.752")
-        XCTAssertEqual(projection.costUpperBound, decimal("0.75155"))
-        XCTAssertTrue(projection.presentation.detailText.contains("A range bounds"))
+        XCTAssertEqual(projection.presentation.costEstimateValue, "$0.84")
+        XCTAssertFalse(projection.presentation.detailText.contains("–"), "no range wording")
+        XCTAssertNil(projection.coverageDetail, "a stated assumption is not a coverage problem")
+        XCTAssertTrue(try XCTUnwrap(projection.sessionCostCoverageDetail).hasPrefix("Complete:"))
+        XCTAssertTrue(try XCTUnwrap(projection.sessionCostCoverageDetail).contains("Pricing assumption: latest request size unavailable"))
+
+        // Two bands without a stated qualifier: standard-context rates, complete coverage, and the
+        // assumption is named in the cost details.
+        let unstated = Self.snapshot(
+            bands: [.init(kind: .shortContext, rates: Self.shortRates), .init(kind: .longContext, rates: Self.longRates)],
+            threshold: nil
+        )
+        var assumed = makeAccumulator()
+        dispatch(&assumed, turn: "t1", snapshot: unstated)
+        XCTAssertEqual(observe(&assumed, observation(1, total: counters(400_000, 0, 0))), .accepted)
+        let assumedInterval = try XCTUnwrap(assumed.record?.codexIntervals?.first)
+        XCTAssertEqual(assumedInterval.bandKind, "shortContext")
+        XCTAssertEqual(assumedInterval.estimatedCostLowerUSD, decimal("0.5"))
+        XCTAssertEqual(assumedInterval.coverage, .complete)
+        XCTAssertEqual(assumedInterval.diagnostic, "long-context qualifier not stated; standard-context rates applied")
+        let assumedProjection = project(assumed)
+        XCTAssertEqual(assumedProjection.costEstimate?.coverage, .complete)
+        XCTAssertNil(assumedProjection.coverageDetail)
+        XCTAssertTrue(try XCTUnwrap(assumedProjection.sessionCostCoverageDetail).contains("Pricing assumption: long-context qualifier not stated"))
+        XCTAssertTrue(assumedProjection.presentation.detailText.contains("standard-context rates applied"))
     }
 
-    func testRangeDisplayRoundsOutwardAndTinyBoundsNeverMasqueradeAsZero() {
-        XCTAssertEqual(Usage.usdLowerBound(decimal("0.37655")), "$0.376")
-        XCTAssertEqual(Usage.usdUpperBound(decimal("0.75145")), "$0.752")
-        XCTAssertEqual(Usage.usdLowerBound(decimal("0.1001")), "$0.100")
-        XCTAssertEqual(Usage.usdUpperBound(decimal("0.1002")), "$0.101")
-        XCTAssertEqual(Usage.usdLowerBound(decimal("0.375")), "$0.375")
-        XCTAssertEqual(Usage.usdUpperBound(decimal("0.375")), "$0.375")
-        XCTAssertEqual(Usage.usdLowerBound(decimal("0.0000125")), "$0.0000125", "a tiny positive lower bound keeps its digits")
-        XCTAssertEqual(Usage.usdUpperBound(decimal("0.00003")), "$0.001")
-        XCTAssertEqual(Usage.usdLowerBound(0), "$0.000")
+    func testContextBandIsMonotonicWithinAnOpenTurn() throws {
+        var accumulator = makeAccumulator()
+        dispatch(&accumulator, turn: "t1", snapshot: Self.bandedSnapshot)
+        // Refinement 1: one 100K request → short.
+        XCTAssertEqual(
+            observe(&accumulator, observation(1, total: counters(100_000, 0, 0), window: 1_000_000)),
+            .accepted
+        )
+        var interval = try XCTUnwrap(accumulator.record?.codexIntervals?.last)
+        XCTAssertEqual(interval.bandKind, "shortContext")
+        XCTAssertEqual(interval.estimatedCostLowerUSD, decimal("0.125"))
+
+        // Refinement 2: the latest request reaches 300K → the whole turn upgrades to long.
+        XCTAssertEqual(
+            observe(&accumulator, observation(2, total: counters(400_000, 0, 0), last: counters(300_000, 0, 0), window: 1_000_000)),
+            .accepted
+        )
+        interval = try XCTUnwrap(accumulator.record?.codexIntervals?.last)
+        XCTAssertEqual(interval.bandKind, "longContext")
+        XCTAssertEqual(interval.estimatedCostLowerUSD, decimal("1"))
+
+        // Refinement 3: the latest request is small again, but the turn never downgrades and
+        // its amount never decreases.
+        XCTAssertEqual(
+            observe(&accumulator, observation(3, total: counters(450_000, 0, 0), last: counters(50000, 0, 0), window: 1_000_000)),
+            .accepted
+        )
+        interval = try XCTUnwrap(accumulator.record?.codexIntervals?.last)
+        XCTAssertEqual(accumulator.record?.codexIntervals?.count, 1, "refinements upsert the turn's interval")
+        XCTAssertEqual(interval.bandKind, "longContext")
+        XCTAssertEqual(interval.estimatedCostLowerUSD, decimal("1.125"))
+        XCTAssertGreaterThanOrEqual(try XCTUnwrap(interval.estimatedCostLowerUSD), decimal("1"))
+
+        // The floor belongs to the turn: the next turn starts from the evidence again.
+        dispatch(&accumulator, turn: "t2", snapshot: Self.bandedSnapshot)
+        XCTAssertEqual(
+            observe(&accumulator, observation(4, turn: "t2", total: counters(460_000, 0, 0), last: counters(10000, 0, 0), window: 1_000_000)),
+            .accepted
+        )
+        interval = try XCTUnwrap(accumulator.record?.codexIntervals?.last)
+        XCTAssertEqual(interval.bandKind, "shortContext")
+        XCTAssertEqual(interval.estimatedCostLowerUSD, decimal("0.0125"))
+        XCTAssertEqual(accumulator.codexSessionCostEstimate?.amount, decimal("1.1375"))
+    }
+
+    func testLegacyRangedIntervalProjectsItsLowerBound() throws {
+        var accumulator = makeAccumulator()
+        dispatch(&accumulator, turn: "t1", snapshot: Self.bandedSnapshot)
+        XCTAssertEqual(observe(&accumulator, observation(1, total: counters(1000, 0, 10))), .accepted)
+        // Shape an interval as an older build persisted it: an envelope with short/long rate sets.
+        var legacy = try XCTUnwrap(accumulator.persistedRepresentation?.record)
+        legacy.codexIntervals?[0].bandKind = "envelope"
+        legacy.codexIntervals?[0].estimatedCostLowerUSD = decimal("1.234")
+        legacy.codexIntervals?[0].estimatedCostUpperUSD = decimal("2.468")
+        legacy.codexIntervals?[0].appliedPricing?.inputRateUpperUSD = decimal("2.5")
+        legacy.codexIntervals?[0].appliedPricing?.outputRateUpperUSD = 20
+        XCTAssertNil(legacy.semanticViolation)
+        let raw = try AgentProviderUsageRawValue(validating: JSONEncoder().encode(legacy))
+        XCTAssertEqual(raw.losslessRecord(), legacy, "the persisted schema still decodes ranged intervals")
+
+        let hydrated = AgentUsageAccumulator(ownerSessionID: owner, persisted: .opaque(raw), hasPriorHistory: true, qualification: .productionClaude)
+        XCTAssertEqual(hydrated.eligibility, .eligible)
+        XCTAssertEqual(hydrated.codexSessionCostEstimate, .init(amount: decimal("1.234"), currency: "USD", coverage: .complete))
+        let projection = project(hydrated)
+        XCTAssertEqual(projection.costEstimate?.amount, decimal("1.234"))
+        XCTAssertEqual(projection.presentation.costEstimateValue, "$1.23")
+        XCTAssertTrue(
+            try XCTUnwrap(projection.sessionCostCoverageDetail)
+                .contains("1 earlier interval(s) were priced as a range by an older build; the lower bound is shown.")
+        )
+        XCTAssertEqual(hydrated.persistedRepresentation, .opaque(raw), "projection never rewrites the stored range")
+
+        // A session mixing the legacy range with a current point interval sums lower + point.
+        var mixed = hydrated
+        mixed.beginCodexExecution(executionID: execution, threadOrigin: .fresh)
+        dispatch(&mixed, turn: "t2")
+        XCTAssertEqual(observe(&mixed, observation(1, turn: "t2", total: counters(1000, 200, 10))), .accepted)
+        XCTAssertEqual(mixed.record?.codexIntervals?.count, 2)
+        XCTAssertEqual(mixed.codexSessionCostEstimate, .init(amount: decimal("1.235125"), currency: "USD", coverage: .complete))
+        let mixedProjection = project(mixed)
+        XCTAssertEqual(mixedProjection.presentation.costEstimateValue, "$1.24")
+        XCTAssertTrue(try XCTUnwrap(mixedProjection.sessionCostCoverageDetail).contains("1 earlier interval(s) were priced as a range"))
+    }
+
+    func testLegacyPartialSubtotalIntervalStaysPartialAndExplainsItself() throws {
+        var accumulator = makeAccumulator()
+        dispatch(&accumulator, turn: "t1", snapshot: Self.bandedSnapshot)
+        XCTAssertEqual(observe(&accumulator, observation(1, total: counters(1000, 0, 10))), .accepted)
+        // An older build persisted a priced subtotal that it marked partial.
+        var legacy = try XCTUnwrap(accumulator.persistedRepresentation?.record)
+        legacy.codexIntervals?[0].bandKind = "envelope"
+        legacy.codexIntervals?[0].estimatedCostLowerUSD = decimal("0.5")
+        legacy.codexIntervals?[0].estimatedCostUpperUSD = decimal("0.9")
+        legacy.codexIntervals?[0].coverage = .partial
+        legacy.codexIntervals?[0].diagnostic = "partial subtotal: cache-write rate not listed for the long band"
+        XCTAssertNil(legacy.semanticViolation)
+        let raw = try AgentProviderUsageRawValue(validating: JSONEncoder().encode(legacy))
+
+        let hydrated = AgentUsageAccumulator(ownerSessionID: owner, persisted: .opaque(raw), hasPriorHistory: true, qualification: .productionClaude)
+        XCTAssertEqual(hydrated.codexSessionCostEstimate, .init(amount: decimal("0.5"), currency: "USD", coverage: .partial))
+        let projection = project(hydrated)
+        let costDetail = try XCTUnwrap(projection.sessionCostCoverageDetail)
+        XCTAssertTrue(costDetail.hasPrefix("Partial:"))
+        XCTAssertTrue(costDetail.contains("partial subtotal: cache-write rate not listed for the long band"))
+        XCTAssertTrue(costDetail.contains("1 earlier interval(s) were priced as a range by an older build"))
+        XCTAssertTrue(try XCTUnwrap(projection.coverageDetail).contains("partial subtotal"), "a partial interval is a coverage problem")
+        XCTAssertEqual(projection.presentation.costEstimateValue, "$0.50")
+        XCTAssertFalse(projection.presentation.readoutText.contains("partial"), "coverage lives in the details only")
+        XCTAssertTrue(projection.presentation.detailText.contains("(partial coverage)"))
+    }
+
+    func testCostDisplayUsesTwoDecimalsHalfUpAndTinyAmountsNeverMasqueradeAsZero() {
+        XCTAssertEqual(Usage.usdAmount(decimal("206.697")), "$206.70")
+        XCTAssertEqual(Usage.usdAmount(decimal("105.305")), "$105.31", "half-up")
+        XCTAssertEqual(Usage.usdAmount(decimal("0.375")), "$0.38")
+        XCTAssertEqual(Usage.usdAmount(decimal("0.005")), "$0.01")
+        XCTAssertEqual(Usage.usdAmount(decimal("0.0049")), "<$0.01", "a positive amount that rounds to zero")
+        XCTAssertEqual(Usage.usdAmount(decimal("0.0000125")), "<$0.01")
+        XCTAssertEqual(Usage.usdAmount(0), "$0.00")
     }
 
     func testLatestCodexRequestUsesLastWhileSessionAggregateAndCostStayCumulative() throws {
@@ -878,7 +1168,7 @@ final class CodexUsageAccountingTests: XCTestCase {
             "latest request is observation.last, not the cumulative total delta"
         )
         XCTAssertEqual(accumulator.codexCacheHitShare?.ratio, decimal("0.4"), "session average remains total-based")
-        XCTAssertEqual(accumulator.codexSessionCostEstimate?.lower, decimal("0.0044"))
+        XCTAssertEqual(accumulator.codexSessionCostEstimate?.amount, decimal("0.0044"))
 
         dispatch(&accumulator, turn: "t3")
         let withoutLast = CodexUsageObservation(
@@ -896,7 +1186,7 @@ final class CodexUsageAccountingTests: XCTestCase {
         XCTAssertTrue(missing.detail.contains("omitted observation.last"))
         XCTAssertEqual(accumulator.codexCacheHitShare?.ratio, decimal("0.325"))
         XCTAssertEqual(
-            accumulator.codexSessionCostEstimate?.lower,
+            accumulator.codexSessionCostEstimate?.amount,
             decimal("0.0060375"),
             "missing request-level counters do not alter cumulative pricing"
         )
@@ -921,8 +1211,8 @@ final class CodexUsageAccountingTests: XCTestCase {
         )
         XCTAssertNil(restored.latestRequestCacheHit(for: .codexLast))
         XCTAssertEqual(restored.codexCacheHitShare?.ratio, decimal("0.325"))
-        XCTAssertEqual(restored.codexSessionCostEstimate?.lower, decimal("0.0060375"))
-        XCTAssertEqual(project(restored).presentation.readoutText, "CH — · Est. $0.006")
+        XCTAssertEqual(restored.codexSessionCostEstimate?.amount, decimal("0.0060375"))
+        XCTAssertEqual(project(restored).presentation.readoutText, "Cache Hit Ratio: — · API Cost Estimates: $0.01")
 
         // Provider lifecycles overlap while an old launch drains. Each source keeps its own slot,
         // so a Claude dispatch/event cannot erase Codex and a later Codex update cannot erase Claude.
@@ -1019,7 +1309,7 @@ final class CodexUsageAccountingTests: XCTestCase {
         let hydrated = AgentUsageAccumulator(ownerSessionID: owner, persisted: .opaque(raw), hasPriorHistory: true, qualification: .productionClaude)
         XCTAssertEqual(hydrated.eligibility, .eligible)
         XCTAssertEqual(hydrated.codexIntervalCount, 1)
-        XCTAssertEqual(hydrated.codexSessionCostEstimate?.lower, decimal("0.0012375"))
+        XCTAssertEqual(hydrated.codexSessionCostEstimate?.amount, decimal("0.0012375"))
         XCTAssertEqual(hydrated.persistedRepresentation, .opaque(raw), "restored bytes stay authoritative until an owned mutation")
 
         // Intervals written before applied pricing existed (no `appliedPricing` member) stay lossless.
@@ -1082,13 +1372,13 @@ final class CodexUsageAccountingTests: XCTestCase {
         XCTAssertTrue(projection.presentation.detailText.contains("price list dated"))
         XCTAssertTrue(projection.presentation.detailText.contains("last validated"))
 
-        // The envelope records the lower and upper rate sets actually applied.
+        // The one applied rate set is recorded in both persisted slots (the long band here).
         dispatch(&accumulator, turn: "t2", snapshot: Self.bandedSnapshot)
-        XCTAssertEqual(observe(&accumulator, observation(2, turn: "t2", total: counters(301_000, 100, 20))), .accepted)
-        let envelope = try XCTUnwrap(accumulator.record?.codexIntervals?.last?.appliedPricing)
-        XCTAssertEqual(envelope.inputRateLowerUSD, decimal("1.25"))
-        XCTAssertEqual(envelope.inputRateUpperUSD, decimal("2.5"))
-        XCTAssertFalse(envelope.wasStale)
+        XCTAssertEqual(observe(&accumulator, observation(2, turn: "t2", total: counters(301_000, 100, 20), window: 1_000_000)), .accepted)
+        let banded = try XCTUnwrap(accumulator.record?.codexIntervals?.last?.appliedPricing)
+        XCTAssertEqual(banded.inputRateLowerUSD, decimal("2.5"))
+        XCTAssertEqual(banded.inputRateUpperUSD, decimal("2.5"))
+        XCTAssertFalse(banded.wasStale)
         XCTAssertEqual(accumulator.codexPricingProvenance?.staleIntervalCount, 1)
 
         // Persisted provenance survives a lossless round-trip and is never repriced on hydration.

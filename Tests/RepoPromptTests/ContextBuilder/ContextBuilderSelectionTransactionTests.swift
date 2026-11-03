@@ -223,7 +223,7 @@ private struct Fixture {
     }
 
     var metadata: MCPServerViewModel.RequestMetadata {
-        .init(connectionID: connectionID, clientName: "selection-transaction-test", windowID: window.windowID)
+        .init(connectionID: connectionID, clientName: "selection-transaction-test", windowID: window.windowID, actorRoutedRunTab: nil)
     }
 
     var canonicalSelection: StoredSelection? {

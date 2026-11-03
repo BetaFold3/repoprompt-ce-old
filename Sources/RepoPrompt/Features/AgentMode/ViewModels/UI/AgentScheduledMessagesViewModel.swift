@@ -496,6 +496,7 @@ final class AgentScheduledMessagesViewModel: ObservableObject {
             dashboardProps(
                 for: snapshot,
                 blockingSessionName: $0.dashboardBlockingSessionName(for: snapshot),
+                recoveryBlocker: $0.recoveryBlocker(scheduleID: record.id),
                 hasHost: true
             )
         } ?? nil
@@ -536,6 +537,7 @@ final class AgentScheduledMessagesViewModel: ObservableObject {
         let props = dashboardProps(
             for: snapshot,
             blockingSessionName: blockingName,
+            recoveryBlocker: coordinator.recoveryBlocker(scheduleID: record.id),
             hasHost: host != nil
         )
         let summary = AgentSessionScheduledSendSummary.make(from: .v1(record))
@@ -565,6 +567,7 @@ final class AgentScheduledMessagesViewModel: ObservableObject {
     private static func dashboardProps(
         for snapshot: AgentScheduledSendDashboardCandidate,
         blockingSessionName: String?,
+        recoveryBlocker: AgentScheduledSendRecoveryBlocker?,
         hasHost: Bool
     ) -> AgentScheduledSendProps? {
         let candidate = snapshot.candidate
@@ -580,7 +583,9 @@ final class AgentScheduledMessagesViewModel: ObservableObject {
             scheduledSend: record,
             blockingSessionName: blockingSessionName,
             recoveryPhase: snapshot.recovery?.phase,
-            pendingConfirmation: snapshot.pendingConfirmation
+            pendingConfirmation: snapshot.pendingConfirmation,
+            // Lossless restart F2: the same recovery-blocked message as the composer banner.
+            recoveryBlocker: recoveryBlocker
         )
     }
 

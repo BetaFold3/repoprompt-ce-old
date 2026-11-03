@@ -481,6 +481,322 @@ final class CodemapAutomaticSelectionBasicTests: WorkspaceFileContextStoreCodema
         await store.unloadRoot(id: loaded.id)
     }
 
+    func testHeldProjectionRecoveryBoundsLastHolderReleasesAndAutomaticPresentation() async throws {
+        let recoveryGate = CodemapSuspensionGate()
+        let sealed = try await makeSealedRecoveryRoot(name: #function, recoveryGate: recoveryGate)
+        let store = sealed.store
+
+        await store.setCodemapProjectionRecoveryObserverWillWaitHandlerForTesting { epoch in
+            guard epoch == sealed.rootEpoch else { return }
+            await recoveryGate.enterAndWait()
+        }
+        let sourceTicket = try await pendingTicket(
+            store.requestCodemapArtifact(forFileID: sealed.source.id)
+        )
+        _ = try await readyResult(settledResult(store: store, ticket: sourceTicket))
+        let recoveryEntered = await recoveryGate.waitUntilEntered()
+        XCTAssertTrue(recoveryEntered)
+        guard recoveryEntered else { return }
+        let held = await store.codemapGraphPublicationRecoveryStateForTesting(
+            rootEpoch: sealed.rootEpoch
+        )
+        XCTAssertTrue(held.observerActive)
+
+        // Last-holder release of a ready demand while the projection rerun is held.
+        let readyReleased = await completes(within: Self.heldRecoveryReleaseBound) {
+            _ = await store.cancelCodemapArtifactDemand(sourceTicket)
+        }
+        XCTAssertTrue(readyReleased, "A ready last-holder release must not wait for the held recovery observer")
+
+        // Last-holder release of a still-pending demand while the projection rerun is held.
+        let unrelatedTicket = try await pendingTicket(
+            store.requestCodemapArtifact(forFileID: sealed.unrelated.id)
+        )
+        let pendingReleased = await completes(within: Self.heldRecoveryReleaseBound) {
+            _ = await store.cancelCodemapArtifactDemand(unrelatedTicket)
+        }
+        XCTAssertTrue(pendingReleased, "A pending last-holder release must not wait for the held recovery observer")
+
+        // An optional automatic enrichment call keeps its short bound while recovery is held.
+        let presentationBox = CodemapPresentationBox()
+        let coordinator = WorkspaceCodemapPresentationCoordinator(
+            store: store,
+            policy: .optionalAutomaticEnrichment
+        )
+        let automaticReturned = await completes(within: Self.heldRecoveryAutomaticBound) {
+            let presentation = try? await coordinator.withPresentation(
+                for: .automatic(sourceFileIDs: [sealed.source.id]),
+                rootScope: .visibleWorkspace
+            ) { $0 }
+            presentationBox.set(presentation)
+        }
+        XCTAssertTrue(automaticReturned, "Optional automatic enrichment must return within its bound while recovery is held")
+        if automaticReturned, let presentation = presentationBox.value {
+            if presentation.orderedEntries.isEmpty {
+                XCTAssertNil(presentation.publicationReceipt)
+            } else {
+                XCTAssertNotNil(presentation.publicationReceipt)
+            }
+        }
+
+        recoveryGate.release()
+        let drained = await waitForCodemapGraphPublicationDrain(store: store, rootEpoch: sealed.rootEpoch)
+        XCTAssertTrue(drained)
+        let converged = try await WorkspaceSelectionMutationService(store: store)
+            .resolveAutomaticCodemapSelection(
+                sourceFileIDs: [sealed.source.id],
+                rootScope: .visibleWorkspace
+            )
+        XCTAssertEqual(converged.targets.map(\.fileID), [sealed.target.id])
+        if let lease = converged.publicationReceipt?.publicationLease {
+            await lease.release()
+        }
+
+        _ = await store.cancelCodemapArtifactDemand(sealed.targetTicket)
+        await store.evictIdleReadyCodemapDemandsForTesting(rootEpoch: sealed.rootEpoch)
+        for file in [sealed.source, sealed.target, sealed.unrelated] {
+            let retainCount = await store.codemapArtifactDemandRetainCountForTesting(
+                rootEpoch: sealed.rootEpoch,
+                fileID: file.id
+            )
+            XCTAssertEqual(retainCount, 0, file.standardizedRelativePath)
+        }
+        await store.unloadRoot(id: sealed.rootID)
+    }
+
+    func testPendingDemandCancelPlansOnlyAgainstPublishedCoverageUntilItCatchesUp() async throws {
+        let publicationGate = CodemapArmableSuspensionGate()
+        let pendingHold = CodemapSuspensionGate()
+        let heldFileID = CodemapLockedFileID()
+        let sealed = try await makeSealedRecoveryRoot(
+            name: #function,
+            recoveryGate: CodemapSuspensionGate(),
+            graphPublicationWaiter: { _ in
+                await publicationGate.enterIfArmedAndWait()
+            },
+            demandResultHook: { ticket, result in
+                if ticket.fileID == heldFileID.value {
+                    await pendingHold.enterAndWait()
+                }
+                return result
+            }
+        )
+        addTeardownBlock {
+            pendingHold.release()
+            publicationGate.release()
+        }
+        let store = sealed.store
+
+        let sourceTicket = try await pendingTicket(
+            store.requestCodemapArtifact(forFileID: sealed.source.id)
+        )
+        _ = try await readyResult(settledResult(store: store, ticket: sourceTicket))
+        let converged = await waitForReadyAutomaticPlan(
+            store: store,
+            sourceFileID: sealed.source.id,
+            timeout: .seconds(10)
+        )
+        XCTAssertEqual(
+            converged?.candidates.map(\.identity.standardizedRelativePath),
+            ["Sources/Target.swift"]
+        )
+        guard converged != nil else { return }
+        let convergedGeneration = await store.codemapOverlayContributionGenerationForTesting(
+            rootEpoch: sealed.rootEpoch
+        )
+
+        // Hold graph publication, then cancel a demand whose store record is still pending.
+        publicationGate.arm()
+        heldFileID.set(sealed.unrelated.id)
+        let unrelatedTicket = try await pendingTicket(
+            store.requestCodemapArtifact(forFileID: sealed.unrelated.id)
+        )
+        let pendingEntered = await pendingHold.waitUntilEntered()
+        XCTAssertTrue(pendingEntered)
+        let cancelClock = ContinuousClock()
+        let cancelled = await store.cancelCodemapArtifactDemand(
+            unrelatedTicket,
+            deadline: cancelClock.now.advanced(by: .milliseconds(250))
+        )
+        XCTAssertTrue(cancelled)
+        let cancelledStatus = await store.codemapArtifactDemandStatus(unrelatedTicket)
+        guard case .unavailable = cancelledStatus else {
+            return XCTFail("A cancelled pending ticket must not stay current: \(cancelledStatus)")
+        }
+        let heldGeneration = await store.codemapOverlayContributionGenerationForTesting(
+            rootEpoch: sealed.rootEpoch
+        )
+        XCTAssertNotEqual(heldGeneration, convergedGeneration, "The pending demand must have changed the overlay")
+
+        // While the newer overlay is unpublished, a plan may only stand on the still-published
+        // coverage: either non-ready, or ready on exactly the converged proofs. The brief's
+        // stricter property (the plan is never ready while the overlay is unpublished) is
+        // deliberately not asserted: the cancelled pending file never entered the published
+        // graph, so the older published coverage stays self-consistent and may answer ready.
+        let identities = await store.codemapAutomaticSelectionSourceIdentities(
+            forFileIDs: [sealed.source.id],
+            rootScope: .visibleWorkspace
+        )
+        let heldPlan = await store.planAutomaticCodemapSelectionCandidates(
+            sources: identities,
+            rootScope: .visibleWorkspace
+        )
+        if case let .ready(plan) = heldPlan {
+            XCTAssertEqual(plan.coverageProofs, converged?.coverageProofs)
+        }
+
+        pendingHold.release()
+        publicationGate.release()
+        let heldContribution = try XCTUnwrap(heldGeneration)
+        let caughtUp = await waitForReadyAutomaticPlan(
+            store: store,
+            sourceFileID: sealed.source.id,
+            timeout: .seconds(10)
+        ) { plan in
+            plan.coverageProofs.allSatisfy {
+                $0.generation.contributionGeneration >= heldContribution
+            }
+        }
+        XCTAssertEqual(
+            caughtUp?.candidates.map(\.identity.standardizedRelativePath),
+            ["Sources/Target.swift"],
+            "The plan must become ready again on coverage that caught up with the cancel"
+        )
+        if let caughtUp {
+            XCTAssertNotEqual(caughtUp.coverageProofs, converged?.coverageProofs)
+        }
+
+        _ = await store.cancelCodemapArtifactDemand(sourceTicket)
+        _ = await store.cancelCodemapArtifactDemand(sealed.targetTicket)
+        await store.unloadRoot(id: sealed.rootID)
+    }
+
+    private static let heldRecoveryReleaseBound: Duration = .milliseconds(500)
+    private static let heldRecoveryAutomaticBound: Duration = .milliseconds(
+        workspaceCodemapOptionalEnrichmentWaitMilliseconds + 750
+    )
+
+    private struct SealedRecoveryRoot {
+        let store: WorkspaceFileContextStore
+        let rootID: UUID
+        let rootEpoch: WorkspaceCodemapRootEpoch
+        let source: WorkspaceFileRecord
+        let target: WorkspaceFileRecord
+        let unrelated: WorkspaceFileRecord
+        let targetTicket: WorkspaceCodemapArtifactDemandTicket
+    }
+
+    /// Warm CAS, completed projection, ready Target, and a generation-matched sealed graph.
+    private func makeSealedRecoveryRoot(
+        name: String,
+        recoveryGate: CodemapSuspensionGate,
+        graphPublicationWaiter: @escaping @Sendable (WorkspaceCodemapRootEpoch) async -> Void = { _ in },
+        demandResultHook: @escaping @Sendable (
+            WorkspaceCodemapArtifactDemandTicket,
+            WorkspaceCodemapBindingDemandResult
+        ) async -> WorkspaceCodemapBindingDemandResult = { _, result in result }
+    ) async throws -> SealedRecoveryRoot {
+        let repositoryFixture = try ReviewGitRepositoryFixture(name: name)
+        let root = try repositoryFixture.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/Source.swift": "protocol SourceProtocol { var target: Target { get } }\n",
+                "Sources/Target.swift": SwiftFixtureSource.emptyStruct("Target"),
+                "Sources/Unrelated.swift": SwiftFixtureSource.emptyStruct("Unrelated")
+            ]
+        )
+        let fixture = try CodemapStoreFixture(name: name, syntheticGraphArtifacts: true)
+        addTeardownBlock {
+            recoveryGate.release()
+            await fixture.shutdown()
+            repositoryFixture.cleanup()
+        }
+
+        let warmStore = fixture.makeStore()
+        let warmRoot = try await warmStore.loadRoot(path: root.path)
+        for file in await warmStore.files(inRoot: warmRoot.id) {
+            let ticket = try await pendingTicket(warmStore.requestCodemapArtifact(forFileID: file.id))
+            _ = try await readyResult(settledResult(store: warmStore, ticket: ticket))
+        }
+        await warmStore.unloadRoot(id: warmRoot.id)
+
+        let graphProbe = CodemapSelectionGraphProbe()
+        let store = fixture.makeStore(
+            codemapProjectionPreloadLaunchPolicy: .enabled,
+            selectionGraphFactory: graphProbe.factory,
+            graphPublicationWaiter: graphPublicationWaiter,
+            demandResultHook: demandResultHook
+        )
+        let loaded = try await store.loadRoot(path: root.path)
+        let rootEpoch = try await WorkspaceCodemapRootEpoch(
+            rootID: loaded.id,
+            rootLifetimeID: store.rootLifetimeIDForTesting(rootID: loaded.id)
+        )
+        let files = await store.files(inRoot: loaded.id)
+        let source = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Sources/Source.swift" })
+        let target = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Sources/Target.swift" })
+        let unrelated = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Sources/Unrelated.swift" })
+        let targetTicket = try await pendingTicket(store.requestCodemapArtifact(forFileID: target.id))
+        _ = try await readyResult(settledResult(store: store, ticket: targetTicket))
+        _ = try await generationMatchedCompleteSeal(
+            catalogClient: fixture.registry.makeBindingCatalogClient(),
+            graphProbe: graphProbe,
+            ticket: targetTicket
+        )
+        return SealedRecoveryRoot(
+            store: store,
+            rootID: loaded.id,
+            rootEpoch: rootEpoch,
+            source: source,
+            target: target,
+            unrelated: unrelated,
+            targetTicket: targetTicket
+        )
+    }
+
+    /// Runs `operation` unstructured and reports whether it finished within `bound`; a late
+    /// operation keeps running and drains once the test releases its gates.
+    private func completes(
+        within bound: Duration,
+        _ operation: @escaping @Sendable () async -> Void
+    ) async -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: bound)
+        let completion = CodemapBoundedCompletionState()
+        Task {
+            await operation()
+            completion.recordCompletion(beforeDeadline: clock.now < deadline)
+        }
+        return await waitForCompletionBeforeExternalDeadline(
+            completion,
+            clock: clock,
+            deadline: deadline
+        )
+    }
+
+    private func waitForReadyAutomaticPlan(
+        store: WorkspaceFileContextStore,
+        sourceFileID: UUID,
+        timeout: Duration,
+        accepting isAccepted: (WorkspaceCodemapAutomaticSelectionCandidatePlan) -> Bool = { _ in true }
+    ) async -> WorkspaceCodemapAutomaticSelectionCandidatePlan? {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            let identities = await store.codemapAutomaticSelectionSourceIdentities(
+                forFileIDs: [sourceFileID],
+                rootScope: .visibleWorkspace
+            )
+            let disposition = await store.planAutomaticCodemapSelectionCandidates(
+                sources: identities,
+                rootScope: .visibleWorkspace
+            )
+            if case let .ready(plan) = disposition, isAccepted(plan) { return plan }
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+        return nil
+    }
+
     func testAutomaticPresentationWatcherInvalidationDuringReconstructionNeverPublishesTargetsWithoutReceipt() async throws {
         let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
         let root = try repositoryFixture.makeRepository(
@@ -1166,16 +1482,30 @@ final class CodemapAutomaticSelectionBasicTests: WorkspaceFileContextStoreCodema
         XCTAssertTrue(queryEntered)
         let targetCancelled = await store.cancelCodemapArtifactDemand(targetReady.ticket)
         XCTAssertTrue(targetCancelled)
+        // A last-holder release keeps the ready target warm; evicting it is the revocation.
+        let targetEvicted = await store.evictIdleReadyCodemapDemandsForTesting(rootEpoch: targetReady.ticket.rootEpoch)
+        XCTAssertEqual(targetEvicted, 1)
         await queryGate.release()
         let result = try await task.value
 
         XCTAssertTrue(result.targets.isEmpty)
         let rootResult = try XCTUnwrap(result.roots.first)
-        XCTAssertTrue(rootResult.targetIssues.isEmpty)
-        XCTAssertEqual(
-            rootResult.coverage,
-            .unavailable(.graph(.invalidGraphResult(identity.rootEpoch)))
+        // Eviction revokes the target without tearing down the published graph, so the query
+        // either sees the revoked target as a stale generation or the advanced graph as invalid.
+        // Both fail closed: no targets and no publication receipt.
+        let staleTarget = WorkspaceCodemapAutomaticSelectionTargetIssue.staleGeneration(
+            rootEpoch: identity.rootEpoch,
+            fileID: target.id,
+            requestGeneration: targetReady.ticket.requestGeneration
         )
+        switch rootResult.coverage {
+        case .stale(.targetStateChanged(staleTarget)):
+            XCTAssertEqual(rootResult.targetIssues, [staleTarget])
+        case .unavailable(.graph(.invalidGraphResult(identity.rootEpoch))):
+            XCTAssertTrue(rootResult.targetIssues.isEmpty)
+        default:
+            XCTFail("Expected fail-closed coverage, got \(rootResult.coverage)")
+        }
         XCTAssertNil(result.publicationReceipt)
         await store.unloadRoot(id: loaded.id)
     }
@@ -1224,6 +1554,9 @@ final class CodemapAutomaticSelectionBasicTests: WorkspaceFileContextStoreCodema
         let ticket = try XCTUnwrap(sourceTicket)
         let cancelled = await store.cancelCodemapArtifactDemand(ticket)
         XCTAssertTrue(cancelled)
+        // A last-holder release keeps the ready source warm; evicting it is the source change.
+        let sourceEvicted = await store.evictIdleReadyCodemapDemandsForTesting(rootEpoch: ticket.rootEpoch)
+        XCTAssertGreaterThanOrEqual(sourceEvicted, 1)
         await queryGate.release()
         let result = try await task.value
 
@@ -1624,5 +1957,31 @@ final class CodemapAutomaticSelectionBasicTests: WorkspaceFileContextStoreCodema
             .budget(.targetLimit(attempted: 2, limit: 1))
         )
         await budgetStore.unloadRoot(id: loaded.id)
+    }
+}
+
+private final class CodemapLockedFileID: @unchecked Sendable {
+    private let lock = NSLock()
+    private var fileID: UUID?
+
+    var value: UUID? {
+        lock.withLock { fileID }
+    }
+
+    func set(_ fileID: UUID) {
+        lock.withLock { self.fileID = fileID }
+    }
+}
+
+private final class CodemapPresentationBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var presentation: WorkspaceCodemapOperationPresentation?
+
+    var value: WorkspaceCodemapOperationPresentation? {
+        lock.withLock { presentation }
+    }
+
+    func set(_ presentation: WorkspaceCodemapOperationPresentation?) {
+        lock.withLock { self.presentation = presentation }
     }
 }

@@ -14,10 +14,10 @@ help:
 	@printf '  %-30s %s\n' 'clean' 'Remove .build'
 	@printf '\n%s\n' 'Coordinated developer daemon targets:'
 	@printf '  %-30s %s\n' 'dev-status' 'Show conductor daemon status'
-	@printf '  %-30s %s\n' 'dev-build' 'Coordinated debug app package build; FAST=1 is a compatibility alias; OPTIMIZED=1 selects the optimized-diagnostics lane (minutes per changed build)'
+	@printf '  %-30s %s\n' 'dev-build' 'Coordinated debug app package build; FAST=1 is a compatibility alias; OPTIMIZED=1 selects the optimized-diagnostics lane (minutes per changed build); OPTIMIZED_INCREMENTAL=1 selects the App-only incremental optimized lane'
 	@printf '  %-30s %s\n' 'dev-swift-build' 'Coordinated Swift build; override with PRODUCT=name'
 	@printf '  %-30s %s\n' 'dev-dsym' 'Regenerate debug dSYMs for built products (never builds); PRODUCT=all|RepoPrompt|repoprompt-mcp|repoprompt-gateway|root-tests'
-	@printf '  %-30s %s\n' 'dev-run' 'Coordinated debug app build and launch; OPTIMIZED=1 selects the optimized-diagnostics lane for this run only'
+	@printf '  %-30s %s\n' 'dev-run' 'Coordinated debug app build and launch; OPTIMIZED=1 or OPTIMIZED_INCREMENTAL=1 selects an optimized lane for this run only'
 	@printf '  %-30s %s\n' 'dev-launch-existing' 'Launch existing coordinated debug app without building'
 	@printf '  %-30s %s\n' 'dev-test' 'Coordinated test run; override with FILTER=name'
 	@printf '  %-30s %s\n' 'dev-test-artifact' 'Fast re-run of built tests; artifact-scoped, not source validation'
@@ -184,8 +184,11 @@ xcode-clean:
 dev-status:
 	./conductor status
 
+# OPTIMIZED=1 and OPTIMIZED_INCREMENTAL=1 are mutually exclusive; checked only when a lane target runs.
+OPTIMIZED_LANE_CONFLICT = $(if $(and $(filter 1,$(OPTIMIZED)),$(filter 1,$(OPTIMIZED_INCREMENTAL))),$(error OPTIMIZED=1 and OPTIMIZED_INCREMENTAL=1 are mutually exclusive; choose one lane))
+
 dev-build:
-	./conductor build$(if $(filter 1,$(FAST)), --fast)$(if $(filter 1,$(OPTIMIZED)), --optimized)
+	$(OPTIMIZED_LANE_CONFLICT)./conductor build$(if $(filter 1,$(FAST)), --fast)$(if $(filter 1,$(OPTIMIZED)), --optimized)$(if $(filter 1,$(OPTIMIZED_INCREMENTAL)), --optimized-incremental)
 
 dev-swift-build:
 	./conductor swift-build --product $(PRODUCT)
@@ -194,7 +197,7 @@ dev-dsym:
 	./conductor dsym --product $(PRODUCT)
 
 dev-run:
-	./conductor run$(if $(filter 1,$(OPTIMIZED)), --optimized)
+	$(OPTIMIZED_LANE_CONFLICT)./conductor run$(if $(filter 1,$(OPTIMIZED)), --optimized)$(if $(filter 1,$(OPTIMIZED_INCREMENTAL)), --optimized-incremental)
 
 dev-launch-existing:
 	./conductor app launch-existing

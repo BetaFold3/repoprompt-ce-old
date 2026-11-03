@@ -1,5 +1,8 @@
 import Foundation
 import RepoPromptAgentCore
+#if DEBUG
+    import OSLog
+#endif
 
 enum AgentModelSelectionHUDMode: String, CaseIterable, Identifiable {
     case switchModel
@@ -48,12 +51,22 @@ enum AgentModelSelectionHUDNotificationUserInfoKey {
     static let mode = "mode"
 }
 
+enum AgentModelSelectionHUDDismissalReason: String {
+    case user
+    case toggle
+    case activeTabChanged
+    case navigation
+    case workspaceEntry
+    case blockingOverlay
+}
+
 struct AgentModelSelectionHUDPresentation {
     let title: String
     let subtitle: String?
     let index: AgentModelSelectionIndex
     let noticeText: String?
     let unavailableMessage: String?
+    let onSuccessfulModelSelection: (@MainActor () -> Void)?
     let commit: @MainActor (AgentModelSelectionLeaf) async throws -> Void
 
     init(
@@ -62,6 +75,7 @@ struct AgentModelSelectionHUDPresentation {
         index: AgentModelSelectionIndex,
         noticeText: String? = nil,
         unavailableMessage: String? = nil,
+        onSuccessfulModelSelection: (@MainActor () -> Void)? = nil,
         commit: @escaping @MainActor (AgentModelSelectionLeaf) async throws -> Void
     ) {
         self.title = title
@@ -69,6 +83,7 @@ struct AgentModelSelectionHUDPresentation {
         self.index = index
         self.noticeText = noticeText
         self.unavailableMessage = unavailableMessage
+        self.onSuccessfulModelSelection = onSuccessfulModelSelection
         self.commit = commit
     }
 
@@ -92,6 +107,11 @@ struct AgentModelSelectionHUDPresentation {
 @MainActor
 final class AgentModelSelectionHUDViewModel: ObservableObject {
     static let displayLimit = 50
+    #if DEBUG
+        private static let logger = Logger(subsystem: "com.repoprompt.app", category: "hud-routing")
+        /// Content-free per-instance ID; the shell's receive logs pair it with the owning window ID.
+        let debugTraceID = String(UUID().uuidString.prefix(8))
+    #endif
 
     @Published private(set) var isPresented = false
     @Published private(set) var focusAssertionEpoch: UInt64 = 0
@@ -113,6 +133,7 @@ final class AgentModelSelectionHUDViewModel: ObservableObject {
     private var index = AgentModelSelectionIndex(leaves: [])
     private var commitAction: (@MainActor (AgentModelSelectionLeaf) async throws -> Void)?
     private var isSuspendedDuringCommit = false
+    private var successfulModelSelectionAction: (@MainActor () -> Void)?
 
     var queryIsEmpty: Bool {
         query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -140,10 +161,13 @@ final class AgentModelSelectionHUDViewModel: ObservableObject {
         presentationProvider: () -> AgentModelSelectionHUDPresentation
     ) {
         if isPresented, self.mode == mode {
-            dismiss()
+            dismiss(reason: .toggle)
             return
         }
-        guard phase != .committing else { return }
+        guard phase != .committing else {
+            trace("present-blocked-committing")
+            return
+        }
 
         let wasPresented = isPresented
         let presentation = presentationProvider()
@@ -153,6 +177,7 @@ final class AgentModelSelectionHUDViewModel: ObservableObject {
         noticeText = presentation.noticeText
         index = presentation.index
         commitAction = presentation.commit
+        successfulModelSelectionAction = mode == .switchModel ? presentation.onSuccessfulModelSelection : nil
         errorMessage = nil
         isRouting = false
         phase = presentation.unavailableMessage.map(AgentModelSelectionHUDPhase.unavailable) ?? .ready
@@ -163,20 +188,30 @@ final class AgentModelSelectionHUDViewModel: ObservableObject {
         }
         rebuildFilteredLeaves(preserveSelection: wasPresented)
         focusAssertionEpoch &+= 1
+        trace("presented")
     }
 
-    func dismiss() {
+    func dismiss(reason: AgentModelSelectionHUDDismissalReason = .user) {
+        trace("dismiss-\(reason.rawValue)")
         guard phase != .committing else { return }
         resetPresentedState()
+    }
+
+    func activeTabDidChange() {
+        guard isPresented || isCommitting else { return }
+        successfulModelSelectionAction = nil
+        dismiss(reason: .activeTabChanged)
     }
 
     /// Immediately unmounts a committing HUD when a higher-priority blocking
     /// overlay appears without cancelling or detaching the in-flight action.
     func suspendForBlockingOverlay() {
         guard phase == .committing else {
-            dismiss()
+            dismiss(reason: .blockingOverlay)
             return
         }
+        trace("suspend-blocking-overlay")
+        successfulModelSelectionAction = nil
         isSuspendedDuringCommit = true
         isPresented = false
     }
@@ -241,10 +276,17 @@ final class AgentModelSelectionHUDViewModel: ObservableObject {
         errorMessage = nil
         isRouting = mode == .handoffLastReply
 
+        trace("commit-start")
         do {
             try await commitAction(leaf)
+            let completion = isPresented && !isSuspendedDuringCommit ? successfulModelSelectionAction : nil
+            // The callback may still reject (source drift, shutdown) and AppKit delivery may fail.
+            trace(completion == nil ? "commit-success-no-focus-callback" : "commit-success-invoke-focus-callback")
             resetPresentedState()
+            // Logical dismissal precedes token publication; AppKit delivery remains deferred.
+            completion?()
         } catch {
+            trace("commit-failed")
             if isSuspendedDuringCommit {
                 resetPresentedState()
             } else {
@@ -267,9 +309,24 @@ final class AgentModelSelectionHUDViewModel: ObservableObject {
         selectedLeafID = nil
         index = AgentModelSelectionIndex(leaves: [])
         commitAction = nil
+        successfulModelSelectionAction = nil
         filteredLeaves = []
         isShowingLimitedResults = false
         totalMatchedLeafCount = 0
+    }
+
+    private func trace(_ event: String) {
+        #if DEBUG
+            let modeName = mode.rawValue
+            let epoch = focusAssertionEpoch
+            let presented = isPresented
+            let committing = isCommitting
+            let suspended = isSuspendedDuringCommit
+            let traceID = debugTraceID
+            Self.logger.debug(
+                "model-hud event=\(event, privacy: .public) hud=\(traceID, privacy: .public) mode=\(modeName, privacy: .public) epoch=\(epoch, privacy: .public) presented=\(presented, privacy: .public) committing=\(committing, privacy: .public) suspended=\(suspended, privacy: .public)"
+            )
+        #endif
     }
 
     private func rebuildFilteredLeaves(preserveSelection: Bool) {

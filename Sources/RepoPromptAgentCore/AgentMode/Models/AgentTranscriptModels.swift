@@ -96,6 +96,8 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
     public var scheduledSend: AgentScheduledSendProvenance?
     public var isLocalControlPlaneEcho: Bool?
     public var isUndeliveredRemoteSend: Bool?
+    /// R1a delivery presentation of a user activity (a mid-turn user item).
+    public var recoveryDelivery: AgentUserItemRecoveryDelivery?
     public var isStreaming: Bool
     public var toolExecution: AgentTranscriptToolExecution?
     public var reasoning: String?
@@ -116,6 +118,7 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
         scheduledSend: AgentScheduledSendProvenance? = nil,
         isLocalControlPlaneEcho: Bool? = nil,
         isUndeliveredRemoteSend: Bool? = nil,
+        recoveryDelivery: AgentUserItemRecoveryDelivery? = nil,
         isStreaming: Bool = false,
         toolExecution: AgentTranscriptToolExecution? = nil,
         reasoning: String? = nil,
@@ -135,6 +138,7 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
         self.scheduledSend = scheduledSend
         self.isLocalControlPlaneEcho = isLocalControlPlaneEcho
         self.isUndeliveredRemoteSend = isUndeliveredRemoteSend
+        self.recoveryDelivery = recoveryDelivery
         self.isStreaming = isStreaming
         self.toolExecution = toolExecution
         self.reasoning = reasoning
@@ -156,6 +160,7 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
         scheduledSend = item.scheduledSend
         isLocalControlPlaneEcho = item.isLocalControlPlaneEcho ? true : nil
         isUndeliveredRemoteSend = item.isUndeliveredRemoteSend ? true : nil
+        recoveryDelivery = item.recoveryDelivery
         isStreaming = item.isStreaming
         self.toolExecution = toolExecution
         reasoning = item.reasoning
@@ -184,6 +189,7 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
             scheduledSend: scheduledSend,
             isLocalControlPlaneEcho: isLocalControlPlaneEcho ?? false,
             isUndeliveredRemoteSend: isUndeliveredRemoteSend ?? false,
+            recoveryDelivery: recoveryDelivery,
             codeModeParentInvocationID: toolExecution?.codeModeParentInvocationID
         )
     }
@@ -251,6 +257,8 @@ public struct AgentTranscriptRequestAnchor: Codable, Identifiable, Sendable, Equ
     public var scheduledSend: AgentScheduledSendProvenance?
     public var isLocalControlPlaneEcho: Bool?
     public var isUndeliveredRemoteSend: Bool?
+    /// R1a delivery presentation of the turn's request bubble.
+    public var recoveryDelivery: AgentUserItemRecoveryDelivery?
 
     public init(from item: AgentChatItem) {
         id = item.id
@@ -264,6 +272,7 @@ public struct AgentTranscriptRequestAnchor: Codable, Identifiable, Sendable, Equ
         scheduledSend = item.scheduledSend
         isLocalControlPlaneEcho = item.isLocalControlPlaneEcho ? true : nil
         isUndeliveredRemoteSend = item.isUndeliveredRemoteSend ? true : nil
+        recoveryDelivery = item.recoveryDelivery
     }
 
     public func toItem() -> AgentChatItem {
@@ -279,7 +288,8 @@ public struct AgentTranscriptRequestAnchor: Codable, Identifiable, Sendable, Equ
             codexGoalMode: codexGoalMode,
             scheduledSend: scheduledSend,
             isLocalControlPlaneEcho: isLocalControlPlaneEcho ?? false,
-            isUndeliveredRemoteSend: isUndeliveredRemoteSend ?? false
+            isUndeliveredRemoteSend: isUndeliveredRemoteSend ?? false,
+            recoveryDelivery: recoveryDelivery
         )
     }
 }
@@ -426,6 +436,102 @@ public struct AgentTranscriptProviderResponseSpan: Codable, Identifiable, Sendab
     }
 }
 
+/// Lossless-restart R5 honest-interruption record of one transcript turn. Written on cold restore
+/// before open spans are sanitized (the turn's `terminalState` stays `.cancelled`, so existing v7
+/// readers and switches are unchanged), from per-attempt evidence first. Optional and additive:
+/// unknown reason/resolution values decode as `unknown`/unresolved instead of failing the session.
+public struct AgentTranscriptTurnInterruption: Codable, Sendable, Equatable {
+    public enum Reason: String, Codable, Sendable, CaseIterable {
+        case appCrash
+        case appQuit
+        case windowClose
+        case safeRestart
+        case providerProcessLost
+        case unknown
+
+        public init(from decoder: Decoder) throws {
+            let raw = try decoder.singleValueContainer().decode(String.self)
+            self = Reason(rawValue: raw) ?? .unknown
+        }
+    }
+
+    public enum Resolution: String, Codable, Sendable, CaseIterable {
+        case importedCompleted
+        case resumed
+        case dismissed
+    }
+
+    public var reason: Reason
+    public var observedAt: Date
+    public var lastConfirmedActivityAt: Date?
+    /// The run attempt that carried the turn; `nil` for a legacy turn (never invented).
+    public var runAttemptID: UUID?
+    public var providerConversationID: String?
+    public var pendingQuestionSummary: String?
+    public var runtimeReference: UUID?
+    public var resolution: Resolution?
+
+    public init(
+        reason: Reason,
+        observedAt: Date,
+        lastConfirmedActivityAt: Date? = nil,
+        runAttemptID: UUID? = nil,
+        providerConversationID: String? = nil,
+        pendingQuestionSummary: String? = nil,
+        runtimeReference: UUID? = nil,
+        resolution: Resolution? = nil
+    ) {
+        self.reason = reason
+        self.observedAt = observedAt
+        self.lastConfirmedActivityAt = lastConfirmedActivityAt
+        self.runAttemptID = runAttemptID
+        self.providerConversationID = providerConversationID
+        self.pendingQuestionSummary = pendingQuestionSummary
+        self.runtimeReference = runtimeReference
+        self.resolution = resolution
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case reason
+        case observedAt
+        case lastConfirmedActivityAt
+        case runAttemptID
+        case providerConversationID
+        case pendingQuestionSummary
+        case runtimeReference
+        case resolution
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        reason = try container.decodeIfPresent(Reason.self, forKey: .reason) ?? .unknown
+        observedAt = try container.decode(Date.self, forKey: .observedAt)
+        lastConfirmedActivityAt = try container.decodeIfPresent(Date.self, forKey: .lastConfirmedActivityAt)
+        runAttemptID = try container.decodeIfPresent(UUID.self, forKey: .runAttemptID)
+        providerConversationID = try container.decodeIfPresent(String.self, forKey: .providerConversationID)
+        pendingQuestionSummary = try container.decodeIfPresent(String.self, forKey: .pendingQuestionSummary)
+        runtimeReference = try container.decodeIfPresent(UUID.self, forKey: .runtimeReference)
+        // A future resolution value is not understood: treat the interruption as unresolved.
+        resolution = (try? container.decodeIfPresent(String.self, forKey: .resolution)).flatMap(Resolution.init(rawValue:))
+    }
+}
+
+/// Lossless-restart Phase 2 (review A F03-R1): cold restore closed this turn while it was still
+/// open, as its run attempt's recorded ordinary outcome (completed, or an ordinary failure or
+/// cancel). The outcome is known, but the saved transcript tail may be missing. Not an
+/// interruption: the turn keeps its outcome. Optional and additive; an unreadable value decodes as
+/// absent. Durable until the recovery item is dismissed (its card acknowledgement).
+public struct AgentTranscriptTurnRecoveredOutcome: Codable, Sendable, Equatable {
+    /// The run attempt whose terminal evidence decided the outcome.
+    public var runAttemptID: UUID
+    public var observedAt: Date
+
+    public init(runAttemptID: UUID, observedAt: Date) {
+        self.runAttemptID = runAttemptID
+        self.observedAt = observedAt
+    }
+}
+
 public struct AgentTranscriptTurn: Codable, Identifiable, Sendable, Equatable {
     public let id: UUID
     public var request: AgentTranscriptRequestAnchor?
@@ -441,6 +547,11 @@ public struct AgentTranscriptTurn: Codable, Identifiable, Sendable, Equatable {
     /// Durable visibility cap for completed full turns whose tool history collapsed.
     /// `nil` means no cap was needed; frozen caps limit this turn but do not reserve global tail budget.
     public var frozenDetailedToolTailLimit: Int?
+    /// R5: set when cold restore closed this turn while it was still open.
+    public var interruption: AgentTranscriptTurnInterruption?
+    /// Set when cold restore closed this open turn as its recorded ordinary outcome (never together
+    /// with an interruption).
+    public var recoveredOutcome: AgentTranscriptTurnRecoveredOutcome?
 
     public init(
         id: UUID = UUID(),
@@ -453,7 +564,9 @@ public struct AgentTranscriptTurn: Codable, Identifiable, Sendable, Equatable {
         startedAt: Date,
         lastActivityAt: Date? = nil,
         completedAt: Date? = nil,
-        frozenDetailedToolTailLimit: Int? = nil
+        frozenDetailedToolTailLimit: Int? = nil,
+        interruption: AgentTranscriptTurnInterruption? = nil,
+        recoveredOutcome: AgentTranscriptTurnRecoveredOutcome? = nil
     ) {
         self.id = id
         self.request = request
@@ -466,6 +579,8 @@ public struct AgentTranscriptTurn: Codable, Identifiable, Sendable, Equatable {
         self.lastActivityAt = lastActivityAt
         self.completedAt = completedAt
         self.frozenDetailedToolTailLimit = frozenDetailedToolTailLimit
+        self.interruption = interruption
+        self.recoveredOutcome = recoveredOutcome
     }
 
     enum CodingKeys: String, CodingKey {
@@ -480,6 +595,8 @@ public struct AgentTranscriptTurn: Codable, Identifiable, Sendable, Equatable {
         case lastActivityAt
         case completedAt
         case frozenDetailedToolTailLimit
+        case interruption
+        case recoveredOutcome
     }
 
     public init(from decoder: Decoder) throws {
@@ -495,6 +612,9 @@ public struct AgentTranscriptTurn: Codable, Identifiable, Sendable, Equatable {
         lastActivityAt = try container.decodeIfPresent(Date.self, forKey: .lastActivityAt)
         completedAt = try container.decodeIfPresent(Date.self, forKey: .completedAt)
         frozenDetailedToolTailLimit = try container.decodeIfPresent(Int.self, forKey: .frozenDetailedToolTailLimit)
+        // Additive member: an unreadable record never fails the session.
+        interruption = try? container.decodeIfPresent(AgentTranscriptTurnInterruption.self, forKey: .interruption)
+        recoveredOutcome = try? container.decodeIfPresent(AgentTranscriptTurnRecoveredOutcome.self, forKey: .recoveredOutcome)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -510,6 +630,8 @@ public struct AgentTranscriptTurn: Codable, Identifiable, Sendable, Equatable {
         try container.encodeIfPresent(lastActivityAt, forKey: .lastActivityAt)
         try container.encodeIfPresent(completedAt, forKey: .completedAt)
         try container.encodeIfPresent(frozenDetailedToolTailLimit, forKey: .frozenDetailedToolTailLimit)
+        try container.encodeIfPresent(interruption, forKey: .interruption)
+        try container.encodeIfPresent(recoveredOutcome, forKey: .recoveredOutcome)
     }
 
     public var isCompleted: Bool {

@@ -1,6 +1,10 @@
 import Foundation
 
 actor WorkspaceCodemapLiveOverlay {
+    #if DEBUG
+        private var demandEventCountsStorageForTesting = WorkspaceCodemapLiveOverlayDemandEventCounts()
+    #endif
+
     private struct Registration: Equatable {
         let capability: GitCodemapRootCapability
         let catalogGeneration: UInt64
@@ -116,7 +120,7 @@ actor WorkspaceCodemapLiveOverlay {
         let catalogGeneration: UInt64
     }
 
-    private let policy: WorkspaceCodemapLiveOverlayPolicy
+    private var policy: WorkspaceCodemapLiveOverlayPolicy
     private let manifestRecordEqualityTraversal: @Sendable () -> Void
     private let manifestAdoptionCommitHook: @Sendable () async -> Void
     private let initialManifestInvalidationGeneration: UInt64
@@ -549,6 +553,9 @@ actor WorkspaceCodemapLiveOverlay {
             return false
         }
         demandPreflights.removeValue(forKey: ticket.reservationID)
+        #if DEBUG
+            demandEventCountsStorageForTesting.preflightCancels += 1
+        #endif
         return true
     }
 
@@ -757,6 +764,9 @@ actor WorkspaceCodemapLiveOverlay {
         ))
         root.liveFileIDByRelativePath[relativePath] = token.identity.fileID
         roots[rootEpoch] = root
+        #if DEBUG
+            demandEventCountsStorageForTesting.begins += 1
+        #endif
         return .started(ticket)
     }
 
@@ -796,6 +806,9 @@ actor WorkspaceCodemapLiveOverlay {
                 $0.owner == owner && $0 == reservation
         }) else { return false }
         admissionReservations.remove(at: index)
+        #if DEBUG
+            demandEventCountsStorageForTesting.reservationCancels += 1
+        #endif
         return true
     }
 
@@ -823,6 +836,9 @@ actor WorkspaceCodemapLiveOverlay {
             )] = Shadow(reason: .modified, accessOrdinal: takeAccessOrdinal())
             advanceAllManifestInvalidationGenerations(&root, rootEpoch: rootEpoch)
             advanceContributionGeneration(&root, rootEpoch: rootEpoch)
+            #if DEBUG
+                demandEventCountsStorageForTesting.lastOwnerCancels += 1
+            #endif
         } else {
             root.liveByFileID[ticket.token.identity.fileID] = .pending(pending)
         }
@@ -864,6 +880,9 @@ actor WorkspaceCodemapLiveOverlay {
                         relativePath: path
                     )] = Shadow(reason: .modified, accessOrdinal: takeAccessOrdinal())
                     advanceAllManifestInvalidationGenerations(&root, rootEpoch: rootEpoch)
+                    #if DEBUG
+                        demandEventCountsStorageForTesting.lastOwnerCancels += 1
+                    #endif
                 } else {
                     root.liveByFileID[fileID] = .pending(pending)
                 }
@@ -889,6 +908,9 @@ actor WorkspaceCodemapLiveOverlay {
         removeLiveEntry(fileID: fileID, from: &root)
         advanceContributionGeneration(&root, rootEpoch: rootEpoch)
         roots[rootEpoch] = root
+        #if DEBUG
+            demandEventCountsStorageForTesting.readyRevokes += 1
+        #endif
         return true
     }
 
@@ -1015,6 +1037,9 @@ actor WorkspaceCodemapLiveOverlay {
         root.liveByFileID[ticket.token.identity.fileID] = .ready(ready)
         advanceContributionGeneration(&root, rootEpoch: rootEpoch)
         roots[rootEpoch] = root
+        #if DEBUG
+            demandEventCountsStorageForTesting.accepts += 1
+        #endif
         return .accepted(readySnapshot(rootEpoch: rootEpoch, ready: ready))
     }
 
@@ -1075,6 +1100,9 @@ actor WorkspaceCodemapLiveOverlay {
         root.liveFileIDByRelativePath[identity.standardizedRelativePath] = identity.fileID
         advanceContributionGeneration(&root, rootEpoch: rootEpoch)
         roots[rootEpoch] = root
+        #if DEBUG
+            demandEventCountsStorageForTesting.unavailableSettlements += 1
+        #endif
         return .accepted
     }
 
@@ -1578,6 +1606,36 @@ actor WorkspaceCodemapLiveOverlay {
         }
     }
 
+    /// Whether the root's own lease or byte budget, not only the process budget, rejects one
+    /// more ready completion of `candidateBytes`. Used to pick which idle record to release
+    /// after a capacity busy.
+    func completionCapacityIsRootLimited(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        candidateBytes: UInt64
+    ) -> Bool {
+        guard let root = roots[rootEpoch] else { return false }
+        return addingSaturating(rootLeaseCount(root), 1) > policy.maximumLeaseCountPerRoot ||
+            addingSaturating(rootArtifactBytes(root), candidateBytes) > policy.maximumArtifactByteCountPerRoot
+    }
+
+    #if DEBUG
+        /// Runs one production capacity eviction for the root, as entry-count overflow would.
+        @discardableResult
+        func evictEntryForCapacityForTesting(rootEpoch: WorkspaceCodemapRootEpoch) -> Bool {
+            evictEntryForCapacity(requiredRootEpoch: rootEpoch, excludingFileIDs: [])
+        }
+
+        /// Replaces the capacity policy so tests can reach lease or byte limits cheaply.
+        func setPolicyForTesting(_ policy: WorkspaceCodemapLiveOverlayPolicy) {
+            self.policy = policy
+        }
+
+        /// Cumulative demand-event and contribution-advance counts (integers only).
+        func demandEventCountsForTesting() -> WorkspaceCodemapLiveOverlayDemandEventCounts {
+            demandEventCountsStorageForTesting
+        }
+    #endif
+
     private func evictEntryForCapacity(
         requiredRootEpoch: WorkspaceCodemapRootEpoch?,
         excludingFileIDs: Set<UUID>
@@ -1689,6 +1747,9 @@ actor WorkspaceCodemapLiveOverlay {
             return
         }
         root.contributionGeneration = .init(rawValue: next)
+        #if DEBUG
+            demandEventCountsStorageForTesting.contributionAdvances += 1
+        #endif
     }
 
     @discardableResult
@@ -1940,6 +2001,9 @@ actor WorkspaceCodemapLiveOverlay {
         advanceContributionGeneration(&root, rootEpoch: rootEpoch)
         roots[rootEpoch] = root
         lease.closeSynchronously()
+        #if DEBUG
+            demandEventCountsStorageForTesting.acceptedUnavailable += 1
+        #endif
         return .acceptedUnavailable(outcome)
     }
 
@@ -2066,3 +2130,18 @@ actor WorkspaceCodemapLiveOverlay {
         lhs >= rhs ? lhs - rhs : 0
     }
 }
+
+#if DEBUG
+    /// Cumulative overlay demand events for diagnostics; integers only.
+    struct WorkspaceCodemapLiveOverlayDemandEventCounts: Equatable {
+        var begins = 0
+        var accepts = 0
+        var acceptedUnavailable = 0
+        var unavailableSettlements = 0
+        var lastOwnerCancels = 0
+        var preflightCancels = 0
+        var reservationCancels = 0
+        var readyRevokes = 0
+        var contributionAdvances = 0
+    }
+#endif

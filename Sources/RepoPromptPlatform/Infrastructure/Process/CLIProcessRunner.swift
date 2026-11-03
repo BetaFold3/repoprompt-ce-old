@@ -262,7 +262,8 @@ package final class CLIProcessRunner {
         timeout: TimeInterval?,
         additionalEnvironment: [String: String] = [:],
         additionalRemovedKeys: Set<String> = [],
-        cancelChildOnTaskCancellation: Bool = false
+        cancelChildOnTaskCancellation: Bool = false,
+        launchOwnership: (any ProcessLaunchOwnership)? = nil
     ) async throws -> Result {
         try await gate.withPermit { [self] in
             let configuredCommand = try validatedConfiguredCommandForLaunch()
@@ -335,19 +336,30 @@ package final class CLIProcessRunner {
             } else {
                 log("Launching \(resolvedCommand)")
             }
+            // Reservation immediately before the spawn: a refusal spawns nothing.
+            let runtimeID = try await launchOwnership?.prepareSpawn()
+            // The reservation was a suspension point: cancellation during it closes the reservation
+            // through the no-spawn path instead of spawning afterwards.
+            if launchOwnership != nil, Task.isCancelled {
+                await launchOwnership?.spawnFailed()
+                throw CancellationError()
+            }
             let spawned: SpawnedProcess
             do {
                 spawned = try ProcessLauncher.spawn(
                     command: resolvedCommand,
                     arguments: arguments,
                     environment: environment,
-                    workingDirectory: workingDirectory
+                    workingDirectory: workingDirectory,
+                    runtimeID: runtimeID
                 )
             } catch let launcherError as ProcessLauncherError {
                 log("Failed to spawn \(resolvedCommand): \(launcherError)")
+                await launchOwnership?.spawnFailed()
                 throw mapLauncherError(launcherError, command: resolvedCommand, workingDirectory: workingDirectory)
             } catch {
                 log("Failed to launch \(resolvedCommand): \(error)")
+                await launchOwnership?.spawnFailed()
                 throw error
             }
             // Use AsyncScope.withCleanup to ensure cleanup completes before gate is released
@@ -356,6 +368,9 @@ package final class CLIProcessRunner {
             } cleanup: {
                 await cleanupProcess(pid: spawned.pid)
             } operation: {
+                // 0) Birth identity is committed before any stdin write; a failed commit reaps the
+                //    exact root without writing to it.
+                try await commitLaunchOwnership(launchOwnership, spawned: spawned)
                 // 1) Immediately start draining child output (prevents cross‑pipe back‑pressure)
                 let group = DispatchGroup()
                 var stdoutData = Data()
@@ -412,9 +427,9 @@ package final class CLIProcessRunner {
                 }
 
                 // 3) Wait asynchronously for termination
-                let waitTask = Task.detached { () throws -> (Int32, Bool) in
+                let waitTask = Task.detached { () throws -> (Int32, Bool, Bool) in
                     // Use async, cooperative waiting to avoid blocking the pool
-                    try await Self.waitForTerminationAsync(
+                    try await Self.waitForTerminationReportingAsync(
                         pid: spawned.pid,
                         processGroupID: spawned.processGroupID,
                         timeout: timeout
@@ -426,20 +441,30 @@ package final class CLIProcessRunner {
                 let status: Int32
                 let timedOut: Bool
                 do {
-                    let termination: (Int32, Bool) = if cancelChildOnTaskCancellation {
-                        try await withTaskCancellationHandler {
-                            let result = try await waitTask.value
-                            try Task.checkCancellation()
-                            return result
-                        } onCancel: {
-                            spawned.stdin?.closeFile()
-                            terminateChild(spawned, sendSigterm: true)
-                            waitTask.cancel()
+                    let termination: (Int32, Bool, Bool)
+                    do {
+                        termination = if cancelChildOnTaskCancellation {
+                            try await withTaskCancellationHandler {
+                                try await waitTask.value
+                            } onCancel: {
+                                spawned.stdin?.closeFile()
+                                terminateChild(spawned, sendSigterm: true)
+                                waitTask.cancel()
+                            }
+                        } else {
+                            try await waitTask.value
                         }
-                    } else {
-                        try await waitTask.value
+                    } catch {
+                        // The wait itself failed: authority ends, but nothing proves the root exited.
+                        await launchOwnership?.rootReaped(pid: spawned.pid, confirmed: false)
+                        throw error
                     }
-                    (status, timedOut) = termination
+                    // Reported on every path where the wait finished, including cancellation below.
+                    await launchOwnership?.rootReaped(pid: spawned.pid, confirmed: termination.2)
+                    if cancelChildOnTaskCancellation {
+                        try Task.checkCancellation()
+                    }
+                    (status, timedOut) = (termination.0, termination.1)
                 } catch {
                     spawned.stdout.closeFile()
                     spawned.stderr.closeFile()
@@ -490,7 +515,8 @@ package final class CLIProcessRunner {
         additionalEnvironment: [String: String] = [:],
         additionalRemovedKeys: Set<String> = [],
         onProcessStarted: (@Sendable (pid_t) async -> Void)? = nil,
-        onProcessTerminated: (@Sendable (pid_t) async -> Void)? = nil
+        onProcessTerminated: (@Sendable (pid_t) async -> Void)? = nil,
+        launchOwnership: (any ProcessLaunchOwnership)? = nil
     ) async throws -> AsyncThrowingStream<StreamEvent, Error> {
         let resolutionCommand = commandForAutomaticResolution
 
@@ -589,27 +615,57 @@ package final class CLIProcessRunner {
         // Absolutely last chance before we actually spawn the child process.
         try await cancelEarlyReleasingGate(phase: "pre-spawn")
 
+        // Reservation immediately before the spawn: a refusal spawns nothing.
+        let runtimeID: UUID?
+        do {
+            runtimeID = try await launchOwnership?.prepareSpawn()
+        } catch {
+            ProcessDiagnostics.log("🔴 [GATE] Releasing after launch-ownership refusal")
+            await gate.release()
+            throw error
+        }
+        // The reservation was a suspension point after the last pre-spawn check: cancellation
+        // during it closes the reservation through the no-spawn path and releases the gate.
+        if launchOwnership != nil, Task.isCancelled {
+            await launchOwnership?.spawnFailed()
+            ProcessDiagnostics.log("🛑 [CANCEL] after launch reservation; releasing gate")
+            await gate.release()
+            throw CancellationError()
+        }
+
         let spawned: SpawnedProcess
         do {
             spawned = try ProcessLauncher.spawn(
                 command: resolvedCommand,
                 arguments: arguments,
                 environment: environment,
-                workingDirectory: workingDirectory
+                workingDirectory: workingDirectory,
+                runtimeID: runtimeID
             )
         } catch let launcherError as ProcessLauncherError {
             log("Failed to spawn \(resolvedCommand): \(launcherError)")
+            await launchOwnership?.spawnFailed()
             ProcessDiagnostics.log("🔴 [GATE] Releasing after spawn failure")
             await gate.release()
             throw mapLauncherError(launcherError, command: resolvedCommand, workingDirectory: workingDirectory)
         } catch {
             log("Failed to launch \(resolvedCommand): \(error)")
+            await launchOwnership?.spawnFailed()
             ProcessDiagnostics.log("🔴 [GATE] Releasing after launch failure")
             await gate.release()
             throw error
         }
 
         await registry.add(spawned)
+        // Birth identity is committed before any stdin write (the stream below starts writing).
+        do {
+            try await commitLaunchOwnership(launchOwnership, spawned: spawned)
+        } catch {
+            await cleanupProcess(pid: spawned.pid)
+            ProcessDiagnostics.log("🔴 [GATE] Releasing after launch-ownership commit failure")
+            await gate.release()
+            throw error
+        }
         await onProcessStarted?(spawned.pid)
 
         let collector = config.logCollector
@@ -683,9 +739,9 @@ package final class CLIProcessRunner {
                 spawned.stdin?.closeFile()
             }
 
-            let waitTask = Task.detached { () throws -> (Int32, Bool) in
+            let waitTask = Task.detached { () throws -> (Int32, Bool, Bool) in
                 // Use async, cooperative waiting to avoid blocking the pool
-                try await Self.waitForTerminationAsync(
+                try await Self.waitForTerminationReportingAsync(
                     pid: spawned.pid,
                     processGroupID: spawned.processGroupID,
                     timeout: timeout
@@ -697,7 +753,15 @@ package final class CLIProcessRunner {
             // Detached so its lifetime outlives this closure and it always releases the permit
             let _ = Task.detached { [self, gateCoordinator] in
                 do {
-                    let (status, timedOut) = try await waitTask.value
+                    let (status, timedOut, rootReaped): (Int32, Bool, Bool)
+                    do {
+                        (status, timedOut, rootReaped) = try await waitTask.value
+                    } catch {
+                        // The wait itself failed: authority ends, but nothing proves the root exited.
+                        await launchOwnership?.rootReaped(pid: spawned.pid, confirmed: false)
+                        throw error
+                    }
+                    await launchOwnership?.rootReaped(pid: spawned.pid, confirmed: rootReaped)
 
                     // IMPORTANT: The child has terminated. Close FDs to unblock reads
                     // and wait for readers to finish.
@@ -782,13 +846,16 @@ package final class CLIProcessRunner {
                     // then close FDs, drain readers briefly, and release the gate.
                     Task.detached { [self, gateCoordinator] in
                         let timeout = ProcessTermination.cooperativeCancellationWaitTimeout()
-                        _ = try? await Self.waitForTerminationAsync(
+                        let reaped = try? await Self.waitForTerminationReportingAsync(
                             pid: spawned.pid,
                             processGroupID: spawned.processGroupID,
                             timeout: timeout
                         ) { msg in
                             ProcessDiagnostics.log(msg)
                         }
+                        // Confirmed only when this wait itself reaped the root (the concurrent
+                        // monitor wait may have reaped it first; that one reports its own reap).
+                        await launchOwnership?.rootReaped(pid: spawned.pid, confirmed: reaped?.2 ?? false)
                         // Ensure reader threads unblock even if the monitor path stalls.
                         ProcessDiagnostics.log("🔒 [FD] Closing FDs (onTermination) for pid=\(spawned.pid)")
                         spawned.stdout.closeFile()
@@ -879,6 +946,25 @@ package final class CLIProcessRunner {
         config.logCollector?.append(message)
         if config.enableDebugLogging {
             print("[CLIProcessRunner] \(message)")
+        }
+    }
+
+    /// Commits `spawned` to its launch owner before any stdin write. On refusal the exact root is
+    /// terminated and reaped without any write, reported reaped, and the owner's error rethrown.
+    private func commitLaunchOwnership(_ owner: (any ProcessLaunchOwnership)?, spawned: SpawnedProcess) async throws {
+        guard let owner else { return }
+        do {
+            try await owner.commitSpawn(pid: spawned.pid, processGroupID: spawned.processGroupID)
+        } catch {
+            log("Launch ownership refused process \(spawned.pid); terminating it before any input")
+            spawned.stdin?.closeFile()
+            let reaped = await ProcessTermination.terminateAndReapReportingRoot(
+                pid: spawned.pid,
+                processGroupID: spawned.processGroupID,
+                logger: { [weak self] message in self?.log(message) }
+            )
+            await owner.rootReaped(pid: spawned.pid, confirmed: reaped.rootReaped)
+            throw error
         }
     }
 
@@ -982,6 +1068,33 @@ package final class CLIProcessRunner {
     }
 
     // MARK: - Cooperative process termination (no blocking sleeps)
+
+    /// `waitForTerminationAsync`, also reporting whether this wait itself reaped the exact root.
+    private static func waitForTerminationReportingAsync(
+        pid: pid_t,
+        processGroupID: pid_t?,
+        timeout: TimeInterval?,
+        logger: (String) -> Void
+    ) async throws -> (Int32, Bool, Bool) {
+        do {
+            let outcome = try await ProcessTermination.waitForTerminationReportingRoot(
+                pid: pid,
+                processGroupID: processGroupID,
+                timeout: timeout,
+                logger: logger
+            )
+            return (outcome.exitCode, outcome.timedOut, outcome.rootReaped)
+        } catch let terminationError as ProcessTerminationError {
+            switch terminationError {
+            case let .childOwnershipLost(pid):
+                throw CLIProcessRunnerError.waitFailed(
+                    "waitpid reported ECHILD for sole-reaper child \(pid)"
+                )
+            case let .waitFailed(message):
+                throw CLIProcessRunnerError.waitFailed(message)
+            }
+        }
+    }
 
     private static func waitForTerminationAsync(
         pid: pid_t,

@@ -48,12 +48,36 @@ final class ClaudeAgentToolTrackingHandler {
 
     // MARK: - Correlation State (moved from TabSession)
 
-    /// Pending provider-stream invocation IDs queued for correlation with tracker callbacks, keyed by signature.
-    private var pendingProviderRepoPromptInvocationsBySignature: [String: [UUID]] = [:]
-    /// Maps tracker invocation IDs to provider-stream invocation IDs for dual-source correlation.
-    private var providerInvocationByTrackerInvocationID: [UUID: UUID] = [:]
-    /// Sequence boundary for provider/tracker tool correlation within the active Claude turn.
+    private enum ToolEventSource {
+        case provider
+        case tracker
+    }
+
+    /// Source-aware identity of one transcript row, keyed by its stable `AgentChatItem.id` and never persisted.
+    /// Provider and tracker invocation IDs are assigned independently, so provenance comes from the event path
+    /// that bound the row, never from the shape or presence of the row's displayed `toolInvocationID`.
+    private struct InvocationBinding {
+        /// Last `toolInvocationID` written or observed on the row; the constant-work index lookup key.
+        var rowInvocationID: UUID?
+        /// A provider `tool_call` was associated with the row, including provider calls without an ID.
+        var providerObserved = false
+        var providerInvocationID: UUID?
+        var trackerInvocationID: UUID?
+        /// The tracker delivered the row's completion; its payload is authoritative and not replaced.
+        var trackerCompleted = false
+    }
+
+    /// One-to-one bindings for rows in the session's active turn. Aliases survive completion so duplicate
+    /// callbacks resolve to their original exchange instead of claiming a later same-signature invocation.
+    private var invocationBindingsByItemID: [UUID: InvocationBinding] = [:]
+    private var itemIDByProviderInvocationID: [UUID: UUID] = [:]
+    private var itemIDByTrackerInvocationID: [UUID: UUID] = [:]
+    /// Sequence boundary for new associations with completed rows within the active Claude turn.
     private var toolCorrelationStartSequenceIndex: Int = 0
+    /// Tracker invocations whose pending rows an empty error completion removed. Duplicate callbacks for them are
+    /// ignored instead of creating a row or claiming a later same-signature call. Scoped to the tracked run and capped.
+    private var removedTrackerInvocationIDs: [UUID] = []
+    private let maxRemovedTrackerInvocationCount = 64
     /// Currently tracked Claude run for explicit provider `tool_result` acknowledgements.
     private var trackedRunID: UUID?
     var currentTrackedRunID: UUID? {
@@ -103,6 +127,7 @@ final class ClaudeAgentToolTrackingHandler {
     ) async {
         if trackedRunID != runID {
             beginTrackingExplicitProviderToolResultAcks(for: runID)
+            removedTrackerInvocationIDs.removeAll()
         }
         await trackingController.startTracking(
             runID: runID,
@@ -135,6 +160,7 @@ final class ClaudeAgentToolTrackingHandler {
     ) async {
         await trackingController.stopTracking()
         resetCorrelationState(session)
+        removedTrackerInvocationIDs.removeAll()
         stopTrackingExplicitProviderToolResultAcks()
     }
 
@@ -289,7 +315,7 @@ final class ClaudeAgentToolTrackingHandler {
     ) {
         let turnStart = toolCorrelationStartSequenceIndex
         func isEligible(_ item: AgentChatItem) -> Bool {
-            item.kind == .toolCall && item.sequenceIndex >= turnStart
+            item.kind == .toolCall && item.sequenceIndex >= turnStart && item.codeModeParentInvocationID == nil
         }
         let placeholderIndex: Int? = {
             if let invocationID {
@@ -321,7 +347,9 @@ final class ClaudeAgentToolTrackingHandler {
             }).lastIndex
         }()
         guard let placeholderIndex else { return }
+        let removedItemID = session.items[placeholderIndex].id
         session.removeItem(at: placeholderIndex)
+        forgetBinding(itemID: removedItemID)
     }
 
     // MARK: - Explicit Provider ACK Waiting (Steering Safety)
@@ -386,55 +414,41 @@ final class ClaudeAgentToolTrackingHandler {
         guard !AgentToolTrackingSupport.shouldHideToolFromTranscript(toolName) else { return }
 
         let storedToolName = Self.canonicalTranscriptToolName(toolName)
-        let signature = Self.repoPromptInvocationSignature(toolName: toolName, argsJSON: argsJSON)
-        if let existingIndex = findCorrelationItemIndex(
+        // Same provider invocation (duplicate or late event): enrich its own row only.
+        if let index = establishedItemIndex(
+            source: .provider,
             invocationID: invocationID,
-            signature: signature,
             toolName: toolName,
             session: session
-        ) {
-            var updated = session.items[existingIndex]
-            var didMutate = false
-            if let providerInvocationID = invocationID,
-               updated.kind == .toolCall,
-               let trackerInvocationID = updated.toolInvocationID,
-               trackerInvocationID != providerInvocationID
-            {
-                providerInvocationByTrackerInvocationID[trackerInvocationID] = providerInvocationID
-            }
-            if let providerInvocationID = invocationID {
-                if updated.kind == .toolCall, updated.toolInvocationID != providerInvocationID {
-                    updated.toolInvocationID = providerInvocationID
-                    didMutate = true
-                } else if updated.toolInvocationID == nil {
-                    updated.toolInvocationID = providerInvocationID
-                    didMutate = true
-                }
-            }
-            if updated.toolName != storedToolName {
-                updated.toolName = storedToolName
-                didMutate = true
-            }
-            if let argsJSON, argsJSON != updated.toolArgsJSON {
-                updated.toolArgsJSON = argsJSON
-                didMutate = true
-            }
-            if didMutate {
-                session.replaceItem(at: existingIndex, with: updated)
-            }
-            if updated.kind == .toolResult {
-                // Late provider placeholder: tracker already finalized this tool in the current turn.
-                return
-            }
+        ).index {
+            enrichFromProviderCall(
+                at: index,
+                invocationID: invocationID,
+                storedToolName: storedToolName,
+                argsJSON: argsJSON,
+                session: session
+            )
             return
         }
 
-        if let invocationID {
-            var pending = pendingProviderRepoPromptInvocationsBySignature[signature, default: []]
-            if !pending.contains(invocationID) {
-                pending.append(invocationID)
-                pendingProviderRepoPromptInvocationsBySignature[signature] = pending
-            }
+        // A tracker-observed invocation awaiting its provider call. A completed tracker row is eligible only
+        // as a unique last resort: the provider stream orders each call before later calls, so an unpaired
+        // completed tracker row's own provider call has not been delivered yet. Adoption never rewrites it.
+        let signature = Self.repoPromptInvocationSignature(toolName: toolName, argsJSON: argsJSON)
+        if let index = uniqueUnclaimedCandidate(
+            for: .provider,
+            signature: signature,
+            session: session
+        ).index {
+            bind(.provider, invocationID: invocationID, to: session.items[index])
+            enrichFromProviderCall(
+                at: index,
+                invocationID: invocationID,
+                storedToolName: storedToolName,
+                argsJSON: argsJSON,
+                session: session
+            )
+            return
         }
 
         let toolItem = AgentChatItem.toolCall(
@@ -444,6 +458,31 @@ final class ClaudeAgentToolTrackingHandler {
             sequenceIndex: session.nextSequenceIndex
         )
         session.appendItem(toolItem)
+        bind(.provider, invocationID: invocationID, to: toolItem)
+    }
+
+    private func enrichFromProviderCall(
+        at index: Int,
+        invocationID: UUID?,
+        storedToolName: String,
+        argsJSON: String?,
+        session: AgentTabSession
+    ) {
+        let current = session.items[index]
+        var updated = current
+        if let invocationID, updated.kind == .toolCall || updated.toolInvocationID == nil {
+            // The provider ID owns a pending slot so an exact provider tool_result can terminalize it.
+            updated.toolInvocationID = invocationID
+        }
+        updated.toolName = storedToolName
+        // Tracker arguments take precedence; provider arguments fill gaps or refresh a provider-only pending call.
+        let trackerBound = invocationBindingsByItemID[current.id]?.trackerInvocationID != nil
+        if Self.hasContent(argsJSON),
+           !Self.hasContent(updated.toolArgsJSON) || (updated.kind == .toolCall && !trackerBound)
+        {
+            updated.toolArgsJSON = argsJSON
+        }
+        replaceBoundItem(at: index, current: current, updated: updated, session: session)
     }
 
     func shouldSuppressClaudeProviderToolResult(
@@ -473,8 +512,7 @@ final class ClaudeAgentToolTrackingHandler {
                 "suppressing explicit RepoPrompt provider tool_result tab=\(session.tabID.uuidString) " +
                     "tool=\(toolName) providerInvocation=\(Self.diagnosticID(invocationID)) " +
                     "matchingItems=\(matchingProviderItemCount) exactProviderSlotTerminalized=\(terminalizedExactProviderSlot) " +
-                    "pendingProviderIDs=\(pendingProviderInvocationCount()) " +
-                    "trackerMappings=\(providerInvocationByTrackerInvocationID.count)"
+                    "bindings=\(invocationBindingsByItemID.count)"
             )
             return true
         }
@@ -515,14 +553,17 @@ final class ClaudeAgentToolTrackingHandler {
             : nil
         guard let index = indexedMatch ?? fallbackMatch else { return false }
 
-        var updated = session.items[index]
+        let current = session.items[index]
+        var updated = current
         updated.kind = .toolResult
         updated.toolName = Self.canonicalTranscriptToolName(toolName)
         updated.toolResultJSON = outputJSON
-        updated.toolArgsJSON = argsJSON ?? updated.toolArgsJSON
+        if !Self.hasContent(updated.toolArgsJSON) {
+            updated.toolArgsJSON = argsJSON
+        }
         updated.toolIsError = isError
         updated.text = outputJSON
-        session.replaceItem(at: index, with: updated)
+        replaceBoundItem(at: index, current: current, updated: updated, session: session)
         hooks.requestUIRefresh(session.tabID, false)
         return true
     }
@@ -537,6 +578,7 @@ final class ClaudeAgentToolTrackingHandler {
     ) {
         guard AgentToolTrackingSupport.isRepoPromptTool(toolName) else { return }
         guard !AgentToolTrackingSupport.shouldHideToolFromTranscript(toolName) else { return }
+        guard !ignoresRemovedTrackerInvocation(invocationID, toolName: toolName) else { return }
         // Flush buffered assistant content before inserting tool card to preserve interleaving order.
         hooks.flushPendingAssistantDelta(session)
         hooks.endActiveAssistantSegment(session)
@@ -553,169 +595,53 @@ final class ClaudeAgentToolTrackingHandler {
             )
             return
         }
-        let signature = Self.repoPromptInvocationSignature(toolName: toolName, argsJSON: argsJSON)
-        if let providerInvocationID = consumePendingProviderInvocationID(
-            forSignature: signature,
+
+        // Same tracker invocation (duplicate callback): enrich its own row only.
+        let established = establishedItemIndex(
+            source: .tracker,
+            invocationID: invocationID,
+            toolName: toolName,
             session: session
-        ) {
-            diagnosticLog(
-                "tracker call consumed pending provider fallback tab=\(session.tabID.uuidString) " +
-                    "tool=\(toolName) trackerInvocation=\(invocationID.uuidString) " +
-                    "providerInvocation=\(providerInvocationID.uuidString) signature=\(Self.diagnosticSignature(signature))"
-            )
-            providerInvocationByTrackerInvocationID[invocationID] = providerInvocationID
-            let indexedCandidates = session.indexedToolItemIndices(invocationID: providerInvocationID)
-            let fallback = indexedCandidates.isEmpty
-                ? session.activeTurnToolItemIndices(where: { $0.toolInvocationID == providerInvocationID })
-                : .init(indices: [], scannedItemCount: 0)
-            if let index = indexedCandidates.last ?? fallback.lastIndex {
-                var updated = session.items[index]
-                updated.toolName = storedToolName
-                updated.toolArgsJSON = argsJSON ?? updated.toolArgsJSON
-                session.replaceItem(at: index, with: updated)
-            } else {
-                let toolItem = AgentChatItem.toolCall(
-                    name: storedToolName,
-                    invocationID: providerInvocationID,
-                    argsJSON: argsJSON,
-                    sequenceIndex: session.nextSequenceIndex
-                )
-                session.appendItem(toolItem)
-            }
-            hooks.requestUIRefresh(session.tabID, false)
-            MCPToolObserverAttributionContext.record(
-                correlationPath: fallback.lastIndex == nil ? "signature_pending_map" : "signature_pending_map_active_turn_scan",
-                scannedItemCount: indexedCandidates.count + fallback.scannedItemCount
-            )
-            return
-        }
-
-        var inspectedItemCount = 0
-        let indexedSignatureCandidates = session.indexedToolItemIndices(
-            signature: signature,
-            pendingCallsOnly: true
-        ).filter { session.items[$0].codeModeParentInvocationID == nil }
-        inspectedItemCount += indexedSignatureCandidates.count
-        var signatureCandidates = indexedSignatureCandidates
-        var signatureUsedFallback = false
-        if signatureCandidates.isEmpty {
-            let fallback = session.activeTurnToolItemIndices(where: { item in
-                item.kind == .toolCall
-                    && item.codeModeParentInvocationID == nil
-                    && Self.repoPromptInvocationSignature(
-                        toolName: item.toolName ?? "",
-                        argsJSON: item.toolArgsJSON
-                    ) == signature
-            })
-            inspectedItemCount += fallback.scannedItemCount
-            signatureCandidates = fallback.indices
-            signatureUsedFallback = !fallback.indices.isEmpty
-        }
-
-        let matchingProviderBackedSignatureIndices = signatureCandidates.filter {
-            session.items[$0].toolInvocationID != nil
-        }
-        if matchingProviderBackedSignatureIndices.count > 1 {
-            diagnosticLog(
-                "ambiguous tracker call signature fallback tab=\(session.tabID.uuidString) " +
-                    "tool=\(toolName) trackerInvocation=\(invocationID.uuidString) " +
-                    "matches=\(matchingProviderBackedSignatureIndices.count) signature=\(Self.diagnosticSignature(signature))"
-            )
-        }
-        if let existingInvocationIndex = matchingProviderBackedSignatureIndices.last,
-           let providerInvocationID = session.items[existingInvocationIndex].toolInvocationID
-        {
-            diagnosticLog(
-                "tracker call using signature fallback tab=\(session.tabID.uuidString) " +
-                    "tool=\(toolName) trackerInvocation=\(invocationID.uuidString) " +
-                    "providerInvocation=\(providerInvocationID.uuidString) matches=\(matchingProviderBackedSignatureIndices.count)"
-            )
-            providerInvocationByTrackerInvocationID[invocationID] = providerInvocationID
-            var updated = session.items[existingInvocationIndex]
-            updated.toolName = storedToolName
-            updated.toolArgsJSON = argsJSON ?? updated.toolArgsJSON
-            session.replaceItem(at: existingInvocationIndex, with: updated)
-            hooks.requestUIRefresh(session.tabID, false)
-            MCPToolObserverAttributionContext.record(
-                correlationPath: signatureUsedFallback ? "signature_active_turn_scan" : "signature",
-                scannedItemCount: inspectedItemCount
-            )
-            return
-        }
-
-        let matchingNilIDSignatureIndices = signatureCandidates.filter {
-            session.items[$0].toolInvocationID == nil
-        }
-        if matchingNilIDSignatureIndices.count > 1 {
-            diagnosticLog(
-                "ambiguous tracker call nil-id signature fallback tab=\(session.tabID.uuidString) " +
-                    "tool=\(toolName) trackerInvocation=\(invocationID.uuidString) " +
-                    "matches=\(matchingNilIDSignatureIndices.count) signature=\(Self.diagnosticSignature(signature))"
-            )
-        }
-        if let fallbackIndex = matchingNilIDSignatureIndices.last {
-            diagnosticLog(
-                "tracker call using nil-id signature fallback tab=\(session.tabID.uuidString) " +
-                    "tool=\(toolName) trackerInvocation=\(invocationID.uuidString) " +
-                    "matches=\(matchingNilIDSignatureIndices.count)"
-            )
-            var updated = session.items[fallbackIndex]
-            updated.toolName = storedToolName
-            updated.toolInvocationID = invocationID
-            updated.toolArgsJSON = argsJSON ?? updated.toolArgsJSON
-            session.replaceItem(at: fallbackIndex, with: updated)
-            hooks.requestUIRefresh(session.tabID, false)
-            MCPToolObserverAttributionContext.record(
-                correlationPath: signatureUsedFallback ? "signature_nil_id_active_turn_scan" : "signature_nil_id",
-                scannedItemCount: inspectedItemCount
-            )
-            return
-        }
-
-        let normalizedToolName = AgentTabSession.normalizedToolCorrelationName(toolName)
-        let indexedNameCandidates = session.indexedNilInvocationToolItemIndices(
-            normalizedToolName: normalizedToolName
         )
-        inspectedItemCount += indexedNameCandidates.count
-        var matchingNilIDNameIndices = indexedNameCandidates.filter { index in
-            let item = session.items[index]
-            return item.kind == .toolCall
-                && AgentTabSession.normalizedToolCorrelationName(item.toolName) == normalizedToolName
-        }
-        var nameUsedFallback = false
-        if matchingNilIDNameIndices.isEmpty {
-            let fallback = session.activeTurnToolItemIndices(where: { item in
-                item.kind == .toolCall
-                    && item.toolInvocationID == nil
-                    && AgentTabSession.normalizedToolCorrelationName(item.toolName) == normalizedToolName
-            })
-            inspectedItemCount += fallback.scannedItemCount
-            matchingNilIDNameIndices = fallback.indices
-            nameUsedFallback = !fallback.indices.isEmpty
-        }
-        if matchingNilIDNameIndices.count > 1 {
-            diagnosticLog(
-                "ambiguous tracker call nil-id name fallback tab=\(session.tabID.uuidString) " +
-                    "tool=\(toolName) trackerInvocation=\(invocationID.uuidString) " +
-                    "matches=\(matchingNilIDNameIndices.count)"
-            )
-        }
-        if let fallbackByNameIndex = matchingNilIDNameIndices.last {
-            diagnosticLog(
-                "tracker call using nil-id name fallback tab=\(session.tabID.uuidString) " +
-                    "tool=\(toolName) trackerInvocation=\(invocationID.uuidString) " +
-                    "matches=\(matchingNilIDNameIndices.count)"
-            )
-            var updated = session.items[fallbackByNameIndex]
+        var inspectedItemCount = established.inspectedItemCount
+        if let index = established.index {
+            let current = session.items[index]
+            var updated = current
             updated.toolName = storedToolName
+            if Self.hasContent(argsJSON), updated.kind == .toolCall || !Self.hasContent(updated.toolArgsJSON) {
+                updated.toolArgsJSON = argsJSON
+            }
+            replaceBoundItem(at: index, current: current, updated: updated, session: session)
+            hooks.requestUIRefresh(session.tabID, false)
+            MCPToolObserverAttributionContext.record(
+                correlationPath: "invocation_id",
+                scannedItemCount: inspectedItemCount
+            )
+            return
+        }
+
+        // A unique pending provider call with this signature that no tracker invocation has claimed.
+        let signature = Self.repoPromptInvocationSignature(toolName: toolName, argsJSON: argsJSON)
+        let candidate = uniqueUnclaimedCandidate(for: .tracker, signature: signature, session: session)
+        inspectedItemCount += candidate.inspectedItemCount
+        if let index = candidate.index {
+            diagnosticLog(
+                "tracker call bound unclaimed provider call tab=\(session.tabID.uuidString) " +
+                    "tool=\(toolName) trackerInvocation=\(invocationID.uuidString) " +
+                    "row=\(Self.diagnosticID(session.items[index].toolInvocationID)) signature=\(Self.diagnosticSignature(signature))"
+            )
+            let current = session.items[index]
+            bind(.tracker, invocationID: invocationID, to: current)
+            var updated = current
+            updated.toolName = storedToolName
+            updated.toolArgsJSON = argsJSON ?? updated.toolArgsJSON
             if updated.toolInvocationID == nil {
                 updated.toolInvocationID = invocationID
             }
-            updated.toolArgsJSON = argsJSON ?? updated.toolArgsJSON
-            session.replaceItem(at: fallbackByNameIndex, with: updated)
+            replaceBoundItem(at: index, current: current, updated: updated, session: session)
             hooks.requestUIRefresh(session.tabID, false)
             MCPToolObserverAttributionContext.record(
-                correlationPath: nameUsedFallback ? "name_active_turn_scan" : "name_fallback",
+                correlationPath: "signature",
                 scannedItemCount: inspectedItemCount
             )
             return
@@ -728,6 +654,7 @@ final class ClaudeAgentToolTrackingHandler {
             sequenceIndex: session.nextSequenceIndex
         )
         session.appendItem(toolItem)
+        bind(.tracker, invocationID: invocationID, to: toolItem)
         hooks.requestUIRefresh(session.tabID, false)
         MCPToolObserverAttributionContext.record(
             correlationPath: "new_item",
@@ -745,6 +672,7 @@ final class ClaudeAgentToolTrackingHandler {
     ) {
         guard AgentToolTrackingSupport.isRepoPromptTool(toolName) else { return }
         guard !AgentToolTrackingSupport.shouldHideToolFromTranscript(toolName) else { return }
+        guard !ignoresRemovedTrackerInvocation(invocationID, toolName: toolName) else { return }
         // Flush buffered assistant content before inserting tool result to preserve interleaving order.
         hooks.flushPendingAssistantDelta(session)
         hooks.endActiveAssistantSegment(session)
@@ -763,124 +691,35 @@ final class ClaudeAgentToolTrackingHandler {
             )
             return
         }
-        let signature = Self.repoPromptInvocationSignature(toolName: toolName, argsJSON: argsJSON)
-        let resolvedInvocationID = providerInvocationByTrackerInvocationID[invocationID] ?? invocationID
-        providerInvocationByTrackerInvocationID.removeValue(forKey: invocationID)
 
+        // Established tracker identity first (aliases survive completion), then a unique unclaimed pending
+        // provider call. Completed rows are never claimed by signature, and missing arguments never match by name.
         var correlationPath = "none"
-        var inspectedItemCount = 0
-        let targetIndex: Int? = {
-            let invocationCandidates = session.indexedToolItemIndices(invocationID: resolvedInvocationID)
-            inspectedItemCount += invocationCandidates.count
-            if let byInvocation = invocationCandidates.last {
-                correlationPath = "invocation_id"
-                return byInvocation
-            }
-            let invocationFallback = session.activeTurnToolItemIndices(where: {
-                $0.toolInvocationID == resolvedInvocationID
-            })
-            inspectedItemCount += invocationFallback.scannedItemCount
-            if let byInvocation = invocationFallback.lastIndex {
-                correlationPath = "invocation_id_active_turn_scan"
-                return byInvocation
-            }
-            if let providerInvocationID = consumePendingProviderInvocationID(
-                forSignature: signature,
-                session: session
-            ) {
-                let providerCandidates = session.indexedToolItemIndices(invocationID: providerInvocationID)
-                inspectedItemCount += providerCandidates.count
-                let providerFallback = providerCandidates.isEmpty
-                    ? session.activeTurnToolItemIndices(where: { $0.toolInvocationID == providerInvocationID })
-                    : .init(indices: [], scannedItemCount: 0)
-                inspectedItemCount += providerFallback.scannedItemCount
-                if let byProviderInvocation = providerCandidates.last ?? providerFallback.lastIndex {
-                    diagnosticLog(
-                        "tracker result consumed pending provider fallback tab=\(session.tabID.uuidString) " +
-                            "tool=\(toolName) trackerInvocation=\(invocationID.uuidString) " +
-                            "providerInvocation=\(providerInvocationID.uuidString) signature=\(Self.diagnosticSignature(signature))"
-                    )
-                    providerInvocationByTrackerInvocationID[invocationID] = providerInvocationID
-                    correlationPath = providerFallback.lastIndex == nil
-                        ? "signature_pending_map"
-                        : "signature_pending_map_active_turn_scan"
-                    return byProviderInvocation
-                }
-            }
-            let indexedSignatureCandidates = session.indexedToolItemIndices(
-                signature: signature,
-                pendingCallsOnly: true
-            ).filter { session.items[$0].codeModeParentInvocationID == nil }
-            inspectedItemCount += indexedSignatureCandidates.count
-            var matchingPendingSignatureIndices = indexedSignatureCandidates
-            var signatureUsedFallback = false
-            if matchingPendingSignatureIndices.isEmpty {
-                let fallback = session.activeTurnToolItemIndices(where: { item in
-                    item.kind == .toolCall
-                        && item.codeModeParentInvocationID == nil
-                        && Self.repoPromptInvocationSignature(
-                            toolName: item.toolName ?? "",
-                            argsJSON: item.toolArgsJSON
-                        ) == signature
-                })
-                inspectedItemCount += fallback.scannedItemCount
-                matchingPendingSignatureIndices = fallback.indices
-                signatureUsedFallback = !fallback.indices.isEmpty
-            }
-            if matchingPendingSignatureIndices.count > 1 {
+        let established = establishedItemIndex(
+            source: .tracker,
+            invocationID: invocationID,
+            toolName: toolName,
+            session: session
+        )
+        var inspectedItemCount = established.inspectedItemCount
+        var targetIndex = established.index
+        if targetIndex != nil {
+            correlationPath = "invocation_id"
+        } else {
+            let signature = Self.repoPromptInvocationSignature(toolName: toolName, argsJSON: argsJSON)
+            let candidate = uniqueUnclaimedCandidate(for: .tracker, signature: signature, session: session)
+            inspectedItemCount += candidate.inspectedItemCount
+            if let index = candidate.index {
                 diagnosticLog(
-                    "ambiguous tracker result signature fallback tab=\(session.tabID.uuidString) " +
+                    "tracker result bound unclaimed provider call tab=\(session.tabID.uuidString) " +
                         "tool=\(toolName) trackerInvocation=\(invocationID.uuidString) " +
-                        "resolvedInvocation=\(resolvedInvocationID.uuidString) matches=\(matchingPendingSignatureIndices.count) " +
-                        "signature=\(Self.diagnosticSignature(signature))"
+                        "row=\(Self.diagnosticID(session.items[index].toolInvocationID)) signature=\(Self.diagnosticSignature(signature))"
                 )
+                bind(.tracker, invocationID: invocationID, to: session.items[index])
+                targetIndex = index
+                correlationPath = "signature"
             }
-            if let byPendingCallSignature = matchingPendingSignatureIndices.last {
-                diagnosticLog(
-                    "tracker result using signature fallback tab=\(session.tabID.uuidString) " +
-                        "tool=\(toolName) trackerInvocation=\(invocationID.uuidString) " +
-                        "resolvedInvocation=\(resolvedInvocationID.uuidString) matches=\(matchingPendingSignatureIndices.count)"
-                )
-                correlationPath = signatureUsedFallback ? "signature_active_turn_scan" : "signature"
-                return byPendingCallSignature
-            }
-            let normalizedToolName = AgentTabSession.normalizedToolCorrelationName(toolName)
-            let indexedNameCandidates = session.indexedNilInvocationToolItemIndices(
-                normalizedToolName: normalizedToolName
-            )
-            inspectedItemCount += indexedNameCandidates.count
-            var matchingPendingNameIndices = indexedNameCandidates.filter {
-                session.items[$0].kind == .toolCall
-            }
-            var nameUsedFallback = false
-            if matchingPendingNameIndices.isEmpty {
-                let fallback = session.activeTurnToolItemIndices(where: { item in
-                    item.kind == .toolCall
-                        && item.toolInvocationID == nil
-                        && AgentTabSession.normalizedToolCorrelationName(item.toolName) == normalizedToolName
-                })
-                inspectedItemCount += fallback.scannedItemCount
-                matchingPendingNameIndices = fallback.indices
-                nameUsedFallback = !fallback.indices.isEmpty
-            }
-            if matchingPendingNameIndices.count > 1 {
-                diagnosticLog(
-                    "ambiguous tracker result nil-id name fallback tab=\(session.tabID.uuidString) " +
-                        "tool=\(toolName) trackerInvocation=\(invocationID.uuidString) " +
-                        "matches=\(matchingPendingNameIndices.count)"
-                )
-            }
-            if let byPendingCallName = matchingPendingNameIndices.last {
-                diagnosticLog(
-                    "tracker result using nil-id name fallback tab=\(session.tabID.uuidString) " +
-                        "tool=\(toolName) trackerInvocation=\(invocationID.uuidString) " +
-                        "matches=\(matchingPendingNameIndices.count)"
-                )
-                correlationPath = nameUsedFallback ? "name_active_turn_scan" : "name_fallback"
-                return byPendingCallName
-            }
-            return nil
-        }()
+        }
         MCPToolObserverAttributionContext.record(
             correlationPath: correlationPath,
             scannedItemCount: inspectedItemCount
@@ -889,48 +728,73 @@ final class ClaudeAgentToolTrackingHandler {
         let trimmedResult = resultJSON.trimmingCharacters(in: .whitespacesAndNewlines)
         if isError, trimmedResult.isEmpty {
             if let index = targetIndex, session.items[index].kind == .toolCall {
+                let removedItemID = session.items[index].id
                 session.removeItem(at: index)
+                forgetBinding(itemID: removedItemID)
+                rememberRemovedTrackerInvocation(invocationID)
                 hooks.requestUIRefresh(session.tabID, false)
             }
             return
         }
 
         if let index = targetIndex {
-            var updated = session.items[index]
-            updated.toolName = storedToolName
-            updated.kind = .toolResult
-            updated.toolResultJSON = resultJSON
-            updated.toolArgsJSON = argsJSON ?? updated.toolArgsJSON
-            updated.toolIsError = isError
-            updated.text = resultJSON
-            if updated.toolInvocationID == nil {
-                updated.toolInvocationID = resolvedInvocationID
+            let current = session.items[index]
+            var updated = current
+            if current.kind == .toolResult,
+               invocationBindingsByItemID[current.id]?.trackerCompleted == true
+            {
+                // Duplicate completion of an exchange the tracker already finalized: keep the accepted
+                // payload and only fill arguments that are still missing.
+                if !Self.hasContent(updated.toolArgsJSON), Self.hasContent(argsJSON) {
+                    updated.toolArgsJSON = argsJSON
+                }
+            } else {
+                updated.toolName = storedToolName
+                updated.kind = .toolResult
+                updated.toolResultJSON = resultJSON
+                updated.toolArgsJSON = argsJSON ?? updated.toolArgsJSON
+                updated.toolIsError = isError
+                updated.text = resultJSON
+                if updated.toolInvocationID == nil {
+                    updated.toolInvocationID = invocationID
+                }
             }
-            session.replaceItem(at: index, with: updated)
+            replaceBoundItem(at: index, current: current, updated: updated, session: session)
+            invocationBindingsByItemID[current.id]?.trackerCompleted = true
         } else {
             let toolResultItem = AgentChatItem.toolResult(
                 name: storedToolName,
-                invocationID: resolvedInvocationID,
+                invocationID: invocationID,
+                argsJSON: argsJSON,
                 resultJSON: resultJSON,
                 isError: isError,
                 sequenceIndex: session.nextSequenceIndex
             )
             session.appendItem(toolResultItem)
+            bind(.tracker, invocationID: invocationID, to: toolResultItem)
+            invocationBindingsByItemID[toolResultItem.id]?.trackerCompleted = true
         }
         hooks.requestUIRefresh(session.tabID, false)
     }
 
     // MARK: - code_mode Child Cards (plan §6 D3)
 
-    /// The parent card's transcript invocation: the provider-stream ID when the tracker
-    /// invocation was correlated to one, else the tracker invocation itself.
+    /// The parent card's transcript invocation: the displayed invocation of the row the parent's tracker
+    /// invocation is bound to (the provider-stream ID once a provider call owns that row), else the tracker
+    /// invocation itself.
     private func transcriptParentInvocationID(for linkage: AgentToolEventLinkage) -> UUID {
-        providerInvocationByTrackerInvocationID[linkage.codeModeParentInvocationID]
-            ?? linkage.codeModeParentInvocationID
+        let trackerInvocationID = linkage.codeModeParentInvocationID
+        guard let itemID = itemIDByTrackerInvocationID[trackerInvocationID],
+              let rowInvocationID = invocationBindingsByItemID[itemID]?.rowInvocationID
+        else {
+            return trackerInvocationID
+        }
+        return rowInvocationID
     }
 
-    /// A child is never correlated with provider-stream slots (the provider never sees it):
-    /// it always gets its own flat canonical card, keyed by its own tracker invocation.
+    /// A child is never correlated with provider-stream slots (the provider never sees it) and never
+    /// bound: it always gets its own flat canonical card, keyed by its own tracker invocation, and an
+    /// unbound row is never claimed by another invocation's signature or identity.
     private func appendCodeModeChildToolCall(
         invocationID: UUID,
         storedToolName: String,
@@ -985,6 +849,7 @@ final class ClaudeAgentToolTrackingHandler {
             updated.toolArgsJSON = argsJSON ?? updated.toolArgsJSON
             updated.toolIsError = isError
             updated.text = resultJSON
+            updated.codeModeParentInvocationID = parentInvocationID
             session.replaceItem(at: targetIndex, with: updated)
         } else {
             var toolResultItem = AgentChatItem.toolResult(
@@ -1001,25 +866,234 @@ final class ClaudeAgentToolTrackingHandler {
         hooks.requestUIRefresh(session.tabID, false)
     }
 
+    /// A bound parent row whose displayed invocation changed (a provider call claimed a tracker-created
+    /// `code_mode` row) carries its active-turn children along, so persisted linkage names the final card.
+    private func relinkCodeModeChildren(from oldInvocationID: UUID, to newInvocationID: UUID, session: AgentTabSession) {
+        let children = session.activeTurnToolItemIndices(where: {
+            $0.codeModeParentInvocationID == oldInvocationID
+        }).indices
+        for index in children {
+            var updated = session.items[index]
+            updated.codeModeParentInvocationID = newInvocationID
+            session.replaceItem(at: index, with: updated)
+        }
+    }
+
     // MARK: - Correlation Helpers
 
+    /// Advances the fence for new completed-row associations and drops bindings whose rows left the session's
+    /// active turn. Bindings for rows still in the active turn survive: Claude native dispatch, including a
+    /// steering send while a question waits, resets turn state while tool invocations are still in flight.
     private func resetCorrelationState(_ session: AgentTabSession) {
-        let pendingProviderCount = pendingProviderInvocationCount()
-        let trackerMappingCount = providerInvocationByTrackerInvocationID.count
-        if pendingProviderCount > 0 || trackerMappingCount > 0 {
+        let previousBindingCount = invocationBindingsByItemID.count
+        for itemID in Array(invocationBindingsByItemID.keys)
+            where liveIndex(ofItemID: itemID, session: session).index == nil
+        {
+            forgetBinding(itemID: itemID)
+        }
+        if previousBindingCount > 0 {
             diagnosticLog(
-                "reset clearing Claude tool correlation state tab=\(session.tabID.uuidString) " +
-                    "pendingProviderIDs=\(pendingProviderCount) trackerMappings=\(trackerMappingCount) " +
+                "reset Claude tool correlation turn tab=\(session.tabID.uuidString) " +
+                    "bindings=\(previousBindingCount) retainedActiveTurnBindings=\(invocationBindingsByItemID.count) " +
                     "nextSequenceIndex=\(session.nextSequenceIndex)"
             )
         }
-        pendingProviderRepoPromptInvocationsBySignature.removeAll(keepingCapacity: false)
-        providerInvocationByTrackerInvocationID.removeAll(keepingCapacity: false)
         toolCorrelationStartSequenceIndex = session.nextSequenceIndex
     }
 
-    private func pendingProviderInvocationCount() -> Int {
-        pendingProviderRepoPromptInvocationsBySignature.values.reduce(0) { $0 + $1.count }
+    /// Resolves a bound row by stable item identity: constant work through the invocation index, with an
+    /// active-turn scan only when the row's invocation ID changed outside this handler.
+    private func liveIndex(
+        ofItemID itemID: UUID,
+        session: AgentTabSession
+    ) -> (index: Int?, inspectedItemCount: Int) {
+        guard let binding = invocationBindingsByItemID[itemID] else { return (nil, 0) }
+        var inspectedItemCount = 0
+        if let rowInvocationID = binding.rowInvocationID {
+            let indexed = session.indexedToolItemIndices(invocationID: rowInvocationID)
+            inspectedItemCount += indexed.count
+            if let index = indexed.last(where: { session.items[$0].id == itemID }) {
+                return (index, inspectedItemCount)
+            }
+        }
+        let scan = session.activeTurnToolItemIndices(where: { $0.id == itemID })
+        return (scan.lastIndex, inspectedItemCount + scan.scannedItemCount)
+    }
+
+    /// Established identity for an incoming source invocation: its retained alias, else an exact transcript
+    /// invocation ID on a row that no other invocation from the same source has claimed.
+    private func establishedItemIndex(
+        source: ToolEventSource,
+        invocationID: UUID?,
+        toolName: String,
+        session: AgentTabSession
+    ) -> (index: Int?, inspectedItemCount: Int) {
+        guard let invocationID else { return (nil, 0) }
+        var inspectedItemCount = 0
+        let aliasedItemID = switch source {
+        case .provider: itemIDByProviderInvocationID[invocationID]
+        case .tracker: itemIDByTrackerInvocationID[invocationID]
+        }
+        if let aliasedItemID {
+            let live = liveIndex(ofItemID: aliasedItemID, session: session)
+            inspectedItemCount += live.inspectedItemCount
+            if let index = live.index {
+                return (index, inspectedItemCount)
+            }
+            forgetBinding(itemID: aliasedItemID)
+        }
+
+        let normalizedToolName = AgentTabSession.normalizedToolCorrelationName(toolName)
+        let indexed = session.indexedToolItemIndices(invocationID: invocationID)
+        inspectedItemCount += indexed.count
+        let exactIndex = indexed.last { index in
+            let item = session.items[index]
+            // `code_mode` children stay outside ordinary correlation (plan §6 D3).
+            guard item.codeModeParentInvocationID == nil,
+                  AgentTabSession.normalizedToolCorrelationName(item.toolName) == normalizedToolName
+            else {
+                return false
+            }
+            guard let binding = invocationBindingsByItemID[item.id] else { return true }
+            switch source {
+            case .provider:
+                return !binding.providerObserved
+            case .tracker:
+                return binding.trackerInvocationID == nil
+            }
+        }
+        guard let exactIndex else { return (nil, inspectedItemCount) }
+        bind(source, invocationID: invocationID, to: session.items[exactIndex])
+        return (exactIndex, inspectedItemCount)
+    }
+
+    /// Signature association is a heuristic limited to exactly one opposite-source row that no invocation from
+    /// the incoming source has claimed. Completed unclaimed rows compete with pending ones: a delayed event may
+    /// belong to an exchange that already finished from the other source, so any ambiguity keeps observations
+    /// separate rather than guessing. Only a provider call may adopt the single completed candidate (see
+    /// `handleClaudeProviderRepoPromptToolCall`); that row must have arguments, a tracker completion, and sit after
+    /// the turn-reset fence.
+    private func uniqueUnclaimedCandidate(
+        for source: ToolEventSource,
+        signature: String,
+        session: AgentTabSession
+    ) -> (index: Int?, inspectedItemCount: Int) {
+        func isUnclaimed(_ item: AgentChatItem) -> Bool {
+            // Unbound rows have unknown provenance and are never claimed by signature.
+            guard let binding = invocationBindingsByItemID[item.id] else { return false }
+            switch source {
+            case .provider:
+                return binding.trackerInvocationID != nil && !binding.providerObserved
+            case .tracker:
+                return binding.providerObserved && binding.trackerInvocationID == nil
+            }
+        }
+
+        let pending = session.indexedToolItemIndices(signature: signature, pendingCallsOnly: true)
+        let all = session.indexedToolItemIndices(signature: signature)
+        let inspectedItemCount = pending.count + all.count
+        let pendingMatches = pending.filter { isUnclaimed(session.items[$0]) }
+        let completedMatches = all.filter { index in
+            session.items[index].kind == .toolResult && isUnclaimed(session.items[index])
+        }
+        guard pendingMatches.count + completedMatches.count == 1 else {
+            if pendingMatches.count + completedMatches.count > 1 {
+                diagnosticLog(
+                    "ambiguous unclaimed signature matches pending=\(pendingMatches.count) " +
+                        "completed=\(completedMatches.count) signature=\(Self.diagnosticSignature(signature)); " +
+                        "keeping observations separate"
+                )
+            }
+            return (nil, inspectedItemCount)
+        }
+        if let index = pendingMatches.first {
+            return (index, inspectedItemCount)
+        }
+        guard source == .provider, let index = completedMatches.first else { return (nil, inspectedItemCount) }
+        let item = session.items[index]
+        guard item.sequenceIndex >= toolCorrelationStartSequenceIndex,
+              Self.hasContent(item.toolArgsJSON),
+              invocationBindingsByItemID[item.id]?.trackerCompleted == true
+        else { return (nil, inspectedItemCount) }
+        return (index, inspectedItemCount)
+    }
+
+    private func ignoresRemovedTrackerInvocation(_ invocationID: UUID, toolName: String) -> Bool {
+        guard removedTrackerInvocationIDs.contains(invocationID) else { return false }
+        diagnosticLog(
+            "ignoring duplicate callback for removed tracker invocation tool=\(toolName) " +
+                "trackerInvocation=\(invocationID.uuidString)"
+        )
+        MCPToolObserverAttributionContext.record(correlationPath: "removed_invocation", scannedItemCount: 0)
+        return true
+    }
+
+    private func rememberRemovedTrackerInvocation(_ invocationID: UUID) {
+        guard !removedTrackerInvocationIDs.contains(invocationID) else { return }
+        removedTrackerInvocationIDs.append(invocationID)
+        if removedTrackerInvocationIDs.count > maxRemovedTrackerInvocationCount {
+            removedTrackerInvocationIDs.removeFirst(removedTrackerInvocationIDs.count - maxRemovedTrackerInvocationCount)
+        }
+    }
+
+    private func bind(_ source: ToolEventSource, invocationID: UUID?, to item: AgentChatItem) {
+        var binding = invocationBindingsByItemID[item.id] ?? InvocationBinding(rowInvocationID: item.toolInvocationID)
+        switch source {
+        case .provider:
+            binding.providerObserved = true
+            if let invocationID {
+                assert(
+                    (itemIDByProviderInvocationID[invocationID] ?? item.id) == item.id
+                        && (binding.providerInvocationID ?? invocationID) == invocationID,
+                    "provider invocation bindings must stay one-to-one"
+                )
+                binding.providerInvocationID = invocationID
+                itemIDByProviderInvocationID[invocationID] = item.id
+            }
+        case .tracker:
+            if let invocationID {
+                assert(
+                    (itemIDByTrackerInvocationID[invocationID] ?? item.id) == item.id
+                        && (binding.trackerInvocationID ?? invocationID) == invocationID,
+                    "tracker invocation bindings must stay one-to-one"
+                )
+                binding.trackerInvocationID = invocationID
+                itemIDByTrackerInvocationID[invocationID] = item.id
+            }
+        }
+        invocationBindingsByItemID[item.id] = binding
+    }
+
+    private func replaceBoundItem(
+        at index: Int,
+        current: AgentChatItem,
+        updated: AgentChatItem,
+        session: AgentTabSession
+    ) {
+        guard updated != current else { return }
+        session.replaceItem(at: index, with: updated)
+        invocationBindingsByItemID[current.id]?.rowInvocationID = updated.toolInvocationID
+        if let oldInvocationID = current.toolInvocationID,
+           let newInvocationID = updated.toolInvocationID,
+           oldInvocationID != newInvocationID,
+           MCPIntegrationHelper.normalizedRepoPromptToolName(current.toolName ?? "") == MCPWindowToolName.codeMode
+        {
+            relinkCodeModeChildren(from: oldInvocationID, to: newInvocationID, session: session)
+        }
+    }
+
+    private func forgetBinding(itemID: UUID) {
+        guard let binding = invocationBindingsByItemID.removeValue(forKey: itemID) else { return }
+        if let providerInvocationID = binding.providerInvocationID,
+           itemIDByProviderInvocationID[providerInvocationID] == itemID
+        {
+            itemIDByProviderInvocationID.removeValue(forKey: providerInvocationID)
+        }
+        if let trackerInvocationID = binding.trackerInvocationID,
+           itemIDByTrackerInvocationID[trackerInvocationID] == itemID
+        {
+            itemIDByTrackerInvocationID.removeValue(forKey: trackerInvocationID)
+        }
     }
 
     private func beginTrackingExplicitProviderToolResultAcks(for runID: UUID) {
@@ -1124,95 +1198,11 @@ final class ClaudeAgentToolTrackingHandler {
         }
     }
 
-    private func findCorrelationItemIndex(
-        invocationID: UUID?,
-        signature: String,
-        toolName: String,
-        session: AgentTabSession
-    ) -> Int? {
-        let turnStartSequenceIndex = toolCorrelationStartSequenceIndex
-        let normalizedToolName = AgentTabSession.normalizedToolCorrelationName(toolName)
-        func isEligible(_ item: AgentChatItem) -> Bool {
-            item.sequenceIndex >= turnStartSequenceIndex
-                && (item.kind == .toolCall || item.kind == .toolResult)
-                && item.codeModeParentInvocationID == nil
-        }
-
-        if let invocationID {
-            let indexed = session.indexedToolItemIndices(invocationID: invocationID)
-            if let match = indexed.last(where: { isEligible(session.items[$0]) }) {
-                return match
-            }
-            let fallback = session.activeTurnToolItemIndices(where: {
-                isEligible($0) && $0.toolInvocationID == invocationID
-            })
-            if let match = fallback.lastIndex {
-                return match
-            }
-        }
-
-        let signatureCandidates = session.indexedToolItemIndices(signature: signature)
-        if let bySignature = signatureCandidates.last(where: { isEligible(session.items[$0]) }) {
-            return bySignature
-        }
-        let signatureFallback = session.activeTurnToolItemIndices(where: {
-            isEligible($0)
-                && Self.repoPromptInvocationSignature(
-                    toolName: $0.toolName ?? "",
-                    argsJSON: $0.toolArgsJSON
-                ) == signature
-        })
-        if let bySignature = signatureFallback.lastIndex {
-            return bySignature
-        }
-
-        let nameCandidates = session.indexedNilInvocationToolItemIndices(
-            normalizedToolName: normalizedToolName
-        )
-        if let byName = nameCandidates.last(where: { index in
-            let item = session.items[index]
-            guard isEligible(item) else { return false }
-            if item.kind == .toolCall {
-                return true
-            }
-            return item.toolArgsJSON?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false
-        }) {
-            return byName
-        }
-        return session.activeTurnToolItemIndices(where: { item in
-            guard isEligible(item) else { return false }
-            guard AgentTabSession.normalizedToolCorrelationName(item.toolName) == normalizedToolName else {
-                return false
-            }
-            if item.kind == .toolCall {
-                return item.toolInvocationID == nil
-            }
-            return item.toolArgsJSON?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false
-        }).lastIndex
-    }
-
-    private func consumePendingProviderInvocationID(
-        forSignature signature: String,
-        session: AgentTabSession
-    ) -> UUID? {
-        guard var queue = pendingProviderRepoPromptInvocationsBySignature[signature], !queue.isEmpty else {
-            return nil
-        }
-        while !queue.isEmpty {
-            let candidate = queue.removeFirst()
-            let indexedCandidates = session.indexedToolItemIndices(invocationID: candidate)
-            let exists = !indexedCandidates.isEmpty
-                || session.activeTurnToolItemIndices(where: { $0.toolInvocationID == candidate }).lastIndex != nil
-            if exists {
-                pendingProviderRepoPromptInvocationsBySignature[signature] = queue.isEmpty ? nil : queue
-                return candidate
-            }
-        }
-        pendingProviderRepoPromptInvocationsBySignature[signature] = nil
-        return nil
-    }
-
     // MARK: - Static Helpers
+
+    private static func hasContent(_ json: String?) -> Bool {
+        json?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+    }
 
     private static func canonicalTranscriptToolName(_ toolName: String) -> String {
         MCPIntegrationHelper.canonicalRepoPromptAskUserToolName(toolName) ?? toolName

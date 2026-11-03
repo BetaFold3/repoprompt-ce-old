@@ -165,6 +165,153 @@ import XCTest
             XCTAssertEqual(diagnostics.composeTabReloadCount, 0)
         }
 
+        // MARK: - Ephemeral workspaces
+
+        /// `isEphemeral` stops automatic workspace-document persistence on the poll and mutation save paths.
+        func testEphemeralWorkspaceAutoAndDirectSavesWriteNoWorkspaceDocument() async throws {
+            let storageRoot = try temporaryDirectory(named: "Ephemeral")
+            defer { try? FileManager.default.removeItem(at: storageRoot) }
+            let composition = makeComposition(windowID: -986)
+            let manager = composition.workspaceManager
+            try await manager.awaitInitialized(timeout: .seconds(60))
+            let workspaceStorage = storageRoot.appendingPathComponent("Ephemeral")
+            var workspace = makeWorkspace(name: "Ephemeral", storage: workspaceStorage)
+            workspace.isEphemeral = true
+            manager.workspaces.append(workspace)
+            let switchResult = await manager.switchWorkspace(to: workspace, saveState: false)
+            XCTAssertTrue(switchResult.didSwitch)
+            manager.markWorkspaceDirty()
+
+            await manager.pollAndSaveStateAsync()
+            let directURL = try await manager.saveWorkspaceToFileAsync(workspace, source: .directUnknown)
+            await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.flush(url: directURL)
+
+            XCTAssertEqual(directURL, manager.workspaceFileURL(for: workspace))
+            let contents = (try? FileManager.default.subpathsOfDirectory(atPath: workspaceStorage.path)) ?? []
+            XCTAssertFalse(FileManager.default.fileExists(atPath: directURL.path), "contents: \(contents)")
+            XCTAssertNil(manager.debugLastSavedVersionForWorkspace(workspace.id))
+        }
+
+        /// Switching away from an unpersisted ephemeral workspace still captures its live state into the
+        /// in-memory model, and switching back restores that model (there is no document to reload from).
+        func testSwitchingAwayFromEphemeralWorkspaceAndBackKeepsInMemoryState() async throws {
+            let storageRoot = try temporaryDirectory(named: "EphemeralSwitch")
+            defer { try? FileManager.default.removeItem(at: storageRoot) }
+            let composition = makeComposition(windowID: -990)
+            let manager = composition.workspaceManager
+            try await manager.awaitInitialized(timeout: .seconds(60))
+            var ephemeral = makeWorkspace(name: "EphemeralSwitch", storage: storageRoot.appendingPathComponent("Ephemeral"))
+            ephemeral.isEphemeral = true
+            let other = makeWorkspace(name: "Other", storage: storageRoot.appendingPathComponent("Other"))
+            manager.workspaces.append(contentsOf: [ephemeral, other])
+            let ephemeralURL = manager.workspaceFileURL(for: ephemeral)
+
+            let toEphemeral = await manager.switchWorkspace(to: ephemeral, saveState: false)
+            XCTAssertTrue(toEphemeral.didSwitch)
+            manager.promptViewModel.promptText = "ephemeral draft"
+            manager.markWorkspaceDirty()
+
+            let toOther = await manager.switchWorkspace(to: other, saveState: true)
+            XCTAssertTrue(toOther.didSwitch)
+            await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.flush(url: ephemeralURL)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: ephemeralURL.path))
+            XCTAssertEqual(manager.workspaces.first { $0.id == ephemeral.id }?.currentPromptText, "ephemeral draft")
+
+            let backToEphemeral = await manager.switchWorkspace(to: ephemeral, saveState: true)
+            XCTAssertTrue(backToEphemeral.didSwitch)
+            XCTAssertEqual(manager.activeWorkspaceID, ephemeral.id)
+            XCTAssertEqual(manager.activeWorkspace?.isEphemeral, true)
+            XCTAssertEqual(manager.activeWorkspace?.currentPromptText, "ephemeral draft")
+            XCTAssertEqual(manager.promptViewModel.promptText, "ephemeral draft")
+            await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.flush(url: ephemeralURL)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: ephemeralURL.path))
+        }
+
+        /// A workspace marked ephemeral while a save is in flight is rechecked before commit.
+        func testSaveSkipsCommitWhenWorkspaceBecomesEphemeralAfterPreparation() async throws {
+            let storageRoot = try temporaryDirectory(named: "BecomesEphemeral")
+            defer { try? FileManager.default.removeItem(at: storageRoot) }
+            let composition = makeComposition(windowID: -987)
+            let manager = composition.workspaceManager
+            try await manager.awaitInitialized(timeout: .seconds(60))
+            let workspace = makeWorkspace(name: "BecomesEphemeral", storage: storageRoot.appendingPathComponent("BecomesEphemeral"))
+            manager.workspaces.append(workspace)
+            let switchResult = await manager.switchWorkspace(to: workspace, saveState: false)
+            XCTAssertTrue(switchResult.didSwitch)
+            manager.markWorkspaceDirty()
+            let expectedURL = manager.workspaceFileURL(for: workspace)
+
+            let gate = WorkspaceSavePreparationGate()
+            manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { workspaceID, fileURL, _ in
+                await gate.arriveAndWait(workspaceID: workspaceID, fileURL: fileURL)
+            }
+            let saveTask = Task { @MainActor in
+                await manager.pollAndSaveStateAsync()
+            }
+            _ = await gate.waitUntilArrived()
+            let index = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == workspace.id })
+            manager.workspaces[index].isEphemeral = true
+            await gate.release()
+            await saveTask.value
+            manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil)
+            await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.flush(url: expectedURL)
+
+            XCTAssertFalse(FileManager.default.fileExists(atPath: expectedURL.path))
+            XCTAssertNil(manager.debugLastSavedVersionForWorkspace(workspace.id))
+        }
+
+        /// The URL command can flag an existing, already-persisted workspace ephemeral; that workspace
+        /// keeps saving so pending and later edits are not dropped.
+        func testPersistedWorkspaceFlaggedEphemeralKeepsSaving() async throws {
+            let storageRoot = try temporaryDirectory(named: "PersistedThenEphemeral")
+            defer { try? FileManager.default.removeItem(at: storageRoot) }
+            let composition = makeComposition(windowID: -989)
+            let manager = composition.workspaceManager
+            try await manager.awaitInitialized(timeout: .seconds(60))
+            let workspace = makeWorkspace(name: "PersistedThenEphemeral", storage: storageRoot.appendingPathComponent("Persisted"))
+            manager.workspaces.append(workspace)
+            let switchResult = await manager.switchWorkspace(to: workspace, saveState: false)
+            XCTAssertTrue(switchResult.didSwitch)
+            manager.markWorkspaceDirty()
+            await manager.pollAndSaveStateAsync()
+            let fileURL = manager.workspaceFileURL(for: workspace)
+            XCTAssertFalse(try WorkspaceManagerViewModel.loadWorkspaceFromFile(at: fileURL).isEphemeral)
+
+            let index = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == workspace.id })
+            manager.workspaces[index].isEphemeral = true
+            manager.markWorkspaceDirty()
+            await manager.pollAndSaveStateAsync()
+
+            // The second save committed: the document now carries the post-flag state.
+            let saved = try WorkspaceManagerViewModel.loadWorkspaceFromFile(at: fileURL)
+            XCTAssertTrue(saved.isEphemeral)
+            XCTAssertEqual(
+                manager.debugLastSavedVersionForWorkspace(workspace.id),
+                manager.debugStateVersionForWorkspace(workspace.id)
+            )
+        }
+
+        /// Promotion clears the flag and then persists the workspace document normally.
+        func testPromotingEphemeralWorkspacePersistsItsDocument() async throws {
+            let storageRoot = try temporaryDirectory(named: "Promotion")
+            defer { try? FileManager.default.removeItem(at: storageRoot) }
+            let composition = makeComposition(windowID: -988)
+            let manager = composition.workspaceManager
+            try await manager.awaitInitialized(timeout: .seconds(60))
+            let workspace = manager.createEphemeralWorkspace(name: "Promoted", repoPaths: [])
+            let index = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == workspace.id })
+            manager.workspaces[index].customStoragePath = storageRoot.appendingPathComponent("Promoted")
+            let fileURL = manager.workspaceFileURL(for: manager.workspaces[index])
+            XCTAssertTrue(manager.workspaces[index].isEphemeral)
+
+            await manager.setWorkspaceEphemeral(workspace.id, false)
+
+            let saved = try WorkspaceManagerViewModel.loadWorkspaceFromFile(at: fileURL)
+            XCTAssertEqual(saved.id, workspace.id)
+            XCTAssertFalse(saved.isEphemeral)
+            XCTAssertEqual(manager.workspaces.first { $0.id == workspace.id }?.isEphemeral, false)
+        }
+
         private func makeComposition(windowID: Int) -> WindowStateComposition {
             WindowStateCompositionFactory.make(
                 windowID: windowID,

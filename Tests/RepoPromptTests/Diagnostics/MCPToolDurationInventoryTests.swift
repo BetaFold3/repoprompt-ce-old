@@ -19,7 +19,7 @@ import XCTest
                     MCPToolExecutionContractCatalog.orderedAdvertisedToolNames,
                     caseLabel
                 )
-                XCTAssertEqual(MCPToolDurationInventory.entries.count, 30, caseLabel)
+                XCTAssertEqual(MCPToolDurationInventory.entries.count, 31, caseLabel)
                 XCTAssertEqual(
                     Set(MCPToolDurationInventory.entries.map(\.toolName)).count,
                     MCPToolDurationInventory.entries.count,
@@ -86,7 +86,7 @@ import XCTest
                     ],
                     caseLabel
                 )
-                XCTAssertEqual(MCPToolDurationInventory.boundedToolNames.count, 13, caseLabel)
+                XCTAssertEqual(MCPToolDurationInventory.boundedToolNames.count, 14, caseLabel)
                 // `code_mode` (plan §6 D3) is bounded by its own 62-second contract.
                 let codeMode = try XCTUnwrap(MCPToolDurationInventory.entries.first {
                     $0.toolName == MCPWindowToolName.codeMode
@@ -233,7 +233,7 @@ import XCTest
                     caseLabel
                 )
                 let tools = try XCTUnwrap(payload["tools"] as? [[String: Any]], caseLabel)
-                XCTAssertEqual(tools.count, 30, caseLabel)
+                XCTAssertEqual(tools.count, 31, caseLabel)
                 let manageWorkspaces = try XCTUnwrap(tools.first {
                     $0["tool"] as? String == MCPGlobalToolName.manageWorkspaces
                 }, caseLabel)

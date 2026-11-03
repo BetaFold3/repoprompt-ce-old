@@ -296,8 +296,21 @@ final class CodemapWatcherFenceTests: WorkspaceFileContextStoreCodemapSeamTestSu
             )
         )
 
+        // Releasing the last holder of a current ready artifact keeps it warm and idle: the
+        // released token is stale, but nothing is revoked until the idle record is evicted.
         let firstCancellation = await store.cancelCodemapArtifactDemand(ticket)
         XCTAssertTrue(firstCancellation)
+        await assertStale(store.codemapArtifactDemandStatus(ticket))
+        XCTAssertEqual(try ready.handle.artifactKey(), ready.snapshot.artifactKey)
+        let cleanupAfterRelease = await store.codemapArtifactDemandCleanupSnapshotForTesting(ticket)
+        XCTAssertEqual(cleanupAfterRelease, cleanupBeforeCancellation)
+        let idleFileIDs = await store.codemapIdleReadyDemandFileIDsForTesting(rootEpoch: ticket.rootEpoch)
+        XCTAssertEqual(idleFileIDs, [file.id])
+        let releasedAgain = await store.cancelCodemapArtifactDemand(ticket)
+        XCTAssertFalse(releasedAgain, "A released retain cannot release or reset the idle record again.")
+
+        let evicted = await store.evictIdleReadyCodemapDemandsForTesting(rootEpoch: ticket.rootEpoch)
+        XCTAssertEqual(evicted, 1)
         await assertStale(store.codemapArtifactDemandStatus(ticket))
         XCTAssertThrowsError(try ready.handle.artifactKey()) {
             XCTAssertEqual($0 as? WorkspaceCodemapLiveOverlayBundleAccessError, .closed)
@@ -353,6 +366,20 @@ final class CodemapWatcherFenceTests: WorkspaceFileContextStoreCodemapSeamTestSu
         let released = await store.releaseReadyCodemapArtifactDemandRetain(ticket)
         XCTAssertTrue(released)
         await assertStale(store.codemapArtifactDemandStatus(ticket))
+        // The final release keeps the ready record, bundle, and live overlay warm until eviction.
+        XCTAssertEqual(try ready.handle.artifactKey(), ready.snapshot.artifactKey)
+        let warm = await store.codemapArtifactDemandCleanupSnapshotForTesting(ticket)
+        XCTAssertEqual(
+            warm,
+            .init(
+                demandRecordPresent: true,
+                bundlePresent: true,
+                ownerCount: 0,
+                liveOverlayPresent: true
+            )
+        )
+        let evicted = await store.evictIdleReadyCodemapDemandsForTesting(rootEpoch: ticket.rootEpoch)
+        XCTAssertEqual(evicted, 1)
         XCTAssertThrowsError(try ready.handle.artifactKey()) {
             XCTAssertEqual($0 as? WorkspaceCodemapLiveOverlayBundleAccessError, .closed)
         }
@@ -368,6 +395,227 @@ final class CodemapWatcherFenceTests: WorkspaceFileContextStoreCodemapSeamTestSu
         )
         let releasedAgain = await store.releaseReadyCodemapArtifactDemandRetain(ticket)
         XCTAssertFalse(releasedAgain)
+        await store.unloadRoot(id: loaded.id)
+    }
+
+    /// An idle eviction's cleanup revokes by request generation, and the unchanged file's next
+    /// demand reuses that generation. The successor waits for the held revoke, so releasing the
+    /// cleanup cannot revoke the successor's ready artifact.
+    func testIdleEvictionCleanupCannotRevokeSameGenerationSuccessor() async throws {
+        let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositoryFixture.makeRepository(
+            named: "repository",
+            files: ["Sources/Feature.swift": SwiftFixtureSource.emptyStruct("Feature")]
+        )
+        let fixture = try CodemapStoreFixture(name: #function, projectionAuthority: .none)
+        let gatedRequestIDs = CodemapLockedValues<UUID>()
+        let cleanupGate = CodemapSuspensionGate()
+        addTeardownBlock {
+            cleanupGate.release()
+            await fixture.shutdown()
+            repositoryFixture.cleanup()
+        }
+        let store = fixture.makeStore(
+            cancellationCleanupHook: { ticket in
+                guard gatedRequestIDs.values.contains(ticket.requestID) else { return }
+                await cleanupGate.enterAndWait()
+            }
+        )
+        let loaded = try await store.loadRoot(path: root.path)
+        let loadedFiles = await store.files(inRoot: loaded.id)
+        let file = try XCTUnwrap(loadedFiles.first)
+        let original = try await readyArtifactDemand(store: store, forFileID: file.id)
+        let rootEpoch = original.ticket.rootEpoch
+        gatedRequestIDs.append(original.ticket.requestID)
+        let released = await store.cancelCodemapArtifactDemand(original.ticket)
+        XCTAssertTrue(released)
+
+        let eviction = Task {
+            await store.evictIdleReadyCodemapDemandsForTesting(rootEpoch: rootEpoch)
+        }
+        let cleanupEntered = await cleanupGate.waitUntilEntered()
+        XCTAssertTrue(cleanupEntered)
+        let fencedWhileHeld = await store.codemapRevokingCleanupPendingForTesting(
+            rootEpoch: rootEpoch,
+            fileID: file.id
+        )
+        XCTAssertTrue(fencedWhileHeld)
+
+        let successorReturned = CodemapLockedCounter()
+        let successorRequest = Task {
+            let result = await store.requestCodemapArtifact(forFileID: file.id)
+            successorReturned.increment()
+            return result
+        }
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertEqual(successorReturned.value, 0, "A same-generation successor must wait for the held revoke")
+
+        cleanupGate.release()
+        let evicted = await eviction.value
+        XCTAssertEqual(evicted, 1)
+        let successorTicket = try await pendingTicket(successorRequest.value)
+        XCTAssertNotEqual(successorTicket.requestID, original.ticket.requestID)
+        XCTAssertEqual(successorTicket.requestGeneration, original.ticket.requestGeneration)
+        let successorReady = try await readyResult(settledResult(store: store, ticket: successorTicket))
+        let fencedAfterRelease = await store.codemapRevokingCleanupPendingForTesting(
+            rootEpoch: rootEpoch,
+            fileID: file.id
+        )
+        XCTAssertFalse(fencedAfterRelease)
+        XCTAssertEqual(try successorReady.handle.artifactKey(), successorReady.snapshot.artifactKey)
+        let snapshot = await store.codemapArtifactDemandCleanupSnapshotForTesting(successorTicket)
+        XCTAssertTrue(snapshot.demandRecordPresent)
+        XCTAssertTrue(snapshot.liveOverlayPresent, "The released revoke must not reach the successor's overlay entry")
+        _ = try await readyResult(store.codemapArtifactDemandStatus(successorTicket))
+
+        _ = await store.cancelCodemapArtifactDemand(successorTicket)
+        await store.unloadRoot(id: loaded.id)
+    }
+
+    /// A rejoin that passed every fence check before suspending in live-entry validation must
+    /// still observe an eviction that ran during that suspension: the paused request cannot
+    /// return a same-generation successor until the eviction's revoking cleanup has run, and the
+    /// successor's overlay entry survives it.
+    func testIdleRejoinSuspendedInLiveEntryValidationObservesConcurrentEvictionFence() async throws {
+        let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositoryFixture.makeRepository(
+            named: "repository",
+            files: ["Sources/Feature.swift": SwiftFixtureSource.emptyStruct("Feature")]
+        )
+        let fixture = try CodemapStoreFixture(name: #function, projectionAuthority: .none)
+        let gatedRequestIDs = CodemapLockedValues<UUID>()
+        let cleanupGate = CodemapSuspensionGate()
+        let validationGate = CodemapArmableSuspensionGate()
+        addTeardownBlock {
+            validationGate.release()
+            cleanupGate.release()
+            await fixture.shutdown()
+            repositoryFixture.cleanup()
+        }
+        let store = fixture.makeStore(
+            cancellationCleanupHook: { ticket in
+                guard gatedRequestIDs.values.contains(ticket.requestID) else { return }
+                await cleanupGate.enterAndWait()
+            }
+        )
+        let loaded = try await store.loadRoot(path: root.path)
+        let loadedFiles = await store.files(inRoot: loaded.id)
+        let file = try XCTUnwrap(loadedFiles.first)
+        let original = try await readyArtifactDemand(store: store, forFileID: file.id)
+        let rootEpoch = original.ticket.rootEpoch
+        gatedRequestIDs.append(original.ticket.requestID)
+        let released = await store.cancelCodemapArtifactDemand(original.ticket)
+        XCTAssertTrue(released)
+        await store.setCodemapIdleRejoinValidationHookForTesting { _ in
+            await validationGate.enterIfArmedAndWait()
+        }
+        validationGate.arm()
+
+        // The rejoin passes the cleanup registry (nothing registered yet) and parks in validation.
+        let requestReturned = CodemapLockedCounter()
+        let request = Task {
+            let result = await store.requestCodemapArtifact(forFileID: file.id)
+            requestReturned.increment()
+            return result
+        }
+        let validationEntered = await validationGate.waitUntilEntered()
+        XCTAssertTrue(validationEntered)
+        let fencedBeforeEviction = await store.codemapRevokingCleanupPendingForTesting(
+            rootEpoch: rootEpoch,
+            fileID: file.id
+        )
+        XCTAssertFalse(fencedBeforeEviction)
+
+        // A concurrent eviction of the same idle record registers a held revoking cleanup.
+        let eviction = Task {
+            await store.evictIdleReadyCodemapDemandsForTesting(rootEpoch: rootEpoch)
+        }
+        let cleanupEntered = await cleanupGate.waitUntilEntered()
+        XCTAssertTrue(cleanupEntered)
+        let fencedDuringEviction = await store.codemapRevokingCleanupPendingForTesting(
+            rootEpoch: rootEpoch,
+            fileID: file.id
+        )
+        XCTAssertTrue(fencedDuringEviction)
+
+        validationGate.release()
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertEqual(
+            requestReturned.value,
+            0,
+            "The resumed rejoin must wait for the held revoke before creating a same-generation successor"
+        )
+
+        cleanupGate.release()
+        let evicted = await eviction.value
+        XCTAssertEqual(evicted, 1)
+        let successorTicket = try await pendingTicket(request.value)
+        XCTAssertNotEqual(successorTicket.requestID, original.ticket.requestID)
+        XCTAssertEqual(successorTicket.requestGeneration, original.ticket.requestGeneration)
+        let successorReady = try await readyResult(settledResult(store: store, ticket: successorTicket))
+        XCTAssertEqual(try successorReady.handle.artifactKey(), successorReady.snapshot.artifactKey)
+        let snapshot = await store.codemapArtifactDemandCleanupSnapshotForTesting(successorTicket)
+        XCTAssertTrue(snapshot.demandRecordPresent)
+        XCTAssertTrue(snapshot.liveOverlayPresent, "The released revoke must not reach the successor's overlay entry")
+        _ = try await readyResult(store.codemapArtifactDemandStatus(successorTicket))
+
+        await store.setCodemapIdleRejoinValidationHookForTesting(nil)
+        _ = await store.cancelCodemapArtifactDemand(successorTicket)
+        await store.unloadRoot(id: loaded.id)
+    }
+
+    /// Overlay capacity eviction removes an idle record's live entry while the store's retained
+    /// bundle keeps the handle resolvable. The next request must not rejoin the record; it
+    /// acquires a fresh demand that publishes a live overlay entry again.
+    func testOverlayCapacityEvictionOfIdleRecordMakesNextRequestAcquireFresh() async throws {
+        let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositoryFixture.makeRepository(
+            named: "repository",
+            files: ["Sources/Feature.swift": SwiftFixtureSource.emptyStruct("Feature")]
+        )
+        let fixture = try CodemapStoreFixture(name: #function, projectionAuthority: .none)
+        addTeardownBlock {
+            await fixture.shutdown()
+            repositoryFixture.cleanup()
+        }
+        let store = fixture.makeStore()
+        let loaded = try await store.loadRoot(path: root.path)
+        let loadedFiles = await store.files(inRoot: loaded.id)
+        let file = try XCTUnwrap(loadedFiles.first)
+        let original = try await readyArtifactDemand(store: store, forFileID: file.id)
+        let rootEpoch = original.ticket.rootEpoch
+        let released = await store.cancelCodemapArtifactDemand(original.ticket)
+        XCTAssertTrue(released)
+        let idle = await store.codemapIdleReadyDemandFileIDsForTesting(rootEpoch: rootEpoch)
+        XCTAssertEqual(idle, [file.id])
+
+        var liveOverlayPresent = true
+        for _ in 0 ..< 4 where liveOverlayPresent {
+            let evicted = await store.evictCodemapOverlayEntryForCapacityForTesting(rootEpoch: rootEpoch)
+            XCTAssertTrue(evicted)
+            liveOverlayPresent = await store.codemapArtifactDemandCleanupSnapshotForTesting(original.ticket)
+                .liveOverlayPresent
+        }
+        XCTAssertFalse(liveOverlayPresent, "Capacity eviction must remove the idle record's live entry")
+        // The premise: the retained bundle's lease still resolves the evicted artifact.
+        XCTAssertEqual(try original.ready.handle.artifactKey(), original.ready.snapshot.artifactKey)
+        let tasksBefore = await store.codemapPresentationOperationCountsForTesting().demandTasksCreated
+
+        let request = await store.requestCodemapArtifactWithOwnership(forFileID: file.id, priority: .background)
+        guard case let .created(successorTicket) = request.ownership else {
+            return XCTFail("A capacity-evicted idle record must not be rejoined, got \(request.ownership)")
+        }
+        XCTAssertNotEqual(successorTicket.requestID, original.ticket.requestID)
+        let tasksAfter = await store.codemapPresentationOperationCountsForTesting().demandTasksCreated
+        XCTAssertEqual(tasksAfter, tasksBefore + 1)
+        let successorReady = try await readyResult(settledResult(store: store, ticket: successorTicket))
+        XCTAssertEqual(try successorReady.handle.artifactKey(), successorReady.snapshot.artifactKey)
+        let snapshot = await store.codemapArtifactDemandCleanupSnapshotForTesting(successorTicket)
+        XCTAssertTrue(snapshot.liveOverlayPresent, "The fresh demand must publish a live overlay entry")
+        let idleAfter = await store.codemapIdleReadyDemandFileIDsForTesting(rootEpoch: rootEpoch)
+        XCTAssertTrue(idleAfter.isEmpty)
+
+        _ = await store.cancelCodemapArtifactDemand(successorTicket)
         await store.unloadRoot(id: loaded.id)
     }
 
@@ -422,8 +670,13 @@ final class CodemapWatcherFenceTests: WorkspaceFileContextStoreCodemapSeamTestSu
         XCTAssertEqual(graphProbe.factoryCount, 1)
         await successorPublicationGate.arm()
 
+        // Releasing the last holder leaves the ready record warm; eviction is the revocation whose
+        // gated cleanup must not touch a same-path successor.
+        let released = await store.cancelCodemapArtifactDemand(cancelledTicket)
+        XCTAssertTrue(released)
+        XCTAssertEqual(try cancelledReady.handle.artifactKey(), cancelledReady.snapshot.artifactKey)
         let cancellationTask = Task {
-            await store.cancelCodemapArtifactDemand(cancelledTicket)
+            await store.evictIdleReadyCodemapDemandsForTesting(rootEpoch: cancelledTicket.rootEpoch)
         }
         let cancellationEntered = await cancellationGate.waitUntilEntered()
         XCTAssertTrue(cancellationEntered)
@@ -459,7 +712,7 @@ final class CodemapWatcherFenceTests: WorkspaceFileContextStoreCodemapSeamTestSu
 
         await cancellationGate.release()
         let cancellationResult = await cancellationTask.value
-        XCTAssertTrue(cancellationResult)
+        XCTAssertEqual(cancellationResult, 1)
         let gatedSuccessor = await store.codemapArtifactDemandCleanupSnapshotForTesting(successorTicket)
         XCTAssertTrue(gatedSuccessor.demandRecordPresent)
         XCTAssertTrue(gatedSuccessor.liveOverlayPresent)
@@ -499,6 +752,67 @@ final class CodemapWatcherFenceTests: WorkspaceFileContextStoreCodemapSeamTestSu
         XCTAssertFalse(reloadedGraph === epochGraph)
         XCTAssertEqual(graphProbe.factoryCount, 2)
         await store.unloadRoot(id: reloaded.id)
+    }
+
+    /// A real source edit invalidates an idle (released, warm) ready record like a retained one:
+    /// the idle record and its handle are retired, and the next request builds the edited content.
+    func testFileModificationInvalidatesIdleReadyRecordAndNextRequestRebuilds() async throws {
+        let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositoryFixture.makeRepository(
+            named: "repository",
+            files: ["Sources/Feature.swift": "struct Feature { func originalIdleSymbol() {} }\n"]
+        )
+        let fixture = try CodemapStoreFixture(name: #function, projectionAuthority: .none)
+        addTeardownBlock {
+            await fixture.shutdown()
+            repositoryFixture.cleanup()
+        }
+        let store = fixture.makeStore()
+        let loaded = try await store.loadRoot(path: root.path)
+        let files = await store.files(inRoot: loaded.id)
+        let file = try XCTUnwrap(files.first)
+        let original = try await readyArtifactDemand(store: store, forFileID: file.id)
+        let released = await store.cancelCodemapArtifactDemand(original.ticket)
+        XCTAssertTrue(released)
+        let idleBeforeEdit = await store.codemapIdleReadyDemandFileIDsForTesting(rootEpoch: original.ticket.rootEpoch)
+        XCTAssertEqual(idleBeforeEdit, [file.id])
+
+        try Self.write(
+            "struct Feature { func editedIdleSymbol() {} }\n",
+            to: root.appendingPathComponent(file.standardizedRelativePath)
+        )
+        await store.replayObservedFileSystemDeltas(
+            rootID: loaded.id,
+            deltas: [.fileModified(file.standardizedRelativePath, nil)]
+        )
+        let idleAfterEdit = await store.codemapIdleReadyDemandFileIDsForTesting(rootEpoch: original.ticket.rootEpoch)
+        XCTAssertTrue(idleAfterEdit.isEmpty)
+        await assertStale(store.codemapArtifactDemandStatus(original.ticket))
+        XCTAssertThrowsError(try original.ready.handle.artifactKey())
+
+        let refreshedFiles = await store.files(inRoot: loaded.id)
+        let refreshed = try XCTUnwrap(refreshedFiles.first {
+            $0.standardizedRelativePath == file.standardizedRelativePath
+        })
+        let rebuiltTicket = try await pendingTicket(store.requestCodemapArtifact(forFileID: refreshed.id))
+        XCTAssertNotEqual(rebuiltTicket.requestID, original.ticket.requestID)
+        XCTAssertGreaterThan(rebuiltTicket.pathGeneration, original.ticket.pathGeneration)
+        let rebuilt = try await readyResult(settledResult(store: store, ticket: rebuiltTicket))
+        XCTAssertNotEqual(rebuilt.snapshot.artifactKey, original.ready.snapshot.artifactKey)
+        let logicalPath = try XCTUnwrap(WorkspaceCodemapLogicalPresentationPath(
+            rootDisplayName: "Logical",
+            standardizedRelativePath: refreshed.standardizedRelativePath
+        ))
+        let bundle = try await frozenPresentationBundle(store.freezeCodemapPresentation([
+            WorkspaceCodemapPresentationRequest(ticket: rebuiltTicket, logicalPath: logicalPath)
+        ]))
+        let rendered = try await renderedPresentationEntries(store.renderCodemapPresentation(bundle))
+        let text = try XCTUnwrap(rendered.first?.text)
+        XCTAssertTrue(text.contains("editedIdleSymbol"), text)
+        XCTAssertFalse(text.contains("originalIdleSymbol"), text)
+        _ = await store.releaseCodemapPresentation(bundle)
+        _ = await store.cancelCodemapArtifactDemand(rebuiltTicket)
+        await store.unloadRoot(id: loaded.id)
     }
 
     func testWatcherRenamePairFencesOnlyOldAndNewPaths() async throws {

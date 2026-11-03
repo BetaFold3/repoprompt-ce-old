@@ -21,7 +21,7 @@ final class HistorySessionScannerTests: XCTestCase {
             .appendingPathComponent("HistorySessionScannerTests-\(UUID().uuidString)", isDirectory: true)
         try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         workspacesRoot = tempDir.appendingPathComponent("Workspaces", isDirectory: true)
-        scanner = HistorySessionScanner(applicationSupportRoot: tempDir)
+        scanner = HistorySessionScanner(workspacesRoot: workspacesRoot)
     }
 
     override func tearDown() {
@@ -76,7 +76,7 @@ final class HistorySessionScannerTests: XCTestCase {
     }
 
     func testScanAllWorkspaces_cacheInvalidatesChangedIndexAfterTTL() async throws {
-        scanner = HistorySessionScanner(applicationSupportRoot: tempDir, scanCacheTTL: 0)
+        scanner = HistorySessionScanner(workspacesRoot: workspacesRoot, scanCacheTTL: 0)
         let wsDir = try createWorkspaceDir(name: "Project", uuid: UUID())
         let first = makeMinimalRecord(name: "First")
         try createAgentSessionsIndex(in: wsDir, records: [first])
@@ -195,7 +195,7 @@ final class HistorySessionScannerTests: XCTestCase {
         try createAgentSessionsIndex(in: ws2, records: [r3])
 
         let scanResults = try await scanner.scanAllWorkspaces()
-        let filtered = scanner.sessionsMatchingFilters(scanResults, workspace: nil, agentKind: nil, model: nil, filePath: nil, from: nil, to: nil)
+        let filtered = try scanner.sessionsMatchingFilters(scanResults, workspace: nil, agentKind: nil, model: nil, filePath: nil, from: nil, to: nil)
 
         XCTAssertEqual(filtered.count, 3)
     }
@@ -209,7 +209,7 @@ final class HistorySessionScannerTests: XCTestCase {
         try createAgentSessionsIndex(in: ws2, records: [r2])
 
         let scanResults = try await scanner.scanAllWorkspaces()
-        let filtered = scanner.sessionsMatchingFilters(scanResults, workspace: "projecta", agentKind: nil, model: nil, filePath: nil, from: nil, to: nil)
+        let filtered = try scanner.sessionsMatchingFilters(scanResults, workspace: "projecta", agentKind: nil, model: nil, filePath: nil, from: nil, to: nil)
 
         XCTAssertEqual(filtered.count, 1)
         XCTAssertEqual(filtered[0].sessionID, r1.id)
@@ -225,7 +225,7 @@ final class HistorySessionScannerTests: XCTestCase {
         try createAgentSessionsIndex(in: ws2, records: [r2])
 
         let scanResults = try await scanner.scanAllWorkspaces()
-        let filtered = scanner.sessionsMatchingFilters(
+        let filtered = try scanner.sessionsMatchingFilters(
             scanResults,
             workspace: "Workspace-RepoPromptCE-",
             agentKind: nil,
@@ -249,7 +249,7 @@ final class HistorySessionScannerTests: XCTestCase {
         try createAgentSessionsIndex(in: ws2, records: [r2])
 
         let scanResults = try await scanner.scanAllWorkspaces()
-        let filtered = scanner.sessionsMatchingFilters(scanResults, workspace: wsUUID.uuidString, agentKind: nil, model: nil, filePath: nil, from: nil, to: nil)
+        let filtered = try scanner.sessionsMatchingFilters(scanResults, workspace: wsUUID.uuidString, agentKind: nil, model: nil, filePath: nil, from: nil, to: nil)
 
         XCTAssertEqual(filtered.count, 1)
         XCTAssertEqual(filtered[0].sessionID, r1.id)
@@ -263,7 +263,7 @@ final class HistorySessionScannerTests: XCTestCase {
         try createAgentSessionsIndex(in: ws, records: [r1, r2, r3])
 
         let scanResults = try await scanner.scanAllWorkspaces()
-        let filtered = scanner.sessionsMatchingFilters(scanResults, workspace: nil, agentKind: "claude", model: nil, filePath: nil, from: nil, to: nil)
+        let filtered = try scanner.sessionsMatchingFilters(scanResults, workspace: nil, agentKind: "claude", model: nil, filePath: nil, from: nil, to: nil)
 
         XCTAssertEqual(filtered.count, 1)
         XCTAssertEqual(filtered[0].sessionID, r1.id)
@@ -277,7 +277,7 @@ final class HistorySessionScannerTests: XCTestCase {
         try createAgentSessionsIndex(in: ws, records: [r1, r2, r3])
 
         let scanResults = try await scanner.scanAllWorkspaces()
-        let filtered = scanner.sessionsMatchingFilters(scanResults, workspace: nil, agentKind: nil, model: "opus", filePath: nil, from: nil, to: nil)
+        let filtered = try scanner.sessionsMatchingFilters(scanResults, workspace: nil, agentKind: nil, model: "opus", filePath: nil, from: nil, to: nil)
 
         XCTAssertEqual(filtered.count, 1)
         XCTAssertEqual(filtered[0].sessionID, r2.id)
@@ -291,7 +291,7 @@ final class HistorySessionScannerTests: XCTestCase {
         try createAgentSessionsIndex(in: ws, records: [r1, r2, r3])
 
         let scanResults = try await scanner.scanAllWorkspaces()
-        let filtered = scanner.sessionsMatchingFilters(scanResults, workspace: nil, agentKind: nil, model: nil, filePath: "main.swift", from: nil, to: nil)
+        let filtered = try scanner.sessionsMatchingFilters(scanResults, workspace: nil, agentKind: nil, model: nil, filePath: "main.swift", from: nil, to: nil)
 
         XCTAssertEqual(filtered.count, 1)
         XCTAssertEqual(filtered[0].sessionID, r1.id)
@@ -303,7 +303,7 @@ final class HistorySessionScannerTests: XCTestCase {
         try createAgentSessionsIndex(in: ws, records: [r1])
 
         let scanResults = try await scanner.scanAllWorkspaces()
-        let filtered = scanner.sessionsMatchingFilters(scanResults, workspace: nil, agentKind: nil, model: nil, filePath: "main.SWIFT", from: nil, to: nil)
+        let filtered = try scanner.sessionsMatchingFilters(scanResults, workspace: nil, agentKind: nil, model: nil, filePath: "main.SWIFT", from: nil, to: nil)
 
         XCTAssertEqual(filtered.count, 1)
     }
@@ -320,7 +320,7 @@ final class HistorySessionScannerTests: XCTestCase {
         let from = epoch.addingTimeInterval(1800) // 30min in
         let to = epoch.addingTimeInterval(5400) // 90min in
 
-        let filtered = scanner.sessionsMatchingFilters(scanResults, workspace: nil, agentKind: nil, model: nil, filePath: nil, from: from, to: to)
+        let filtered = try scanner.sessionsMatchingFilters(scanResults, workspace: nil, agentKind: nil, model: nil, filePath: nil, from: from, to: to)
 
         XCTAssertEqual(filtered.count, 1)
         XCTAssertEqual(filtered[0].sessionID, r2.id)
@@ -367,7 +367,7 @@ final class HistorySessionScannerTests: XCTestCase {
         // activityDate-based filter would drop this session).
         let from = try XCTUnwrap(record.firstActivityAt?.addingTimeInterval(-10))
         let to = try XCTUnwrap(record.lastActivityAt?.addingTimeInterval(10))
-        let filtered = scanner.sessionsMatchingFilters(scanResults, workspace: nil, agentKind: nil, model: nil, filePath: nil, from: from, to: to)
+        let filtered = try scanner.sessionsMatchingFilters(scanResults, workspace: nil, agentKind: nil, model: nil, filePath: nil, from: from, to: to)
 
         XCTAssertEqual(filtered.count, 1, "filter should use transcript activity bounds, not the sidebar date")
         XCTAssertEqual(filtered.first?.sessionID, record.id)
@@ -382,7 +382,7 @@ final class HistorySessionScannerTests: XCTestCase {
         try createAgentSessionsIndex(in: ws, records: [r1, r2, r3])
 
         let scanResults = try await scanner.scanAllWorkspaces()
-        let filtered = scanner.sessionsMatchingFilters(
+        let filtered = try scanner.sessionsMatchingFilters(
             scanResults,
             workspace: nil,
             agentKind: "claudeCode",
@@ -396,8 +396,8 @@ final class HistorySessionScannerTests: XCTestCase {
         XCTAssertEqual(filtered[0].sessionID, r1.id)
     }
 
-    func testSessionsMatchingFilters_emptyScanResults() {
-        let filtered = scanner.sessionsMatchingFilters(
+    func testSessionsMatchingFilters_emptyScanResults() throws {
+        let filtered = try scanner.sessionsMatchingFilters(
             [],
             workspace: "anything",
             agentKind: nil,
@@ -548,14 +548,15 @@ final class HistorySessionScannerTests: XCTestCase {
     }
 
     func testScanAllWorkspacesRefreshing_bypassesTTLCacheAndRepopulates() async throws {
-        // F6 mechanism: `scanAllWorkspacesRefreshing()` forces a fresh scan, ignoring the
-        // TTL cache, while the cached scan still hides a freshly-saved session; and the
-        // refresh repopulates the cache so later cached scans see it too.
+        // F6 mechanism: `refreshWorkspacesContainingSession` re-reads the workspace that
+        // holds a freshly-saved session, ignoring the TTL cache, while the cached scan
+        // still hides it; the refresh splices it into the cache so later cached scans see
+        // it too — all without a second full inventory scan.
         let wsDir = try createWorkspaceDir(name: "Project", uuid: UUID())
         let sessionA = UUID()
         try createAgentSessionsIndex(in: wsDir, records: [makeMinimalRecord(id: sessionA, name: "A")])
 
-        let cachedScanner = HistorySessionScanner(applicationSupportRoot: tempDir, scanCacheTTL: 3600)
+        let cachedScanner = HistorySessionScanner(workspacesRoot: workspacesRoot, scanCacheTTL: 3600)
         _ = try await cachedScanner.scanAllWorkspaces() // warm the cache with [A]
 
         // App saves B: writes its file + updates the index.
@@ -566,11 +567,236 @@ final class HistorySessionScannerTests: XCTestCase {
         let cachedIDs = try await Set(cachedScanner.scanAllWorkspaces().flatMap(\.records).map(\.id))
         XCTAssertFalse(cachedIDs.contains(sessionB), "Cached scan within TTL hides the freshly-saved session")
 
-        let refreshedIDs = try await Set(cachedScanner.scanAllWorkspacesRefreshing().flatMap(\.records).map(\.id))
+        let refreshedIDs = try await Set(cachedScanner.refreshWorkspacesContainingSession(sessionB).flatMap(\.records).map(\.id))
         XCTAssertTrue(refreshedIDs.contains(sessionB), "Refreshing scan bypasses the TTL and sees the freshly-saved session")
 
         let postRefreshCachedIDs = try await Set(cachedScanner.scanAllWorkspaces().flatMap(\.records).map(\.id))
         XCTAssertTrue(postRefreshCachedIDs.contains(sessionB), "Refreshing repopulates the cache so later cached scans see B")
+        let inventoryScans = await cachedScanner.inventoryScanCountForTesting
+        XCTAssertEqual(inventoryScans, 1, "Targeted refresh must not run another full inventory scan")
+    }
+
+    // MARK: - Cancellation
+
+    func testAlreadyCancelledCalls_throwCancellationEvenWithWarmCaches() async throws {
+        let wsDir = try createWorkspaceDir(name: "Project", uuid: UUID())
+        let sessionID = UUID()
+        try writeSessionFile(AgentSession(id: sessionID, name: "S", transcript: AgentTranscript(turns: []), itemCount: 0), in: wsDir)
+        try createAgentSessionsIndex(in: wsDir, records: [makeMinimalRecord(id: sessionID, name: "S")])
+        let warmScanner = HistorySessionScanner(workspacesRoot: workspacesRoot, scanCacheTTL: 3600)
+        let scanResults = try await warmScanner.scanAllWorkspaces()
+        _ = try await warmScanner.loadTranscriptForSearch(sessionID: sessionID, workspaceDir: wsDir)
+
+        let outcomes = await Task { () -> [String: Bool] in
+            withUnsafeCurrentTask { $0?.cancel() }
+            var threwCancellation: [String: Bool] = [:]
+            do {
+                _ = try await warmScanner.scanAllWorkspaces()
+                threwCancellation["scanAllWorkspaces"] = false
+            } catch { threwCancellation["scanAllWorkspaces"] = error is CancellationError }
+            do {
+                _ = try await warmScanner.loadTranscriptForSearch(sessionID: sessionID, workspaceDir: wsDir)
+                threwCancellation["loadTranscriptForSearch"] = false
+            } catch { threwCancellation["loadTranscriptForSearch"] = error is CancellationError }
+            do {
+                _ = try warmScanner.sessionsMatchingFilters(scanResults, workspace: nil, agentKind: nil, model: nil, filePath: nil, from: nil, to: nil)
+                threwCancellation["sessionsMatchingFilters"] = false
+            } catch { threwCancellation["sessionsMatchingFilters"] = error is CancellationError }
+            do {
+                _ = try await warmScanner.refreshWorkspacesContainingSession(sessionID)
+                threwCancellation["refreshWorkspacesContainingSession"] = false
+            } catch { threwCancellation["refreshWorkspacesContainingSession"] = error is CancellationError }
+            return threwCancellation
+        }.value
+
+        XCTAssertEqual(outcomes, [
+            "scanAllWorkspaces": true,
+            "loadTranscriptForSearch": true,
+            "sessionsMatchingFilters": true,
+            "refreshWorkspacesContainingSession": true
+        ])
+    }
+
+    func testInventoryCancelledMidScan_publishesNothingAndDoesNotPrune() async throws {
+        for index in 0 ..< 4 {
+            let wsDir = try createWorkspaceDir(name: "P\(index)", uuid: UUID())
+            try createAgentSessionsIndex(in: wsDir, records: [makeMinimalRecord(name: "S\(index)")])
+        }
+        let clock = HistoryTestClock(Date(timeIntervalSince1970: 0))
+        let cancelHook = HistoryInventoryCancelHook()
+        let scanner = HistorySessionScanner(
+            workspacesRoot: workspacesRoot,
+            scanCacheTTL: 90,
+            now: { clock.now },
+            inventoryWorkspaceHookForTesting: { cancelHook.visit($0) }
+        )
+        let first = HistoryExecutionDiagnostics()
+        _ = try await scanner.scanAllWorkspaces(diagnostics: first)
+        XCTAssertEqual(first.snapshot().counters.indexDecodes, 4)
+
+        clock.now = Date(timeIntervalSince1970: 100) // TTL expired
+        cancelHook.cancelAtVisit = 2
+        let cancelled = await Task { () -> Bool in
+            do {
+                _ = try await scanner.scanAllWorkspaces()
+                return false
+            } catch { return error is CancellationError }
+        }.value
+        XCTAssertTrue(cancelled, "Mid-scan cancellation must throw CancellationError")
+
+        // Same instant: a partial inventory published by the cancelled scan would be
+        // served from the TTL cache; pruning against its partial seen-set would have
+        // evicted the two unvisited index entries.
+        let after = HistoryExecutionDiagnostics()
+        let results = try await scanner.scanAllWorkspaces(diagnostics: after)
+        XCTAssertEqual(results.count, 4, "Cancelled scan must not publish a partial inventory")
+        XCTAssertFalse(after.snapshot().counters.inventoryFromTTLCache)
+        XCTAssertEqual(after.snapshot().counters.indexCacheHits, 4, "Cancelled scan must not prune live index entries")
+        XCTAssertEqual(after.snapshot().counters.indexDecodes, 0)
+    }
+
+    func testInventoryCancelledMidScan_keepsDecodedIndexEntriesSoNextScanDecodesFewer() async throws {
+        var workspaceDirs: [URL] = []
+        for index in 0 ..< 4 {
+            let wsDir = try createWorkspaceDir(name: "P\(index)", uuid: UUID())
+            try createAgentSessionsIndex(in: wsDir, records: [makeMinimalRecord(name: "S\(index)")])
+            workspaceDirs.append(wsDir)
+        }
+        let cancelHook = HistoryInventoryCancelHook()
+        let scanner = HistorySessionScanner(
+            workspacesRoot: workspacesRoot,
+            scanCacheTTL: 0,
+            inventoryWorkspaceHookForTesting: { cancelHook.visit($0) }
+        )
+        _ = try await scanner.scanAllWorkspaces()
+
+        // Every index changes, so each needs a fresh decode.
+        for (index, wsDir) in workspaceDirs.enumerated() {
+            try createAgentSessionsIndex(in: wsDir, records: [makeMinimalRecord(name: "S\(index)"), makeMinimalRecord(name: "T\(index)")])
+        }
+        cancelHook.cancelAtVisit = 2
+        let cancelledScan = HistoryExecutionDiagnostics()
+        let cancelled = await Task { () -> Bool in
+            do {
+                _ = try await scanner.scanAllWorkspaces(diagnostics: cancelledScan)
+                return false
+            } catch { return error is CancellationError }
+        }.value
+        XCTAssertTrue(cancelled)
+        XCTAssertEqual(cancelledScan.snapshot().counters.indexDecodes, 2)
+
+        let next = HistoryExecutionDiagnostics()
+        let results = try await scanner.scanAllWorkspaces(diagnostics: next)
+        XCTAssertEqual(results.flatMap(\.records).count, 8)
+        XCTAssertEqual(next.snapshot().counters.indexDecodes, 2, "Entries decoded before cancellation are reused")
+        XCTAssertEqual(next.snapshot().counters.indexCacheHits, 2)
+    }
+
+    func testInventoryTTL_startsWhenScanCompletes() async throws {
+        let wsDir = try createWorkspaceDir(name: "Project", uuid: UUID())
+        try createAgentSessionsIndex(in: wsDir, records: [makeMinimalRecord(name: "S")])
+        let clock = HistoryTestClock(Date(timeIntervalSince1970: 0))
+        let scanner = HistorySessionScanner(
+            workspacesRoot: workspacesRoot,
+            scanCacheTTL: 90,
+            now: { clock.now },
+            // The scan takes 100s: it starts at t=0 and completes at t=100.
+            inventoryWorkspaceHookForTesting: { _ in clock.now = Date(timeIntervalSince1970: 100) }
+        )
+        _ = try await scanner.scanAllWorkspaces()
+
+        clock.now = Date(timeIntervalSince1970: 150) // 50s after completion, 150s after start
+        let diagnostics = HistoryExecutionDiagnostics()
+        _ = try await scanner.scanAllWorkspaces(diagnostics: diagnostics)
+        XCTAssertTrue(diagnostics.snapshot().counters.inventoryFromTTLCache, "TTL is measured from scan completion")
+        let inventoryScans = await scanner.inventoryScanCountForTesting
+        XCTAssertEqual(inventoryScans, 1)
+    }
+
+    func testInventoryCancelledDuringEnumeration_throwsBeforeAnyIndexIsScanned() async throws {
+        for index in 0 ..< 3 {
+            let wsDir = try createWorkspaceDir(name: "E\(index)", uuid: UUID())
+            try createAgentSessionsIndex(in: wsDir, records: [makeMinimalRecord(name: "S\(index)")])
+        }
+        let scanner = HistorySessionScanner(workspacesRoot: workspacesRoot, scanCacheTTL: 90)
+        let observer = HistoryPhaseCancelObserver(cancelOn: .inventoryEnumeration)
+        let diagnostics = HistoryExecutionDiagnostics { observer.observe($0, $1) }
+        let cancelled = await Task { () -> Bool in
+            do {
+                _ = try await scanner.scanAllWorkspaces(diagnostics: diagnostics)
+                return false
+            } catch { return error is CancellationError }
+        }.value
+
+        XCTAssertTrue(cancelled, "Cancellation during the listing must throw CancellationError")
+        // The workspace listing itself observes cancellation, so the index scan never begins.
+        XCTAssertFalse(observer.startedPhases.contains(.inventoryIndexScan))
+        XCTAssertEqual(diagnostics.snapshot().counters.workspaceDirsVisited, 0)
+
+        let next = HistoryExecutionDiagnostics()
+        let results = try await scanner.scanAllWorkspaces(diagnostics: next)
+        XCTAssertEqual(results.count, 3)
+        XCTAssertFalse(next.snapshot().counters.inventoryFromTTLCache, "A scan cancelled while listing publishes nothing")
+    }
+
+    func testRefreshCancelledDuringEnumeration_throwsWithoutProbingOrSplicing() async throws {
+        let wsDir = try createWorkspaceDir(name: "Project", uuid: UUID())
+        try createAgentSessionsIndex(in: wsDir, records: [makeMinimalRecord(name: "Existing")])
+        let scanner = HistorySessionScanner(workspacesRoot: workspacesRoot, scanCacheTTL: 3600)
+        _ = try await scanner.scanAllWorkspaces()
+
+        // A session saved after the inventory was cached.
+        let fresh = makeMinimalRecord(name: "Fresh")
+        try createAgentSessionsIndex(in: wsDir, records: [makeMinimalRecord(name: "Existing"), fresh])
+        try writeSessionFile(AgentSession(id: fresh.id, name: "Fresh", transcript: .empty, itemCount: 1), in: wsDir)
+
+        let observer = HistoryPhaseCancelObserver(cancelOn: .inventoryEnumeration)
+        let diagnostics = HistoryExecutionDiagnostics { observer.observe($0, $1) }
+        let cancelled = await Task { () -> Bool in
+            do {
+                _ = try await scanner.refreshWorkspacesContainingSession(fresh.id, diagnostics: diagnostics)
+                return false
+            } catch { return error is CancellationError }
+        }.value
+
+        XCTAssertTrue(cancelled)
+        XCTAssertFalse(observer.startedPhases.contains(.inventoryIndexScan))
+        XCTAssertEqual(diagnostics.snapshot().counters.workspaceDirsVisited, 0, "No session-file probe after cancellation")
+        let cached = try await scanner.scanAllWorkspaces()
+        XCTAssertEqual(cached.flatMap(\.records).count, 1, "A cancelled refresh must not splice into the cached inventory")
+    }
+
+    func testTranscriptDecodedAsCancellationArrives_isCachedButNotReturned() async throws {
+        let wsDir = try createWorkspaceDir(name: "Project", uuid: UUID())
+        let sessionID = UUID()
+        try writeSessionFile(
+            AgentSession(
+                id: sessionID,
+                name: "S",
+                transcript: AgentTranscript(turns: [AgentTranscriptTurn(startedAt: Date(timeIntervalSince1970: 1000))]),
+                itemCount: 1
+            ),
+            in: wsDir
+        )
+        let decoder = CancelAfterSessionDecodeDecoder()
+        let scanner = HistorySessionScanner(decoder: decoder, workspacesRoot: workspacesRoot)
+
+        decoder.armed = true
+        let cancelled = await Task { () -> Bool in
+            do {
+                _ = try await scanner.loadTranscriptForSearch(sessionID: sessionID, workspaceDir: wsDir)
+                return false
+            } catch { return error is CancellationError }
+        }.value
+        XCTAssertTrue(cancelled, "A cancelled caller never receives the transcript")
+        let decodedWhileCancelled = await scanner.transcriptDecodeCountForTesting
+        XCTAssertEqual(decodedWhileCancelled, 1)
+
+        // The completed decode was cached, so the next (uncancelled) load reuses it.
+        let transcript = try await scanner.loadTranscriptForSearch(sessionID: sessionID, workspaceDir: wsDir)
+        XCTAssertEqual(transcript.turns.count, 1)
+        let decodedAfterRetry = await scanner.transcriptDecodeCountForTesting
+        XCTAssertEqual(decodedAfterRetry, 1, "Repeated cancelled searches make progress: no re-decode")
     }
 
     // MARK: - Cross-Workspace Unification
@@ -586,7 +812,7 @@ final class HistorySessionScannerTests: XCTestCase {
         try createAgentSessionsIndex(in: ws2, records: [r2])
 
         let scanResults = try await scanner.scanAllWorkspaces()
-        let filtered = scanner.sessionsMatchingFilters(scanResults, workspace: nil, agentKind: nil, model: nil, filePath: nil, from: nil, to: nil)
+        let filtered = try scanner.sessionsMatchingFilters(scanResults, workspace: nil, agentKind: nil, model: nil, filePath: nil, from: nil, to: nil)
 
         XCTAssertEqual(filtered.count, 2, "Expected 2 filtered records, got \(filtered.count)")
         let scanNames = scanResults.map(\.workspaceName)
@@ -642,7 +868,7 @@ final class HistorySessionScannerTests: XCTestCase {
         )
 
         let scanResults = try await scanner.scanAllWorkspaces()
-        let filtered = scanner.sessionsMatchingFilters(
+        let filtered = try scanner.sessionsMatchingFilters(
             scanResults,
             workspace: nil,
             agentKind: nil,
@@ -734,5 +960,99 @@ final class HistorySessionScannerTests: XCTestCase {
             keyPaths: keyPaths,
             coveredTurnDurationSeconds: activeDurationSeconds
         )
+    }
+}
+
+/// Settable test clock for the scanner's `now` seam.
+private final class HistoryTestClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var current: Date
+
+    init(_ start: Date) {
+        current = start
+    }
+
+    var now: Date {
+        get { lock.withLock { current } }
+        set { lock.withLock { current = newValue } }
+    }
+}
+
+/// Phase observer that records started phases and cancels the executing task the first
+/// time a given phase starts (the observer runs synchronously on that task).
+private final class HistoryPhaseCancelObserver: @unchecked Sendable {
+    private let lock = NSLock()
+    private let cancelOn: HistoryExecutionDiagnostics.Phase
+    private var started: [HistoryExecutionDiagnostics.Phase] = []
+    private var fired = false
+
+    init(cancelOn: HistoryExecutionDiagnostics.Phase) {
+        self.cancelOn = cancelOn
+    }
+
+    var startedPhases: [HistoryExecutionDiagnostics.Phase] {
+        lock.withLock { started }
+    }
+
+    func observe(_ phase: HistoryExecutionDiagnostics.Phase, _ transition: HistoryExecutionDiagnostics.PhaseTransition) {
+        guard transition == .started else { return }
+        let shouldCancel = lock.withLock {
+            started.append(phase)
+            guard phase == cancelOn, !fired else { return false }
+            fired = true
+            return true
+        }
+        if shouldCancel {
+            withUnsafeCurrentTask { $0?.cancel() }
+        }
+    }
+}
+
+/// Decoder that cancels the calling task right after it finishes decoding an
+/// `AgentSession` (models cancellation arriving as a transcript decode completes).
+private final class CancelAfterSessionDecodeDecoder: JSONDecoder, @unchecked Sendable {
+    private let lock = NSLock()
+    private var isArmed = false
+
+    var armed: Bool {
+        get { lock.withLock { isArmed } }
+        set { lock.withLock { isArmed = newValue } }
+    }
+
+    override func decode<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
+        let value = try super.decode(type, from: data)
+        if type == AgentSession.self {
+            let shouldCancel = lock.withLock {
+                defer { isArmed = false }
+                return isArmed
+            }
+            if shouldCancel {
+                withUnsafeCurrentTask { $0?.cancel() }
+            }
+        }
+        return value
+    }
+}
+
+/// Inventory hook that cancels the scanning task when it reaches a given workspace
+/// index, then disarms (deterministic mid-scan cancellation without sleeps).
+private final class HistoryInventoryCancelHook: @unchecked Sendable {
+    private let lock = NSLock()
+    private var armedAt: Int?
+
+    var cancelAtVisit: Int? {
+        get { lock.withLock { armedAt } }
+        set { lock.withLock { armedAt = newValue } }
+    }
+
+    func visit(_ visited: Int) {
+        let shouldCancel = lock.withLock {
+            guard armedAt == visited else { return false }
+            armedAt = nil
+            return true
+        }
+        if shouldCancel {
+            withUnsafeCurrentTask { $0?.cancel() }
+        }
     }
 }

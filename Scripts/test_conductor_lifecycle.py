@@ -95,7 +95,9 @@ class LifecycleQueueTests(LifecycleTestCase):
         # 17: forwards RPCE_INDEX_STORE, which an idle protocol-16 daemon would drop.
         # 18: forwards REPOPROMPT_DEBUG_PACKAGE_CACHE, which an idle protocol-17 daemon would drop.
         # 19: `build --optimized` (args.optimized); an idle protocol-18 daemon would drop it and build debug.
-        self.assertEqual(conductor.PROTOCOL_VERSION, 19)
+        # 20: `--optimized-incremental` (args.optimizedIncremental); an idle protocol-19 daemon would drop it
+        # and build debug.
+        self.assertEqual(conductor.PROTOCOL_VERSION, 20)
 
     def test_ensure_daemon_stops_and_replaces_idle_protocol_15_daemon(self) -> None:
         tmp, state = self.make_state()
@@ -560,10 +562,11 @@ class LifecycleQueueTests(LifecycleTestCase):
             conductor.ConductorError
         ) as usage:
             conductor.handle_real_operation(state.paths, "app", ["--optimized", "relaunch"])
-        # The usage error offers --optimized for relaunch only.
-        self.assertIn("relaunch [--optimized] [-- <app args...>]", str(usage.exception))
+        # The usage error offers the lane flags for relaunch only.
+        self.assertIn("relaunch [--optimized | --optimized-incremental] [-- <app args...>]", str(usage.exception))
         self.assertIn("launch-existing [-- <app args...>]", str(usage.exception))
-        self.assertEqual(str(usage.exception).count("--optimized"), 1)
+        self.assertEqual(str(usage.exception).count("--optimized "), 1)
+        self.assertEqual(str(usage.exception).count("--optimized-incremental"), 1)
         with mock.patch.object(conductor, "enqueue_and_maybe_wait", return_value=0), self.assertRaises(
             conductor.ConductorError
         ) as raised:
@@ -709,6 +712,229 @@ class LifecycleQueueTests(LifecycleTestCase):
             payload = state.enqueue({"operation": "run", "args": {"optimized": True, "appArgs": []}})
         self.assertEqual(prior.state, "queued")
         self.assertEqual(payload.get("supersededJobs"), [])
+
+    # Optimized-incremental App lane (`--optimized-incremental`): a separate, mutually exclusive selector
+    # that maps to package_app.sh debug-optimized-incremental. Nothing below builds, stops or launches.
+
+    INCREMENTAL = "optimizedIncremental"
+
+    def test_build_optimized_incremental_cli_sets_its_own_key_and_rejects_mixed_lanes(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        cases = {
+            ("--optimized-incremental",): ({self.INCREMENTAL: True}, None),
+            ("--optimized-incremental", "--fast"): ({"fastPackage": True, self.INCREMENTAL: True}, None),
+            ("--timeout", "900", "--optimized-incremental"): ({self.INCREMENTAL: True}, 900.0),
+            ("--optimized",): ({"optimized": True}, None),
+            (): ({}, None),
+        }
+        for argv, (expected_args, expected_timeout) in cases.items():
+            with self.subTest(argv=argv), mock.patch.object(conductor, "enqueue_and_maybe_wait", return_value=0) as enqueue:
+                self.assertEqual(conductor.handle_real_operation(state.paths, "build", list(argv)), 0)
+                self.assertEqual(enqueue.call_args.args[2], expected_args)
+                self.assertEqual(enqueue.call_args.args[3].timeout, expected_timeout)
+        for argv in (("--optimized", "--optimized-incremental"), ("--optimized-incremental", "--fast", "--optimized")):
+            with self.subTest(argv=argv), mock.patch.object(conductor, "enqueue_and_maybe_wait", return_value=0) as enqueue:
+                with self.assertRaisesRegex(conductor.ConductorError, "mutually exclusive"):
+                    conductor.handle_real_operation(state.paths, "build", list(argv))
+                enqueue.assert_not_called()
+        with mock.patch.object(conductor, "enqueue_and_maybe_wait", return_value=0), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            conductor.handle_real_operation(state.paths, "build", ["--optimized-incremental=yes"])
+
+    def test_build_optimized_incremental_prepare_maps_config_lanes_floor_and_rejects_malformed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = conductor.OperationRegistry(Path(tmp))
+            script = str(Path(tmp) / "Scripts" / "package_app.sh")
+            lane = registry.prepare({"operation": "build", "args": {self.INCREMENTAL: True}, "env": {}})
+            lane_fast = registry.prepare(
+                {"operation": "build", "args": {self.INCREMENTAL: True, "fastPackage": True}, "env": {}}
+            )
+            self.assertEqual(lane[0], [script, "debug-optimized-incremental"])
+            self.assertEqual(lane_fast[0], [script, "debug-optimized-incremental", "fast"])
+            floor = max(conductor.MEDIUM_TIMEOUT_SECONDS, conductor.OPTIMIZED_LANE_TIMEOUT_FLOOR_SECONDS)
+            for prepared in (lane, lane_fast):
+                self.assertEqual(prepared[1], ["build", "debugArtifact"])
+                self.assertEqual(prepared[4], floor)
+            with mock.patch.object(conductor, "OPTIMIZED_LANE_TIMEOUT_FLOOR_SECONDS", conductor.MEDIUM_TIMEOUT_SECONDS * 3):
+                self.assertEqual(
+                    registry.prepare({"operation": "build", "args": {self.INCREMENTAL: True}, "env": {}})[4],
+                    conductor.MEDIUM_TIMEOUT_SECONDS * 3,
+                )
+            self.assertEqual(
+                registry.prepare({"operation": "build", "args": {self.INCREMENTAL: True}, "env": {}, "timeout": 5.0})[4], 5.0
+            )
+            # Default and old-lane requests keep their argv byte for byte.
+            self.assertEqual(registry.prepare({"operation": "build", "args": {}, "env": {}})[0], [script, "debug"])
+            self.assertEqual(
+                registry.prepare({"operation": "build", "args": {"optimized": True}, "env": {}})[0], [script, "debug-optimized"]
+            )
+            for bad in (False, "true", 1, None, "1"):
+                with self.subTest(bad=bad), self.assertRaisesRegex(conductor.ConductorError, "optimizedIncremental' must be true"):
+                    registry.prepare({"operation": "build", "args": {self.INCREMENTAL: bad}, "env": {}})
+            # Both lane keys is a malformed request on every path, with or without an explicit timeout.
+            both = {"optimized": True, self.INCREMENTAL: True}
+            for request in (
+                {"operation": "build", "args": dict(both), "env": {}},
+                {"operation": "build", "args": dict(both), "env": {}, "timeout": 600.0},
+                {"operation": "run", "args": dict(both, appArgs=[]), "env": {}, "timeout": 600.0},
+                {"operation": "app", "args": dict(both, subcommand="relaunch", appArgs=[]), "env": {}, "timeout": 600.0},
+            ):
+                with self.subTest(request=request), self.assertRaisesRegex(conductor.ConductorError, "mutually exclusive"):
+                    registry.prepare(request)
+            with self.assertRaisesRegex(conductor.ConductorError, "mutually exclusive"):
+                conductor.debug_package_config_for_request(both)
+            self.assertEqual(conductor.debug_package_config_for_request({}), "debug")
+            # Other operations are untouched by the key.
+            self.assertEqual(registry.prepare({"operation": "package", "args": {"config": "debug"}, "env": {}})[0][-1], "debug")
+            # Distinct request identity from both the default and the WMO lane.
+            fingerprints = {
+                registry.fingerprint({"operation": "build", "args": args})
+                for args in ({}, {"optimized": True}, {self.INCREMENTAL: True})
+            }
+            self.assertEqual(len(fingerprints), 3)
+
+    def test_optimized_incremental_gate_is_never_forwarded(self) -> None:
+        self.assertNotIn("RPCE_OPTIMIZED_INCREMENTAL", conductor.OperationRegistry.PASSTHROUGH_ENV_KEYS)
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ, {"RPCE_OPTIMIZED_INCREMENTAL": "1", "RPCE_OPTIMIZED_DIAGNOSTICS": "1"}
+        ):
+            snapshot = conductor.OperationRegistry.client_env_snapshot()
+            registry = conductor.OperationRegistry(Path(tmp))
+            forged = dict(snapshot, RPCE_OPTIMIZED_INCREMENTAL="1", RPCE_OPTIMIZED_DIAGNOSTICS="1")
+            for request in (
+                {"operation": "build", "args": {self.INCREMENTAL: True}, "env": forged},
+                {"operation": "run", "args": {self.INCREMENTAL: True, "appArgs": []}, "env": forged},
+                {"operation": "app", "args": {"subcommand": "relaunch", self.INCREMENTAL: True, "appArgs": []}, "env": forged},
+            ):
+                with self.subTest(operation=request["operation"]):
+                    env = registry.prepare(request)[3]
+                    self.assertNotIn("RPCE_OPTIMIZED_INCREMENTAL", env)
+                    self.assertNotIn("RPCE_OPTIMIZED_DIAGNOSTICS", env)
+
+    def test_run_and_relaunch_optimized_incremental_cli(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        run_cases = {
+            ("--optimized-incremental",): {self.INCREMENTAL: True, "appArgs": []},
+            ("--optimized-incremental", "--", "--demo"): {self.INCREMENTAL: True, "appArgs": ["--demo"]},
+            # A repeat of the same flag keeps today's pass-through rule; after '--' it is an app argument.
+            ("--optimized-incremental", "--optimized-incremental"): {
+                self.INCREMENTAL: True, "appArgs": ["--optimized-incremental"]
+            },
+            ("--", "--optimized-incremental"): {"appArgs": ["--optimized-incremental"]},
+            ("--optimized", "--", "--optimized-incremental"): {"optimized": True, "appArgs": ["--optimized-incremental"]},
+        }
+        for argv, expected in run_cases.items():
+            with self.subTest(argv=argv), mock.patch.object(conductor, "enqueue_and_maybe_wait", return_value=0) as enqueue:
+                self.assertEqual(conductor.handle_real_operation(state.paths, "run", list(argv)), 0)
+                self.assertEqual(enqueue.call_args.args[2], expected)
+        relaunch_cases = {
+            ("relaunch", "--optimized-incremental"): {"subcommand": "relaunch", self.INCREMENTAL: True, "appArgs": []},
+            ("relaunch", "--optimized-incremental", "--", "--demo"): {
+                "subcommand": "relaunch", self.INCREMENTAL: True, "appArgs": ["--demo"]
+            },
+            ("relaunch", "--", "--optimized-incremental"): {"subcommand": "relaunch", "appArgs": ["--optimized-incremental"]},
+        }
+        for argv, expected in relaunch_cases.items():
+            with self.subTest(argv=argv), mock.patch.object(conductor, "enqueue_and_maybe_wait", return_value=0) as enqueue:
+                self.assertEqual(conductor.handle_real_operation(state.paths, "app", list(argv)), 0)
+                self.assertEqual(enqueue.call_args.args[2], expected)
+        rejected = {
+            ("run", "--optimized", "--optimized-incremental"): "mutually exclusive",
+            ("run", "--optimized-incremental", "--optimized"): "mutually exclusive",
+            ("app", "relaunch", "--optimized", "--optimized-incremental"): "mutually exclusive",
+            ("app", "relaunch", "--optimized-incremental", "--optimized"): "mutually exclusive",
+            ("app", "relaunch", "--optimized-incremental", "--demo"): "must follow '--'",
+            ("app", "launch-existing", "--optimized-incremental"): "launch-existing does not build",
+            ("app", "status", "--optimized-incremental"): "does not accept application arguments",
+        }
+        for (operation, *argv), message in rejected.items():
+            with self.subTest(argv=argv), mock.patch.object(conductor, "enqueue_and_maybe_wait", return_value=0) as enqueue:
+                with self.assertRaisesRegex(conductor.ConductorError, message):
+                    conductor.handle_real_operation(state.paths, operation, list(argv))
+                enqueue.assert_not_called()
+
+    def test_run_and_relaunch_optimized_incremental_prepare_and_launch_existing_refusal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = conductor.OperationRegistry(Path(tmp))
+            floor = max(conductor.MEDIUM_TIMEOUT_SECONDS, conductor.OPTIMIZED_LANE_TIMEOUT_FLOOR_SECONDS)
+            for request in (
+                {"operation": "run", "args": {self.INCREMENTAL: True, "appArgs": ["--demo"]}, "env": {}},
+                {"operation": "app", "args": {"subcommand": "relaunch", self.INCREMENTAL: True, "appArgs": []}, "env": {}},
+            ):
+                with self.subTest(operation=request["operation"]):
+                    argv, lanes, _cwd, _env, timeout = registry.prepare(request)
+                    payload = json.loads(argv[-1])
+                    self.assertEqual(payload["kind"], "debug_app_build_then_launch")
+                    self.assertIs(payload["args"][self.INCREMENTAL], True)
+                    self.assertNotIn("optimized", payload["args"])
+                    self.assertEqual((lanes, timeout), (["liveApp"], floor))
+                    with self.assertRaisesRegex(conductor.ConductorError, "must be true"):
+                        registry.prepare(dict(request, args=dict(request["args"], **{self.INCREMENTAL: "true"}), timeout=1.0))
+            with self.assertRaisesRegex(conductor.ConductorError, "launch-existing does not build"):
+                registry.prepare(
+                    {"operation": "app", "args": {"subcommand": "launch-existing", self.INCREMENTAL: True, "appArgs": []}}
+                )
+
+    def test_optimized_incremental_timeout_hint_names_its_own_flag(self) -> None:
+        for operation, args, command in (
+            ("build", {self.INCREMENTAL: True}, "./conductor build --optimized-incremental --timeout <seconds>"),
+            ("run", {self.INCREMENTAL: True, "appArgs": []}, "./conductor run --optimized-incremental --timeout <seconds>"),
+            ("app", {"subcommand": "relaunch", self.INCREMENTAL: True, "appArgs": []},
+             "./conductor app relaunch --optimized-incremental --timeout <seconds>"),
+        ):
+            with self.subTest(operation=operation):
+                hint = conductor.optimized_lane_timeout_hint(operation, args, 10.0) or ""
+                self.assertIn(command, hint)
+                self.assertIn("every module except RepoPromptApp", hint)
+        for operation, args in (
+            ("app", {"subcommand": "launch-existing", self.INCREMENTAL: True}),
+            ("package", {"config": "debug", self.INCREMENTAL: True}),
+        ):
+            self.assertIsNone(conductor.optimized_lane_timeout_hint(operation, args, 10.0))
+        # The WMO lane's hint is unchanged.
+        self.assertIn("./conductor build --optimized --timeout", conductor.optimized_lane_timeout_hint("build", {"optimized": True}, 1.0))
+        _state, waited, prepared = self.run_build_until_timeout({self.INCREMENTAL: True})
+        self.assertEqual((waited["state"], waited["exitCode"]), ("failed", 124))
+        self.assertIn("./conductor build --optimized-incremental --timeout <seconds>", waited.get("error") or "")
+        self.assertIn("hint: optimized-incremental builds", "".join(waited.get("logTail") or []))
+        floor = max(conductor.MEDIUM_TIMEOUT_SECONDS, conductor.OPTIMIZED_LANE_TIMEOUT_FLOOR_SECONDS)
+        self.assertEqual(float(prepared[0]), float(floor))
+
+    def test_optimized_incremental_requests_never_share_a_request_key_with_other_lanes(self) -> None:
+        for operation, plain_args in (("build", {}), ("run", {"appArgs": []}), ("app", {"subcommand": "relaunch", "appArgs": []})):
+            with self.subTest(operation=operation):
+                tmp, state = self.make_state()
+                self.addCleanup(tmp.cleanup)
+                lane_args = dict(plain_args, **{self.INCREMENTAL: True})
+                with mock.patch.object(state, "_schedule_locked"):
+                    first = state.enqueue({"operation": operation, "args": lane_args, "env": {}, "requestKey": "k"})
+                    for other in (plain_args, dict(plain_args, optimized=True)):
+                        with self.assertRaisesRegex(conductor.ConductorError, "request-key mismatch"):
+                            state.enqueue({"operation": operation, "args": dict(other), "env": {}, "requestKey": "k"})
+                    again = state.enqueue({"operation": operation, "args": dict(lane_args), "env": {}, "requestKey": "k"})
+                self.assertEqual(again["ticket"], first["ticket"])
+                self.assertIs(state.jobs[first["ticket"]].args[self.INCREMENTAL], True)
+
+    def test_newest_relaunch_intent_supersedes_the_incremental_lane_too(self) -> None:
+        for old_operation, old_args, new_args in (
+            ("run", {self.INCREMENTAL: True, "appArgs": []}, {"subcommand": "relaunch", "optimized": True, "appArgs": []}),
+            ("app", {"subcommand": "relaunch", "optimized": True, "appArgs": []},
+             {"subcommand": "relaunch", self.INCREMENTAL: True, "appArgs": []}),
+        ):
+            with self.subTest(old=old_args, new=new_args):
+                tmp, state = self.make_state()
+                self.addCleanup(tmp.cleanup)
+                old = self.make_job(state, "old", old_operation, dict(old_args), ["liveApp"])
+                state.jobs[old.ticket] = old
+                state.queue.append(old.ticket)
+                with mock.patch.object(state, "_schedule_locked"):
+                    payload = state.enqueue({"operation": "app", "args": dict(new_args)})
+                self.assertEqual(old.state, "canceled")
+                newest = state.jobs[payload["ticket"]]
+                self.assertEqual(newest.args.get(self.INCREMENTAL), new_args.get(self.INCREMENTAL))
+                self.assertEqual(newest.args.get("optimized"), new_args.get("optimized"))
 
     def test_guardrails_delegates_aggregator_without_lanes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -6549,7 +6775,7 @@ class AppStatusIdentityTests(unittest.TestCase):
 
     def test_staged_package_forwards_lane_config_and_keeps_reuse_source(self) -> None:
         # Step 5: only the package_app.sh config changes; staging and the reuse source are as for debug.
-        for config in ("debug", "debug-optimized"):
+        for config in ("debug", "debug-optimized", "debug-optimized-incremental"):
             captured: dict = {}
 
             def fake_package(name, argv, cwd, env=None, **_kwargs):
@@ -6580,7 +6806,8 @@ class AppStatusIdentityTests(unittest.TestCase):
         )
 
     def test_staged_package_rejects_unknown_config_before_staging_or_slot(self) -> None:
-        for config in ("release", "fast", "", "debug ", "Debug", "debug-optimized fast"):
+        for config in ("release", "fast", "", "debug ", "Debug", "debug-optimized fast", "debug-incremental",
+                       "debug-optimized-incremental fast", "optimized-incremental"):
             with self.subTest(config=config), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 live = root / "DebugApps" / "RepoPrompt.app"
@@ -6633,6 +6860,8 @@ class AppStatusIdentityTests(unittest.TestCase):
             ({"appArgs": ["--demo"], "subcommand": "relaunch"}, "debug"),
             ({"optimized": True, "appArgs": []}, "debug-optimized"),
             ({"optimized": True, "appArgs": ["--demo"], "subcommand": "relaunch"}, "debug-optimized"),
+            ({"optimizedIncremental": True, "appArgs": []}, "debug-optimized-incremental"),
+            ({"optimizedIncremental": True, "appArgs": ["--demo"], "subcommand": "relaunch"}, "debug-optimized-incremental"),
         )
         for args, config in cases:
             with self.subTest(args=args), mock.patch.object(
@@ -6645,14 +6874,22 @@ class AppStatusIdentityTests(unittest.TestCase):
             self.assertEqual(launch_args["stagedBundle"], "/tmp/staged/RepoPrompt.app")
             self.assertEqual(launch_args["appArgs"], args["appArgs"])
         for bad in (False, "true", 1):
-            with self.subTest(bad=bad), mock.patch.object(conductor, "package_debug_app_under_heavy") as package:
-                with self.assertRaisesRegex(conductor.ConductorError, "must be true"):
-                    conductor.operation_debug_app_build_then_launch(Path("/tmp/repo"), {"optimized": bad, "appArgs": []})
-            package.assert_not_called()
+            for key in ("optimized", "optimizedIncremental"):
+                with self.subTest(bad=bad, key=key), mock.patch.object(conductor, "package_debug_app_under_heavy") as package:
+                    with self.assertRaisesRegex(conductor.ConductorError, "must be true"):
+                        conductor.operation_debug_app_build_then_launch(Path("/tmp/repo"), {key: bad, "appArgs": []})
+                package.assert_not_called()
+        with mock.patch.object(conductor, "package_debug_app_under_heavy") as package:
+            with self.assertRaisesRegex(conductor.ConductorError, "mutually exclusive"):
+                conductor.operation_debug_app_build_then_launch(
+                    Path("/tmp/repo"), {"optimized": True, "optimizedIncremental": True, "appArgs": []}
+                )
+        package.assert_not_called()
 
     def test_provenance_report_names_build_lane_or_pre_lane_unknown(self) -> None:
         cases = (
             ({"buildLane": "debug-optimized"}, "    build lane: debug-optimized"),
+            ({"buildLane": "debug-optimized-incremental"}, "    build lane: debug-optimized-incremental"),
             ({"buildLane": "debug"}, "    build lane: debug"),
             ({}, "    build lane: unknown (pre-lane provenance)"),
             ({"buildLane": ""}, "    build lane: <invalid: ''>"),

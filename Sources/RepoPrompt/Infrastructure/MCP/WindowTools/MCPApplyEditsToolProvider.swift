@@ -176,8 +176,19 @@ final class MCPApplyEditsToolProvider: MCPWindowToolProviding {
             }
 
             if shouldRequireApproval, let approvalScope {
+                // Step 5a: the review's recovery owner (or its established untracked status) is
+                // frozen before any new await; nothing later adopts a replacement owner.
+                let agentModeViewModel = try dependencies.requireTargetWindow().agentModeViewModel
+                let recoveryOwner = try agentModeViewModel.mcpCaptureApplyEditsReviewOwner(tabID: approvalScope.tabID)
+                // A recovery-tracked review is bound to one canonical absolute file: the preview reads
+                // it, the proposal stores it, and the reviewed write targets it (untracked unchanged).
+                let existingTarget: String? = if recoveryOwner != nil {
+                    await host.canonicalExistingFilePath(path: effectivePath)
+                } else {
+                    nil
+                }
                 let previewRequest = ApplyEditsRequest(
-                    path: effectivePath,
+                    path: existingTarget ?? effectivePath,
                     mode: request.mode,
                     verbose: true
                 )
@@ -188,26 +199,60 @@ final class MCPApplyEditsToolProvider: MCPWindowToolProviding {
                 }
                 let reviewUnifiedDiff = previewResult.unifiedDiffForToolCard(filePath: displayPath)
                     ?? "No textual diff available for this apply_edits request."
+                let reviewTargetPath: String = if recoveryOwner == nil {
+                    effectivePath
+                } else {
+                    try await Self.canonicalReviewTarget(
+                        existingTarget: existingTarget,
+                        previewExists: preview.exists,
+                        effectivePath: effectivePath,
+                        host: host
+                    )
+                }
 
-                let decision = await dependencies.applyEditsApprovalStore.requestReview(
-                    scope: approvalScope,
+                // Then the review's identity, then its proposal saved for crash recovery under the
+                // frozen owner before the review is shown.
+                let ticket = await dependencies.applyEditsApprovalStore.beginReview(scope: approvalScope)
+                let recovery = try await agentModeViewModel.mcpAdmitApplyEditsReviewProposal(
+                    owner: recoveryOwner,
+                    reviewID: ticket.reviewID,
+                    input: ApplyEditsReviewProposalInput(
+                        physicalPath: reviewTargetPath,
+                        displayPath: displayPath,
+                        unifiedDiff: reviewUnifiedDiff,
+                        proposedText: previewResult.updatedText,
+                        baseText: preview.exists ? preview.originalText : nil
+                    )
+                )
+                let decision = await dependencies.applyEditsApprovalStore.awaitReview(
+                    ticket,
                     path: displayPath,
                     unifiedDiff: reviewUnifiedDiff,
                     timeoutSeconds: MCPTimeoutPolicy.applyEditsApprovalTimeoutSeconds
                 )
+                let recoveryViewModel = recovery == nil ? nil : agentModeViewModel
+                let approvalStore = dependencies.applyEditsApprovalStore
 
                 switch decision {
                 case .accept:
-                    try await EditFlowPerf.measure(
-                        EditFlowPerf.Stage.ApplyEdits.hostWrite,
-                        EditFlowPerf.Dimensions(fileBytes: previewResult.updatedText.utf8.count, appliedCount: previewResult.editsApplied)
-                    ) {
-                        try await host.writeText(
-                            path: effectivePath,
-                            content: previewResult.updatedText,
-                            overwrite: preview.exists
-                        )
-                    }
+                    // `applicationStarted` acknowledged, then the exact ticket and owner re-checked,
+                    // before the existing host write (recovery-tracked sessions only).
+                    let recorded = try await agentModeViewModel.mcpPerformAcceptedApplyEditsReview(
+                        recovery,
+                        ticketIsCurrent: { await approvalStore.isReviewTicketCurrent(ticket) },
+                        write: {
+                            try await EditFlowPerf.measure(
+                                EditFlowPerf.Stage.ApplyEdits.hostWrite,
+                                EditFlowPerf.Dimensions(fileBytes: previewResult.updatedText.utf8.count, appliedCount: previewResult.editsApplied)
+                            ) {
+                                try await host.writeText(
+                                    path: reviewTargetPath,
+                                    content: previewResult.updatedText,
+                                    overwrite: preview.exists
+                                )
+                            }
+                        }
+                    )
                     let freshness = await postMutationFreshness(
                         userPath: effectivePath,
                         rootScope: lookupContext.rootScope
@@ -224,6 +269,23 @@ final class MCPApplyEditsToolProvider: MCPWindowToolProviding {
                             outcome: "success"
                         )
                     #endif
+                    guard recorded else {
+                        // Truthful partial success: the file was written; only the recovery
+                        // record of that is missing. Never "nothing changed", never retry.
+                        return editSummary(
+                            from: persistedResult,
+                            path: displayPath,
+                            statusOverride: "partial",
+                            noteOverride: Self.recoveryRecordFailedNote,
+                            reviewStatus: "accepted",
+                            requiresUserApproval: true,
+                            operationID: operationID,
+                            freshness: freshness,
+                            errorMessage: Self.recoveryRecordFailedNote,
+                            errorCode: "recovery_record_failed",
+                            retryable: false
+                        )
+                    }
                     return editSummary(
                         from: persistedResult,
                         path: displayPath,
@@ -233,6 +295,24 @@ final class MCPApplyEditsToolProvider: MCPWindowToolProviding {
                         freshness: freshness
                     )
                 case let .reject(reason):
+                    let withdrawn = await recoveryViewModel?.mcpFinishApplyEditsReview(recovery, .withdrawn) ?? true
+                    guard withdrawn else {
+                        // Truthful: nothing was written, but the rejection was not saved, so the
+                        // proposal stays historical in Needs Attention.
+                        let note = Self.rejectionNotRecordedNote(reason: reason)
+                        return editSummary(
+                            from: previewResult,
+                            path: displayPath,
+                            statusOverride: "failed",
+                            noteOverride: note,
+                            reviewStatus: "rejected",
+                            rejectionReason: reason,
+                            requiresUserApproval: true,
+                            errorMessage: note,
+                            errorCode: "recovery_record_failed",
+                            retryable: false
+                        )
+                    }
                     return editSummary(
                         from: previewResult,
                         path: displayPath,
@@ -243,6 +323,7 @@ final class MCPApplyEditsToolProvider: MCPWindowToolProviding {
                         requiresUserApproval: true
                     )
                 case .timeout:
+                    await recoveryViewModel?.mcpFinishApplyEditsReview(recovery, .preserved)
                     return editSummary(
                         from: previewResult,
                         path: displayPath,
@@ -252,6 +333,7 @@ final class MCPApplyEditsToolProvider: MCPWindowToolProviding {
                         requiresUserApproval: true
                     )
                 case let .cancelled(reason):
+                    await recoveryViewModel?.mcpFinishApplyEditsReview(recovery, .preserved)
                     return editSummary(
                         from: previewResult,
                         path: displayPath,
@@ -397,7 +479,10 @@ final class MCPApplyEditsToolProvider: MCPWindowToolProviding {
         rejectionReason: String? = nil,
         requiresUserApproval: Bool? = nil,
         operationID: String? = nil,
-        freshness: String? = nil
+        freshness: String? = nil,
+        errorMessage: String? = nil,
+        errorCode: String? = nil,
+        retryable: Bool? = nil
     ) -> EditSummary {
         let lineStats = result.toolCardLineStats()
         return EditSummary(
@@ -417,11 +502,39 @@ final class MCPApplyEditsToolProvider: MCPWindowToolProviding {
             reviewStatus: reviewStatus,
             rejectionReason: rejectionReason,
             requiresUserApproval: requiresUserApproval,
+            errorMessage: errorMessage,
+            errorCode: errorCode,
+            retryable: retryable,
             operationID: operationID,
             mutationState: operationID == nil ? nil : "applied",
             freshness: freshness
         )
     }
+
+    /// Step 5a: the canonical absolute file a recovery-tracked review previewed and will write: the
+    /// existing file resolved before the preview, or for a new file the create destination resolved
+    /// now (current selection and policy). Fails closed rather than inventing a target when the
+    /// preview disagrees with the resolution or no destination can be established.
+    static func canonicalReviewTarget(
+        existingTarget: String?,
+        previewExists: Bool,
+        effectivePath: String,
+        host: WorkspaceFileEditHost
+    ) async throws -> String {
+        let unestablished = "apply_edits: the file this edit targets couldn't be established for review (it appeared, disappeared, or moved while the edit was being prepared). Nothing was changed. Retry the edit."
+        if previewExists {
+            guard let existingTarget else { throw MCPError.invalidParams(unestablished) }
+            return existingTarget
+        }
+        guard existingTarget == nil else { throw MCPError.invalidParams(unestablished) }
+        return try await host.canonicalCreateDestinationPath(path: effectivePath)
+    }
+
+    static func rejectionNotRecordedNote(reason: String) -> String {
+        "Rejected by user: \(reason). The file was not changed, but RepoPrompt could not save the rejection in its crash-recovery state, so the proposal remains listed in Needs Attention. It is never applied automatically."
+    }
+
+    static let recoveryRecordFailedNote = "The edit was written to the file, but RepoPrompt could not record that in its crash-recovery state. Do not retry this edit; it is already applied. After a restart this edit may be listed as possibly applied."
 
     private static func mapApplyEditsError(_ error: ApplyEditsError) -> MCPError {
         switch error {

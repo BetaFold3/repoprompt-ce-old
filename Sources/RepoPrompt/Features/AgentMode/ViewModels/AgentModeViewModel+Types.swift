@@ -29,6 +29,13 @@ extension AgentModeViewModel {
         case scheduled(record: AgentScheduledSendPersist, attempt: AgentScheduledSendPersist.Attempt)
     }
 
+    /// Whether the shared append seam appended the turn's bubble or reused an authorized, already
+    /// shown deterministic bubble (Send saved, review A P1-06).
+    enum PreparedUserTurnBubbleDisposition: Equatable {
+        case appended
+        case reused
+    }
+
     /// Result of the shared append seam used by composer, MCP, and scheduled turns.
     struct PreparedUserTurnAppend {
         let userItem: AgentChatItem
@@ -38,6 +45,13 @@ extension AgentModeViewModel {
         let wrappedText: String
         let codexCompactionInFlight: Bool
         let stagedCodexComputerUseActivationID: UUID?
+        var disposition: PreparedUserTurnBubbleDisposition = .appended
+
+        /// The bubble failure cleanup may remove: only one this submission appended. A reused
+        /// bubble belongs to an earlier submission and is never deleted.
+        var removableUserItemID: UUID? {
+            disposition == .appended ? userItem.id : nil
+        }
     }
 
     struct AgentComposerSubmitClaim {

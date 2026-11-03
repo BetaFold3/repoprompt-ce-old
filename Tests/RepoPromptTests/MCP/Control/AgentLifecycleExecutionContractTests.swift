@@ -315,7 +315,8 @@ final class AgentLifecycleExecutionContractTests: XCTestCase {
         let metadata = MCPServerViewModel.RequestMetadata(
             connectionID: connectionID,
             clientName: "agent-lifecycle-contract-tests",
-            windowID: window.windowID
+            windowID: window.windowID,
+            actorRoutedRunTab: nil
         )
         let bound = await window.mcpServer.resolveAgentLifecycleWaitPolicyContext(metadata: metadata)
         XCTAssertEqual(bound.parentFamily, .codex)
@@ -365,14 +366,16 @@ final class AgentLifecycleExecutionContractTests: XCTestCase {
         let unboundConnection = MCPServerViewModel.RequestMetadata(
             connectionID: UUID(),
             clientName: "agent-lifecycle-contract-tests",
-            windowID: window.windowID
+            windowID: window.windowID,
+            actorRoutedRunTab: nil
         )
         let unbound = await window.mcpServer.resolveAgentLifecycleWaitPolicyContext(metadata: unboundConnection)
         XCTAssertEqual(unbound.parentFamily, .unresolved)
         let noConnection = MCPServerViewModel.RequestMetadata(
             connectionID: nil,
             clientName: "agent-lifecycle-contract-tests",
-            windowID: window.windowID
+            windowID: window.windowID,
+            actorRoutedRunTab: nil
         )
         let anonymous = await window.mcpServer.resolveAgentLifecycleWaitPolicyContext(metadata: noConnection)
         XCTAssertEqual(anonymous.parentFamily, .unresolved)
@@ -411,7 +414,8 @@ final class AgentLifecycleExecutionContractTests: XCTestCase {
         let metadata = MCPServerViewModel.RequestMetadata(
             connectionID: connectionID,
             clientName: "agent-lifecycle-contract-tests",
-            windowID: window.windowID
+            windowID: window.windowID,
+            actorRoutedRunTab: nil
         )
         let context = await window.mcpServer.resolveAgentLifecycleWaitPolicyContext(metadata: metadata)
         XCTAssertEqual(context.parentFamily, .unresolved)
@@ -437,7 +441,8 @@ final class AgentLifecycleExecutionContractTests: XCTestCase {
         let remote = MCPServerViewModel.RequestMetadata(
             connectionID: connectionID,
             clientName: "remote:abcd1234",
-            windowID: window.windowID
+            windowID: window.windowID,
+            actorRoutedRunTab: nil
         )
         let remoteContext = await window.mcpServer.resolveAgentLifecycleWaitPolicyContext(metadata: remote)
         XCTAssertEqual(remoteContext.parentFamily, .unresolved)
@@ -446,7 +451,8 @@ final class AgentLifecycleExecutionContractTests: XCTestCase {
         let wildcard = MCPServerViewModel.RequestMetadata(
             connectionID: connectionID,
             clientName: MCPClientIdentity.remoteAllDevicesWildcard,
-            windowID: window.windowID
+            windowID: window.windowID,
+            actorRoutedRunTab: nil
         )
         let wildcardContext = await window.mcpServer.resolveAgentLifecycleWaitPolicyContext(metadata: wildcard)
         XCTAssertEqual(wildcardContext.parentFamily, .unresolved)
@@ -455,7 +461,8 @@ final class AgentLifecycleExecutionContractTests: XCTestCase {
         let local = MCPServerViewModel.RequestMetadata(
             connectionID: connectionID,
             clientName: "agent-lifecycle-contract-tests",
-            windowID: window.windowID
+            windowID: window.windowID,
+            actorRoutedRunTab: nil
         )
         let localContext = await window.mcpServer.resolveAgentLifecycleWaitPolicyContext(metadata: local)
         XCTAssertEqual(localContext.parentFamily, .codex)
@@ -476,7 +483,8 @@ final class AgentLifecycleExecutionContractTests: XCTestCase {
         let metadata = MCPServerViewModel.RequestMetadata(
             connectionID: UUID(),
             clientName: "legacy-compatibility-client",
-            windowID: window.windowID
+            windowID: window.windowID,
+            actorRoutedRunTab: nil
         )
         let context = await window.mcpServer.resolveAgentLifecycleWaitPolicyContext(metadata: metadata)
         XCTAssertEqual(context.parentFamily, .unresolved)

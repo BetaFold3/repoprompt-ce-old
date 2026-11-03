@@ -718,6 +718,16 @@ class KeyTests(unittest.TestCase):
                 self.fx.git, self.fx.fields, self.fx.environ = list(saved[0]), saved[1], saved[2]
                 self.assertEqual(self.fx.keys(), self.original)
 
+    def test_debug_lane_conf_isolates_input_key_and_same_lane_reuses_it(self) -> None:
+        lanes = ("debug", "debug-optimized", "debug-optimized-incremental")
+        input_keys = {}
+        for lane in lanes:
+            self.fx.fields["CONF"] = lane
+            first = self.fx.keys()
+            self.assertEqual(self.fx.keys(), first)  # same lane, same inputs: reusable
+            input_keys[lane] = first["input_key"]
+        self.assertEqual(len(set(input_keys.values())), len(lanes))  # reuse never crosses lanes
+
     def test_worktree_identity_changes_input_key(self) -> None:
         moved = self.fx.base / "other-worktree"
         os.rename(self.fx.root, moved)

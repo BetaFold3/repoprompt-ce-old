@@ -47,15 +47,31 @@ struct AgentDelegatedQuestionNoticeRegistry {
             /// `startAgentRun` is still assembling or starting the run; only its own settle step
             /// (or the provider send outcome) may resolve the stage.
             case startInFlight
-            /// The run started; the provider send outcome is still pending. Rolled back if the
-            /// parent run stops without reporting one.
+            /// The run started; the provider send outcome is still pending. Held as
+            /// `deliveryUnknown` if the parent run stops without reporting one.
             case awaitingSendOutcome
+            /// The input carrying this stage may have reached the provider, but no outcome proves
+            /// it either way. Neither acknowledged nor released: the notices stay undeliverable (no
+            /// duplicate) and the child question stays answerable; only this stage's own late
+            /// outcome (`sent` commits once, `notSent` releases) or the question's resolution ends it.
+            case deliveryUnknown
         }
 
         let stageID: UUID
         let keys: Set<AgentDelegatedQuestionNoticeKey>
         let text: String
         var phase: Phase = .startInFlight
+        /// Parent run whose first input carried this stage, captured while that run is provably the
+        /// carrier (its own start in flight, or its start just returned). `nil` when unknown: a late
+        /// commit then stamps no run rather than a successor run.
+        var carryingRunID: UUID?
+    }
+
+    /// A stage no longer current for its parent tab (superseded by a newer first input, or its
+    /// delivery is unknown) whose own outcome is still owed.
+    struct HeldTurnNotice: Equatable {
+        let parentTabID: UUID
+        var notice: StagedTurnNotice
     }
 
     struct Reservation: Equatable {
@@ -73,12 +89,62 @@ struct AgentDelegatedQuestionNoticeRegistry {
     var records: [AgentDelegatedQuestionNoticeKey: Record] = [:]
     /// Next-turn notices staged into a parent's provider input, keyed by parent tab.
     var stagedTurnNoticesByParentTabID: [UUID: StagedTurnNotice] = [:]
+    /// Unresolved earlier stages, keyed by stage ID. Their records keep `stagedParentTabID`, so a
+    /// newer stage never re-carries them.
+    var heldTurnNoticesByStageID: [UUID: HeldTurnNotice] = [:]
     /// Open tool-result handoffs, keyed by reservation ID.
     var reservations: [UUID: Reservation] = [:]
     var isReconciling = false
 
     var isEmpty: Bool {
-        records.isEmpty && stagedTurnNoticesByParentTabID.isEmpty && reservations.isEmpty
+        records.isEmpty && stagedTurnNoticesByParentTabID.isEmpty && heldTurnNoticesByStageID.isEmpty
+            && reservations.isEmpty
+    }
+
+    /// The stage `stageID` of `parentTabID`, current or held.
+    func turnStage(stageID: UUID, parentTabID: UUID) -> StagedTurnNotice? {
+        if let current = stagedTurnNoticesByParentTabID[parentTabID], current.stageID == stageID {
+            return current
+        }
+        guard let held = heldTurnNoticesByStageID[stageID], held.parentTabID == parentTabID else { return nil }
+        return held.notice
+    }
+
+    /// Forgets stage `stageID` of `parentTabID` from both stores (never another stage).
+    mutating func removeTurnStage(stageID: UUID, parentTabID: UUID) {
+        if stagedTurnNoticesByParentTabID[parentTabID]?.stageID == stageID {
+            stagedTurnNoticesByParentTabID.removeValue(forKey: parentTabID)
+        }
+        if heldTurnNoticesByStageID[stageID]?.parentTabID == parentTabID {
+            heldTurnNoticesByStageID.removeValue(forKey: stageID)
+        }
+    }
+
+    /// Moves stage `staged` of `parentTabID` to the held store with `phase`.
+    mutating func holdTurnStage(_ staged: StagedTurnNotice, parentTabID: UUID, phase: StagedTurnNotice.Phase) {
+        removeTurnStage(stageID: staged.stageID, parentTabID: parentTabID)
+        var held = staged
+        held.phase = phase
+        heldTurnNoticesByStageID[staged.stageID] = HeldTurnNotice(parentTabID: parentTabID, notice: held)
+    }
+
+    /// Updates the phase (and, when given, the carrying run) of stage `stageID` in whichever store
+    /// holds it.
+    mutating func setTurnStagePhase(
+        _ phase: StagedTurnNotice.Phase,
+        stageID: UUID,
+        parentTabID: UUID,
+        carryingRunID: UUID? = nil
+    ) {
+        if var current = stagedTurnNoticesByParentTabID[parentTabID], current.stageID == stageID {
+            current.phase = phase
+            current.carryingRunID = current.carryingRunID ?? carryingRunID
+            stagedTurnNoticesByParentTabID[parentTabID] = current
+        } else if var held = heldTurnNoticesByStageID[stageID], held.parentTabID == parentTabID {
+            held.notice.phase = phase
+            held.notice.carryingRunID = held.notice.carryingRunID ?? carryingRunID
+            heldTurnNoticesByStageID[stageID] = held
+        }
     }
 
     func isDeliverable(_ record: Record, toRunID runID: UUID) -> Bool {
@@ -336,14 +402,36 @@ extension AgentModeViewModel {
             changed = true
         }
         for (parentTabID, staged) in delegatedQuestionNotices.stagedTurnNoticesByParentTabID {
-            // A stage whose parent tab is gone, or whose started run stopped without reporting a
-            // send outcome, never reached the model: release it so the notice stays deliverable.
+            // A stage whose parent tab is gone never reaches the model: release it so the notice
+            // stays deliverable elsewhere. A started run that stopped without reporting a send
+            // outcome is not proof of non-delivery: hold the stage as unknown (no re-delivery,
+            // no acknowledgement) until its own late outcome or the question's resolution.
             let parent = sessions[parentTabID]
-            let runStoppedWithoutOutcome = staged.phase == .awaitingSendOutcome
-                && parent?.runState.isActive != true
-            guard parent == nil || runStoppedWithoutOutcome else { continue }
-            rollBackStagedDelegatedQuestionNotices(staged, parentTabID: parentTabID)
-            changed = true
+            if parent == nil {
+                rollBackStagedDelegatedQuestionNotices(staged, parentTabID: parentTabID)
+                changed = true
+            } else if staged.phase == .awaitingSendOutcome, parent?.runState.isActive != true {
+                delegatedQuestionNotices.holdTurnStage(staged, parentTabID: parentTabID, phase: .deliveryUnknown)
+                Self.steeringDebugLog("[DelegatedQuestion] next-turn stage delivery unknown tab=\(parentTabID) stage=\(staged.stageID)")
+                changed = true
+            }
+        }
+        for (stageID, held) in delegatedQuestionNotices.heldTurnNoticesByStageID {
+            let parentTabID = held.parentTabID
+            let holdsLiveRecord = held.notice.keys.contains {
+                delegatedQuestionNotices.records[$0]?.stagedParentTabID == parentTabID
+            }
+            if !holdsLiveRecord {
+                // Every question it carried resolved (or fell back): nothing left to settle.
+                delegatedQuestionNotices.heldTurnNoticesByStageID.removeValue(forKey: stageID)
+                changed = true
+            } else if sessions[parentTabID] == nil {
+                rollBackStagedDelegatedQuestionNotices(held.notice, parentTabID: parentTabID)
+                changed = true
+            } else if held.notice.phase == .awaitingSendOutcome, sessions[parentTabID]?.runState.isActive != true {
+                delegatedQuestionNotices.setTurnStagePhase(.deliveryUnknown, stageID: stageID, parentTabID: parentTabID)
+                changed = true
+            }
         }
         for (reservationID, reservation) in delegatedQuestionNotices.reservations {
             // A tool-result handoff that can no longer reach its run attempt (the run ended, or a
@@ -372,6 +460,7 @@ extension AgentModeViewModel {
         let isRelevant = delegatedQuestionNotices.records.values.contains { record in
             record.childTabID == tabID || record.parentTabID == tabID || record.parentSessionID == sessionID
         } || delegatedQuestionNotices.stagedTurnNoticesByParentTabID[tabID] != nil
+            || delegatedQuestionNotices.heldTurnNoticesByStageID.values.contains { $0.parentTabID == tabID }
         guard isRelevant else { return }
         reconcileDelegatedQuestionNotices(trigger: "bindings")
     }
@@ -723,9 +812,11 @@ extension AgentModeViewModel {
         guard !delegatedQuestionNotices.records.isEmpty || delegatedQuestionNotices.stagedTurnNoticesByParentTabID[session.tabID] != nil else {
             return text
         }
-        // A new first-input assembly supersedes an unresolved earlier stage for this tab.
-        if let stale = delegatedQuestionNotices.stagedTurnNoticesByParentTabID[session.tabID] {
-            rollBackStagedDelegatedQuestionNotices(stale, parentTabID: session.tabID)
+        // A new first-input assembly supersedes an unresolved earlier stage for this tab. Its input
+        // may still reach the provider, so it is held (never rolled back and re-carried) until its
+        // own outcome settles it.
+        if let earlier = delegatedQuestionNotices.stagedTurnNoticesByParentTabID[session.tabID] {
+            delegatedQuestionNotices.holdTurnStage(earlier, parentTabID: session.tabID, phase: earlier.phase)
         }
         guard session.remoteHost == nil,
               let parentSessionID = session.activeAgentSessionID,
@@ -770,31 +861,53 @@ extension AgentModeViewModel {
     }
 
     /// Settles a next-turn stage once `runService.startRun` has returned. A stage the provider send
-    /// outcome already committed or rolled back is gone. Otherwise a start that reported no send,
-    /// or left the run inactive (failed, cancelled, stale, or refused before the provider), rolls
-    /// the stage back so the notice stays deliverable; an active run still owes its send outcome,
-    /// and reconcile rolls the stage back if that run stops without reporting one.
+    /// outcome already committed or rolled back is gone. `startDisposition` is the start's own
+    /// verified result (`AgentModeViewModel.stagedInputStartDisposition`): `notSent` (failed,
+    /// cancelled, stale) releases the stage so the notice stays deliverable; `deliveryUnknown`
+    /// holds it; `nil` means the runner owns the outcome, so the stage awaits it while the run is
+    /// active and is held as unknown otherwise (an inactive run alone is not proof of non-delivery).
     func settleDelegatedQuestionTurnStageAfterRunStart(
         _ stageID: UUID?,
         session: AgentTabSession,
-        startReportedNoSend: Bool
+        startDisposition: AgentStagedInputDisposition?
     ) {
         guard let stageID,
-              var staged = delegatedQuestionNotices.stagedTurnNoticesByParentTabID[session.tabID],
-              staged.stageID == stageID,
+              let staged = delegatedQuestionNotices.turnStage(stageID: stageID, parentTabID: session.tabID),
               staged.phase == .startInFlight
         else {
             return
         }
-        guard !startReportedNoSend, session.runState.isActive else {
-            rollBackStagedDelegatedQuestionNotices(staged, parentTabID: session.tabID)
-            Self.steeringDebugLog("[DelegatedQuestion] next-turn stage released after start without send tab=\(session.tabID)")
-            publishDelegatedQuestionChange(childTabIDs: [])
-            wakeParentsForDelegatedQuestionsIfNeeded()
-            return
+        if let startDisposition {
+            recordDelegatedQuestionNoticeSendOutcome(for: session, stageID: stageID, disposition: startDisposition)
+            if startDisposition == .notSent {
+                Self.steeringDebugLog("[DelegatedQuestion] next-turn stage released after start without send tab=\(session.tabID)")
+                wakeParentsForDelegatedQuestionsIfNeeded()
+            }
+        } else if session.runState.isActive {
+            // The start just returned: its run is the carrier.
+            delegatedQuestionNotices.setTurnStagePhase(
+                .awaitingSendOutcome,
+                stageID: stageID,
+                parentTabID: session.tabID,
+                carryingRunID: delegatedQuestionCarryingRunID(staged, session: session)
+            )
+        } else {
+            recordDelegatedQuestionNoticeSendOutcome(for: session, stageID: stageID, disposition: .deliveryUnknown)
         }
-        staged.phase = .awaitingSendOutcome
-        delegatedQuestionNotices.stagedTurnNoticesByParentTabID[session.tabID] = staged
+    }
+
+    /// Run whose input carried `staged`: the captured carrying run, else the session's run while the
+    /// stage is still the tab's current in-flight start (that start's run is the carrier). `nil`
+    /// otherwise, so a late outcome never stamps a successor run.
+    private func delegatedQuestionCarryingRunID(
+        _ staged: AgentDelegatedQuestionNoticeRegistry.StagedTurnNotice,
+        session: AgentTabSession
+    ) -> UUID? {
+        if let carryingRunID = staged.carryingRunID { return carryingRunID }
+        guard staged.phase == .startInFlight,
+              delegatedQuestionNotices.stagedTurnNoticesByParentTabID[session.tabID]?.stageID == staged.stageID
+        else { return nil }
+        return session.runID
     }
 
     /// Wraps already-neutralized notice text (`AgentDelegatedQuestionNoticePayload.renderedText`)
@@ -811,25 +924,46 @@ extension AgentModeViewModel {
         return "<\(tag) kind=\"delegated_child_questions\">\n\(body)\n</\(tag)>\n\n"
     }
 
-    /// Commits (stamp with the parent's run, acknowledge, persist a labeled note) or rolls back
-    /// the staged next-turn notices once the provider submission outcome of the input that carried
-    /// them is known. Only the stage identified by `stageID` is settled: a late outcome from an
-    /// earlier, superseded start never commits or releases a newer stage. A nil `stageID` (the
-    /// input carried no notices) is a no-op.
+    /// Verified two-state outcome (`didSend` true → `sent`, false → `notSent`).
     func recordDelegatedQuestionNoticeSendOutcome(for session: AgentTabSession, stageID: UUID?, didSend: Bool) {
+        recordDelegatedQuestionNoticeSendOutcome(for: session, stageID: stageID, disposition: didSend ? .sent : .notSent)
+    }
+
+    /// Settles exactly the stage `stageID` (current or held) once the stage-delivery outcome of
+    /// the input that carried it is known: `sent` commits once (stamp with the parent's run,
+    /// acknowledge, persist a labeled note); `notSent` releases it (and strips it from queued Codex
+    /// copies); `deliveryUnknown` holds it, neither acknowledged nor released. A late outcome of an
+    /// earlier stage never commits or releases a newer stage. A nil `stageID` (the input carried
+    /// no notices) is a no-op.
+    func recordDelegatedQuestionNoticeSendOutcome(
+        for session: AgentTabSession,
+        stageID: UUID?,
+        disposition: AgentStagedInputDisposition
+    ) {
         guard let stageID,
-              let staged = delegatedQuestionNotices.stagedTurnNoticesByParentTabID[session.tabID],
-              staged.stageID == stageID
+              let staged = delegatedQuestionNotices.turnStage(stageID: stageID, parentTabID: session.tabID)
         else {
             return
         }
-        guard didSend else {
+        switch disposition {
+        case .notSent:
             rollBackStagedDelegatedQuestionNotices(staged, parentTabID: session.tabID)
             publishDelegatedQuestionChange(childTabIDs: [])
             return
+        case .deliveryUnknown:
+            guard staged.phase != .deliveryUnknown else { return }
+            var held = staged
+            held.carryingRunID = delegatedQuestionCarryingRunID(staged, session: session)
+            delegatedQuestionNotices.holdTurnStage(held, parentTabID: session.tabID, phase: .deliveryUnknown)
+            Self.steeringDebugLog("[DelegatedQuestion] next-turn stage delivery unknown tab=\(session.tabID) stage=\(stageID)")
+            publishDelegatedQuestionChange(childTabIDs: [])
+            return
+        case .sent:
+            break
         }
-        delegatedQuestionNotices.stagedTurnNoticesByParentTabID.removeValue(forKey: session.tabID)
-        let runID = session.runID
+        // The carrying run, never a successor that is current when a late outcome arrives.
+        let runID = delegatedQuestionCarryingRunID(staged, session: session)
+        delegatedQuestionNotices.removeTurnStage(stageID: stageID, parentTabID: session.tabID)
         for key in staged.keys {
             guard var record = delegatedQuestionNotices.records[key],
                   record.stagedParentTabID == session.tabID
@@ -884,7 +1018,7 @@ extension AgentModeViewModel {
         recordDelegatedQuestionNoticeSendOutcome(
             for: session,
             stageID: delegatedQuestionTurnStageID(forTabID: session.tabID),
-            didSend: true
+            disposition: .sent
         )
         return staged
     }
@@ -893,7 +1027,7 @@ extension AgentModeViewModel {
         _ staged: AgentDelegatedQuestionNoticeRegistry.StagedTurnNotice,
         parentTabID: UUID
     ) {
-        delegatedQuestionNotices.stagedTurnNoticesByParentTabID.removeValue(forKey: parentTabID)
+        delegatedQuestionNotices.removeTurnStage(stageID: staged.stageID, parentTabID: parentTabID)
         for key in staged.keys where delegatedQuestionNotices.records[key]?.stagedParentTabID == parentTabID {
             delegatedQuestionNotices.records[key]?.stagedParentTabID = nil
         }

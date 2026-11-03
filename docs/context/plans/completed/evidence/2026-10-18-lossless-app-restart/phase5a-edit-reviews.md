@@ -1,0 +1,57 @@
+# Step 5a — preserve pending apply_edits proposals
+
+Scope: read when the task touches lossless-restart preservation of ordinary pending edit reviews, its source validation or bounded reviews.
+Authority: Reference
+Last-verified: 2026-10-23
+
+## Scope and baseline
+
+Baseline is Step 5b checkpoint 9e508587 (unsigned O8 fallback). This step implements ordinary apply_edits proposals; worktree merge uses its existing operation/artifact authority in separate Step 5c. See [remaining source scope](pre-live-work.md). Phase 3/4 activation remains OFF and O3 live acceptance pending. No app lifecycle or packaging is part of this step.
+
+The main agent's reversible scope assumption is historical View/Copy exact proposal/Discard only, with no recovered Apply. This preserves data without reviving a dead provider request, permission scope or continuation. Base evidence fingerprints preview's decoded original text, with an explicit domain/version and existence flag; it is not a raw-byte checksum. A comparison observes current content, not whether an operation executed. Optional polish and retention remain deferred.
+
+Required live ordering is acknowledged proposal commit before actionable card publication, acknowledged applicationStarted before the existing host write, then an outcome commit. Failure after a successful filesystem write must remain an honest partial success/uncertainty. Owner session/incarnation/reset state and approval scope/review identity must remain current across every new await. Lifecycle/transport expiry preserves historical proposals; explicit user rejection/Discard withdraws durably. No English reason-string inference or fail-open persistence is selected.
+
+## Initial validation evidence
+
+Main directly verified Conductor completed/exit-0 receipts for lint 64fcc11e-cc0e-4f5e-b4aa-78e3100b36ae, format-check 4396fd69-b24b-4bf8-aece-26c638d96403, compile-only app f60ecd06-3f8e-44db-816b-88ae60cc597a and new suite dda73668-cbeb-4f54-8616-7fc7c2b8d57c (9 tests). Main also checked eight adjacent suite receipts/counts: startup reconciliation 21, store 21, questions 14, coordinator 45, delegated-child links 12, disposal 2, metadata extension 32 and MCP mutation failure 14; total 161/0. The adjacent runs precede final style-only edits and are not represented as post-correction validation. [Worker evidence](phase5a-edit-reviews-worker.md) retains all ticket IDs, compile/test/style failures and fixes, refusal of the regex filter, and unverified UI paths. No full-root/core/release-configuration or live validation ran. Final pre-review corrections still require affected validation.
+
+Main verified the pre-review corrected frozen source: 20 source/test files, +1957/-25; staged tree c1d037631854b7d4bd6ef9d2cd5ac64378e4b543 and snapshot 2026-10-23/1445. Final receipts all completed/exit 0: compile-only app d30dccab-547e-4dcf-9ed4-87e7c8d7ebf1, 11-test proposal suite e75236b6-2778-47d0-ac2e-24a769c7e81b, disposal 2/0 48bbd8ea-64ec-461c-aefa-3b2610732dc4, lifecycle-status 8/0 671ada93-48c0-4f81-9065-c14ea9ac708e, lint 0f670995-f3e9-4a50-b5b5-565854495d93 and format check c6344b7a-a139-4313-b87d-a61b1070f5a8. Existing ownership facts and exact ticket are checked after applicationStarted; public lifecycle cancellation also expires the accepted ticket. The real provider uses the tested executing helper. No source write is claimed cancelled once the host owns it.
+
+## Initial independent review
+
+Both fresh lanes completed together on snapshot 2026-10-23/1445 and returned the exact requested explicit UUID/name identities, verified before synthesis. Main read the complete responses: [OracleA](phase5a-edit-reviews-oraclea.md), [OracleB](phase5a-edit-reviews-oracleb.md). A F1/F2 are accepted: freeze owner/recovery requirement before the new ticket await rather than capturing a replacement, and establish canonical physical target through the preview/write resolver rather than storing translated input. Main confirmed both code paths directly. Same Pair worker owns the bounded repair; main owns required fresh A/B re-review.
+
+Cheap coupled corrections include A F3 reset-generation ordering and B neutral comparison/heading, typed dead-code removal, precise Discard identity, stale View reset and known-unstarted revert. Main searched all Sources for AgentRecoveryRecord construction: only codec and store.replace; both carry proposals. A reset-survival assertion will close B P2-5 without a new writer. Retention/growth, generic identity rename, status rename, brittle source-guard refactor and live/UI qualification stay deferred. Full details remain in lane evidence. No additional round is run solely for P2/P3.
+
+Independent scope audit 2026-10-23/1447 read MAP 1–154 and patch 1–2485 completely: exact20 files/+1957/-25, 18 source and two tests, no unrelated hunk, assertion weakening/skip, frozen ledger, release/dependency change or framework expansion. The worker could not independently obtain the staged-tree hash; main's git write-tree supplies it. This is scope evidence, not correctness clearance.
+
+## Repair frozen for R1
+
+Main read the frozen owner/admission/provider path and shared create resolver extraction. The repair is nine files/+471/-140 against unchanged initial index; current total code scope is22 files including WorkspaceFileMutationService and the newly changed WorkspaceFileEditHost. The R1 brief's total of21 was an arithmetic typo; its selected full source and exact nine-file delta did include both helpers. Snapshot2026-10-23/1514 contains only this delta. Worker headings such as Round3 and R1–R21 denote implementation iterations/tickets, not Oracle rounds: the first required R1 A/B review was submitted next.
+
+Main verified final completed/exit0 receipts: compile-only55f7fd2f-1080-4112-bf55-8148e2d9b80b; proposal14/0 bfb65d7e-8aa1-415a-975f-6e16f546cfbc; MCP mutation14/0 5cec5c92-3772-48bf-9941-43e9d393b2c4; lint e0d5fcea-a9fd-48eb-bbf2-21067741d07e; format30267a16-26ca-48c6-8b5b-a836b9ddadc9. Ten adjacent suites on the repaired tree passed297/0 (including WorkspaceFileContextStore128); they precede two provider assignment-to-if-expression style edits. Counts overlap, not unique totals. The final two suites/app compile were rerun after those edits. Full ticket IDs and fixed source-order/style failures remain in worker evidence.
+
+F1 freezes recovery requirement and owner before all new target/preview/ticket awaits and fails closed for a missing mandatory owner. F2 preview/proposal/write use one canonical absolute target; create destination uses exactly the existing resolveCreation policy/refusals, not a new framework. The two-root fixture asserts real comparison results and canonical create output. It does not vary selection: relative unaliased multi-root create already requires unambiguous resolution, and this extraction preserves that contract. Out-of-window worktree targets remain unavailable to historical comparison with neutral wording, not guessed absent. A F3 reset-generation guard and actual current-binding reset-survival assertion are implemented. Open remains existing routing/sidebar behavior; no global router is added. Retention/growth, bounded viewer construction, naming/source-guard refactors, release compile and live/UI qualification stay deferred.
+
+## R1 disposition
+
+Both fresh R1 lanes completed together on snapshot2026-10-23/1514, with each own-lane open P0/P1 verbatim and dispositions, identical code/context/validation and full policy. Both exact returned explicit preset UUID/name identities matched; main read complete [OracleA R1](phase5a-edit-reviews-oraclea-r1.md) and [OracleB R1](phase5a-edit-reviews-oracleb-r1.md). A closes F1/F2/F3 and approves the bounded repair; B finds no P0/P1 regressions. No pending Oracle operation remains. This clears one re-review round, not live qualification.
+
+B R1-P3-2 is corrected by narrowing the two create-destination comments: resolution is not permission to create; final scope/folder/existence checks still apply at the actual write. No behavior changed. R1-P2-1's known-unwritten conservative uncertainty after a retired-lane revert is deferred rather than adopting a successor owner for cosmetic certainty. R1-P3-1 absolute tool diff/error paths remain, while card paths stay logical; R1-P3-3 fail-closed error ordering is intentional. No new P2/P3-only round is run. Prior retention/growth, viewer-construction and naming/source-guard limits remain deferred.
+
+The attempted independent delta audit could not constrain native Git path filtering: snapshot1517 included24files/unrelated dirt and was rejected before its full patch was read. It issued no verdict. Main's Oracle packet was the correct selected nine-file1514 snapshot, not1517. Finalization uses a whole-index audit of only intended staged work without path filtering.
+
+## Maintainer-guidance check
+
+The user benefit is preserving proposed work without reviving a dead request or duplicating file side effects. Existing recovery/session ownership, canonical path resolution, approval ticket and normal write host remain authoritative. No new proposal journal, generic filesystem transaction, provider identity join or retention framework was added. The ordinary reviewed path is source-complete after bounded reviews; full app restart acceptance and unrelated Step4 blockers remain outstanding.
+
+## Local signing
+
+Normal signed commit was retried after validation/audit and waited without a signer result. When main sent an interrupt after the wait, the observed result was exit128 with 1Password's failed-to-fill-buffer error and failed-to-write-commit-object error, not exit130; no signed commit was created. Main then used O8's per-command unsigned fallback, producing76057942471b1e613871948a270c52108096e8b1 (signature N). No signing identity/configuration was changed. This corrects the exit-code wording recorded in that checkpoint; source and review results are unchanged.
+
+## Finalization
+
+Implementation, focused source validation and required independent A/B R1 are complete. Main's pre-review corrections (ticket/owner fence and truthful failed withdrawal) preceded the initial review and are not extra Oracle rounds. Post-review changes are comments only; format check c74af82a-7e80-4a86-8497-e28a1d5d0a43 passed. Guardrails, the context checker, its23 regression tests, pre-commit and staged whitespace checks passed. Full-root/core/release and live checks remain unrun. Main's final status check caught the reviewed host helper still unstaged; it was staged before commit, bringing intended scope to22 code/test plus ten documentation/allowlist files. The final audit was restarted on that complete32-file index. Local checkpoint follows that audit. This checkpoint intentionally also persists the next Step5c scope/planning evidence, not Step5c implementation.
+
+Updated final scope audit snapshot2026-10-23/1524 supersedes the31-file snapshot: MAP1–198 and patch1–4037 read completely, exact32files/+3354/-46 (20source,2tests,9docs,1allowlist), no unrelated staging, assertion weakening/skip, frozen ledger, release metadata or new framework. Main confirmed32indexpaths, tree22359c7021fe4f544e2200474ba95f1966afc6c0 and that only original CodemapSeamTestSupport remains unstaged under source/tests. All four initial/R1 review bodies were compared to original exports and retained completely after documented trailing-whitespace normalization. This audit is scope evidence only; correctness clearance is the required A/B R1.

@@ -26,6 +26,25 @@ struct WorkspaceFileEditHost: FileEditHost {
         await (mutationService.exactExistingFile(path, rootScope: lookupRootScope)) != nil
     }
 
+    /// Step 5a: the canonical absolute path of the existing file `path` names now (the same exact
+    /// lookup `readText`/`writeText` use), or nil when no existing file matches. Passing it back to
+    /// this host reaches the same file whatever the later selection.
+    func canonicalExistingFilePath(path: String) async -> String? {
+        await mutationService.exactExistingFile(path, rootScope: lookupRootScope)?.standardizedFullPath
+    }
+
+    /// Step 5a: resolves a canonical absolute create destination using this host's root scope,
+    /// current selection bias, and create policy, without creating it. Actual creation still runs
+    /// its final scope, folder, and already-exists checks.
+    func canonicalCreateDestinationPath(path: String) async throws -> String {
+        try await mutationService.resolveCreateDestination(
+            userPath: path,
+            rootScope: lookupRootScope,
+            selectedFileFullPaths: selectedFileFullPaths(),
+            pathResolutionPolicy: createPathResolutionPolicy
+        )
+    }
+
     func readText(path: String) async throws -> String {
         let resolved = try await mutationService.resolveExactExistingFileForMutation(path, rootScope: lookupRootScope)
         return try await mutationService.readText(file: resolved) ?? ""

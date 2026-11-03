@@ -90,6 +90,32 @@ final class AppQuitPolicyTests: XCTestCase {
         }
     }
 
+    // MARK: Shutdown reason latch (review A P1-09)
+
+    func testCancelledRestartConfirmationThenOrdinaryQuitIsAPlainQuit() {
+        var latch = AppShutdownReasonLatch()
+        XCTAssertEqual(latch.pending, .appQuit)
+        // Restart safely arms its own termination request; the termination entry takes it first thing,
+        // then the user cancels the quit confirmation (R4 never starts).
+        latch.armSafeRestart()
+        XCTAssertEqual(latch.take(), .safeRestart)
+        latch.disarm()
+        // A later ordinary Quit (Cmd-Q, menu, Dock) is never a restart.
+        XCTAssertEqual(latch.take(), .appQuit)
+        XCTAssertEqual(latch.pending, .appQuit)
+    }
+
+    func testRestartReasonIsBoundToExactlyOneTerminationRequest() {
+        var latch = AppShutdownReasonLatch()
+        latch.armSafeRestart()
+        XCTAssertEqual(latch.take(), .safeRestart)
+        XCTAssertEqual(latch.take(), .appQuit, "a second request in the same cycle (joining one in progress) is a plain quit")
+        // A restart whose terminate was never delivered to the delegate disarms afterwards.
+        latch.armSafeRestart()
+        latch.disarm()
+        XCTAssertEqual(latch.take(), .appQuit)
+    }
+
     private func activity(
         id: String,
         count: Int,

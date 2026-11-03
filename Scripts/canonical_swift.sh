@@ -13,12 +13,21 @@ set -eo pipefail
 # configuration spelling and -Xswiftc (which reaches third-party modules) exit 2
 # before Swift. The manifest gate reaches Swift only through this flag: env -i
 # drops an inherited RPCE_OPTIMIZED_DIAGNOSTICS.
+# Optimized-incremental App lane (`package_app.sh debug-optimized-incremental`): a leading
+# --rpce-optimized-incremental takes the same rules, adds RPCE_OPTIMIZED_INCREMENTAL=1 after the
+# diagnostics gate and uses its own scratch folder. The two lane flags are mutually exclusive.
 optimized_lane=""
-if [[ "${1:-}" == "--rpce-optimized-diagnostics" ]]; then
+optimized_incremental_lane=""
+lane_flag=""
+case "${1:-}" in
+    --rpce-optimized-diagnostics) lane_flag="$1" ;;
+    --rpce-optimized-incremental) lane_flag="$1"; optimized_incremental_lane=1 ;;
+esac
+if [[ -n "$lane_flag" ]]; then
     shift
     optimized_lane=1
     lane_reject() {
-        echo "canonical_swift.sh: --rpce-optimized-diagnostics $1" >&2
+        echo "canonical_swift.sh: $lane_flag $1" >&2
         exit 2
     }
     [[ "${1:-}" == build ]] || lane_reject "supports only the build command; got '${1:-}'"
@@ -38,7 +47,7 @@ if [[ "${1:-}" == "--rpce-optimized-diagnostics" ]]; then
                 ;;
             --build-tests | -Xswiftc | -Xswiftc=* | --scratch-path | --scratch-path=* | --build-path | --build-path=* | \
                 --package-path | --package-path=* | --configuration | --configuration=* | -c=* | \
-                --rpce-optimized-diagnostics)
+                --rpce-optimized-diagnostics | --rpce-optimized-incremental)
                 lane_reject "does not accept '$lane_token'"
                 ;;
         esac
@@ -78,6 +87,9 @@ fi
 if [[ -n "$optimized_lane" ]]; then
     swift_env+=("RPCE_OPTIMIZED_DIAGNOSTICS=1")
 fi
+if [[ -n "$optimized_incremental_lane" ]]; then
+    swift_env+=("RPCE_OPTIMIZED_INCREMENTAL=1")
+fi
 
 # Index store policy (RPCE_INDEX_STORE=on|off; unset means off). No known
 # consumer reads SwiftPM's index store, so qualified debug build/test
@@ -111,7 +123,9 @@ esac
 # The lane's own build folder: never thrashes .build/<arch>/debug or the shared
 # host-native release tree. It precedes classification, so the dSYM and index
 # policies see it (release configuration: full symbols, no index flag).
-if [[ -n "$optimized_lane" ]]; then
+if [[ -n "$optimized_incremental_lane" ]]; then
+    set -- "${@:1:4}" --scratch-path "$PWD/.build/optimized-incremental" "${@:5}"
+elif [[ -n "$optimized_lane" ]]; then
     set -- "${@:1:4}" --scratch-path "$PWD/.build/optimized-diagnostics" "${@:5}"
 fi
 

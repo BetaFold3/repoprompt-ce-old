@@ -171,7 +171,13 @@ import RepoPromptWorkspace
                     )
                     let finalURL = try await window.workspaceManager.saveWorkspaceToFileAsync(activeWorkspace, source: .debugWorkspaceSelectionFixtureApply)
                     await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.flush(url: finalURL)
-                    extra["workspaceSaveFlushed"] = true
+                    // An unpersisted ephemeral workspace is never written, so report the skip
+                    // rather than a flush of a document that does not exist.
+                    let persisted = FileManager.default.fileExists(atPath: finalURL.path)
+                    extra["workspaceSaveFlushed"] = persisted
+                    if !persisted, activeWorkspace.isEphemeral {
+                        extra["workspaceSaveError"] = "ephemeral workspace is not persisted"
+                    }
                     if let diskSelection = Self.debugDiskActiveComposeTabSelection(window: window) {
                         WorkspaceRestorePerfLog.event(
                             "workspaceSelection.fixtureApply.afterDiskFlush",

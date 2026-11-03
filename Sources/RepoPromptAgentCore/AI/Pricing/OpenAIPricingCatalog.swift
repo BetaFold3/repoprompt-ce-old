@@ -124,9 +124,10 @@ package struct OpenAIPricingContextBand: Codable, Equatable, Sendable {
     package let rates: OpenAIPricingRates
 }
 
-/// Per-dimension lower/upper rate bounds across every eligible band, for conditional range
-/// pricing when the caller cannot attribute usage to one band. A dimension is `nil` when any
-/// eligible band lacks it, so a missing rate never collapses into the cheaper band.
+/// Per-dimension lower/upper rate bounds across every eligible band, describing the spread of a
+/// model's listed rates. Usage pricing does not use it (Codex intervals are priced as a point in
+/// one band). A dimension is `nil` when any eligible band lacks it, so a missing rate never
+/// collapses into the cheaper band.
 // swiftformat:disable:next redundantSendable
 package struct OpenAIPricingRateEnvelope: Equatable, Sendable {
     package let input: ClosedRange<Decimal>?
@@ -143,7 +144,8 @@ package struct OpenAIPricingRateEnvelope: Equatable, Sendable {
 }
 
 /// Normalized pricing for one exact model ID. Band distinctions are preserved rather than
-/// flattened; callers choose a band only with positive context attribution.
+/// flattened; the usage pricer chooses exactly one band per interval and names any assumption
+/// it makes when the evidence does not prove the band.
 // swiftformat:disable:next redundantSendable
 package struct OpenAIModelPricing: Codable, Equatable, Sendable {
     let modelID: String
@@ -171,10 +173,11 @@ package struct OpenAIModelPricing: Codable, Equatable, Sendable {
         return band.rates
     }
 
-    /// Selects the band that positively covers `contextTokens`.
+    /// The band the official threshold assigns to a request of `contextTokens` input tokens.
     ///
-    /// Returns `nil` when the choice cannot be made safely: two listed bands without an
-    /// official threshold, or usage at or above a threshold whose long band is not listed.
+    /// Returns `nil` when the threshold cannot decide: two listed bands without an official
+    /// threshold, or a request at or above a threshold whose long band is not listed. Callers that
+    /// must still price (for example with an unstated threshold) apply their own stated assumption.
     package func band(forContextTokens contextTokens: Int) -> OpenAIPricingContextBand? {
         if let flat = bands.first, bands.count == 1, flat.kind == .all {
             return flat
@@ -189,7 +192,7 @@ package struct OpenAIModelPricing: Codable, Equatable, Sendable {
     }
 
     /// Bounds across all eligible bands, available only when the band set is complete
-    /// (`.all`, or both short and long). Ranges bound the stated token-price assumptions only.
+    /// (`.all`, or both short and long). Descriptive only; never used to price usage.
     package var rateEnvelope: OpenAIPricingRateEnvelope {
         let kinds = Set(bands.map(\.kind))
         let complete = kinds == [.all] || kinds == [.shortContext, .longContext]

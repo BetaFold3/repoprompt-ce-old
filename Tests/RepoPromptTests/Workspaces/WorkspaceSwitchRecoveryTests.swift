@@ -9,29 +9,21 @@ import XCTest
 @MainActor
 final class WorkspaceSwitchRecoveryTests: XCTestCase {
     private var originalMCPAutoStart: Bool?
-    private var originalGlobalCustomStorageURL: Any?
-    private var hadOriginalGlobalCustomStorageURL = false
+    private var originalGlobalCustomStorageURL: URL?
 
     override func setUp() {
         super.setUp()
         originalMCPAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
-        originalGlobalCustomStorageURL = UserDefaults.standard.object(forKey: "GlobalCustomStorageURL")
-        hadOriginalGlobalCustomStorageURL =
-            UserDefaults.standard.object(forKey: "GlobalCustomStorageURL") != nil
+        originalGlobalCustomStorageURL = WorkspaceGlobalCustomStorageLocation.load()
     }
 
     override func tearDown() {
         if let originalMCPAutoStart {
             GlobalSettingsStore.shared.setMCPAutoStart(originalMCPAutoStart, commit: false)
         }
-        if hadOriginalGlobalCustomStorageURL {
-            UserDefaults.standard.set(originalGlobalCustomStorageURL, forKey: "GlobalCustomStorageURL")
-        } else {
-            UserDefaults.standard.removeObject(forKey: "GlobalCustomStorageURL")
-        }
+        WorkspaceGlobalCustomStorageLocation.store(originalGlobalCustomStorageURL)
         originalMCPAutoStart = nil
         originalGlobalCustomStorageURL = nil
-        hadOriginalGlobalCustomStorageURL = false
         super.tearDown()
     }
 
@@ -1285,19 +1277,14 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
         storageRoot: URL? = nil
     ) -> WindowStateComposition {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
-        let defaults = UserDefaults.standard
-        let previousStoragePath = defaults.string(forKey: "GlobalCustomStorageURL")
+        let previousStorageRoot = WorkspaceGlobalCustomStorageLocation.load()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
         if let storageRoot {
-            defaults.set(storageRoot.path, forKey: "GlobalCustomStorageURL")
+            WorkspaceGlobalCustomStorageLocation.store(storageRoot)
         }
         defer {
             GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
-            if let previousStoragePath {
-                defaults.set(previousStoragePath, forKey: "GlobalCustomStorageURL")
-            } else {
-                defaults.removeObject(forKey: "GlobalCustomStorageURL")
-            }
+            WorkspaceGlobalCustomStorageLocation.store(previousStorageRoot)
         }
         return WindowStateCompositionFactory.make(
             windowID: -900 - Int.random(in: 1 ... 99),

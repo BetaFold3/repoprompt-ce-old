@@ -191,6 +191,12 @@ struct CodeMapRootManifestAuthority: Hashable {
     let repositoryBindingEpoch: String
     let worktreeBindingEpoch: String
     let layoutGeneration: String
+    /// Digest of the index entry contents (`ls-files --stage -v`), not of the index file's stat,
+    /// except for roots whose entries output exceeds the capability service's limit: those still
+    /// carry the index stat digest. Records written when every root held the stat digest only match
+    /// a current value for such an oversized root with an unchanged index stat, which is the same
+    /// authority as before; every other old record mismatches once and is rebuilt (fail closed), so no
+    /// domain bump is needed.
     let indexGeneration: String
     let checkoutConfigurationGeneration: String
     let attributeGeneration: String

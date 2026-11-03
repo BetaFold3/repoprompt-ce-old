@@ -17,12 +17,23 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
     private let toolTracking: AgentToolTrackingController
     private var streamTask: Task<Void, Never>?
     private var codexItemInvocationIDs: [String: UUID] = [:]
+    /// R6 launch ownership (mandatory for this managed headless caller while registration is on).
+    private let launchAuthority: AgentRuntimeLaunchAuthority
+    private let worktreePath: String?
 
     private var enableDebugLogging: Bool {
         config.enableDebugLogging
     }
 
-    init(runner: CLIProcessRunner, config: CodexExecAgentConfig, mcpHost: any AgentMCPHosting) {
+    init(
+        runner: CLIProcessRunner,
+        config: CodexExecAgentConfig,
+        mcpHost: any AgentMCPHosting,
+        worktreePath: String? = nil,
+        launchAuthority: AgentRuntimeLaunchAuthority = .production
+    ) {
+        self.launchAuthority = launchAuthority
+        self.worktreePath = worktreePath
         self.runner = runner
         self.config = config
         self.mcpHost = mcpHost
@@ -226,11 +237,23 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
 
                                     let expectedPIDRunID = context.runID
                                     let expectedPIDMCPHost = self.mcpHost
+                                    // Each (re)launch is its own runtime; exec runs start fresh conversations.
+                                    // No approval/sandbox configuration is requested by exec runs and no
+                                    // thread identity is parsed from their output: permission unavailable.
+                                    let launch = self.launchAuthority.makeLaunch(AgentRuntimeLaunchContext(
+                                        family: .codexExec,
+                                        provider: .codex,
+                                        session: message.runtimeSession,
+                                        worktreePath: self.worktreePath ?? context.workingDirectory,
+                                        permission: .unavailable
+                                    ))
                                     let stream = try await self.runner.runStreaming(
                                         args: args,
                                         stdin: combinedPrompt,
                                         outputMode: .none,
                                         timeout: 6000,
+                                        // Managed launch boundary: an inherited runtime marker never reaches the child.
+                                        additionalRemovedKeys: [ProcessLauncher.runtimeMarkerEnvironmentKey],
                                         onProcessStarted: { pid in
                                             await expectedPIDMCPHost.registerExpectedAgentPID(
                                                 pid,
@@ -246,7 +269,8 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
                                                 for: Self.codexMCPClientID,
                                                 runID: expectedPIDRunID
                                             )
-                                        }
+                                        },
+                                        launchOwnership: launch
                                     )
 
                                     var framer = LineFramer()

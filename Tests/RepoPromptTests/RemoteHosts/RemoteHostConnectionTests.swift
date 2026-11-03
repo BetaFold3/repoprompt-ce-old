@@ -85,6 +85,12 @@ final class RemoteHostConnectionTests: XCTestCase {
                 devices: [(device, false)]
             )
         )
+        // Step 3 flip: paired connections bind through the access authority and lock unless a valid
+        // capability-1 snapshot authorizes them. These connection tests predate passkey policy, so
+        // apply an all-off snapshot (paired `.unprotected`) to preserve their behavior.
+        _ = await authenticator.applyCapabilityTrust(
+            GatewayAuthTestSupport.capabilityOffSnapshot(hostSigner: hostSigner, devices: [device])
+        )
 
         appConnection = RecordingAppLinkConnection()
         appLink = AppLinkSession(

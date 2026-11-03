@@ -1097,6 +1097,194 @@ final class WorkspaceCodemapGitCapabilityServiceTests: XCTestCase {
         await assertEqual(indexService.state(for: indexRootRequest.rootEpoch), .eligible(indexCapability))
     }
 
+    #if DEBUG
+        func testSourceAuthorityBatchSharesOneRepositoryWindow() async throws {
+            let fixture = try ReviewGitRepositoryFixture(name: #function)
+            let paths = (0 ..< 5).map { "Sources/Feature\($0).swift" }
+            let root = try fixture.makeRepository(
+                named: "repository",
+                files: Dictionary(uniqueKeysWithValues: paths.map { ($0, "let value = 1\n") })
+            )
+            try fixture.settleIndex(at: root)
+            let service = WorkspaceCodemapGitCapabilityService(namespaceSalt: namespaceSalt)
+            let capability = try await capability(service.resolve(root: request(for: root, seed: 106)))
+
+            let before = await service.authorityCaptureCountForTesting()
+            let issuances = await issueSourceAuthorities(service, capability: capability, paths: paths)
+            let after = await service.authorityCaptureCountForTesting()
+
+            XCTAssertEqual(after - before, 2, "One batch must share one pre and one post repository capture.")
+            XCTAssertEqual(issuances.count, paths.count)
+            XCTAssertEqual(issuances.map { $0.token?.standardizedRepositoryRelativePath }, paths)
+        }
+
+        func testSourceAuthorityBatchIsolatesPerCandidatePathRejection() async throws {
+            let fixture = try ReviewGitRepositoryFixture(name: #function)
+            let paths = (0 ..< 5).map { "Sources/Feature\($0).swift" }
+            let root = try fixture.makeRepository(
+                named: "repository",
+                files: Dictionary(uniqueKeysWithValues: paths.map { ($0, "let value = 1\n") })
+            )
+            try fixture.settleIndex(at: root)
+            let service = WorkspaceCodemapGitCapabilityService(namespaceSalt: namespaceSalt)
+            let capability = try await capability(service.resolve(root: request(for: root, seed: 107)))
+            let symlinked = root.appendingPathComponent(paths[2])
+            let target = root.appendingPathComponent("Sources/Target.swift")
+            try "let target = true\n".write(to: target, atomically: true, encoding: .utf8)
+            try FileManager.default.removeItem(at: symlinked)
+            try FileManager.default.createSymbolicLink(at: symlinked, withDestinationURL: target)
+
+            // A no-follow leaf symlink is not a regular file; an escaping path is rejected outright.
+            let requested = paths + ["../Escape.swift"]
+            let before = await service.authorityCaptureCountForTesting()
+            let issuances = await issueSourceAuthorities(service, capability: capability, paths: requested)
+            let after = await service.authorityCaptureCountForTesting()
+
+            XCTAssertEqual(issuances.count, requested.count)
+            for (index, issuance) in issuances.enumerated() {
+                switch index {
+                case 2:
+                    XCTAssertEqual(issuance, .unavailable(.candidateNotRegularFile))
+                case paths.count:
+                    XCTAssertEqual(issuance, .unavailable(.candidatePathRejected))
+                default:
+                    XCTAssertEqual(issuance.token?.standardizedRepositoryRelativePath, requested[index])
+                }
+            }
+            XCTAssertEqual(after - before, 2, "Per-candidate rejections must not open extra windows.")
+        }
+
+        func testSourceAuthorityBatchReportsRootWideIndexChangeForEveryCandidate() async throws {
+            let fixture = try ReviewGitRepositoryFixture(name: #function)
+            let paths = (0 ..< 5).map { "Sources/Feature\($0).swift" }
+            let root = try fixture.makeRepository(
+                named: "repository",
+                files: Dictionary(uniqueKeysWithValues: paths.map { ($0, "let value = 1\n") })
+            )
+            try fixture.settleIndex(at: root)
+            let service = WorkspaceCodemapGitCapabilityService(namespaceSalt: namespaceSalt)
+            let rootRequest = request(for: root, seed: 108)
+            let capability = try await capability(service.resolve(root: rootRequest))
+            try fixture.write("notes\n", to: "Notes.txt", at: root)
+            try fixture.stage("Notes.txt", at: root)
+
+            let before = await service.authorityCaptureCountForTesting()
+            let issuances = await issueSourceAuthorities(service, capability: capability, paths: paths)
+            let after = await service.authorityCaptureCountForTesting()
+
+            XCTAssertEqual(
+                issuances,
+                Array(repeating: .unavailable(.repositoryAuthorityChanged(changed: [.index])), count: paths.count)
+            )
+            XCTAssertEqual(after - before, 1, "A baseline mismatch must end the window after the opening capture.")
+            await assertEqual(service.state(for: rootRequest.rootEpoch), .eligible(capability))
+        }
+
+        func testSourceAuthorityBatchConfigEditInsideWindowIsUnstableForEveryCandidate() async throws {
+            let fixture = try ReviewGitRepositoryFixture(name: #function)
+            let paths = (0 ..< 5).map { "Sources/Feature\($0).swift" }
+            let root = try fixture.makeRepository(
+                named: "repository",
+                files: Dictionary(uniqueKeysWithValues: paths.map { ($0, "let value = 1\n") })
+            )
+            try fixture.settleIndex(at: root)
+            // Edit only an included config file: it is outside every authority file digest, so only
+            // the window's fresh effective-configuration read can observe the change.
+            let includedDirectory = fixture.sandbox.appendingPathComponent("included-config", isDirectory: true)
+            try FileManager.default.createDirectory(at: includedDirectory, withIntermediateDirectories: true)
+            let includedConfig = includedDirectory.appendingPathComponent("extra.config")
+            try "# included\n".write(to: includedConfig, atomically: true, encoding: .utf8)
+            _ = try fixture.runGit(["config", "include.path", includedConfig.path], at: root)
+            let configEdit = RepositoryConfigEdit(configURL: includedConfig)
+            let service = WorkspaceCodemapGitCapabilityService(
+                namespaceSalt: namespaceSalt,
+                hooks: WorkspaceCodemapGitCapabilityServiceHooks(
+                    beforeSourceAuthorityPostRepositoryCapture: { await configEdit.editOnce() }
+                )
+            )
+            let rootRequest = request(for: root, seed: 109)
+            let capability = try await capability(service.resolve(root: rootRequest))
+
+            let issuances = await issueSourceAuthorities(service, capability: capability, paths: paths)
+
+            let didEdit = await configEdit.didEdit
+            XCTAssertTrue(didEdit)
+            XCTAssertEqual(
+                issuances,
+                Array(repeating: .unavailable(.unstableWindow(.repository)), count: paths.count),
+                "Effective configuration must be captured fresh at the window's closing end."
+            )
+            await assertEqual(service.state(for: rootRequest.rootEpoch), .eligible(capability))
+        }
+
+        func testSourceAuthorityBatchIsolatesMidWindowCandidateMutation() async throws {
+            let fixture = try ReviewGitRepositoryFixture(name: #function)
+            let paths = (0 ..< 5).map { "Sources/Feature\($0).swift" }
+            let root = try fixture.makeRepository(
+                named: "repository",
+                files: Dictionary(uniqueKeysWithValues: paths.map { ($0, "let value = 1\n") })
+            )
+            try fixture.settleIndex(at: root)
+            let mutation = SourcePathMutation(url: root.appendingPathComponent(paths[3]))
+            let service = WorkspaceCodemapGitCapabilityService(
+                namespaceSalt: namespaceSalt,
+                hooks: WorkspaceCodemapGitCapabilityServiceHooks(
+                    afterSourcePathFingerprintCapture: { await mutation.mutateOnce() }
+                )
+            )
+            let capability = try await capability(service.resolve(root: request(for: root, seed: 111)))
+
+            let before = await service.authorityCaptureCountForTesting()
+            let issuances = await issueSourceAuthorities(service, capability: capability, paths: paths)
+            let after = await service.authorityCaptureCountForTesting()
+
+            XCTAssertEqual(issuances.count, paths.count)
+            for (index, issuance) in issuances.enumerated() {
+                if index == 3 {
+                    XCTAssertEqual(issuance, .unavailable(.unstableWindow(.pathFingerprint)))
+                } else {
+                    XCTAssertEqual(issuance.token?.standardizedRepositoryRelativePath, paths[index], "index \(index)")
+                }
+            }
+            XCTAssertEqual(after - before, 2, "A candidate-local mutation must not open extra windows.")
+        }
+
+        func testSourceAuthorityBatchSplitsWindowsAndPreservesRequestOrder() async throws {
+            let fixture = try ReviewGitRepositoryFixture(name: #function)
+            let files = (0 ..< 3).map { "Sources/Feature\($0).swift" }
+            let root = try fixture.makeRepository(
+                named: "repository",
+                files: Dictionary(uniqueKeysWithValues: files.map { ($0, "let value = 1\n") })
+            )
+            try fixture.settleIndex(at: root)
+            let service = WorkspaceCodemapGitCapabilityService(namespaceSalt: namespaceSalt)
+            let capability = try await capability(service.resolve(root: request(for: root, seed: 110)))
+            let windowSize = WorkspaceCodemapGitCapabilityService.maximumSourceAuthorityWindowCandidateCount
+            let requestCount = windowSize * 2 + 1
+            let paths = (0 ..< requestCount).map { index in
+                index.isMultiple(of: 10) ? "../Escape\(index).swift" : files[index % files.count]
+            }
+
+            let before = await service.authorityCaptureCountForTesting()
+            let issuances = await issueSourceAuthorities(service, capability: capability, paths: paths)
+            let after = await service.authorityCaptureCountForTesting()
+
+            XCTAssertEqual(issuances.count, requestCount)
+            XCTAssertEqual(after - before, 2 * 3, "Requests beyond one window must split into three windows.")
+            for (index, issuance) in issuances.enumerated() {
+                if index.isMultiple(of: 10) {
+                    XCTAssertEqual(issuance, .unavailable(.candidatePathRejected), "index \(index)")
+                } else {
+                    XCTAssertEqual(
+                        issuance.token?.standardizedRepositoryRelativePath,
+                        paths[index],
+                        "index \(index)"
+                    )
+                }
+            }
+        }
+    #endif
+
     func testLayoutIdentityAndPointerChangesRemainRejected() async throws {
         let fixture = try ReviewGitRepositoryFixture(name: #function)
         let canonical = try fixture.makeRepository(named: "canonical")
@@ -1324,6 +1512,27 @@ final class WorkspaceCodemapGitCapabilityServiceTests: XCTestCase {
             currentPathGeneration: 1,
             observedIngressGeneration: 1,
             currentIngressGeneration: 1
+        )
+    }
+
+    private func issueSourceAuthorities(
+        _ service: WorkspaceCodemapGitCapabilityService,
+        capability: GitCodemapRootCapability,
+        paths: [String]
+    ) async -> [WorkspaceCodemapSourceAuthorityIssuance] {
+        await service.makeSourceAuthorities(
+            capability: capability,
+            observedRootEpoch: capability.rootEpoch,
+            observedRepositoryAuthority: capability.repositoryAuthority,
+            observedIngressGeneration: 1,
+            currentIngressGeneration: 1,
+            requests: paths.map {
+                WorkspaceCodemapSourceAuthorityRequest(
+                    candidateRepositoryRelativePath: $0,
+                    observedPathGeneration: 1,
+                    currentPathGeneration: 1
+                )
+            }
         )
     }
 
@@ -1753,6 +1962,24 @@ private final class DirectoryLeafWindowMutation: @unchecked Sendable {
             value.st_ctimespec.tv_sec,
             value.st_ctimespec.tv_nsec
         ]
+    }
+}
+
+private actor RepositoryConfigEdit {
+    private let configURL: URL
+    private(set) var didEdit = false
+
+    init(configURL: URL) {
+        self.configURL = configURL
+    }
+
+    func editOnce() {
+        guard !didEdit else { return }
+        didEdit = true
+        guard let handle = try? FileHandle(forWritingTo: configURL) else { return }
+        defer { try? handle.close() }
+        _ = try? handle.seekToEnd()
+        try? handle.write(contentsOf: Data("[core]\n\tautocrlf = true\n".utf8))
     }
 }
 

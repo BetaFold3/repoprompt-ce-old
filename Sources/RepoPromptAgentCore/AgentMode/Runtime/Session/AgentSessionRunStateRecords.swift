@@ -140,25 +140,71 @@ package struct AgentCodexComputerUseActivation: Equatable {
     }
 }
 
+/// Identity of one staging of a pending-handoff payload into one provider input. Outcomes settle only
+/// the stage they name: a late outcome of an earlier stage never consumes or releases a newer one, and
+/// an outcome for another payload never clears this one.
+package struct AgentPendingHandoffStage: Equatable, Hashable {
+    package let payloadID: UUID
+    package let stageID: UUID
+
+    package init(payloadID: UUID, stageID: UUID = UUID()) {
+        self.payloadID = payloadID
+        self.stageID = stageID
+    }
+}
+
+/// Why a pending-handoff payload is neither consumed nor available for automatic prepend.
+package enum AgentPendingHandoffDeliveryHold: Equatable {
+    /// Its stage entered the provider boundary without proof either way (this launch).
+    case deliveryUnknown
+    /// Hydrated payload whose recovery-intent join has not resolved yet.
+    case recoveryJoinPending
+    /// Hydrated payload carried by a recovery intent whose delivery is in flight or unknown.
+    case recoveryDeliveryUncertain
+    /// Hydrated payload whose snapshot a still-owning recovery intent (`queued` or `failed`) carries:
+    /// that intent may still be sent explicitly with it, so the payload stays reserved until the
+    /// carrier is withdrawn or its delivery settles.
+    case recoveryCarriedByIntent
+    /// Hydrated payload whose recovery authority is missing or unreadable.
+    case recoveryAuthorityUnavailable
+
+    /// Holds resolved only by the recovery join (never by a runtime stage outcome).
+    package var isRecoveryHold: Bool {
+        self != .deliveryUnknown
+    }
+}
+
 package struct AgentPendingHandoffState: Equatable {
     package var payload: String?
     package var createdAt: Date?
     package var sourceItemID: UUID?
+    /// Durable identity of `payload`, assigned once when the payload is created (or, for a legacy
+    /// payload, by `ensurePayloadID()` before any provider dispatch) and preserved through saves and
+    /// hydration. Recovery intents carry it (`AgentRecoveryPendingHandoffSnapshot.payloadID`) so a
+    /// still-pending payload can be joined against delivery evidence after a restart.
+    package var payloadID: UUID?
     /// True only for a freshly-created handoff tab. Keeps agent selection editable
     /// until the destination tab successfully sends its first real user turn.
     package var defersProviderLockUntilSend: Bool = false
     package var isStagedForSend: Bool = false
+    /// The stage currently carrying `payload` in a provider input (runtime only, never persisted).
+    package var stage: AgentPendingHandoffStage?
+    /// Set while the payload may already have been delivered (runtime only; a hydrated hold is
+    /// recomputed from recovery evidence). A held payload is never prepended automatically.
+    package var deliveryHold: AgentPendingHandoffDeliveryHold?
 
     package init(
         payload: String? = nil,
         createdAt: Date? = nil,
         sourceItemID: UUID? = nil,
+        payloadID: UUID? = nil,
         defersProviderLockUntilSend: Bool = false,
         isStagedForSend: Bool = false
     ) {
         self.payload = payload
         self.createdAt = createdAt
         self.sourceItemID = sourceItemID
+        self.payloadID = payloadID
         self.defersProviderLockUntilSend = defersProviderLockUntilSend
         self.isStagedForSend = isStagedForSend
     }
@@ -168,12 +214,39 @@ package struct AgentPendingHandoffState: Equatable {
         return !payload.isEmpty
     }
 
+    /// The payload is staged into an input awaiting its outcome, or held as possibly delivered:
+    /// it is neither prepended again nor captured for another admission.
+    package var isReservedForSend: Bool {
+        isStagedForSend || stage != nil || deliveryHold != nil
+    }
+
+    /// The next send would prepend this payload (`stagePendingHandoffIfNeeded`'s guards): non-empty
+    /// after trimming and not reserved.
+    package var hasStageablePayload: Bool {
+        guard let payload, !isReservedForSend else { return false }
+        return !payload.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// The payload's durable identity, assigning a new one only to a legacy payload that has none.
+    /// `nil` when there is no payload. The caller persists an assigned ID through its existing
+    /// fenced session save before dispatch; it never changes an ID that is already set.
+    package mutating func ensurePayloadID() -> UUID? {
+        guard hasPayload else { return nil }
+        if let payloadID { return payloadID }
+        let assigned = UUID()
+        payloadID = assigned
+        return assigned
+    }
+
     package mutating func clearAfterSend() {
         payload = nil
         createdAt = nil
         sourceItemID = nil
+        payloadID = nil
         defersProviderLockUntilSend = false
         isStagedForSend = false
+        stage = nil
+        deliveryHold = nil
     }
 }
 
@@ -227,6 +300,9 @@ package struct AgentBashLiveExecutionState: Equatable {
     package var output: String?
     var isSummaryOnly: Bool
     var lastSignalAt: Date
+    /// `codexControllerGeneration` of the controller whose events drive this execution; `nil`
+    /// when it was rebuilt from saved rows with no owning controller (e.g. after relaunch).
+    var ownerControllerGeneration: UUID?
 
     var isRunning: Bool {
         guard let statusWord = statusWord?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),

@@ -167,6 +167,20 @@ final class AgentRunWaitDrainIntegrationTests: XCTestCase {
                 interruptedObject["_meta"]?.objectValue?["wake_reason"]?.stringValue,
                 AgentRunSessionStore.WakeReason.steeringRequested.rawValue
             )
+            // The final service value, not a hand-built fixture, must reach the parent model as
+            // one same-session, tool-correct resume instruction.
+            let sessionID = harness.fixture.sessionID.uuidString
+            let runText = try Self.formattedText(
+                ToolOutputFormatter.formatAgentRun(args: ["op": .string("wait")], value: interruptedValue)
+            )
+            XCTAssertEqual(runText.components(separatedBy: "### Resume waiting").count - 1, 1)
+            XCTAssertTrue(runText.contains("call `agent_run` with `op=wait` and `session_id=\"\(sessionID)\"`"))
+            XCTAssertTrue(runText.contains("- Status: **Running**"))
+            let exploreText = try Self.formattedText(
+                ToolOutputFormatter.formatAgentExplore(args: ["op": .string("wait")], value: interruptedValue)
+            )
+            XCTAssertTrue(exploreText.contains("call `agent_explore` with `op=wait` and `session_id=\"\(sessionID)\"`"))
+            XCTAssertFalse(exploreText.contains("agent_run"))
             XCTAssertFalse(harness.server.hasActiveChildAgentRunWaits(runID: harness.parentRunID))
             XCTAssertEqual(harness.activeScopeCount(), 0)
             let firstCompletions = await harness.completionRecorder.completions()
@@ -195,12 +209,25 @@ final class AgentRunWaitDrainIntegrationTests: XCTestCase {
             try await harness.publishTerminal()
             let terminalValue = try await secondWait.value
             XCTAssertEqual(terminalValue.objectValue?["status"]?.stringValue, AgentRunMCPSnapshot.Status.completed.rawValue)
+            let terminalText = try Self.formattedText(
+                ToolOutputFormatter.formatAgentRun(args: ["op": .string("wait")], value: terminalValue)
+            )
+            XCTAssertFalse(terminalText.contains("### Resume waiting"))
             XCTAssertFalse(harness.server.hasActiveChildAgentRunWaits(runID: harness.parentRunID))
             XCTAssertEqual(harness.activeScopeCount(), 0)
             let allCompletions = await harness.completionRecorder.completions()
             XCTAssertEqual(allCompletions.count, 2)
             XCTAssertEqual(allCompletions.last?.reason, .snapshotReady)
         }
+    }
+
+    private static func formattedText(_ blocks: [MCP.Tool.Content]) throws -> String {
+        XCTAssertEqual(blocks.count, 1)
+        guard case let .text(text, _, _) = try XCTUnwrap(blocks.first) else {
+            XCTFail("Expected a text block")
+            return ""
+        }
+        return text
     }
 }
 
@@ -230,7 +257,8 @@ final class AgentRunWaitDrainTestHarness {
         MCPServerViewModel.RequestMetadata(
             connectionID: connectionID,
             clientName: "agent-run-wait-drain-tests",
-            windowID: window.windowID
+            windowID: window.windowID,
+            actorRoutedRunTab: nil
         )
     }
 
@@ -301,7 +329,8 @@ final class AgentRunWaitDrainTestHarness {
                 MCPServerViewModel.RequestMetadata(
                     connectionID: connectionID,
                     clientName: "agent-run-wait-drain-tests",
-                    windowID: window.windowID
+                    windowID: window.windowID,
+                    actorRoutedRunTab: nil
                 )
             },
             requireTargetWindow: { window },

@@ -134,6 +134,40 @@ package struct WorkspaceFileMutationService {
         selectedFileFullPaths: Set<String> = [],
         pathResolutionPolicy: WorkspaceFileCreatePathResolutionPolicy = .literalPreferredIfStronger
     ) async throws -> WorkspaceFileMutationWriteResult {
+        let result = try await resolveCreation(
+            userPath: userPath,
+            rootScope: rootScope,
+            selectedFileFullPaths: selectedFileFullPaths,
+            pathResolutionPolicy: pathResolutionPolicy
+        )
+        return try await createWithPostcondition(using: result, userPath: userPath, content: content, rootScope: rootScope)
+    }
+
+    /// Resolves a canonical absolute destination without creating anything, using the create
+    /// path's resolver, selection bias, and policy. Actual creation still performs its final scope,
+    /// folder, and already-exists checks; resolution alone is not permission to create.
+    /// An absolute destination resolves to the same root-relative file regardless of later selection.
+    package func resolveCreateDestination(
+        userPath: String,
+        rootScope: WorkspaceLookupRootScope = .visibleWorkspace,
+        selectedFileFullPaths: Set<String> = [],
+        pathResolutionPolicy: WorkspaceFileCreatePathResolutionPolicy = .literalPreferredIfStronger
+    ) async throws -> String {
+        let result = try await resolveCreation(
+            userPath: userPath,
+            rootScope: rootScope,
+            selectedFileFullPaths: selectedFileFullPaths,
+            pathResolutionPolicy: pathResolutionPolicy
+        )
+        return try await creationTarget(of: result, rootScope: rootScope).absolutePath
+    }
+
+    private func resolveCreation(
+        userPath: String,
+        rootScope: WorkspaceLookupRootScope,
+        selectedFileFullPaths: Set<String>,
+        pathResolutionPolicy: WorkspaceFileCreatePathResolutionPolicy
+    ) async throws -> FileCreationResult {
         guard await store.rootScopeAvailability(rootScope) == .available else {
             throw FileManagerError.fileSystemServiceNotFoundWithContext(
                 "The session-bound workspace scope is unavailable. File creation stopped rather than using a replacement root."
@@ -155,12 +189,7 @@ package struct WorkspaceFileMutationService {
         if pathResolutionPolicy == .literalPreferredIfStronger,
            let literal = await resolvedLiteralCreateResult(for: standardizedInput, preflight: preflight, rootScope: rootScope)
         {
-            return try await createWithPostcondition(
-                using: literal,
-                userPath: userPath,
-                content: content,
-                rootScope: rootScope
-            )
+            return literal
         }
 
         if let folder = await exactExistingFolder(standardizedInput, rootScope: rootScope) {
@@ -200,13 +229,21 @@ package struct WorkspaceFileMutationService {
                 "Path '\(userPath)' could match multiple workspace roots: \(candidates). Please disambiguate using 'RootName/\(userPath)' or provide an absolute path."
             )
         case let .unique(result):
-            return try await createWithPostcondition(
-                using: result,
-                userPath: userPath,
-                content: content,
-                rootScope: rootScope
-            )
+            return result
         }
+    }
+
+    private func creationTarget(
+        of result: FileCreationResult,
+        rootScope: WorkspaceLookupRootScope
+    ) async throws -> (root: WorkspaceRootRef, relativePath: String, absolutePath: String) {
+        let rootPath = StandardizedPath.absolute(result.rootFolder.rootPath)
+        guard let root = await store.rootRefs(scope: rootScope).first(where: { $0.standardizedFullPath == rootPath }) else {
+            throw FileManagerError.fileSystemServiceNotFoundWithContext("Internal error: computed creation root is not currently loaded.")
+        }
+        let relativePath = StandardizedPath.relative(result.componentsToCreate.joined(separator: "/"))
+        let absolutePath = StandardizedPath.join(standardizedRoot: root.standardizedFullPath, standardizedRelativePath: relativePath)
+        return (root, relativePath, absolutePath)
     }
 
     private func createWithPostcondition(
@@ -220,12 +257,7 @@ package struct WorkspaceFileMutationService {
                 "The session-bound workspace scope changed during path resolution. File creation stopped rather than using a replacement root."
             )
         }
-        let rootPath = StandardizedPath.absolute(result.rootFolder.rootPath)
-        guard let root = await store.rootRefs(scope: rootScope).first(where: { $0.standardizedFullPath == rootPath }) else {
-            throw FileManagerError.fileSystemServiceNotFoundWithContext("Internal error: computed creation root is not currently loaded.")
-        }
-        let relativePath = StandardizedPath.relative(result.componentsToCreate.joined(separator: "/"))
-        let absolutePath = StandardizedPath.join(standardizedRoot: root.standardizedFullPath, standardizedRelativePath: relativePath)
+        let (root, relativePath, absolutePath) = try await creationTarget(of: result, rootScope: rootScope)
         if let folder = await exactExistingFolder(absolutePath, rootScope: rootScope) {
             throw await FileManagerError.fileSystemServiceNotFoundWithContext("'\(displayPath(for: folder, rootScope: rootScope))' resolves to a folder. Provide a file path.")
         }

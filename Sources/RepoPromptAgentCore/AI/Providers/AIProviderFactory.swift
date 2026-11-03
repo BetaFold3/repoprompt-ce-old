@@ -387,6 +387,10 @@ package struct AIStreamResult {
     package let contentMessageID: String?
     /// Raw provider usage observation for `usage` and result `message_stop` events when available.
     let usageObservation: AgentProviderUsageObservation?
+    /// Step 4d3b (inactive): transient Claude live-identity evidence, set only by a qualified Claude
+    /// native producer (`ClaudeLiveTranscriptProducerState`); `nil` everywhere else. Never encoded,
+    /// logged or persisted; a rebuilt result drops it (fails closed: no identity).
+    package var claudeLiveTranscriptEvidence: ClaudeLiveTranscriptEvidence?
 
     init(
         type: String,

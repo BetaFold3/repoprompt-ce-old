@@ -69,17 +69,12 @@ final class WorkspaceRemoteHostBindingTests: XCTestCase {
 
     private func makeComposition(storageRoot: URL) -> WindowStateComposition {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
-        let defaults = UserDefaults.standard
-        let previousStoragePath = defaults.string(forKey: "GlobalCustomStorageURL")
+        let previousStorageRoot = WorkspaceGlobalCustomStorageLocation.load()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
-        defaults.set(storageRoot.path, forKey: "GlobalCustomStorageURL")
+        WorkspaceGlobalCustomStorageLocation.store(storageRoot)
         defer {
             GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
-            if let previousStoragePath {
-                defaults.set(previousStoragePath, forKey: "GlobalCustomStorageURL")
-            } else {
-                defaults.removeObject(forKey: "GlobalCustomStorageURL")
-            }
+            WorkspaceGlobalCustomStorageLocation.store(previousStorageRoot)
         }
         return WindowStateCompositionFactory.make(
             windowID: -1200 - Int.random(in: 1 ... 99),

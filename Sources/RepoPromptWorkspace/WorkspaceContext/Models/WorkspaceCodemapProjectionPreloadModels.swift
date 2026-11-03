@@ -115,6 +115,13 @@ enum WorkspaceCodemapProjectionDemandAcquisition: Hashable {
     )
 }
 
+/// Identity of the projection catalog a projection job reads and publishes against.
+///
+/// `topologyGeneration` and `appliedIndexGeneration` are store-owned projection revisions: the raw
+/// catalog (topology) and applied-index generations recorded at the last projection-relevant
+/// (non-neutral) applied-index batch, 0 at root load. They are not the shard's current raw
+/// generations; projection-neutral folder-only batches advance the raw generations without moving
+/// them.
 struct WorkspaceCodemapProjectionCatalogToken: Hashable {
     let rootEpoch: WorkspaceCodemapRootEpoch
     let topologyGeneration: UInt64

@@ -621,34 +621,50 @@ final class AgentModeViewModelDelegatedQuestionTests: XCTestCase {
         let key = AgentDelegatedQuestionNoticeKey(childSessionID: child.sessionID, interactionID: interaction.id)
         let itemCount = parent.session.items.count
 
-        // Refused or failed before the provider: the run never became active.
+        // Refused or failed before the provider: the start's own outcome proves no handoff.
         _ = vm.stageDelegatedQuestionNoticesForTurnInput("one", session: parent.session)
         let refusedStage = vm.delegatedQuestionTurnStageID(forTabID: parent.tabID)
         XCTAssertNotNil(refusedStage)
         vm.reconcileDelegatedQuestionNotices(trigger: "test")
         XCTAssertNotNil(vm.delegatedQuestionTurnStageID(forTabID: parent.tabID), "A start in flight keeps its stage")
-        vm.settleDelegatedQuestionTurnStageAfterRunStart(refusedStage, session: parent.session, startReportedNoSend: false)
+        vm.settleDelegatedQuestionTurnStageAfterRunStart(refusedStage, session: parent.session, startDisposition: .notSent)
         assertReleased(vm, key: key, parentTabID: parent.tabID)
 
         // The start reported no send (stale, cancelled, or failed) even though a run is active.
         parent.session.runState = .running
         _ = vm.stageDelegatedQuestionNoticesForTurnInput("two", session: parent.session)
         let failedStage = vm.delegatedQuestionTurnStageID(forTabID: parent.tabID)
-        vm.settleDelegatedQuestionTurnStageAfterRunStart(failedStage, session: parent.session, startReportedNoSend: true)
+        vm.settleDelegatedQuestionTurnStageAfterRunStart(failedStage, session: parent.session, startDisposition: .notSent)
         assertReleased(vm, key: key, parentTabID: parent.tabID)
 
-        // Started, but the run stopped without ever reporting a send outcome.
+        // Started; the run stopped without ever reporting a send outcome. That is not proof of
+        // non-delivery: the stage is held unknown (never re-delivered, never acknowledged) until its
+        // own late outcome, which here proves it was never written.
         _ = vm.stageDelegatedQuestionNoticesForTurnInput("three", session: parent.session)
-        let startedStage = vm.delegatedQuestionTurnStageID(forTabID: parent.tabID)
-        vm.settleDelegatedQuestionTurnStageAfterRunStart(UUID(), session: parent.session, startReportedNoSend: true)
+        let startedStage = try XCTUnwrap(vm.delegatedQuestionTurnStageID(forTabID: parent.tabID))
+        vm.settleDelegatedQuestionTurnStageAfterRunStart(UUID(), session: parent.session, startDisposition: .notSent)
         XCTAssertEqual(vm.delegatedQuestionTurnStageID(forTabID: parent.tabID), startedStage, "Settling never touches another stage")
-        vm.settleDelegatedQuestionTurnStageAfterRunStart(startedStage, session: parent.session, startReportedNoSend: false)
+        vm.settleDelegatedQuestionTurnStageAfterRunStart(startedStage, session: parent.session, startDisposition: nil)
         XCTAssertEqual(vm.delegatedQuestionTurnStageID(forTabID: parent.tabID), startedStage, "An active run awaits its send outcome")
         vm.reconcileDelegatedQuestionNotices(trigger: "test")
         XCTAssertEqual(vm.delegatedQuestionTurnStageID(forTabID: parent.tabID), startedStage)
         parent.session.runState = .failed
         vm.reconcileDelegatedQuestionNotices(trigger: "test")
+        XCTAssertNil(vm.delegatedQuestionTurnStageID(forTabID: parent.tabID), "No longer the tab's current stage")
+        XCTAssertEqual(vm.delegatedQuestionNotices.heldTurnNoticesByStageID[startedStage]?.notice.phase, .deliveryUnknown)
+        XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.stagedParentTabID, parent.tabID, "Held: not deliverable again")
+        XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.acknowledged, false, "Held: not acknowledged")
+        let heldRunID = startParentRun(parent)
+        XCTAssertTrue(
+            vm.mcpHandOffDelegatedQuestionNotices(parentRunID: heldRunID, coveredKeys: []).isEmpty,
+            "A possibly delivered notice is never delivered a second time"
+        )
+        XCTAssertEqual(vm.stageDelegatedQuestionNoticesForTurnInput("four", session: parent.session), "four")
+        XCTAssertTrue(child.session.pendingAskUser?.isAwaitingParentAgent == true, "The child question stays answerable")
+        parent.session.runState = .completed
+        vm.recordDelegatedQuestionNoticeSendOutcome(for: parent.session, stageID: startedStage, disposition: .notSent)
         assertReleased(vm, key: key, parentTabID: parent.tabID)
+        XCTAssertTrue(vm.delegatedQuestionNotices.heldTurnNoticesByStageID.isEmpty)
 
         XCTAssertEqual(parent.session.items.count, itemCount, "Released stages never write a transcript note")
         let nextRunID = startParentRun(parent)
@@ -662,11 +678,114 @@ final class AgentModeViewModelDelegatedQuestionTests: XCTestCase {
         _ = try await task.value
     }
 
+    func testUncertainTurnNoticeSurvivesSupersedingInputAndCommitsOnceOnItsLateSentOutcome() async throws {
+        let vm = makeViewModel()
+        let parent = makeSession(vm, parent: nil)
+        let child = makeSession(vm, parent: parent.sessionID)
+        vm.test_setMCPControlledTabIDs([child.tabID])
+        let firstInteraction = makeInteraction(timeoutSeconds: 60)
+        let firstTask = Task { try await vm.askUser(tabID: child.tabID, interaction: firstInteraction) }
+        try await waitUntil { child.session.pendingAskUser?.isAwaitingParentAgent == true }
+        let firstKey = AgentDelegatedQuestionNoticeKey(childSessionID: child.sessionID, interactionID: firstInteraction.id)
+        let itemCount = parent.session.items.count
+
+        // A start whose delivery is unknown holds its stage.
+        _ = vm.stageDelegatedQuestionNoticesForTurnInput("one", session: parent.session)
+        let uncertainStage = try XCTUnwrap(vm.delegatedQuestionTurnStageID(forTabID: parent.tabID))
+        vm.settleDelegatedQuestionTurnStageAfterRunStart(uncertainStage, session: parent.session, startDisposition: .deliveryUnknown)
+        XCTAssertNil(vm.delegatedQuestionTurnStageID(forTabID: parent.tabID))
+        XCTAssertEqual(vm.delegatedQuestionNotices.heldTurnNoticesByStageID[uncertainStage]?.notice.phase, .deliveryUnknown)
+
+        // The next input and attempt end never re-carry or release it.
+        XCTAssertEqual(vm.stageDelegatedQuestionNoticesForTurnInput("two", session: parent.session), "two")
+        vm.reconcileDelegatedQuestionNotices(trigger: "test")
+        XCTAssertNotNil(vm.delegatedQuestionNotices.heldTurnNoticesByStageID[uncertainStage])
+        XCTAssertEqual(vm.delegatedQuestionNotices.records[firstKey]?.stagedParentTabID, parent.tabID)
+        XCTAssertEqual(parent.session.items.count, itemCount)
+
+        // Its late `sent` commits exactly once; a repeated outcome is a no-op. The run current at the
+        // late outcome did not carry it (the carrier was never identified), so no run is stamped.
+        startParentRun(parent)
+        vm.recordDelegatedQuestionNoticeSendOutcome(for: parent.session, stageID: uncertainStage, disposition: .sent)
+        XCTAssertEqual(vm.delegatedQuestionNotices.records[firstKey]?.acknowledged, true)
+        XCTAssertEqual(vm.delegatedQuestionNotices.records[firstKey]?.deliveredRunIDs, [], "Never a successor run")
+        XCTAssertNil(vm.delegatedQuestionNotices.records[firstKey]?.stagedParentTabID)
+        XCTAssertTrue(vm.delegatedQuestionNotices.heldTurnNoticesByStageID.isEmpty)
+        XCTAssertEqual(noticeNotes(parent).count, 1, "One persisted note for the committed stage")
+        vm.recordDelegatedQuestionNoticeSendOutcome(for: parent.session, stageID: uncertainStage, disposition: .sent)
+        vm.recordDelegatedQuestionNoticeSendOutcome(for: parent.session, stageID: uncertainStage, disposition: .notSent)
+        XCTAssertEqual(noticeNotes(parent).count, 1)
+        XCTAssertEqual(vm.delegatedQuestionNotices.records[firstKey]?.acknowledged, true, "Never downgraded")
+        XCTAssertTrue(child.session.pendingAskUser?.isAwaitingParentAgent == true, "Acknowledged, still answerable")
+        parent.session.runState = .completed
+
+        vm.skipAskUser(tabID: child.tabID, interactionID: firstInteraction.id)
+        _ = try await firstTask.value
+
+        // A superseded in-flight stage is held, not rolled back: the newer stage carries only new
+        // notices, and the earlier stage's late outcome never settles the newer one.
+        let secondInteraction = makeInteraction(timeoutSeconds: 60)
+        let secondTask = Task { try await vm.askUser(tabID: child.tabID, interaction: secondInteraction) }
+        try await waitUntil { child.session.pendingAskUser?.interaction.id == secondInteraction.id && child.session.pendingAskUser?.isAwaitingParentAgent == true }
+        let secondKey = AgentDelegatedQuestionNoticeKey(childSessionID: child.sessionID, interactionID: secondInteraction.id)
+        _ = vm.stageDelegatedQuestionNoticesForTurnInput("three", session: parent.session)
+        let supersededStage = try XCTUnwrap(vm.delegatedQuestionTurnStageID(forTabID: parent.tabID))
+        XCTAssertEqual(vm.stageDelegatedQuestionNoticesForTurnInput("four", session: parent.session), "four", "Nothing re-carried")
+        XCTAssertEqual(vm.delegatedQuestionNotices.heldTurnNoticesByStageID[supersededStage]?.notice.keys, [secondKey])
+        vm.recordDelegatedQuestionNoticeSendOutcome(for: parent.session, stageID: supersededStage, disposition: .notSent)
+        assertReleased(vm, key: secondKey, parentTabID: parent.tabID)
+
+        vm.skipAskUser(tabID: child.tabID, interactionID: secondInteraction.id)
+        _ = try await secondTask.value
+        vm.reconcileDelegatedQuestionNotices(trigger: "test")
+        XCTAssertTrue(vm.delegatedQuestionNotices.isEmpty)
+    }
+
+    func testLateOutcomeAfterSuccessorRunStampsOnlyTheCarryingRun() async throws {
+        let vm = makeViewModel()
+        let parent = makeSession(vm, parent: nil)
+        let child = makeSession(vm, parent: parent.sessionID)
+        vm.test_setMCPControlledTabIDs([child.tabID])
+        let interaction = makeInteraction(timeoutSeconds: 60)
+        let task = Task { try await vm.askUser(tabID: child.tabID, interaction: interaction) }
+        try await waitUntil { child.session.pendingAskUser?.isAwaitingParentAgent == true }
+        let key = AgentDelegatedQuestionNoticeKey(childSessionID: child.sessionID, interactionID: interaction.id)
+
+        // Run A carries the stage: its start returns with the run active.
+        _ = vm.stageDelegatedQuestionNoticesForTurnInput("one", session: parent.session)
+        let stage = try XCTUnwrap(vm.delegatedQuestionTurnStageID(forTabID: parent.tabID))
+        let carryingRunID = startParentRun(parent)
+        vm.settleDelegatedQuestionTurnStageAfterRunStart(stage, session: parent.session, startDisposition: nil)
+        // Run A stops without an outcome; successor run B starts before A's late outcome arrives.
+        parent.session.runState = .completed
+        vm.reconcileDelegatedQuestionNotices(trigger: "test")
+        XCTAssertEqual(vm.delegatedQuestionNotices.heldTurnNoticesByStageID[stage]?.notice.phase, .deliveryUnknown)
+        let successorRunID = startParentRun(parent)
+        XCTAssertNotEqual(successorRunID, carryingRunID)
+
+        vm.recordDelegatedQuestionNoticeSendOutcome(for: parent.session, stageID: stage, disposition: .sent)
+        XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.acknowledged, true)
+        XCTAssertEqual(
+            vm.delegatedQuestionNotices.records[key]?.deliveredRunIDs,
+            [carryingRunID],
+            "The late outcome is attributed to the run that carried it, never the successor"
+        )
+        XCTAssertEqual(noticeNotes(parent).count, 1)
+
+        vm.skipAskUser(tabID: child.tabID, interactionID: interaction.id)
+        _ = try await task.value
+    }
+
     func testCodexQueuedFallbackDropsTheReleasedStageBlockAndLaterDispatchCarriesNoStaleNotice() async throws {
         for resolvesBeforeDispatch in [false, true] {
             let controller = LifecycleNoopCodexController(recorder: LifecycleRecorder())
             let vm = makeViewModel(codexController: controller)
-            let parent = makeSession(vm, parent: nil)
+            // A Codex fallback is queued only under a store-issued queue receipt: the parent is
+            // bound to a real temporary recovery lane and its input is admitted through it.
+            let recovery = try await RecoveryLaneFixture.make("DelegatedQuestionCodexFallback")
+            defer { recovery.tearDown() }
+            let parent = makeSession(vm, parent: nil, sessionID: recovery.sessionID)
+            parent.session.recoveryLane = recovery.lane
             parent.session.selectedAgent = .codexExec
             let child = makeSession(vm, parent: parent.sessionID)
             vm.test_setMCPControlledTabIDs([child.tabID])
@@ -680,9 +799,22 @@ final class AgentModeViewModelDelegatedQuestionTests: XCTestCase {
             // The parent's run becomes active (without an authoritative Codex turn) after the
             // idle-turn stage was built and before the provider handoff, so Codex queues the staged
             // input as a fallback instead of sending it.
+            let identity = try await recovery.queuedIdentity("user follow-up")
+            let admittedQueueID = try XCTUnwrap(identity.intentID)
             let outcome = await vm.startAgentRun(
                 tabID: parent.tabID,
                 initialMessage: "user follow-up",
+                inputConstituents: nil,
+                codexFallbackContext: AgentTabSession.CodexFallbackSubmissionContext(
+                    queueID: admittedQueueID,
+                    providerText: "user follow-up",
+                    images: [],
+                    taggedFileAttachments: [],
+                    draftText: "user follow-up",
+                    identity: identity,
+                    origin: .manual,
+                    dispatchTicket: nil
+                ),
                 providerHandoffAuthorization: {
                     parent.session.runID = UUID()
                     parent.session.runState = .running
@@ -690,12 +822,14 @@ final class AgentModeViewModelDelegatedQuestionTests: XCTestCase {
                     return true
                 }
             )
-            guard case let .queuedFallback(queueID, .activeWithoutAuthoritativeIdentity)? = outcome else {
+            guard case let .queuedFallback(receipt, .activeWithoutAuthoritativeIdentity)? = outcome else {
                 XCTFail("Expected a queued Codex fallback, got \(String(describing: outcome))")
                 vm.skipAskUser(tabID: child.tabID, interactionID: interaction.id)
                 _ = try await task.value
                 return
             }
+            let queueID = receipt.intent.intentID
+            XCTAssertEqual(queueID, admittedQueueID, "The queue ID is the admitted intent ID")
             // Codex session setup binds the run it starts the thread for; the queued entry carries it.
             let runID = try XCTUnwrap(parent.session.runID)
             XCTAssertEqual(parent.session.codexFallbackQueue.first?.originRunID, runID)
@@ -708,7 +842,7 @@ final class AgentModeViewModelDelegatedQuestionTests: XCTestCase {
             XCTAssertFalse(queuedText.contains(AgentDelegatedQuestionNoticeWire.noticeHeader))
             XCTAssertFalse(queuedText.contains(interaction.id.uuidString))
             XCTAssertTrue(queuedText.contains("user follow-up"))
-            XCTAssertEqual(entry.draftText, queuedText, "A queued fallback without composer context restores the same text")
+            XCTAssertEqual(entry.draftText, "user follow-up", "The admitted submission keeps its own original text")
             assertReleased(vm, key: key, parentTabID: parent.tabID)
             XCTAssertEqual(vm.delegatedQuestionNotices.records[key]?.deliveredRunIDs, [])
             XCTAssertTrue(noticeNotes(parent).isEmpty, "A queued fallback never records the notice")
@@ -1367,12 +1501,12 @@ final class AgentModeViewModelDelegatedQuestionTests: XCTestCase {
     private func makeSession(
         _ vm: AgentModeViewModel,
         parent: UUID?,
+        sessionID: UUID = UUID(),
         controlled: Bool = true,
         originatingConnectionID: UUID? = nil,
         forceControlContext: Bool = false
     ) -> LiveSession {
         let tabID = UUID()
-        let sessionID = UUID()
         let session = vm.session(for: tabID, createIfNeeded: true)!
         session.testInstallPersistentSessionBinding(sessionID: sessionID)
         session.parentSessionID = parent

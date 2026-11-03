@@ -79,6 +79,72 @@ final class AgentWorktreeMergeAttentionTests: XCTestCase {
         )
     }
 
+    // MARK: - Step 5c historical reviews
+
+    func testHistoricalReviewIsDistinctReadOnlyAttentionAndNeverAConflictBlocker() throws {
+        var historical = makeOperation(id: "history", status: .awaitingApproval, updatedAt: epoch(30))
+        historical.reviewPreservation = .historical(reason: "RepoPrompt closed", at: epoch(30))
+        var live = makeOperation(id: "live", status: .awaitingApproval, updatedAt: epoch(10))
+        live.reviewPreservation = .live
+        let legacy = makeOperation(id: "legacy", status: .awaitingApproval, updatedAt: epoch(5))
+
+        XCTAssertTrue(historical.isHistoricalReview)
+        XCTAssertFalse(live.isHistoricalReview)
+        XCTAssertFalse(legacy.isHistoricalReview)
+
+        // A newer ended review never outranks a live one.
+        XCTAssertEqual(AgentWorktreeMergeBlockerSelector.sidebarAttention(in: [legacy, live, historical])?.operationID, "live")
+        let attention = try XCTUnwrap(AgentWorktreeMergeBlockerSelector.sidebarAttention(in: [historical]))
+        XCTAssertEqual(attention.operationID, "history")
+        XCTAssertEqual(attention.kind, .historicalReview)
+        XCTAssertTrue(attention.tooltipText.contains("ended review (read-only)"), attention.tooltipText)
+        XCTAssertEqual(AgentWorktreeMergeAttention(operation: live).kind, .awaitingApproval)
+
+        let summary = try XCTUnwrap(historical.activeSummary, "A historical review stays discoverable")
+        XCTAssertEqual(summary.isHistoricalReview, true)
+        XCTAssertEqual(AgentWorktreeMergeAttention(summary: summary).kind, .historicalReview)
+        let liveSummary = try XCTUnwrap(live.activeSummary)
+        XCTAssertNil(liveSummary.isHistoricalReview, "A live review is not flagged historical")
+        XCTAssertEqual(AgentWorktreeMergeAttention(summary: liveSummary).kind, .awaitingApproval)
+
+        XCTAssertEqual(AgentWorktreeMergeBlockerSelector.historicalReviewOperation(in: [legacy, live, historical])?.id, "history")
+        XCTAssertNil(AgentWorktreeMergeBlockerSelector.historicalReviewOperation(in: [legacy, live]))
+        XCTAssertNil(AgentWorktreeMergeBlockerSelector.activeConflictOperation(in: [historical]))
+
+        // Only `awaitingApproval` carries history: a stray marker on another status is not historical.
+        var cancelled = makeOperation(id: "cancelled", status: .cancelled, updatedAt: epoch(40))
+        cancelled.reviewPreservation = .historical(reason: "x", at: epoch(40))
+        XCTAssertFalse(cancelled.isHistoricalReview)
+    }
+
+    func testActiveConflictAndAwaitingCommitOutrankNewerHistoryInLiveAndSummarySelectors() throws {
+        var historical = makeOperation(id: "history", status: .awaitingApproval, updatedAt: epoch(50))
+        historical.reviewPreservation = .historical(reason: "Run ended", at: epoch(50))
+        let conflicted = makeOperation(id: "conflict", status: .conflicted, updatedAt: epoch(10))
+        let awaitingCommit = makeOperation(id: "commit", status: .awaitingCommit, updatedAt: epoch(20))
+
+        let cases: [(AgentSessionWorktreeMergeOperation, AgentWorktreeMergeAttention.Kind)] = [
+            (conflicted, .conflicted),
+            (awaitingCommit, .awaitingCommit)
+        ]
+        for (active, kind) in cases {
+            let live = try XCTUnwrap(AgentWorktreeMergeBlockerSelector.sidebarAttention(in: [historical, active]))
+            XCTAssertEqual(live.operationID, active.id, "Live selector: \(active.id) outranks newer history")
+            XCTAssertEqual(live.kind, kind)
+
+            let summaries = try [XCTUnwrap(historical.activeSummary), XCTUnwrap(active.activeSummary)]
+            let closed = try XCTUnwrap(AgentWorktreeMergeBlockerSelector.sidebarAttention(inSummaries: summaries))
+            XCTAssertEqual(closed.operationID, active.id, "Closed-summary selector: \(active.id) outranks newer history")
+            XCTAssertEqual(closed.kind, kind)
+            XCTAssertEqual(AgentWorktreeMergeBlockerSelector.primarySummary(in: Array(summaries.reversed()))?.id, active.id)
+        }
+        // Among active operations the newest still wins; history alone is still surfaced.
+        XCTAssertEqual(AgentWorktreeMergeBlockerSelector.sidebarAttention(in: [conflicted, awaitingCommit, historical])?.operationID, "commit")
+        let onlyHistory = try [XCTUnwrap(historical.activeSummary)]
+        XCTAssertEqual(AgentWorktreeMergeBlockerSelector.sidebarAttention(inSummaries: onlyHistory)?.kind, .historicalReview)
+        XCTAssertNil(AgentWorktreeMergeBlockerSelector.sidebarAttention(inSummaries: []))
+    }
+
     // MARK: - Attention summary view-model
 
     func testAttentionFromSessionSummaryUsesPersistedFieldsAndKind() {

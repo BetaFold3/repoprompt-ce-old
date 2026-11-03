@@ -1,6 +1,7 @@
 import Foundation
 import RepoPromptAgentCore
 import RepoPromptShared
+import RepoPromptUI
 import SwiftUI
 
 func isAutoExpandableEditToolResult(_ item: AgentChatItem) -> Bool {
@@ -133,10 +134,12 @@ enum ToolCardRouter {
             toolIsError: item.toolIsError,
             agentControlContext: agentControlContext
         )
+        let header = genericHeader(for: item, normalizedToolName: normalized, explicitTitle: presentation?.title)
         return markingCodeModeChild(item, AnyView(
             ToolCallCard(
                 item: item,
-                title: presentation?.title ?? toolDisplayName(for: normalized ?? item.toolName),
+                title: header.title,
+                sourceLabel: header.sourceLabel,
                 subtitle: subtitle,
                 oracleOpenContext: oracleOpenContext,
                 showRunScopedToolCancel: showRunScopedToolCancel,
@@ -263,8 +266,26 @@ enum ToolCardRouter {
             if NativeToolCardPresentationBuilder.build(item: item, normalizedToolName: key) != nil {
                 return AnyView(NativeToolResultCard(item: item, normalizedToolName: key))
             }
-            return AnyView(UnknownToolResultCard(item: item, title: toolDisplayName(for: normalized ?? item.toolName)))
+            let header = genericHeader(for: item, normalizedToolName: normalized, explicitTitle: nil)
+            return AnyView(UnknownToolResultCard(item: item, title: header.title, sourceLabel: header.sourceLabel))
         }
+    }
+
+    /// Generic call/result header. An explicit specialized title (for example a web action) wins and
+    /// carries no source label; otherwise external MCP tools split into action title + server label,
+    /// parsed from the raw tool name before lossy dotted-suffix normalization.
+    static func genericHeader(
+        for item: AgentChatItem,
+        normalizedToolName: String?,
+        explicitTitle: String?
+    ) -> ToolCardHeaderPresentation {
+        if let explicitTitle {
+            return ToolCardHeaderPresentation(title: explicitTitle, sourceLabel: nil)
+        }
+        return ToolCardHeaderPresentation.generic(
+            rawToolName: item.toolName,
+            normalizedToolName: normalizedToolName
+        )
     }
 
     struct ToolCallPresentation: Equatable {
@@ -1000,21 +1021,53 @@ func oracleToolCallPopoverUserInfo(
 }
 
 enum ToolCallCardStateResolver {
+    /// Display status for a generic tool-call card.
+    ///
+    /// A call with no attached result evidence, or with evidence that does not classify, is
+    /// `.neutral`: render blocks carry no per-call liveness, so the card must not claim the call
+    /// is executing. The session-level run indicator shows run activity, and separate result cards
+    /// own their outcomes. Explicitly classified success, warning, failure, or running is kept.
     static func status(for item: AgentChatItem) -> ToolCardStatus {
-        if item.toolResultJSON != nil || item.toolIsError != nil {
-            return ToolResultStatusResolver.resolve(
-                toolIsError: item.toolIsError,
-                raw: item.toolResultJSON,
-                fallback: .running
-            )
-        }
-        return .running
+        guard hasAttachedResultEvidence(item) else { return .neutral }
+        return ToolResultStatusResolver.resolve(
+            toolIsError: item.toolIsError,
+            raw: item.toolResultJSON,
+            fallback: .neutral
+        )
+    }
+
+    /// Run-scoped cancel eligibility, intentionally identical to the pre-Step-4d6 set (the old
+    /// `.running` fallback). This is not a claim that this call is executing; the cancel action
+    /// targets the run's active tools.
+    static func allowsRunScopedCancel(for item: AgentChatItem) -> Bool {
+        guard hasAttachedResultEvidence(item) else { return true }
+        return ToolResultStatusResolver.resolve(
+            toolIsError: item.toolIsError,
+            raw: item.toolResultJSON,
+            fallback: .running
+        ) == .running
+    }
+
+    static func showsRunScopedCancel(
+        for item: AgentChatItem,
+        showRunScopedToolCancel: Bool,
+        hasCancelAction: Bool
+    ) -> Bool {
+        showRunScopedToolCancel
+            && hasCancelAction
+            && allowsRunScopedCancel(for: item)
+            && MCPIntegrationHelper.isRepoPromptToolNameAfterNormalization(item.toolName)
+    }
+
+    private static func hasAttachedResultEvidence(_ item: AgentChatItem) -> Bool {
+        item.toolResultJSON != nil || item.toolIsError != nil
     }
 }
 
 struct ToolCallCard: View {
     let item: AgentChatItem
     let title: String
+    let sourceLabel: String?
     let subtitle: String?
     let oracleOpenContext: AgentOracleOpenContext?
     let showRunScopedToolCancel: Bool
@@ -1023,6 +1076,7 @@ struct ToolCallCard: View {
     init(
         item: AgentChatItem,
         title: String,
+        sourceLabel: String? = nil,
         subtitle: String?,
         oracleOpenContext: AgentOracleOpenContext?,
         showRunScopedToolCancel: Bool = false,
@@ -1030,6 +1084,7 @@ struct ToolCallCard: View {
     ) {
         self.item = item
         self.title = title
+        self.sourceLabel = sourceLabel
         self.subtitle = subtitle
         self.oracleOpenContext = oracleOpenContext
         self.showRunScopedToolCancel = showRunScopedToolCancel
@@ -1040,14 +1095,17 @@ struct ToolCallCard: View {
         ToolCallCardStateResolver.status(for: item)
     }
 
-    /// Whether this card should show a cancel button in the header.
-    /// Only for running RepoPrompt MCP tools when cancel context is available.
+    /// Whether this card should show the run-scoped cancel button in the header.
+    /// Eligibility is decoupled from the display status (see `ToolCallCardStateResolver`).
     private var showsCancelButton: Bool {
-        status == .running
-            && showRunScopedToolCancel
-            && cancelActiveToolsAction != nil
-            && MCPIntegrationHelper.isRepoPromptToolNameAfterNormalization(item.toolName)
+        ToolCallCardStateResolver.showsRunScopedCancel(
+            for: item,
+            showRunScopedToolCancel: showRunScopedToolCancel,
+            hasCancelAction: cancelActiveToolsAction != nil
+        )
     }
+
+    private static let cancelActiveToolsLabel = "Cancel active tools for this run"
 
     private var onTap: (() -> Void)? {
         guard let userInfo = oracleToolCallPopoverUserInfo(
@@ -1064,14 +1122,21 @@ struct ToolCallCard: View {
             iconName: toolIcon(for: item.toolName),
             iconColor: ToolCardAccentResolver.color(for: item.toolName),
             title: title,
+            sourceLabel: sourceLabel,
             subtitle: subtitle,
             status: status,
             timestamp: item.timestamp,
             showsTimestamp: !showsCancelButton,
-            headerTrailingView: showsCancelButton ? AnyView(ToolCardCancelButton(action: cancelActiveToolsAction!)) : nil,
+            headerTrailingView: showsCancelButton
+                ? AnyView(
+                    ToolCardCancelButton(action: cancelActiveToolsAction!)
+                        .hoverTooltip(Self.cancelActiveToolsLabel)
+                        .accessibilityLabel(Self.cancelActiveToolsLabel)
+                )
+                : nil,
             onTap: onTap
         ) {
-            // Tool calls in progress don't show args by default
+            // Tool call cards don't show args by default
             EmptyView()
         }
     }

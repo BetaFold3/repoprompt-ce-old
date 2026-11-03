@@ -86,6 +86,33 @@ extension CodexAgentModeCoordinatorHost {
     }
 }
 
+/// Immutable identity of one committed durable dispatch a history baseline binds to (Phase 4).
+package struct AgentDispatchBaselineIdentity: Equatable {
+    /// Existing durable dispatch identity (the first delivery attempt ID).
+    package let dispatchID: UUID
+    package let runAttemptID: UUID?
+    /// Ordered local user items of the dispatch's constituents.
+    package let userItemIDs: [UUID]
+    /// Whether `userItemIDs` is the dispatch's complete constituent list: every constituent named
+    /// its user item, none was dropped, the list is nonempty and duplicate-free. Only a complete
+    /// identity can carry an outbound user-message claim (baseline capture itself is unchanged).
+    package let hasCompleteUserItems: Bool
+
+    package init(dispatchID: UUID, runAttemptID: UUID?, userItemIDs: [UUID], hasCompleteUserItems: Bool = false) {
+        self.dispatchID = dispatchID
+        self.runAttemptID = runAttemptID
+        self.userItemIDs = userItemIDs
+        self.hasCompleteUserItems = hasCompleteUserItems
+    }
+}
+
+/// Whether the pre-byte history baseline refused one Claude write (main-actor box shared with
+/// the controller's write-admission closure).
+@MainActor
+final class ClaudeDispatchBaselineRefusal {
+    var refused = false
+}
+
 /// Host surface used by `ClaudeAgentModeCoordinator`.
 @MainActor
 package protocol ClaudeAgentModeCoordinatorHost: AgentSessionHost {
@@ -102,17 +129,45 @@ package protocol ClaudeAgentModeCoordinatorHost: AgentSessionHost {
         ifStillOwned: @escaping @MainActor () -> Bool,
         beforeCommit: (@MainActor () async -> Void)?
     ) async -> Bool
-    func prependPendingHandoffIfNeeded(
+    /// Prepends the pending-handoff payload when it is neither staged nor held, reporting the
+    /// exact stage this call created.
+    func stagePendingHandoffIfNeeded(
         _ text: String,
         session: AgentTabSession
-    ) -> String
+    ) -> AgentStagedProviderText
+    /// Durable form: stages the payload and returns its exact snapshot (payload ID saved first),
+    /// for `AgentProviderHandoff.notePendingHandoff` before the dispatch commit.
+    func stagePendingHandoffForDurableDispatch(
+        _ text: String,
+        session: AgentTabSession
+    ) async -> AgentPendingHandoffDispatchStaging
     @discardableResult
     func updatePermissionBindingState(from session: AgentTabSession, syncUI: Bool) -> Bool
+    /// Lossless restart Phase 4: inside the managed-transport write admission, immediately before
+    /// a Claude dispatch's user bytes, capture and commit that dispatch's pre-send history baseline.
+    /// `.denied` = the enabled baseline could not be persisted (zero bytes are sent). With history
+    /// reconciliation unqualified (production) it admits without any read or write. The admitted
+    /// UUID is `outboundUserMessage.uuid` only when THIS call newly committed a captured baseline
+    /// carrying that claim (complete canonical constituents); otherwise it is omitted.
+    func admitClaudeDispatchBaseline(
+        _ identity: AgentDispatchBaselineIdentity?,
+        outboundUserMessage: AgentSessionProviderHistoryRecovery.DispatchBaseline.OutboundUserMessage?,
+        session: AgentTabSession
+    ) async -> AgentRuntimeWriteAdmission
 }
 
 /// Mirrors the default of `AgentModeViewModel.updatePermissionBindingState` (`syncUI: true`).
 @MainActor
 extension ClaudeAgentModeCoordinatorHost {
+    /// Hosts without recovery capture nothing and admit the ordinary send.
+    package func admitClaudeDispatchBaseline(
+        _: AgentDispatchBaselineIdentity?,
+        outboundUserMessage _: AgentSessionProviderHistoryRecovery.DispatchBaseline.OutboundUserMessage?,
+        session _: AgentTabSession
+    ) async -> AgentRuntimeWriteAdmission {
+        .admittedWithoutIdentity
+    }
+
     @discardableResult
     func updatePermissionBindingState(from session: AgentTabSession) -> Bool {
         updatePermissionBindingState(from: session, syncUI: true)

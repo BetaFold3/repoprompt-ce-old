@@ -162,7 +162,8 @@ package struct OhMyPiThinkingCapabilityControllerSessionFactory:
             workspacePath: workspacePath,
             resumeSessionID: nil,
             attachments: [],
-            taskLabelKind: nil
+            taskLabelKind: nil,
+            runtimeSession: .sessionless
         )
         let provider = providerFactory(config)
         let startedAt = now()

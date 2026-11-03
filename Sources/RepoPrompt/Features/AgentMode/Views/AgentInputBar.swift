@@ -13,6 +13,9 @@ import RepoPromptUI
 import RepoPromptWorkspace
 import SwiftUI
 import UniformTypeIdentifiers
+#if DEBUG
+    import OSLog
+#endif
 
 struct AgentComposerActions {
     let storeDraft: (_ tabID: UUID, _ text: String) -> Void
@@ -44,6 +47,11 @@ struct AgentComposerActions {
     let openCLIProvidersSettings: () -> Void
     /// Delegated ask_user parent banner actions (plan §6.5); nil hides the Open action.
     var delegatedQuestions: AgentDelegatedQuestionBannerActions?
+    /// Lossless-restart recovery list actions; nil hides the list.
+    var recoveryList: AgentRecoveryListActions?
+    /// Live R4 edit freeze (quit or window close preserving this window): the composer refuses
+    /// edits and image attachments at their entry instead of accepting input it could lose.
+    var isShutdownFrozen: () -> Bool = { false }
 }
 
 enum CursorModelProviderChipDisplay {
@@ -169,6 +177,10 @@ struct AgentInputBar: View {
             statusPills
                 .padding(.bottom, Self.footerHeight + ComposerChrome<EmptyView, EmptyView>.baseBarHeight + composerBottomInset - 8)
         }
+        // R4 edit freeze, published through the observed composer store (the detail view holds the
+        // view model unobserved); after the overlay so the status pills are covered too. The text
+        // field also refuses edits at its entry while frozen.
+        .disabled(composerUI.props.isShutdownFrozen)
         .onChange(of: composerFocusObservationCue) { oldCue, newCue in
             let tabChanged = AgentComposerFocusObservationCue.tabChanged(
                 from: oldCue,
@@ -185,7 +197,11 @@ struct AgentInputBar: View {
     }
 
     private func applyComposerFocusRequest(discardMismatch: Bool) {
-        switch composerFocusObservationCue.requestAction(discardMismatch: discardMismatch) {
+        let action = composerFocusObservationCue.requestAction(discardMismatch: discardMismatch)
+        #if DEBUG
+            Self.traceComposerFocusRequestAction(action, pendingRequestID: composerFocusObservationCue.requestID)
+        #endif
+        switch action {
         case .none, .leavePending:
             return
         case let .discard(requestID):
@@ -200,6 +216,34 @@ struct AgentInputBar: View {
             composerUI.consumeFocusRequest(id: requestID)
         }
     }
+
+    #if DEBUG
+        /// Content-free: action name and request token only, to locate where a requested focus stopped.
+        private static func traceComposerFocusRequestAction(
+            _ action: AgentComposerFocusObservationCue.RequestAction,
+            pendingRequestID: UUID?
+        ) {
+            let actionName: String
+            let requestToken: String
+            switch action {
+            case .none:
+                actionName = "none"
+                requestToken = "none"
+            case .leavePending:
+                actionName = "leavePending"
+                requestToken = pendingRequestID?.uuidString ?? "none"
+            case let .discard(requestID):
+                actionName = "discard"
+                requestToken = requestID.uuidString
+            case let .applyAndConsume(requestID):
+                actionName = "applyAndConsume"
+                requestToken = requestID.uuidString
+            }
+            Logger(subsystem: "com.repoprompt.app", category: "composer-focus").debug(
+                "cue action=\(actionName, privacy: .public) token=\(requestToken, privacy: .public)"
+            )
+        }
+    #endif
 
     private var composerActions: AgentComposerActions {
         AgentComposerActions(
@@ -264,7 +308,7 @@ struct AgentInputBar: View {
                     await agentModeVM.retryStaleResetRecoveryStop(tabID: tabID, recoveryID: recoveryID)
                 }
             ),
-            cancelRun: { target in _ = await agentModeVM.cancelAgentRun(target: target) },
+            cancelRun: { target in _ = await agentModeVM.cancelAgentRun(target: target, cause: .userCancel) },
             attachImages: { tabID, urls in agentModeVM.attachImages(tabID: tabID, urls: urls) },
             removeImage: { tabID, attachmentID in agentModeVM.removePendingImage(tabID: tabID, attachmentID: attachmentID) },
             commitTaggedFile: { tabID, suggestion, displayName in
@@ -331,7 +375,28 @@ struct AgentInputBar: View {
             },
             delegatedQuestions: AgentDelegatedQuestionBannerActions(
                 openChild: { row in await agentModeVM.openDelegatedQuestionChild(row) }
-            )
+            ),
+            recoveryList: AgentRecoveryListActions(
+                perform: { rowID, action in
+                    await agentModeVM.performRecoveryListAction(rowID: rowID, action: action)
+                },
+                performContinuation: { rowID, action, text, warning in
+                    await agentModeVM.performRecoveryListContinuation(
+                        rowID: rowID,
+                        action: action,
+                        text: text,
+                        acknowledgedWarning: warning
+                    )
+                },
+                continuationDraft: { rowID in agentModeVM.recoveryContinuationDraft(rowID: rowID) },
+                updateContinuationDraft: { rowID, text in
+                    agentModeVM.updateRecoveryContinuationDraft(rowID: rowID, text: text)
+                },
+                retryStartup: { agentModeVM.retryRecoveryStartup() },
+                openNeedsAttention: { agentModeVM.presentRecoveryNeedsAttention() },
+                inspect: { rowID in await agentModeVM.inspectRecoveryEditProposal(rowID: rowID) }
+            ),
+            isShutdownFrozen: { agentModeVM.isShutdownFrozen }
         )
     }
 
@@ -447,7 +512,7 @@ struct AgentComposerView: View, Equatable {
     @State private var ohMyPiThinkingRevision: UInt = 0
     @State private var showPermissionPopover: Bool = false
     @State private var showClaudeToolsPopover: Bool = false
-    @State private var steeringUnsupportedMessage: String? = nil
+    @State private var steeringNotice = AgentComposerSubmitNotice()
     @State private var steeringUnsupportedDismissTask: Task<Void, Never>?
     @State private var modelMenuSnapshotByAgent: [AgentProviderKind: [AgentModelOption]]? = nil
     @State private var modelMenuSnapshotReleaseTask: Task<Void, Never>? = nil
@@ -541,6 +606,16 @@ struct AgentComposerView: View, Equatable {
         return props.delegatedQuestions
     }
 
+    private var renderedRecoveryList: AgentRecoveryListProps? {
+        guard actions.recoveryList != nil, props.currentTabID == currentTabID else { return nil }
+        return props.recoveryList
+    }
+
+    private var recoveryListBannerReservedHeight: CGFloat {
+        guard let list = renderedRecoveryList else { return 0 }
+        return AgentRecoveryListBanner.reservedHeight(for: list) + AgentAttachmentStripLayout.composerVerticalSpacingWhenPresent
+    }
+
     private var renderedStaleResetRecovery: AgentStaleResetRecoveryProps? {
         guard let recovery = props.staleResetRecovery,
               recovery.tabID == props.currentTabID,
@@ -594,6 +669,10 @@ struct AgentComposerView: View, Equatable {
         permissionBinding?.externallyManagedReason != nil
     }
 
+    private var steeringUnsupportedMessage: String? {
+        steeringNotice.message
+    }
+
     private var hasSteeringUnsupportedNotice: Bool {
         guard let message = steeringUnsupportedMessage else { return false }
         return !message.isEmpty
@@ -631,6 +710,7 @@ struct AgentComposerView: View, Equatable {
             hasTaggedFiles: hasPendingTaggedFileAttachments
         ) + steeringUnsupportedInfoBoxReservedHeight + scheduledSendBannerReservedHeight
             + staleResetRecoveryBannerReservedHeight + delegatedQuestionsBannerReservedHeight
+            + recoveryListBannerReservedHeight
     }
 
     private var composerChromeVerticalPadding: CGFloat {
@@ -738,6 +818,9 @@ struct AgentComposerView: View, Equatable {
             if let newTabID {
                 loadDraftFromSession(for: newTabID)
             }
+            // Review A LIST-01: a persistent refusal belongs to the previous tab's send, also when
+            // the new tab's draft is identical (no text change fires).
+            clearPersistentSteeringNotice()
             dismissCursorModelParametersPopover()
         }
         .onChange(of: props.selectedAgent) { _, selectedAgent in
@@ -784,6 +867,7 @@ struct AgentComposerView: View, Equatable {
         }
         .onChange(of: localInputText) { _, newValue in
             isInputEmpty = newValue.isEmpty
+            clearPersistentSteeringNotice()
             guard let tabID = currentTabID, !isSyncingDraftFromSession else { return }
             actions.storeDraft(tabID, newValue)
         }
@@ -806,6 +890,15 @@ struct AgentComposerView: View, Equatable {
                 } else {
                     restoredText = event.text + "\n" + existing
                 }
+            case let .appendAfterBlankLine(result):
+                guard let update = AgentModeViewModel.recoveryComposerAppendUpdate(live: localInputText, result: result) else {
+                    isSyncingDraftFromSession = false
+                    if !event.message.isEmpty {
+                        showSteeringUnsupportedNotice(event.message)
+                    }
+                    return
+                }
+                restoredText = update
             }
             setLocalInputText(restoredText, forceRevision: true)
             actions.storeDraft(event.tabID, restoredText)
@@ -853,6 +946,10 @@ struct AgentComposerView: View, Equatable {
 
     private var mainContent: some View {
         VStack(alignment: .leading, spacing: AgentAttachmentStripLayout.composerVerticalSpacingWhenPresent) {
+            if let recoveryList = renderedRecoveryList, let recoveryListActions = actions.recoveryList {
+                AgentRecoveryListBanner(props: recoveryList, actions: recoveryListActions)
+            }
+
             if let staleResetRecovery = renderedStaleResetRecovery {
                 AgentStaleResetRecoveryBanner(
                     props: staleResetRecovery,
@@ -919,7 +1016,8 @@ struct AgentComposerView: View, Equatable {
                     snippetPaletteScope: currentTabID.map {
                         SnippetPaletteScope(windowID: windowID, tabID: $0)
                     },
-                    composerFocusToken: composerFocusToken
+                    composerFocusToken: composerFocusToken,
+                    acceptsEdits: { [actions] in !actions.isShutdownFrozen() }
                 ),
                 onHeightChange: { newHeight in
                     editorTextFieldHeight = newHeight
@@ -2302,17 +2400,24 @@ struct AgentComposerView: View, Equatable {
         notBefore: Date,
         runAlongsideOtherSessions: Bool
     ) {
+        clearPersistentSteeringNotice()
         guard !submissionLatch.isLatched(for: currentTabID) else {
-            logViewSubmitRejection(reason: "local_attempt_latched", target: renderedSubmitTarget)
+            logViewSubmitRejection(reason: "local_attempt_latched", target: renderedSubmitTarget, persistent: true)
             return
         }
-        guard canScheduleToRenderedTarget else { return }
+        guard canScheduleToRenderedTarget else {
+            logViewSubmitRejection(reason: "schedule_unavailable_for_rendered_target", target: renderedSubmitTarget, persistent: true)
+            return
+        }
 
         let rawDraftSnapshot = localInputText
         let trimmed = rawDraftSnapshot.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty || hasPendingAttachments else { return }
+        guard !trimmed.isEmpty || hasPendingAttachments else {
+            logViewSubmitRejection(reason: "empty_draft", target: renderedSubmitTarget, persistent: true)
+            return
+        }
         guard let submitTarget = renderedSubmitTarget else {
-            logViewSubmitRejection(reason: "view_nil_target", target: props.submitTarget)
+            logViewSubmitRejection(reason: "view_nil_target", target: props.submitTarget, persistent: true)
             showSteeringUnsupportedNotice(Self.staleSubmitTargetMessage)
             return
         }
@@ -2320,7 +2425,7 @@ struct AgentComposerView: View, Equatable {
             target: submitTarget,
             rawDraftSnapshot: rawDraftSnapshot
         ) else {
-            logViewSubmitRejection(reason: "local_attempt_latched", target: submitTarget)
+            logViewSubmitRejection(reason: "local_attempt_latched", target: submitTarget, persistent: true)
             return
         }
 
@@ -2349,11 +2454,17 @@ struct AgentComposerView: View, Equatable {
                     resetTextFieldTrigger.toggle()
                 }
                 if let blockedMessage = effects.blockedMessage {
-                    showSteeringUnsupportedNotice(blockedMessage)
+                    // The reason only: the message can carry error descriptions.
+                    logViewSubmitRejection(reason: "schedule_completion_blocked", target: attempt.target, persistent: true)
+                    showSteeringUnsupportedNotice(
+                        blockedMessage,
+                        persistent: AgentModeViewModel.isRecoveryAdmissionRefusalNotice(blockedMessage)
+                    )
                 }
             }
         case let .rejected(rejection):
             submissionLatch.cancel(attempt)
+            logViewSubmitRejection(reason: "schedule_claim_\(rejection.diagnosticReason)", target: submitTarget, persistent: true)
             if case .activeAttemptExists = rejection {
                 return
             }
@@ -2362,11 +2473,17 @@ struct AgentComposerView: View, Equatable {
     }
 
     private func sendMessage() {
+        clearPersistentSteeringNotice()
         guard !submissionLatch.isLatched(for: currentTabID) else {
-            logViewSubmitRejection(reason: "local_attempt_latched", target: renderedSubmitTarget)
+            logViewSubmitRejection(reason: "local_attempt_latched", target: renderedSubmitTarget, persistent: true)
             return
         }
         guard props.canSendWithCurrentProvider else {
+            logViewSubmitRejection(
+                reason: props.hasAvailableAgentProviders ? "selected_provider_unavailable" : "no_agent_providers",
+                target: renderedSubmitTarget,
+                persistent: true
+            )
             if props.hasAvailableAgentProviders {
                 showSteeringUnsupportedNotice(props.unavailableSelectedAgentMessage ?? "Connect this agent provider in Settings before sending.")
             } else {
@@ -2376,9 +2493,12 @@ struct AgentComposerView: View, Equatable {
         }
         let rawDraftSnapshot = localInputText
         let trimmed = rawDraftSnapshot.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty || hasPendingAttachments else { return }
+        guard !trimmed.isEmpty || hasPendingAttachments else {
+            logViewSubmitRejection(reason: "empty_draft", target: renderedSubmitTarget, persistent: true)
+            return
+        }
         guard let submitTarget = renderedSubmitTarget else {
-            logViewSubmitRejection(reason: "view_nil_target", target: props.submitTarget)
+            logViewSubmitRejection(reason: "view_nil_target", target: props.submitTarget, persistent: true)
             showSteeringUnsupportedNotice(Self.staleSubmitTargetMessage)
             return
         }
@@ -2386,7 +2506,7 @@ struct AgentComposerView: View, Equatable {
             target: submitTarget,
             rawDraftSnapshot: rawDraftSnapshot
         ) else {
-            logViewSubmitRejection(reason: "local_attempt_latched", target: submitTarget)
+            logViewSubmitRejection(reason: "local_attempt_latched", target: submitTarget, persistent: true)
             return
         }
 
@@ -2410,11 +2530,18 @@ struct AgentComposerView: View, Equatable {
                     resetTextFieldTrigger.toggle()
                 }
                 if let blockedMessage = effects.blockedMessage {
-                    showSteeringUnsupportedNotice(blockedMessage)
+                    // The reason only: the message can carry error descriptions.
+                    logViewSubmitRejection(reason: "completion_blocked", target: attempt.target, persistent: true)
+                    // 9-live V1: a recovery admission refusal stays until the next attempt or edit.
+                    showSteeringUnsupportedNotice(
+                        blockedMessage,
+                        persistent: AgentModeViewModel.isRecoveryAdmissionRefusalNotice(blockedMessage)
+                    )
                 }
             }
         case let .rejected(rejection):
             submissionLatch.cancel(attempt)
+            logViewSubmitRejection(reason: "claim_\(rejection.diagnosticReason)", target: submitTarget, persistent: true)
             if case .activeAttemptExists = rejection {
                 return
             }
@@ -2422,30 +2549,51 @@ struct AgentComposerView: View, Equatable {
         }
     }
 
-    private func showSteeringUnsupportedNotice(_ message: String) {
+    /// Shows `message` under the composer: for 3 seconds, or until the next submit attempt or text
+    /// change when `persistent`.
+    private func showSteeringUnsupportedNotice(_ message: String, persistent: Bool = false) {
         guard !message.isEmpty else { return }
         submissionLatch.advanceNoticeRevision()
         let noticeRevision = submissionLatch.noticeRevision
         steeringUnsupportedDismissTask?.cancel()
+        steeringUnsupportedDismissTask = nil
+        var needsTimer = false
         withAnimation(.easeInOut(duration: 0.15)) {
-            steeringUnsupportedMessage = message
+            needsTimer = steeringNotice.show(message, persistent: persistent)
         }
+        guard needsTimer else { return }
         steeringUnsupportedDismissTask = Task {
-            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            try? await Task.sleep(nanoseconds: AgentComposerSubmitNotice.transientDurationNanoseconds)
             guard !Task.isCancelled else { return }
             await MainActor.run {
-                guard submissionLatch.noticeRevision == noticeRevision,
-                      steeringUnsupportedMessage == message
-                else { return }
+                guard submissionLatch.noticeRevision == noticeRevision else { return }
                 withAnimation(.easeInOut(duration: 0.2)) {
-                    steeringUnsupportedMessage = nil
+                    _ = steeringNotice.transientTimerFired(for: message)
                 }
                 steeringUnsupportedDismissTask = nil
             }
         }
     }
 
-    private func logViewSubmitRejection(reason: String, target: AgentComposerSubmitTarget?) {
+    /// 9-live V1: the next submit attempt, composer text change, or tab change clears a persistent
+    /// notice.
+    private func clearPersistentSteeringNotice() {
+        guard steeringNotice.isPersistent else { return }
+        withAnimation(.easeInOut(duration: 0.2)) {
+            _ = steeringNotice.clearPersistent()
+        }
+    }
+
+    /// `persistent` also writes the reason to the always-on `ComposerSubmit` log.
+    private func logViewSubmitRejection(reason: String, target: AgentComposerSubmitTarget?, persistent: Bool = false) {
+        if persistent {
+            AgentComposerSubmitDiagnostics.viewRejected(
+                reason: reason,
+                currentTabID: currentTabID,
+                propsTabID: props.currentTabID,
+                targetTabID: target?.tabID
+            )
+        }
         #if DEBUG
             AgentModePerfDiagnostics.event(
                 "agent.composer.submit.rejected",
@@ -2516,9 +2664,18 @@ struct AgentComposerView: View, Equatable {
         guard let tabID = currentTabID else {
             return false
         }
+        // Frozen: the drop is refused (never accepted), so the source keeps it.
+        guard !actions.isShutdownFrozen() else {
+            return false
+        }
         return imageInputAdapter.loadPreparedImages(from: providers) { prepared in
             guard !prepared.isEmpty else { return }
             Task { @MainActor in
+                // A freeze that began while the images loaded: the composer is not changed.
+                guard !actions.isShutdownFrozen() else {
+                    imageInputAdapter.cleanupTemporaryFiles(prepared)
+                    return
+                }
                 attachPreparedImages(prepared, tabID: tabID)
             }
         }
@@ -2530,6 +2687,10 @@ struct AgentComposerView: View, Equatable {
         }
         guard imageInputAdapter.shouldConsumePasteAsImageAttachment(from: pasteboard) else {
             return false
+        }
+        // Frozen: the image is consumed unattached (never inserted as text, never accepted).
+        guard !actions.isShutdownFrozen() else {
+            return true
         }
         let prepared = imageInputAdapter.preparedImages(from: pasteboard)
         guard !prepared.isEmpty else {

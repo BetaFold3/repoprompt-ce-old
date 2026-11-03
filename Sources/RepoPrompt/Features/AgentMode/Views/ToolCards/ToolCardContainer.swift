@@ -63,6 +63,8 @@ struct ToolCardContainer<Content: View>: View {
     let iconName: String
     let iconColor: Color
     let title: String
+    /// Optional small source label (for example an external MCP server) shown after the title.
+    let sourceLabel: String?
     let headerStatusText: String?
     let detailText: String?
     let subtitle: String?
@@ -85,6 +87,7 @@ struct ToolCardContainer<Content: View>: View {
         iconName: String,
         iconColor: Color = .orange,
         title: String,
+        sourceLabel: String? = nil,
         headerStatusText: String? = nil,
         detailText: String? = nil,
         subtitle: String? = nil,
@@ -103,6 +106,7 @@ struct ToolCardContainer<Content: View>: View {
         self.iconName = iconName
         self.iconColor = iconColor
         self.title = title
+        self.sourceLabel = ToolCardSourceLabel.displayText(sourceLabel)
         self.headerStatusText = headerStatusText
         self.detailText = detailText
         self.subtitle = subtitle
@@ -124,6 +128,7 @@ struct ToolCardContainer<Content: View>: View {
         iconName: String,
         iconColor: Color = .orange,
         title: String,
+        sourceLabel: String? = nil,
         headerStatusText: String? = nil,
         detailText: String? = nil,
         subtitle: String? = nil,
@@ -143,6 +148,7 @@ struct ToolCardContainer<Content: View>: View {
         self.iconName = iconName
         self.iconColor = iconColor
         self.title = title
+        self.sourceLabel = ToolCardSourceLabel.displayText(sourceLabel)
         self.headerStatusText = headerStatusText
         self.detailText = detailText
         self.subtitle = subtitle
@@ -261,6 +267,11 @@ struct ToolCardContainer<Content: View>: View {
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundColor(.primary)
                 .lineLimit(1)
+                .layoutPriority(ToolCardSourceLabel.titleLayoutPriority(hasSourceLabel: sourceLabel != nil))
+
+            if let sourceLabel {
+                ToolCardSourceLabelText(text: sourceLabel)
+            }
 
             if let headerStatusText, !headerStatusText.isEmpty {
                 StatusBadge(text: headerStatusText, status: status)
@@ -324,6 +335,8 @@ struct StaticToolCardContainer<Content: View>: View {
     let iconName: String
     let iconColor: Color
     let title: String
+    /// Optional small source label (for example an external MCP server) shown after the title.
+    let sourceLabel: String?
     let subtitle: String?
     let status: ToolCardStatus
     let timestamp: Date?
@@ -338,6 +351,7 @@ struct StaticToolCardContainer<Content: View>: View {
         iconName: String,
         iconColor: Color = .orange,
         title: String,
+        sourceLabel: String? = nil,
         subtitle: String? = nil,
         status: ToolCardStatus = .neutral,
         timestamp: Date? = nil,
@@ -349,6 +363,7 @@ struct StaticToolCardContainer<Content: View>: View {
         self.iconName = iconName
         self.iconColor = iconColor
         self.title = title
+        self.sourceLabel = ToolCardSourceLabel.displayText(sourceLabel)
         self.subtitle = subtitle
         self.status = status
         self.timestamp = timestamp
@@ -442,6 +457,11 @@ struct StaticToolCardContainer<Content: View>: View {
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundColor(.primary)
                 .lineLimit(1)
+                .layoutPriority(ToolCardSourceLabel.titleLayoutPriority(hasSourceLabel: sourceLabel != nil))
+
+            if let sourceLabel {
+                ToolCardSourceLabelText(text: sourceLabel)
+            }
 
             StatusDot(status: status, size: 6)
 
@@ -464,6 +484,40 @@ struct StaticToolCardContainer<Content: View>: View {
         default:
             BubbleColors.toolResultBackground(colorScheme: colorScheme)
         }
+    }
+}
+
+// MARK: - Tool Card Source Label
+
+/// Pure presentation rules for the optional header source label shared by both containers.
+enum ToolCardSourceLabel {
+    /// Trimmed label, or nil when absent or blank so blank labels never render an empty chip.
+    static func displayText(_ raw: String?) -> String? {
+        guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
+            return nil
+        }
+        return trimmed
+    }
+
+    /// The title keeps the default priority without a source label, so existing cards lay out
+    /// unchanged. With a label, the action title wins space first at narrow header widths and the
+    /// source label and subtitle truncate before it.
+    static func titleLayoutPriority(hasSourceLabel: Bool) -> Double {
+        hasSourceLabel ? 1 : 0
+    }
+}
+
+/// Small secondary label for the tool source (for example `BusyCal`) next to the card title.
+struct ToolCardSourceLabelText: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(.system(size: 10, weight: .medium))
+            .foregroundColor(.secondary)
+            .lineLimit(1)
+            .truncationMode(.tail)
+            .accessibilityLabel("Source: \(text)")
     }
 }
 

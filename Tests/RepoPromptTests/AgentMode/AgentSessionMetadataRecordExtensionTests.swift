@@ -712,7 +712,7 @@ final class AgentSessionMetadataRecordExtensionTests: XCTestCase {
     }
 
     func testScheduledProjectionBoundsPreviewAndPreservesHistoryThroughIndexAndEntry() throws {
-        XCTAssertEqual(AgentSessionMetadataIndex.currentSchemaVersion, 7)
+        XCTAssertEqual(AgentSessionMetadataIndex.currentSchemaVersion, 8)
         let tabID = UUID()
         let scheduledFor = Date(timeIntervalSince1970: 1_800_000_000)
         let schedule = AgentScheduledSendPersist(
@@ -766,7 +766,7 @@ final class AgentSessionMetadataRecordExtensionTests: XCTestCase {
             AgentSessionMetadataIndex.self,
             from: JSONEncoder().encode(index)
         )
-        XCTAssertEqual(decoded.schemaVersion, 7)
+        XCTAssertEqual(decoded.schemaVersion, 8)
         XCTAssertEqual(decoded.entries.first?.scheduledSendSummary, summary)
         XCTAssertEqual(decoded.entries.first?.lastScheduledDispatch, receipt)
         var changedSummary = record
@@ -775,6 +775,156 @@ final class AgentSessionMetadataRecordExtensionTests: XCTestCase {
         changedHistory.lastScheduledDispatch = nil
         XCTAssertFalse(record.matchesIndexedSessionMetadata(changedSummary))
         XCTAssertFalse(record.matchesIndexedSessionMetadata(changedHistory))
+    }
+
+    /// Review A F08: the bounded summary carries the confirmation's schedule attempt, so an
+    /// index-sourced card names the same occurrence as the hydrated schedule; an entry written
+    /// without the member decodes with no attempt and is otherwise unchanged.
+    func testScheduledSummaryCarriesTheAttemptAndAnEntryWithoutItDecodes() throws {
+        let notBefore = Date(timeIntervalSince1970: 1_800_000_000)
+        let attempt = AgentScheduledSendPersist.Attempt(attemptID: UUID(), itemID: UUID(), startedAt: notBefore)
+        let schedule = AgentScheduledSendPersist(
+            id: UUID(),
+            createdAt: notBefore.addingTimeInterval(-60),
+            updatedAt: notBefore,
+            notBefore: notBefore,
+            state: .needsConfirmation,
+            confirmationReason: .missedWhileClosed,
+            rawText: "scheduled",
+            attachments: [],
+            taggedFileAttachments: [],
+            interviewFirst: false,
+            isNewSessionStart: false,
+            runAlongsideOtherSessions: false,
+            attempt: attempt
+        )
+        let summary = try XCTUnwrap(AgentSessionScheduledSendSummary.make(from: .v1(schedule)))
+        XCTAssertEqual(summary.attemptID, attempt.attemptID)
+        let roundTripped = try JSONDecoder().decode(AgentSessionScheduledSendSummary.self, from: JSONEncoder().encode(summary))
+        XCTAssertEqual(roundTripped, summary)
+
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(summary)) as? [String: Any])
+        XCTAssertNotNil(object.removeValue(forKey: "attemptID"))
+        let older = try JSONDecoder().decode(
+            AgentSessionScheduledSendSummary.self,
+            from: JSONSerialization.data(withJSONObject: object)
+        )
+        XCTAssertNil(older.attemptID)
+        var expected = summary
+        expected.attemptID = nil
+        XCTAssertEqual(older, expected)
+
+        let unattempted = try XCTUnwrap(AgentSessionScheduledSendSummary.make(from: .v1(AgentScheduledSendPersist(
+            id: UUID(), createdAt: notBefore, updatedAt: notBefore, notBefore: notBefore, state: .needsConfirmation,
+            confirmationReason: .missedWhileClosed, rawText: "x", attachments: [], taggedFileAttachments: [],
+            interviewFirst: false, isNewSessionStart: false, runAlongsideOtherSessions: false
+        ))))
+        XCTAssertNil(unattempted.attemptID)
+    }
+
+    // MARK: Schema-8 recovery hint
+
+    func testRecoveryHintDecodesMissingAndUnknownValuesAsUnknown() throws {
+        // A decoded transcript with no unresolved interruption, and no recovery record: clear.
+        let session = AgentSession(composeTabID: UUID(), name: "Hint").withItems([AgentChatItem.user("hello", sequenceIndex: 0)])
+        XCTAssertNotNil(session.transcript)
+        let record = AgentSessionMetadataRecord.record(
+            from: session,
+            fileURL: URL(fileURLWithPath: "/tmp/hint.json"),
+            observedFileSize: nil,
+            observedFileModificationDate: nil,
+            recoveryRecordFacts: .absent
+        )
+        XCTAssertEqual(record.recoveryHint.state, .none)
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(record)) as? [String: Any])
+
+        // A schema-7 entry (no hint) reads as unknown, never as clear.
+        object.removeValue(forKey: "recoveryHint")
+        let legacy = try JSONDecoder().decode(
+            AgentSessionMetadataRecord.self,
+            from: JSONSerialization.data(withJSONObject: object)
+        )
+        XCTAssertEqual(legacy.recoveryHint, .unknown)
+
+        // Values a newer build wrote read tolerantly; a negative count is dropped.
+        object["recoveryHint"] = ["state": "futureState", "reason": "futureReason", "unsentCount": -2, "hasDraft": true]
+        let future = try JSONDecoder().decode(
+            AgentSessionMetadataRecord.self,
+            from: JSONSerialization.data(withJSONObject: object)
+        )
+        XCTAssertEqual(future.recoveryHint.state, .unknown)
+        XCTAssertNil(future.recoveryHint.reason)
+        XCTAssertNil(future.recoveryHint.unsentCount)
+        XCTAssertEqual(future.recoveryHint.hasDraft, true)
+
+        // A malformed hint never fails the entry.
+        object["recoveryHint"] = "not an object"
+        let malformed = try JSONDecoder().decode(
+            AgentSessionMetadataRecord.self,
+            from: JSONSerialization.data(withJSONObject: object)
+        )
+        XCTAssertEqual(malformed.recoveryHint, .unknown)
+    }
+
+    func testRecoveryHintNeedsEveryInputKnownToBeClear() {
+        let pending = AgentSessionRecoveryHint.RecordFacts(unsentCount: 2, hasDraft: true, hasQuestions: false, hasOpenRun: false, isUnreadable: false)
+        // Not inspected (stub) or no record facts yet: unknown, never `none`.
+        XCTAssertEqual(AgentSessionRecoveryHint.make(unresolvedInterruption: nil, reason: nil, schedule: nil, record: .absent).state, .unknown)
+        XCTAssertEqual(AgentSessionRecoveryHint.make(unresolvedInterruption: false, reason: nil, schedule: nil, record: nil).state, .unknown)
+        XCTAssertEqual(AgentSessionRecoveryHint.make(unresolvedInterruption: false, reason: nil, schedule: nil, record: .absent).state, .none)
+
+        // Any known input needing attention decides, even with another input unknown.
+        let interrupted = AgentSessionRecoveryHint.make(unresolvedInterruption: true, reason: .appCrash, schedule: nil, record: nil)
+        XCTAssertEqual(interrupted.state, .needsAttention)
+        XCTAssertEqual(interrupted.reason, .appCrash)
+        XCTAssertNil(interrupted.unsentCount)
+        let unsent = AgentSessionRecoveryHint.make(unresolvedInterruption: nil, reason: .appQuit, schedule: nil, record: pending)
+        XCTAssertEqual(unsent.state, .needsAttention)
+        XCTAssertNil(unsent.reason, "A reason is kept only for an unresolved interruption")
+        XCTAssertEqual(unsent.unsentCount, 2)
+        XCTAssertEqual(unsent.hasDraft, true)
+        XCTAssertEqual(
+            AgentSessionRecoveryHint.make(unresolvedInterruption: false, reason: nil, schedule: nil, record: .unreadable).state,
+            .needsAttention,
+            "Unreadable record data needs attention"
+        )
+        XCTAssertEqual(AgentSessionRecoveryHint(state: .none, unsentCount: -1).unsentCount, 0)
+    }
+
+    func testRecoveryHintFollowsRecordFactsAndParticipatesInIndexedMetadata() throws {
+        let session = AgentSession(composeTabID: UUID(), name: "Hint").withItems([AgentChatItem.user("hello", sequenceIndex: 0)])
+        func record(_ facts: AgentSessionRecoveryHint.RecordFacts?) -> AgentSessionMetadataRecord {
+            AgentSessionMetadataRecord.record(
+                from: session,
+                fileURL: URL(fileURLWithPath: "/tmp/hint.json"),
+                observedFileSize: nil,
+                observedFileModificationDate: nil,
+                recoveryRecordFacts: facts
+            )
+        }
+        let unknown = record(nil)
+        let clear = record(.absent)
+        // Without a decoded transcript (a stub) the transcript input is unknown.
+        let stub = AgentSessionMetadataRecord.record(
+            from: AgentSession(composeTabID: UUID(), name: "Stub"),
+            fileURL: URL(fileURLWithPath: "/tmp/stub.json"),
+            observedFileSize: nil,
+            observedFileModificationDate: nil,
+            recoveryRecordFacts: .absent
+        )
+        XCTAssertEqual(stub.recoveryHint.state, .unknown)
+        let attention = record(AgentSessionRecoveryHint.RecordFacts(unsentCount: 0, hasDraft: false, hasQuestions: true, hasOpenRun: false, isUnreadable: false))
+        XCTAssertEqual(unknown.recoveryHint.state, .unknown)
+        XCTAssertEqual(clear.recoveryHint.state, .none)
+        XCTAssertEqual(attention.recoveryHint.state, .needsAttention)
+        XCTAssertFalse(clear.matchesIndexedSessionMetadata(attention), "A hint change rewrites the entry")
+        XCTAssertTrue(clear.matchesIndexedSessionMetadata(record(.absent)))
+
+        let index = AgentSessionMetadataIndex(entries: [attention])
+        let decoded = try JSONDecoder().decode(AgentSessionMetadataIndex.self, from: JSONEncoder().encode(index))
+        XCTAssertEqual(decoded.entries.first?.recoveryHint, attention.recoveryHint)
+        let encoded = try XCTUnwrap(String(data: JSONEncoder().encode(attention.recoveryHint), encoding: .utf8))
+        XCTAssertFalse(encoded.contains("Hint"), "The hint carries no session text")
     }
 
     func testUnreadableScheduledProjectionRetainsAttentionAndHistory() throws {

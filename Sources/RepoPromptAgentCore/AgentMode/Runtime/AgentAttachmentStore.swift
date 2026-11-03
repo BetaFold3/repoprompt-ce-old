@@ -50,6 +50,12 @@ package struct AgentAttachmentStore {
     }
 
     package func importImageFile(sourceURL: URL, workspaceDirectory: URL) throws -> ImportResult {
+        try importImageFile(sourceURL: sourceURL, storageRoot: Self.managedStorageRootURL(for: workspaceDirectory))
+    }
+
+    /// Same validation and copy as the workspace import, into a caller-owned storage root (used by
+    /// the recovery store's durable per-session attachment directory).
+    package func importImageFile(sourceURL: URL, storageRoot: URL) throws -> ImportResult {
         let sourceURL = sourceURL.standardizedFileURL
         guard sourceURL.isFileURL else {
             throw Error.invalidSourceURL
@@ -58,7 +64,6 @@ package struct AgentAttachmentStore {
             throw Error.sourceIsNotImage
         }
 
-        let storageRoot = Self.managedStorageRootURL(for: workspaceDirectory)
         try fileManager.createDirectory(at: storageRoot, withIntermediateDirectories: true)
 
         let fileExtension = normalizedFileExtension(for: sourceURL)

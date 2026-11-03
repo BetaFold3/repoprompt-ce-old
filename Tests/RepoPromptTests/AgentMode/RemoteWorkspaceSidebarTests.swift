@@ -528,6 +528,72 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
     }
 
     @MainActor
+    func testRemoteModelSelectionHUDRestoresSourceComposerFocusAndRejectsTabDrift() async throws {
+        let store = StubWorkspaceSessionCatalogStore(state: .loaded(.init(
+            hostWorkspaceID: nil,
+            hostWorkspaceName: nil,
+            sessions: [],
+            fetchedAt: Date()
+        )))
+        let catalog = RemoteHostAgentCatalog(agents: [.hostDefault])
+        let fixture = try await makeFixture(store: store, catalogProvider: { _ in catalog })
+        let sourceSession = try await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
+        sourceSession.remoteHost = binding(host: fixture.host, remoteSessionID: UUID().uuidString)
+        fixture.viewModel.test_resetRemoteCatalogLoadState(hostID: fixture.host.id)
+        let composer = fixture.viewModel.ui.composer
+        let isHostDefault: (AgentModelSelectionLeaf) -> Bool = {
+            if case .hostDefault = $0.commitPayload { return true }
+            return false
+        }
+
+        let hud = AgentModelSelectionHUDViewModel()
+        hud.present(mode: .switchModel) {
+            fixture.viewModel.makeModelSelectionHUDPresentation(
+                mode: .switchModel,
+                sourceTabID: sourceSession.tabID,
+                windowID: 1
+            )
+        }
+        XCTAssertTrue(hud.isPresented)
+        XCTAssertNil(hud.unavailableMessage)
+        let leaf = try XCTUnwrap(hud.filteredLeaves.first(where: isHostDefault))
+        if let staleRequestID = composer.focusRequest?.id {
+            composer.consumeFocusRequest(id: staleRequestID)
+        }
+        await hud.commit(leaf)
+        XCTAssertNil(hud.errorMessage)
+        XCTAssertFalse(hud.isPresented)
+        XCTAssertEqual(sourceSession.selectedModelRaw, RemoteHostAgentCatalog.hostDefaultModelID)
+        let request = try XCTUnwrap(composer.focusRequest)
+        XCTAssertEqual(request.tabID, sourceSession.tabID)
+        XCTAssertEqual(request.reason, .modelSelectionCommitted)
+        composer.consumeFocusRequest(id: request.id)
+
+        let stalePresentation = fixture.viewModel.makeModelSelectionHUDPresentation(
+            mode: .switchModel,
+            sourceTabID: sourceSession.tabID,
+            windowID: 1
+        )
+        let staleFocusCallback = try XCTUnwrap(stalePresentation.onSuccessfulModelSelection)
+        hud.present(mode: .switchModel) { stalePresentation }
+        let staleLeaf = try XCTUnwrap(hud.filteredLeaves.first(where: isHostDefault))
+        fixture.viewModel.test_setCurrentTabIDOverride(UUID())
+        defer { fixture.viewModel.test_setCurrentTabIDOverride(fixture.initialTabID) }
+        await hud.commit(staleLeaf)
+        XCTAssertTrue(hud.isPresented, "A rejected remote commit keeps the HUD open with its error.")
+        XCTAssertEqual(
+            hud.errorMessage,
+            AgentModelSelectionCommitError.sourceUnavailable.localizedDescription
+        )
+        XCTAssertNil(composer.focusRequest)
+        staleFocusCallback()
+        XCTAssertNil(
+            composer.focusRequest,
+            "A remote source-pinned callback must not focus after the current tab drifts."
+        )
+    }
+
+    @MainActor
     func testCanForkCurrentSessionReflectsCapableAndLegacyHostsWithoutChangingLocalGate() async throws {
         let catalog = RemoteHostAgentCatalog.degraded
         let capableStore = StubWorkspaceSessionCatalogStore(state: .loaded(.init(
@@ -741,7 +807,8 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
 
         let outcome = await fixture.viewModel.startAgentRun(
             tabID: session.tabID,
-            initialMessage: "Run this locally"
+            initialMessage: "Run this locally",
+            inputConstituents: nil
         )
         XCTAssertTrue(outcome?.didSend == true, String(describing: outcome))
         XCTAssertTrue(fixture.lifecycleRecorder.events.contains("codex:send"))
@@ -1003,7 +1070,7 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
         fixture.coordinator.test_installController(controller, for: session, hostID: fixture.host.id)
         fixture.viewModel.interviewFirst = true
 
-        _ = fixture.viewModel.submitUserTurn(text: "Actually dispatched text", tabID: session.tabID)
+        _ = fixture.viewModel.submitUserTurn(text: "Actually dispatched text", tabID: session.tabID, codexAttemptID: nil, admitted: nil)
         await waitUntil {
             session.items.contains { $0.kind == .user && $0.isUndeliveredRemoteSend }
         }
@@ -1757,7 +1824,7 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
             hostID: fixture.host.id
         )
 
-        _ = fixture.viewModel.submitUserTurn(text: "Quit while picker open", tabID: session.tabID)
+        _ = fixture.viewModel.submitUserTurn(text: "Quit while picker open", tabID: session.tabID, codexAttemptID: nil, admitted: nil)
         await waitUntil {
             guard fixture.viewModel.pendingRemoteStartWindowPicker != nil,
                   let userItem = session.items.first(where: {
@@ -1850,7 +1917,9 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
         XCTAssertEqual(selectedPersistedPayload.windowID, 61)
         XCTAssertEqual(selectedPersistedPayload.workspaceID, "workspace-selected")
         XCTAssertEqual(selectedLoaded.locallyAttributedStartItemID, attributedItemID)
-        XCTAssertEqual(selectedLoaded.lastRunState, AgentSessionRunState.idle.rawValue)
+        // F-7: a same-launch read keeps the live owner's saved active run; the cold hydration below
+        // restores it.
+        XCTAssertEqual(selectedLoaded.lastRunState, AgentSessionRunState.running.rawValue)
 
         let selectedHydrationRequest = AgentSessionHydrationRequest(
             workspace: workspace,

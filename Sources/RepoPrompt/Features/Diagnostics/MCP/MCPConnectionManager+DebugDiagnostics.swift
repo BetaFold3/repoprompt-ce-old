@@ -69,6 +69,10 @@ import MCP
                 return await debugSleepThenLargeResponsePayload(op: op, arguments: arguments)
             case "force_remove_connection":
                 return await debugForceRemoveConnectionPayload(op: op, connectionID: connectionID, arguments: arguments)
+            case "force_execution_watchdog_abort":
+                return await debugForceExecutionWatchdogAbortPayload(op: op, connectionID: connectionID, arguments: arguments)
+            case "soft_disconnect_connection":
+                return await debugSoftDisconnectConnectionPayload(op: op, connectionID: connectionID, arguments: arguments)
             case "seed_active_tool_probe":
                 return await debugSeedActiveToolProbePayload(op: op, arguments: arguments)
             case "active_tool_probe_status":

@@ -107,14 +107,18 @@ final class RemoteTranscriptProjectorTests: XCTestCase {
         XCTAssertNotNil(item.toolResultJSON)
         XCTAssertEqual(item.toolIsError, false)
         XCTAssertNotEqual(ToolCallCardStateResolver.status(for: item), .running)
+        XCTAssertEqual(ToolCallCardStateResolver.status(for: item), .success)
     }
 
+    /// Step 4d6: the method name is ledger-pinned. A result-less call no longer claims
+    /// per-call liveness; it renders neutral while staying eligible for run-scoped cancel.
     func testToolCallWithoutToolResultRemainsRunning() throws {
         let item = try XCTUnwrap(project(xml: #"<tool_call name="read_file"/>"#).first)
 
         XCTAssertNil(item.toolResultJSON)
         XCTAssertNil(item.toolIsError)
-        XCTAssertEqual(ToolCallCardStateResolver.status(for: item), .running)
+        XCTAssertEqual(ToolCallCardStateResolver.status(for: item), .neutral)
+        XCTAssertTrue(ToolCallCardStateResolver.allowsRunScopedCancel(for: item))
     }
 
     func testToolResultDoesNotConsumeSequenceIndex() {
@@ -157,7 +161,83 @@ final class RemoteTranscriptProjectorTests: XCTestCase {
             toolIsError: nil
         )
 
-        XCTAssertEqual(ToolCallCardStateResolver.status(for: item), .running)
+        // Step 4d6: the method name is ledger-pinned. Unclassifiable evidence now falls back to
+        // neutral display, while cancel eligibility keeps the old `.running` fallback.
+        XCTAssertEqual(ToolCallCardStateResolver.status(for: item), .neutral)
+        XCTAssertTrue(ToolCallCardStateResolver.allowsRunScopedCancel(for: item))
+    }
+
+    func testToolCallCardDisplayStatusTruthTable() {
+        let cases: [(name: String, raw: String?, isError: Bool?, expected: ToolCardStatus)] = [
+            ("missing evidence", nil, nil, .neutral),
+            ("unknown status word", #"{"status":"unknown"}"#, nil, .neutral),
+            ("unclassifiable non-JSON", "plain text", nil, .neutral),
+            ("status word running", #"{"status":"running"}"#, nil, .neutral),
+            ("negative command exit without timing", Self.negativeCommandExitJSON, nil, .neutral),
+            ("success", #"{"status":"success"}"#, nil, .success),
+            ("isError false only", nil, false, .success),
+            ("warning", #"{"status":"warning"}"#, nil, .warning),
+            ("failure", #"{"status":"failed"}"#, nil, .failure),
+            ("isError true only", nil, true, .failure),
+            ("explicit running summary", Self.runningRenderSummaryJSON, nil, .running)
+        ]
+        for testCase in cases {
+            let item = Self.toolCallItem(raw: testCase.raw, isError: testCase.isError)
+            XCTAssertEqual(ToolCallCardStateResolver.status(for: item), testCase.expected, testCase.name)
+        }
+    }
+
+    func testToolCallCardRunScopedCancelKeepsPreStep4d6Eligibility() {
+        let cases: [(name: String, raw: String?, isError: Bool?, allowed: Bool)] = [
+            ("missing evidence", nil, nil, true),
+            ("unknown status word", #"{"status":"unknown"}"#, nil, true),
+            ("unclassifiable non-JSON", "plain text", nil, true),
+            ("status word running", #"{"status":"running"}"#, nil, false),
+            ("negative command exit without timing", Self.negativeCommandExitJSON, nil, false),
+            ("success", #"{"status":"success"}"#, nil, false),
+            ("isError false only", nil, false, false),
+            ("warning", #"{"status":"warning"}"#, nil, false),
+            ("failure", #"{"status":"failed"}"#, nil, false),
+            ("isError true only", nil, true, false),
+            ("explicit running summary", Self.runningRenderSummaryJSON, nil, true)
+        ]
+        for testCase in cases {
+            let item = Self.toolCallItem(raw: testCase.raw, isError: testCase.isError)
+            // The pre-4d6 formula restated for comparison; it is not an independent oracle.
+            // The hardcoded `allowed` column is what pins the behavior.
+            let oldEligibility = testCase.raw == nil && testCase.isError == nil
+                || ToolResultStatusResolver.resolve(toolIsError: testCase.isError, raw: testCase.raw, fallback: .running) == .running
+            XCTAssertEqual(oldEligibility, testCase.allowed, "pre-4d6 formula: \(testCase.name)")
+            XCTAssertEqual(ToolCallCardStateResolver.allowsRunScopedCancel(for: item), testCase.allowed, testCase.name)
+        }
+    }
+
+    func testToolCallCardRunScopedCancelRequiresRunScopeActionAndRepoPromptTool() {
+        let unresolved = Self.toolCallItem(raw: nil, isError: nil, toolName: "mcp__\(MCPIntegrationHelper.repoPromptMCPServerName)__read_file")
+        let plainRepoPrompt = Self.toolCallItem(raw: nil, isError: nil, toolName: "read_file")
+        let foreign = Self.toolCallItem(raw: nil, isError: nil, toolName: "Bash")
+        let settled = Self.toolCallItem(raw: #"{"status":"success"}"#, isError: false, toolName: "read_file")
+
+        XCTAssertTrue(ToolCallCardStateResolver.showsRunScopedCancel(
+            for: unresolved, showRunScopedToolCancel: true, hasCancelAction: true
+        ))
+        XCTAssertTrue(ToolCallCardStateResolver.showsRunScopedCancel(
+            for: plainRepoPrompt, showRunScopedToolCancel: true, hasCancelAction: true
+        ))
+        XCTAssertFalse(ToolCallCardStateResolver.showsRunScopedCancel(
+            for: unresolved, showRunScopedToolCancel: false, hasCancelAction: true
+        ))
+        XCTAssertFalse(ToolCallCardStateResolver.showsRunScopedCancel(
+            for: unresolved, showRunScopedToolCancel: true, hasCancelAction: false
+        ))
+        XCTAssertFalse(ToolCallCardStateResolver.showsRunScopedCancel(
+            for: foreign, showRunScopedToolCancel: true, hasCancelAction: true
+        ))
+        XCTAssertFalse(ToolCallCardStateResolver.showsRunScopedCancel(
+            for: settled, showRunScopedToolCancel: true, hasCancelAction: true
+        ))
+        // Cancel eligibility is decoupled from the neutral display.
+        XCTAssertEqual(ToolCallCardStateResolver.status(for: unresolved), .neutral)
     }
 
     func testRowTimestampAttributesParseAcrossRowKindsWithSyntheticFallback() {
@@ -290,5 +370,21 @@ final class RemoteTranscriptProjectorTests: XCTestCase {
                 "transcript_xml": .string(xml)
             ]))
             .items
+    }
+
+    /// An explicit `.neutral` from the command-exit override (a negative exit code with no timing hint).
+    private static let negativeCommandExitJSON = #"{"type":"command_execution","exitCode":-1}"#
+
+    private static let runningRenderSummaryJSON =
+        #"{"summary_only":true,"render_summary":{"tool_name":"manage_selection","status":"running"}}"#
+
+    private static func toolCallItem(raw: String?, isError: Bool?, toolName: String = "read_file") -> AgentChatItem {
+        AgentChatItem(
+            kind: .toolCall,
+            text: "Using tool: \(toolName)",
+            toolName: toolName,
+            toolResultJSON: raw,
+            toolIsError: isError
+        )
     }
 }

@@ -41,6 +41,33 @@ package protocol NativeAgentRuntimeControlling: Actor {
     func interruptTurn(reason: String) async -> NativeAgentRuntimeInterruptOutcome
     func shutdown() async
     func respondToPermissionRequest(id: String, decision: AgentApprovalDecision) async
+    /// Whether the runtime failed `turnID` because its provider process ended unexpectedly (not a
+    /// shutdown it was asked for): the run's terminal cause is provider-process loss (review A F06).
+    /// Answers once per turn. Runtimes without that evidence answer `false`.
+    func turnEndedByProcessLoss(_ turnID: UUID) async -> Bool
+    /// R6: whether this runtime's launches are registered. A registered start joins the tab's
+    /// retained runtime retirements (any provider) before it reserves. Others never join.
+    nonisolated var joinsRetirementBeforeSuccessor: Bool { get }
+    /// O49: the written, not yet completed turn that provider output (model text, reasoning, or a
+    /// tool call) has been attributed to, or `nil`. A queued turn the provider has not begun is
+    /// never reported. Runtimes without per-turn output attribution report `nil`.
+    nonisolated var startedTurnID: UUID? { get }
+    /// RepoPrompt MCP health of the current launch. Runtimes without health tracking report
+    /// `.unknown` and are never recovered for MCP health.
+    var currentRepoPromptMCPHealth: NativeAgentRuntimeRepoPromptMCPHealth { get async }
+    /// The PID of the current, healthy launch's spawned agent process, bound to that launch's
+    /// RepoPrompt MCP launch token, or `nil` (no running launch, shutting down, or unhealthy). It
+    /// may not be registered as the run's expected MCP agent yet; the host proves a route only
+    /// against a registered instance, so an unregistered PID never skips the wait. A later turn may
+    /// skip its routing wait only for a route proven to belong to this launch. Runtimes without
+    /// it report `nil` and always wait.
+    var repoPromptMCPLaunchAgentPID: pid_t? { get async }
+    /// Bounded wait for fresh RepoPrompt MCP connected evidence on the current launch. Runtimes
+    /// without such evidence never report `connected`.
+    func awaitRepoPromptMCPConnectedEvidence(
+        timeoutSeconds: TimeInterval,
+        pollIntervalSeconds: TimeInterval
+    ) async -> NativeAgentRuntimeRepoPromptMCPProbeOutcome
 }
 
 extension NativeAgentRuntimeControlling {
@@ -59,6 +86,33 @@ extension NativeAgentRuntimeControlling {
 
     func emitEventMarker(_: UUID) async -> UInt64? {
         nil
+    }
+
+    func turnEndedByProcessLoss(_: UUID) async -> Bool {
+        false
+    }
+
+    nonisolated var joinsRetirementBeforeSuccessor: Bool {
+        false
+    }
+
+    nonisolated var startedTurnID: UUID? {
+        nil
+    }
+
+    var currentRepoPromptMCPHealth: NativeAgentRuntimeRepoPromptMCPHealth {
+        get async { .unknown }
+    }
+
+    var repoPromptMCPLaunchAgentPID: pid_t? {
+        get async { nil }
+    }
+
+    func awaitRepoPromptMCPConnectedEvidence(
+        timeoutSeconds _: TimeInterval,
+        pollIntervalSeconds _: TimeInterval
+    ) async -> NativeAgentRuntimeRepoPromptMCPProbeOutcome {
+        .notConnected("This runtime reports no RepoPrompt MCP connection evidence.")
     }
 }
 
@@ -79,9 +133,12 @@ package struct NativeAgentRuntimeEventsSubscription {
 package typealias NativeAgentRuntimeEvent = ClaudeNativeProcessSessionController.Event
 package typealias NativeAgentRuntimeSessionRef = ClaudeNativeProcessSessionController.SessionRef
 typealias NativeAgentRuntimeTurnStatus = ClaudeNativeProcessSessionController.TurnStatus
+typealias NativeAgentRuntimeTurnCompletionOrigin = ClaudeNativeProcessSessionController.TurnCompletionOrigin
 typealias NativeAgentRuntimeRuntimeInitStatus = ClaudeNativeProcessSessionController.RuntimeInitStatus
 package typealias NativeAgentRuntimeInterruptOutcome = ClaudeNativeProcessSessionController.InterruptOutcome
 typealias NativeAgentRuntimeControllerError = ClaudeNativeProcessSessionController.ControllerError
+package typealias NativeAgentRuntimeRepoPromptMCPHealth = ClaudeNativeProcessSessionController.RepoPromptMCPHealth
+package typealias NativeAgentRuntimeRepoPromptMCPProbeOutcome = ClaudeNativeProcessSessionController.RepoPromptMCPConnectionProbeOutcome
 package typealias NativeAgentRuntimeEffortLevel = ClaudeCodeEffortLevel
 package typealias NativeUsageAccountingEvent = ClaudeNativeProcessSessionController.UsageAccountingEvent
 typealias NativeProcessLaunchIdentity = ClaudeNativeProcessSessionController.ProcessLaunchIdentity

@@ -3,7 +3,9 @@ set -euo pipefail
 # The optimized-diagnostics manifest gate reaches Swift only through canonical_swift.sh
 # --rpce-optimized-diagnostics (debug-optimized below); never inherit it, including on paths
 # that call Swift directly, such as the KeyboardShortcuts helper's `swift package resolve`.
-unset RPCE_OPTIMIZED_DIAGNOSTICS
+# The optimized-incremental App lane's extra gate reaches Swift only through
+# --rpce-optimized-incremental (debug-optimized-incremental below).
+unset RPCE_OPTIMIZED_DIAGNOSTICS RPCE_OPTIMIZED_INCREMENTAL
 
 CONF="${1:-debug}"
 FAST_PACKAGE_MARKER="${2:-}"
@@ -170,11 +172,11 @@ case "$FAST_PACKAGE_MARKER" in
     *) fail "Unknown package mode '$FAST_PACKAGE_MARKER'. Expected 'fast' or no package mode." ;;
 esac
 if (( $# > 2 )); then
-    fail "Too many arguments. Usage: $0 [debug|debug-optimized|release] [fast]"
+    fail "Too many arguments. Usage: $0 [debug|debug-optimized|debug-optimized-incremental|release] [fast]"
 fi
 case "$CONF" in
-    debug|debug-optimized|release) ;;
-    *) fail "Unknown configuration '$CONF'. Usage: $0 [debug|debug-optimized|release] [fast]" ;;
+    debug|debug-optimized|debug-optimized-incremental|release) ;;
+    *) fail "Unknown configuration '$CONF'. Usage: $0 [debug|debug-optimized|debug-optimized-incremental|release] [fast]" ;;
 esac
 # Debug package cache escape, checked before any build or mutation. Unset means on; release ignores it.
 DEBUG_PACKAGE_CACHE_MODE="on"
@@ -187,17 +189,18 @@ fi
 # Optimized-diagnostics lane preconditions from the caller's environment, checked before any
 # mutation or build: an explicit Apple Development identity (persistent debug Keychain storage),
 # no bundle-ID overrides and no Sentry. The resolved bundle ID is checked once it is known.
-if [[ "$CONF" == "debug-optimized" ]]; then
+# The optimized-incremental App lane takes the same preconditions under its own name.
+if [[ "$CONF" == "debug-optimized" || "$CONF" == "debug-optimized-incremental" ]]; then
     [[ -n "${SIGN_IDENTITY:-}" ]] ||
-        fail "debug-optimized requires an explicit SIGN_IDENTITY=\"Apple Development: ...\"; auto-detected and ad-hoc signing are not supported."
+        fail "$CONF requires an explicit SIGN_IDENTITY=\"Apple Development: ...\"; auto-detected and ad-hoc signing are not supported."
     [[ "$SIGN_IDENTITY" != "-" ]] ||
-        fail "debug-optimized does not support ad-hoc signing (SIGN_IDENTITY=-); set SIGN_IDENTITY=\"Apple Development: ...\"."
+        fail "$CONF does not support ad-hoc signing (SIGN_IDENTITY=-); set SIGN_IDENTITY=\"Apple Development: ...\"."
     [[ "$SIGN_IDENTITY" == "Apple Development:"* ]] ||
-        fail "debug-optimized requires SIGN_IDENTITY to begin with 'Apple Development:'; got '$SIGN_IDENTITY'."
+        fail "$CONF requires SIGN_IDENTITY to begin with 'Apple Development:'; got '$SIGN_IDENTITY'."
     [[ -z "${BUNDLE_ID:-}" && -z "${DEBUG_BUNDLE_ID:-}" ]] ||
-        fail "debug-optimized keeps the debug bundle ID; unset BUNDLE_ID and DEBUG_BUNDLE_ID."
+        fail "$CONF keeps the debug bundle ID; unset BUNDLE_ID and DEBUG_BUNDLE_ID."
     [[ -z "${REPOPROMPT_ENABLE_SENTRY+set}" && -z "${REPOPROMPT_UPLOAD_SENTRY_SYMBOLS+set}" ]] ||
-        fail "debug-optimized does not support Sentry; unset REPOPROMPT_ENABLE_SENTRY and REPOPROMPT_UPLOAD_SENTRY_SYMBOLS."
+        fail "$CONF does not support Sentry; unset REPOPROMPT_ENABLE_SENTRY and REPOPROMPT_UPLOAD_SENTRY_SYMBOLS."
 fi
 
 BUNDLE_ID_OVERRIDE="${BUNDLE_ID:-}"
@@ -228,12 +231,24 @@ CANONICAL_PREFIX=()
 COMPAT_CONF="$CONF"
 IS_OPTIMIZED_LANE=0
 OPTIMIZED_SCRATCH_DIR="$ROOT_DIR/.build/optimized-diagnostics"
+LANE_VERIFY_ARGS=()
+LANE_VERIFY_LABEL="optimized-diagnostics"
 LANE_FLAGS_VERIFIED=0
 if [[ "$CONF" == "debug-optimized" ]]; then
     IS_OPTIMIZED_LANE=1
     SWIFT_CONF="release"
     CANONICAL_PREFIX=(--rpce-optimized-diagnostics)
     COMPAT_CONF="debug"
+elif [[ "$CONF" == "debug-optimized-incremental" ]]; then
+    # The optimized lane with only RepoPromptApp compiled non-WMO (incremental batch mode) in its
+    # own scratch folder; every other branch below is the debug-optimized one.
+    IS_OPTIMIZED_LANE=1
+    SWIFT_CONF="release"
+    CANONICAL_PREFIX=(--rpce-optimized-incremental)
+    COMPAT_CONF="debug"
+    OPTIMIZED_SCRATCH_DIR="$ROOT_DIR/.build/optimized-incremental"
+    LANE_VERIFY_ARGS=(--lane optimized-incremental)
+    LANE_VERIFY_LABEL="optimized-incremental"
 fi
 if (( FAST_PACKAGE_REQUESTED )); then
     if (( IS_RELEASE )); then
@@ -251,8 +266,12 @@ else
 fi
 if (( IS_OPTIMIZED_LANE )); then
     [[ "$BUNDLE_ID" == "com.pvncher.repoprompt.ce.debug" ]] ||
-        fail "debug-optimized requires the debug bundle ID com.pvncher.repoprompt.ce.debug; resolved '$BUNDLE_ID'."
-    echo "*** OPTIMIZED DIAGNOSTICS LANE: swift -c release, first-party DEBUG, debug identity ***"
+        fail "$CONF requires the debug bundle ID com.pvncher.repoprompt.ce.debug; resolved '$BUNDLE_ID'."
+    if [[ "$CONF" == "debug-optimized-incremental" ]]; then
+        echo "*** OPTIMIZED INCREMENTAL APP LANE: swift -c release, first-party DEBUG, RepoPromptApp non-WMO incremental, rest WMO, debug identity ***"
+    else
+        echo "*** OPTIMIZED DIAGNOSTICS LANE: swift -c release, first-party DEBUG, debug identity ***"
+    fi
 fi
 
 phase "Checking build environment"
@@ -445,23 +464,24 @@ printf 'BUILD_DIR=%s\nAPP_BUNDLE=%s\nCOMPAT_APP_BUNDLE=%s\nCLI_PATH=%s\nGATEWAY_
 # Optimized-diagnostics lane-flag verifier: on every lane package (fresh, noop-dest and noop-clone)
 # before the cache plan and any reuse. Any non-zero status, usage errors (2) included, fails packaging.
 if (( IS_OPTIMIZED_LANE )); then
-    phase "Verifying optimized-diagnostics lane flags"
+    phase "Verifying $LANE_VERIFY_LABEL lane flags"
     LANE_SCRATCH_CANONICAL="$(CDPATH='' cd -- "$OPTIMIZED_SCRATCH_DIR" 2>/dev/null && pwd -P)" ||
-        fail "debug-optimized scratch folder is missing: $OPTIMIZED_SCRATCH_DIR"
+        fail "$CONF scratch folder is missing: $OPTIMIZED_SCRATCH_DIR"
     LANE_BUILD_DIR_CANONICAL="$(CDPATH='' cd -- "$BUILD_DIR" 2>/dev/null && pwd -P)" ||
-        fail "debug-optimized BUILD_DIR is missing: $BUILD_DIR"
+        fail "$CONF BUILD_DIR is missing: $BUILD_DIR"
     [[ "$LANE_BUILD_DIR_CANONICAL" == "$LANE_SCRATCH_CANONICAL/"* ]] ||
-        fail "debug-optimized BUILD_DIR must lie under $OPTIMIZED_SCRATCH_DIR; got $BUILD_DIR ($LANE_BUILD_DIR_CANONICAL)."
+        fail "$CONF BUILD_DIR must lie under $OPTIMIZED_SCRATCH_DIR; got $BUILD_DIR ($LANE_BUILD_DIR_CANONICAL)."
     LANE_BUILD_PLAN_DIR="$(CDPATH='' cd -- "$LANE_BUILD_DIR_CANONICAL/../.." 2>/dev/null && pwd -P)" ||
-        fail "debug-optimized could not resolve the build-plan folder of $BUILD_DIR"
+        fail "$CONF could not resolve the build-plan folder of $BUILD_DIR"
     [[ "$LANE_BUILD_PLAN_DIR" == "$LANE_SCRATCH_CANONICAL" ]] ||
-        fail "debug-optimized BUILD_DIR must be <scratch>/<triple>/release under $OPTIMIZED_SCRATCH_DIR; got $BUILD_DIR ($LANE_BUILD_DIR_CANONICAL)."
+        fail "$CONF BUILD_DIR must be <scratch>/<triple>/release under $OPTIMIZED_SCRATCH_DIR; got $BUILD_DIR ($LANE_BUILD_DIR_CANONICAL)."
     LANE_BUILD_YAML="$LANE_BUILD_PLAN_DIR/release.yaml"
-    echo_cmd python3 -I -S "$CONTROL_PLANE_SCRIPTS_DIR/verify_build_lane_flags.py" --build-yaml "$LANE_BUILD_YAML"
+    # ${arr[@]+...} keeps the empty debug-optimized argument list safe under set -u on bash 3.2.
+    echo_cmd python3 -I -S "$CONTROL_PLANE_SCRIPTS_DIR/verify_build_lane_flags.py" --build-yaml "$LANE_BUILD_YAML" ${LANE_VERIFY_ARGS[@]+"${LANE_VERIFY_ARGS[@]}"}
     LANE_VERIFY_STATUS=0
-    python3 -I -S "$CONTROL_PLANE_SCRIPTS_DIR/verify_build_lane_flags.py" --build-yaml "$LANE_BUILD_YAML" || LANE_VERIFY_STATUS=$?
+    python3 -I -S "$CONTROL_PLANE_SCRIPTS_DIR/verify_build_lane_flags.py" --build-yaml "$LANE_BUILD_YAML" ${LANE_VERIFY_ARGS[@]+"${LANE_VERIFY_ARGS[@]}"} || LANE_VERIFY_STATUS=$?
     (( LANE_VERIFY_STATUS == 0 )) ||
-        fail "verify_build_lane_flags.py exited with status $LANE_VERIFY_STATUS; the build plan does not prove the optimized-diagnostics lane flags."
+        fail "verify_build_lane_flags.py exited with status $LANE_VERIFY_STATUS; the build plan does not prove the $LANE_VERIFY_LABEL lane flags."
     LANE_FLAGS_VERIFIED=1
 fi
 
@@ -803,11 +823,12 @@ lane = os.environ["BUILD_LANE_FOR_PROVENANCE"]
 lane_labels = {
     "debug": {"swiftConfiguration": "debug", "optimization": "Onone", "assertConfiguration": "Debug", "laneFlagsVerified": None},
     "debug-optimized": {"swiftConfiguration": "release", "optimization": "O", "assertConfiguration": "Release", "laneFlagsVerified": True},
+    "debug-optimized-incremental": {"swiftConfiguration": "release", "optimization": "O", "assertConfiguration": "Release", "laneFlagsVerified": True},
 }
 if lane not in lane_labels:
     raise SystemExit(f"ERROR: unknown debug build lane {lane!r} for provenance")
-if lane == "debug-optimized" and os.environ["LANE_FLAGS_VERIFIED_FOR_PROVENANCE"] != "1":
-    raise SystemExit("ERROR: debug-optimized provenance requires verified lane flags")
+if lane in ("debug-optimized", "debug-optimized-incremental") and os.environ["LANE_FLAGS_VERIFIED_FOR_PROVENANCE"] != "1":
+    raise SystemExit(f"ERROR: {lane} provenance requires verified lane flags")
 now = time.time()
 payload = {
     "version": 1,

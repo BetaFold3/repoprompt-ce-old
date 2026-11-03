@@ -148,6 +148,7 @@ extension AgentModeViewModel {
         cancelPersistedLoad(for: session)
         // Authority is dropped; the incarnation ID is kept so no creation path can ever target it.
         session.persistenceState = nil
+        recoveryPersistenceStateDidChange(for: session)
         session.clearCurrentBindingHydration()
         session.hasLoadedPersistedState = false
         session.isDirty = true
@@ -254,7 +255,7 @@ extension AgentModeViewModel {
             // The terminal commit flushes buffered assistant output into the retained view,
             // finalizes streaming items and pending tool calls, drains provider buffers, and the
             // completion awaits the registered teardown of the run attempt's resources.
-            await cancelAgentRun(tabID: tabID, completion: .terminalTeardownCompleted)
+            await cancelAgentRun(tabID: tabID, cause: .ordinary, completion: .terminalTeardownCompleted)
         }
         guard let afterCancel = session.staleResetRecovery,
               afterCancel.id == recoveryID,
@@ -263,7 +264,7 @@ extension AgentModeViewModel {
         else { return }
         // Buffered output that no terminal commit consumed (remote projections, already-inactive
         // runs) is committed to the retained view rather than discarded.
-        flushPendingAssistantDelta(session)
+        session.drainPendingAssistantDelta()
         var registrationActive = false
         if let sessionID = session.activeAgentSessionID {
             registrationActive = await AgentRunSessionStore.hasActiveRegistration(sessionID: sessionID)

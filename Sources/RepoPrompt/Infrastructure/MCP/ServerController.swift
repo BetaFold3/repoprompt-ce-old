@@ -80,6 +80,7 @@ final actor ServerController: ObservableObject {
     private let discoveryAuthority: RemotePairingDiscoveryAuthority
     private static let remoteGatewayMaxRestartAttempts = 6
     private static let remoteGatewayStableUptimeSeconds: TimeInterval = 60
+    static let remoteGatewayStoppedWithServerReason = "Stopped with the MCP server."
 
     /// Set the approval callback
     func setApprovalCallback(_ callback: @escaping (String) async -> Void) {
@@ -472,17 +473,24 @@ final actor ServerController: ObservableObject {
     func applyRemoteGatewaySettings() async {
         let generation = await remoteGatewayActivationGate.begin()
         await remoteGatewayProcessLifecycle.selectGeneration(generation)
-        let enabled = await MainActor.run {
-            GlobalSettingsStore.shared.mcpRemoteGatewayEnabled()
+        let (enabled, browserHTTPSPort) = await MainActor.run {
+            (
+                GlobalSettingsStore.shared.mcpRemoteGatewayEnabled(),
+                GlobalSettingsStore.shared.mcpRemoteGatewayBrowserHTTPSPort()
+            )
         }
 
         guard enabled else {
-            try? await remoteGatewayProcessLifecycle.stop(generation: generation)
-            await publishRemoteGatewayStatus(.disabled)
+            await Self.stopRemoteGateway(
+                .disabled,
+                generation: generation,
+                statusStore: .shared,
+                lifecycle: remoteGatewayProcessLifecycle
+            )
             return
         }
 
-        await publishRemoteGatewayStatus(.resolvingTailscale)
+        await publishRemoteGatewayStatus(.resolvingTailscale, generation: generation)
         var configuredLaunchID: UUID?
         do {
             let snapshot = try await tailscaleStatusProvider.status()
@@ -492,11 +500,19 @@ final actor ServerController: ObservableObject {
             }
             let buildIdentity = RemoteControlBuildIdentity.current
             let origin = try RemoteGatewayOrigin(tailscaleIPv4: bindHost, channel: buildIdentity.channel)
+            let browserOrigin = RemoteGatewayBrowserOrigin.derive(
+                selfDNSName: snapshot.selfDNSName,
+                port: browserHTTPSPort
+            )
             let launchConfiguration = RemoteGatewayLaunchConfiguration.production(
                 bindHost: bindHost,
-                buildIdentity: buildIdentity
+                browserOrigin: browserOrigin,
+                buildIdentity: buildIdentity,
+                // Fail-closed: when any paired device requires a passkey (or the registry can't be
+                // read), pass the policy-version flag so an incompatible gateway refuses to start.
+                requiredPasskeyPolicyVersion: RemoteGatewayLaunchConfiguration.resolveRequiredPasskeyPolicyVersion()
             )
-            await publishRemoteGatewayStatus(.starting(origin))
+            await publishRemoteGatewayStatus(.starting(origin), browserOrigin: browserOrigin, generation: generation)
             try await ensureRemoteGatewayGeneration(generation)
             let processIdentity = try await remoteGatewayProcessLifecycle.startIfNeeded(
                 launchConfiguration,
@@ -538,7 +554,7 @@ final actor ServerController: ObservableObject {
             } catch {
                 throw CancellationError()
             }
-            await publishRemoteGatewayStatus(.discoverable(origin))
+            await publishRemoteGatewayStatus(.discoverable(origin), browserOrigin: browserOrigin, generation: generation)
         } catch is CancellationError {
             if let configuredLaunchID {
                 await discoveryAuthority.clear(ifLaunchID: configuredLaunchID)
@@ -561,9 +577,9 @@ final actor ServerController: ObservableObject {
             }
             let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             if error is TailscaleStatusError {
-                await publishRemoteGatewayStatus(.unavailable(message))
+                await publishRemoteGatewayStatus(.unavailable(message), generation: generation)
             } else {
-                await publishRemoteGatewayStatus(.failed(message))
+                await publishRemoteGatewayStatus(.failed(message), generation: generation)
             }
         }
     }
@@ -602,10 +618,33 @@ final actor ServerController: ObservableObject {
         throw lastError ?? RemoteHostHTTPClientError.invalidResponse
     }
 
-    private func publishRemoteGatewayStatus(_ status: RemoteGatewayStatusStore.Status) async {
+    /// Status publication is fenced by the activation-gate generation, so a publication that
+    /// lost a race with a newer apply, stop, or exit is dropped.
+    private func publishRemoteGatewayStatus(
+        _ status: RemoteGatewayStatusStore.Status,
+        browserOrigin: RemoteGatewayOrigin? = nil,
+        generation: UInt64
+    ) async {
         await MainActor.run {
-            RemoteGatewayStatusStore.shared.publish(status)
+            _ = RemoteGatewayStatusStore.shared.publish(status, browserOrigin: browserOrigin, generation: generation)
         }
+    }
+
+    /// Every gateway stop withdraws the published status (and with it the active browser link)
+    /// for its generation first, then runs `beforeStop`, then awaits process termination, which
+    /// can take seconds. Alerts admitted meanwhile are text-only.
+    static func stopRemoteGateway(
+        _ stop: RemoteGatewayStatusStore.Stop,
+        generation: UInt64,
+        statusStore: RemoteGatewayStatusStore,
+        lifecycle: RemoteGatewayProcessLifecycle,
+        beforeStop: @Sendable () async -> Void = {}
+    ) async {
+        await MainActor.run {
+            _ = statusStore.publishStop(stop, generation: generation)
+        }
+        await beforeStop()
+        try? await lifecycle.stop(generation: generation)
     }
 
     private nonisolated static func remoteGatewayHostName() -> String {
@@ -664,7 +703,13 @@ final actor ServerController: ObservableObject {
                 environment["REPOPROMPT_GATEWAY_PARENT_PID"] = String(getpid())
                 environment["REPOPROMPT_GATEWAY_PROCESS_LEASE_FILE"] = remoteGatewayProcessLeaseFileURL(for: configuration).path
                 environment["REPOPROMPT_GATEWAY_APP_LINK_MAX_RECONNECT_ATTEMPTS"] = "24"
+                // Always set (empty when unset) so an inherited value never widens the Host allowlist.
+                environment["REPOPROMPT_GATEWAY_BROWSER_ORIGIN"] = configuration.browserOrigin?.string ?? ""
                 process.environment = environment
+                // Non-empty only when a passkey policy is required. The current gateway rejects an
+                // unknown flag at config parse (before the listener), so an incompatible binary
+                // fails closed instead of serving a required policy it cannot enforce.
+                process.arguments = configuration.gatewayProcessArguments
                 let diagnostics = RemoteGatewayProcessDiagnosticsCapture(
                     runtimeRootURL: URL(fileURLWithPath: configuration.appSupportRoot),
                     generation: token
@@ -726,9 +771,9 @@ final actor ServerController: ObservableObject {
 
     private func remoteGatewayDidTerminate(_ identity: RemoteGatewayProcessIdentity) async {
         guard let termination = await remoteGatewayProcessLifecycle.didTerminate(identity),
-              await remoteGatewayActivationGate.invalidate(ifGeneration: termination.generation)
+              let exitGeneration = await remoteGatewayActivationGate.invalidate(ifGeneration: termination.generation)
         else { return }
-        await publishRemoteGatewayStatus(.unavailable("Gateway process exited."))
+        await publishRemoteGatewayStatus(.unavailable("Gateway process exited."), generation: exitGeneration)
         let shouldRestart = await MainActor.run {
             GlobalSettingsStore.shared.mcpRemoteGatewayEnabled()
         }
@@ -776,8 +821,14 @@ final actor ServerController: ObservableObject {
     func stopServer() async {
         let generation = await remoteGatewayActivationGate.invalidate()
         await remoteGatewayProcessLifecycle.selectGeneration(generation)
-        await networkManager.setEnabled(false)
-        try? await remoteGatewayProcessLifecycle.stop(generation: generation)
+        let networkManager = networkManager
+        await Self.stopRemoteGateway(
+            .stopped(reason: Self.remoteGatewayStoppedWithServerReason),
+            generation: generation,
+            statusStore: .shared,
+            lifecycle: remoteGatewayProcessLifecycle,
+            beforeStop: { await networkManager.setEnabled(false) }
+        )
         endPowerActivity()
         updateServerStatus("Disabled")
     }
@@ -786,8 +837,14 @@ final actor ServerController: ObservableObject {
     func fullShutdown() async {
         let generation = await remoteGatewayActivationGate.invalidate()
         await remoteGatewayProcessLifecycle.selectGeneration(generation)
-        await networkManager.stop()
-        try? await remoteGatewayProcessLifecycle.stop(generation: generation)
+        let networkManager = networkManager
+        await Self.stopRemoteGateway(
+            .stopped(reason: Self.remoteGatewayStoppedWithServerReason),
+            generation: generation,
+            statusStore: .shared,
+            lifecycle: remoteGatewayProcessLifecycle,
+            beforeStop: { await networkManager.stop() }
+        )
         endPowerActivity()
         updateServerStatus("Stopped")
     }

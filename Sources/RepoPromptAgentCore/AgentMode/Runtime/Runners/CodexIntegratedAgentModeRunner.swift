@@ -23,7 +23,7 @@ final class CodexIntegratedAgentModeRunner {
         initialMessageForRun: String,
         attachments: [AgentImageAttachment],
         fallbackContext: AgentTabSession.CodexFallbackSubmissionContext?,
-        delegatedQuestionStageID: UUID? = nil
+        stagedInput: AgentCarriedStagedInput = AgentCarriedStagedInput()
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome {
         let ownership: AgentRunOwnership
         let createdOwnership: Bool
@@ -64,24 +64,28 @@ final class CodexIntegratedAgentModeRunner {
                 attachmentReservationID: attachmentReservationID,
                 terminalizeRejectedSend: createdOwnership
             )
-            // The pending handoff is tab-wide; a superseded send leaves the successor's staging alone.
+            // Exact-stage settlement. Uncertainty is neither consumption nor permission to replay:
+            // both stages stay held. A superseded send leaves the successor's staging alone.
             if !Self.isSupersededBySuccessor(ownership, attemptGeneration: attemptGeneration, session: session) {
-                hooks.recordPendingHandoffSendOutcome(session, outcome.didSend)
+                hooks.recordPendingHandoffSendOutcome(
+                    session,
+                    stagedInput.pendingHandoffStage,
+                    Self.pendingHandoffDisposition(for: outcome)
+                )
             }
-            // Delegated child-question notices acknowledge only on an actual send. A queued
-            // fallback (`didSend == true`) has not reached the model yet, so its stage is released
-            // and the notices stay deliverable; the release also removes the stage's runtime
-            // block from the queued fallback text, so only a later delivery carries them.
-            let delegatedQuestionNoticesSent = if case .sent = outcome { true } else { false }
-            hooks.recordDelegatedQuestionNoticeSendOutcome(
-                session,
-                delegatedQuestionStageID,
-                delegatedQuestionNoticesSent
-            )
+            if stagedInput.delegatedQuestionStageID != nil {
+                hooks.recordDelegatedQuestionNoticeSendOutcome(
+                    session,
+                    stagedInput.delegatedQuestionStageID,
+                    Self.delegatedQuestionNoticeDisposition(for: outcome)
+                )
+            }
             switch outcome {
             case .sent:
                 session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .running)
-            case .cancelled, .failed, .stale:
+            case .cancelled, .failed, .stale, .deliveryUnknown:
+                // `.deliveryUnknown`: the durable intent stays uncertain (or in flight through
+                // another send); it is never retried from here.
                 if createdOwnership {
                     session.endRunAttempt(ifCurrent: ownership, source: "codex.sendRejected")
                 }
@@ -112,5 +116,37 @@ final class CodexIntegratedAgentModeRunner {
         }
         guard let currentOwnership = session.activeRunOwnership else { return false }
         return currentOwnership != ownership
+    }
+
+    /// Codex stage-delivery boundary for the staged pending-handoff payload. `turn/start` is the send
+    /// boundary; a queued fallback carries the payload inside its durably queued provider text, so
+    /// the session's copy is consumed. Uncertainty holds the payload; every other refusal proves
+    /// nothing was handed off.
+    static func pendingHandoffDisposition(
+        for outcome: CodexAgentModeCoordinator.NativeSendOutcome
+    ) -> AgentStagedInputDisposition {
+        switch outcome {
+        case .sent, .queuedFallback:
+            .sent
+        case .deliveryUnknown:
+            .deliveryUnknown
+        case .stale, .cancelled, .failed:
+            .notSent
+        }
+    }
+
+    /// Delegated child-question notices acknowledge only at an actual send: a queued fallback has not
+    /// reached the model, so its stage is released (and its block stripped from the queued copy).
+    static func delegatedQuestionNoticeDisposition(
+        for outcome: CodexAgentModeCoordinator.NativeSendOutcome
+    ) -> AgentStagedInputDisposition {
+        switch outcome {
+        case .sent:
+            .sent
+        case .deliveryUnknown:
+            .deliveryUnknown
+        case .queuedFallback, .stale, .cancelled, .failed:
+            .notSent
+        }
     }
 }

@@ -21,6 +21,8 @@ struct ClaudeCLIOptions {
     var timeout: TimeInterval?
     var environmentOverrides: [String: String] = [:]
     var removedEnvironmentKeys: Set<String> = []
+    /// The actual Claude provider this launch reaches (runtime ownership only; never an argument).
+    var runtimeVariant: ClaudeCodeRuntimeVariant = .standard
 
     var additionalEnvironment: [String: String] {
         var environment = environmentOverrides
@@ -115,6 +117,9 @@ package final class ClaudeCodeProvider: AIProvider {
     private let maxRetries: Int
     private let initialBackoff: TimeInterval
     private let maxBackoff: TimeInterval = 8.0
+    /// R6 launch ownership for print-mode launches (a managed AgentCore provider caller).
+    private let launchAuthority: AgentRuntimeLaunchAuthority
+    private let launchWorktreePath: String?
 
     /// - Parameters:
     ///   - launchEnvironmentResolver: Resolves compatible-backend launch environments. `nil`
@@ -129,8 +134,11 @@ package final class ClaudeCodeProvider: AIProvider {
         logCollector: CLIProcessLogCollector? = nil,
         defaults: UserDefaults = .standard,
         launchEnvironmentResolver: (any ClaudeCodeLaunchEnvironmentResolving)? = nil,
-        initialRetryBackoff: TimeInterval? = nil
+        initialRetryBackoff: TimeInterval? = nil,
+        launchAuthority: AgentRuntimeLaunchAuthority = .production
     ) throws {
+        self.launchAuthority = launchAuthority
+        launchWorktreePath = workingDirectory
         let commandSelection = try CLIExecutableOverrideStore.effectiveCommand(
             for: CLILaunchProfiles.claudeCode,
             defaults: defaults
@@ -276,19 +284,49 @@ package final class ClaudeCodeProvider: AIProvider {
         additionalEnvironment: [String: String],
         removedEnvironmentKeys: Set<String>
     ) async throws -> CLIProcessRunner.Result {
+        // Each attempt is its own runtime; print mode never resumes a provider conversation.
+        // Oracle and connection tests are not Agent Mode sessions: explicitly sessionless.
+        let launch = launchAuthority.makeLaunch(AgentRuntimeLaunchContext(
+            family: .claudeHeadless,
+            provider: .claude(options.runtimeVariant),
+            session: .sessionless,
+            worktreePath: launchWorktreePath,
+            permission: .claude(permissionMode: options.permissionMode)
+        ))
+        let result: CLIProcessRunner.Result
         do {
-            return try await runner.run(
+            result = try await runner.run(
                 args: Self.printModeArguments(for: options),
                 stdin: stdin,
                 outputMode: .auto(Self.printModeOutputFormat),
                 timeout: options.timeout,
                 additionalEnvironment: additionalEnvironment,
-                additionalRemovedKeys: removedEnvironmentKeys,
-                cancelChildOnTaskCancellation: true
+                // Managed launch boundary: an inherited runtime marker never reaches the child.
+                additionalRemovedKeys: removedEnvironmentKeys.union([ProcessLauncher.runtimeMarkerEnvironmentKey]),
+                cancelChildOnTaskCancellation: true,
+                launchOwnership: launch
             )
         } catch {
             throw mapProcessError(error)
         }
+        // R6: the fresh conversation the CLI reports is recorded for this runtime; a failure is
+        // reported by the launch and never changes the result.
+        if let launch, let observed = Self.observedPrintModeSessionID(result.stdout) {
+            await launch.recordObservedConversation(observed)
+        }
+        return result
+    }
+
+    /// The Claude session the print-mode output reports (`session_id` on its stream-json lines).
+    static func observedPrintModeSessionID(_ data: Data) -> String? {
+        for object in cliJSONObjects(from: data).objects.reversed() {
+            let dictionary = object.dictionary
+            let raw = dictionary["session_id"] as? String ?? dictionary["sessionId"] as? String
+            if let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty {
+                return trimmed
+            }
+        }
+        return nil
     }
 
     private func launchEnvironmentResolver() -> any ClaudeCodeLaunchEnvironmentResolving {
@@ -332,6 +370,7 @@ package final class ClaudeCodeProvider: AIProvider {
             options.model = launchEnvironment.effectiveModel
             options.environmentOverrides = launchEnvironment.environmentOverrides
             options.removedEnvironmentKeys = launchEnvironment.removedEnvironmentKeys
+            options.runtimeVariant = Self.runtimeVariant(for: descriptor.backendID)
             options.timeout = defaultRequestTimeout
             return options
         }
@@ -937,6 +976,7 @@ package final class ClaudeCodeProvider: AIProvider {
         options.disallowedTools = disallowedTools
         options.mcpConfigPath = emptyConfigLease.url.path
         options.model = launchEnvironment.effectiveModel
+        options.runtimeVariant = Self.runtimeVariant(for: backendID)
         options.systemPromptOverride = ClaudeAgentToolPreferences.agentModePromptDelivery().nativeSystemPromptOverride(instructions: "")
         options.timeout = timeout ?? testRequestTimeout
         let additionalEnvironment = options.additionalEnvironment.merging(

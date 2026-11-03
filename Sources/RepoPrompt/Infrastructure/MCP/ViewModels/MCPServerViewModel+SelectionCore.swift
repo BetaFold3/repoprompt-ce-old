@@ -262,10 +262,7 @@ extension MCPServerViewModel {
     }
 
     enum SelectionReplyAssembler {
-        private static let codemapPresentationPolicy = WorkspaceCodemapPresentationRequestPolicy(
-            maximumReadinessRounds: 1,
-            maximumTotalWait: .zero
-        )
+        private static let codemapPresentationPolicy = WorkspaceCodemapPresentationRequestPolicy.noReadinessWait
 
         struct SelectedEntry {
             let entry: ResolvedPromptFileEntry
@@ -432,6 +429,41 @@ extension MCPServerViewModel {
             let fileExtension = (file.name as NSString).pathExtension.lowercased()
             guard !fileExtension.isEmpty else { return false }
             return SyntaxManager.supportsCodeMap(fileExtension: fileExtension)
+        }
+
+        /// Terminal automatic-codemap conditions for the selection, each identifying the root whose
+        /// retained superseded projection causes it. Pending, manual, and unmapped semantics are
+        /// unchanged. Returns nil when no root is affected.
+        static func automaticCodemapIssues(
+            presentation: WorkspaceCodemapOperationPresentation,
+            store: WorkspaceFileContextStore
+        ) async -> [ToolResultDTOs.AutomaticCodemapIssueDTO]? {
+            var rootIDs: [UUID] = []
+            for issue in presentation.issues + coverageIssues(presentation.coverage) {
+                guard case let .automatic(.unavailable(.graph(.definitionUniverse(
+                    rootEpoch,
+                    .projectionSuperseded
+                )))) = issue,
+                    !rootIDs.contains(rootEpoch.rootID)
+                else { continue }
+                rootIDs.append(rootEpoch.rootID)
+            }
+            guard !rootIDs.isEmpty else { return nil }
+            let rootNames = await Dictionary(
+                store.rootRefs(scope: .allLoaded).map { ($0.id, $0.name) },
+                uniquingKeysWith: { first, _ in first }
+            )
+            return rootIDs.map { rootID in
+                let rootLabel = rootNames[rootID].map { "root '\($0)'" } ?? "a loaded root"
+                return ToolResultDTOs.AutomaticCodemapIssueDTO(
+                    rootID: rootID.uuidString,
+                    reason: "projection_superseded",
+                    message: "Automatic codemaps for this selection are unavailable because "
+                        + "\(rootLabel) has a superseded projection. Selected files are unaffected; "
+                        + "continue without automatic codemaps. Remove and re-add the root, then "
+                        + "request automatic codemaps to schedule a fresh projection."
+                )
+            }
         }
 
         private static func coverageIssues(
@@ -1585,9 +1617,16 @@ extension MCPServerViewModel {
             diagnostics diagnosticFiles: [WorkspaceFileRecord],
             presentation: WorkspaceCodemapOperationPresentation
         ) async -> ToolResultDTOs.SelectedCodeStructureDTO? {
-            guard !renderingFiles.isEmpty || !diagnosticFiles.isEmpty else { return nil }
             let disabled = await MainActor.run { owner.promptVM.codeMapsGloballyDisabled }
             guard !disabled else { return nil }
+            let store = await MainActor.run { owner.promptVM.workspaceFileContextStore }
+            let automaticIssues = await SelectionReplyAssembler.automaticCodemapIssues(
+                presentation: presentation,
+                store: store
+            )
+            guard !renderingFiles.isEmpty || !diagnosticFiles.isEmpty || automaticIssues != nil else {
+                return nil
+            }
 
             let fileIDs = Set(renderingFiles.map(\.id))
             let rendered = presentation.orderedEntries.filter { fileIDs.contains($0.fileID) }
@@ -1604,7 +1643,7 @@ extension MCPServerViewModel {
                 }
                 return file.standardizedRelativePath
             }
-            guard !included.isEmpty || !diagnostics.isEmpty else { return nil }
+            guard !included.isEmpty || !diagnostics.isEmpty || automaticIssues != nil else { return nil }
             return ToolResultDTOs.SelectedCodeStructureDTO(
                 fileCount: included.count,
                 content: included.map(\.text).joined(separator: "\n\n"),
@@ -1613,7 +1652,8 @@ extension MCPServerViewModel {
                 omittedCount: rendered.count > included.count ? rendered.count - included.count : nil,
                 worktreeScope: ToolResultDTOs.WorktreeScopeDTO.sessionBound(
                     from: lookupContext.bindingProjection
-                )
+                ),
+                automaticCodemapIssues: automaticIssues
             )
         }
     }

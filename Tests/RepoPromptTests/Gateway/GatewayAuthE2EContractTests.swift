@@ -2,6 +2,7 @@ import CryptoKit
 import Foundation
 import Logging
 import NIOCore
+import NIOPosix
 @testable import RepoPromptAgentCore
 @testable import RepoPromptApp
 @testable import RepoPromptGateway
@@ -24,12 +25,30 @@ final class GatewayAuthE2EContractTests: XCTestCase {
     private var capacityDevice: GatewayAuthTestSupport.TestDeviceIdentity!
     private var connector: E2EPoolConnector!
     private var watchManager: SessionWatchManager!
+    private var appLinkPool: AppLinkPool!
+    private var defaultAppLink: AppLinkSession!
     private var server: GatewayHTTPServer!
     private var port: Int!
+
+    private static let browserOrigin = "https://mac.example-tailnet.ts.net:8443"
 
     override func setUp() async throws {
         try await super.setUp()
         root = try GatewayTestHelpers.temporaryRoot("gateway-auth-e2e")
+        hostSigner = P256.Signing.PrivateKey()
+        device = GatewayAuthTestSupport.makeDevice(deviceID: "remote:1a2b3c4d")
+        capacityDevice = GatewayAuthTestSupport.makeDevice(deviceID: "remote:eeff0011")
+        try await makeServer()
+        try await server.start()
+        guard let boundPort = server.localAddress?.port else {
+            throw XCTSkip("Could not determine the ephemeral gateway port")
+        }
+        port = boundPort
+    }
+
+    /// Builds, but does not start, the gateway under test. `extraArguments` follow the defaults,
+    /// so a later `--port` or `--bind-host` wins.
+    private func makeServer(extraArguments: [String] = [], requiredDevices: [GatewayAuthTestSupport.TestDeviceIdentity] = []) async throws {
         configuration = try GatewayConfiguration.parse(
             arguments: [
                 "--app-support-root", root.path,
@@ -37,19 +56,31 @@ final class GatewayAuthE2EContractTests: XCTestCase {
                 "--bootstrap-token", "bootstrap-token",
                 "--bootstrap-socket", root.appendingPathComponent("bootstrap.sock").path,
                 "--port", "0"
-            ],
+            ] + extraArguments,
             environment: [:]
         )
-        hostSigner = P256.Signing.PrivateKey()
-        device = GatewayAuthTestSupport.makeDevice(deviceID: "remote:1a2b3c4d")
-        capacityDevice = GatewayAuthTestSupport.makeDevice(deviceID: "remote:eeff0011")
-
         let trust = GatewayAuthTestSupport.trustSnapshot(
             hostSigner: hostSigner,
             devices: [(device, false), (capacityDevice, false)]
         )
         let usedTicketStore = try GatewayAuthTestSupport.makeUsedTicketStore(root: root)
         let authenticator = DeviceAuthenticator(usedTicketStore: usedTicketStore, trust: trust)
+        // Step 3 flip: paired connections now bind through the access authority and lock unless a
+        // valid capability-1 snapshot authorizes them. Most M4 contract assertions predate passkey
+        // policy, so default to an all-off snapshot (paired `.unprotected`, static allowed) to
+        // preserve their exact pre-Step-3 behavior; a required-policy test opts specific devices in.
+        let capability: GatewayCapabilityTrustSnapshot = if requiredDevices.isEmpty {
+            GatewayAuthTestSupport.capabilityOffSnapshot(hostSigner: hostSigner, devices: [device, capacityDevice])
+        } else {
+            GatewayAuthTestSupport.capabilityRequiredSnapshot(
+                hostSigner: hostSigner,
+                required: requiredDevices,
+                off: [device, capacityDevice].filter { candidate in
+                    !requiredDevices.contains { $0.deviceID == candidate.deviceID }
+                }
+            )
+        }
+        _ = await authenticator.applyCapabilityTrust(capability)
 
         connector = E2EPoolConnector(capacityRejectedClientName: capacityDevice.deviceID)
         let pool = AppLinkPool(
@@ -57,11 +88,13 @@ final class GatewayAuthE2EContractTests: XCTestCase {
             connector: connector,
             bindingProbe: { _ in .bound }
         )
+        appLinkPool = pool
 
         let defaultAppLink = AppLinkSession(
             config: configuration,
             connector: StaticAppLinkConnector(connection: RecordingAppLinkConnection())
         )
+        self.defaultAppLink = defaultAppLink
         try await defaultAppLink.connect()
 
         let watchManager = SessionWatchManager(appLink: defaultAppLink, appLinkPool: pool)
@@ -82,17 +115,40 @@ final class GatewayAuthE2EContractTests: XCTestCase {
             auditLog: auditLog,
             hostName: "Gateway Auth E2E Host"
         )
-        try await server.start()
-        guard let boundPort = server.localAddress?.port else {
-            throw XCTSkip("Could not determine the ephemeral gateway port")
+    }
+
+    /// Stops the gateway under test and the app link, pool, and watch manager built with it, in
+    /// the gateway's own shutdown order.
+    private func disposeServer() async {
+        await server?.shutdown()
+        await watchManager?.shutdown()
+        await appLinkPool?.shutdownAll()
+        await defaultAppLink?.shutdown()
+    }
+
+    /// Replaces the default `127.0.0.1` gateway with one configured by `extraArguments`. An IPv6
+    /// bind host is probed first; the gateway start itself is never turned into a skip.
+    private func restartServer(extraArguments: [String]) async throws {
+        await disposeServer()
+        try await makeServer(extraArguments: extraArguments)
+        if configuration.bindHost.contains(":") {
+            try GatewayTestHelpers.requireIPv6Loopback()
         }
-        port = boundPort
+        try await server.start()
+        port = try XCTUnwrap(server.localAddress?.port)
+    }
+
+    /// An IPv6-loopback primary with a browser origin: `openSocket()` (IPv4 `127.0.0.1`) then
+    /// reaches the companion listener, never the primary.
+    private func restartWithLoopbackCompanion() async throws {
+        try await restartServer(extraArguments: ["--bind-host", "::1", "--browser-origin", Self.browserOrigin])
+        XCTAssertEqual(server.localAddress?.ipAddress, "::1")
+        XCTAssertEqual(server.companionLocalAddress?.ipAddress, "127.0.0.1")
+        XCTAssertEqual(server.companionLocalAddress?.port, port, "The companion uses the primary's actual port")
     }
 
     override func tearDown() async throws {
-        if let server {
-            await server.shutdown()
-        }
+        await disposeServer()
         if let root {
             try? FileManager.default.removeItem(at: root)
         }
@@ -370,6 +426,188 @@ final class GatewayAuthE2EContractTests: XCTestCase {
             "capacity_exceeded"
         )
         try await assertAuditContains(code: "capacity_exceeded", deviceID: capacityDevice.deviceID)
+    }
+
+    // MARK: - Required passkey policy (Step 3)
+
+    /// Under a required (enrolled) policy the paired device binds LOCKED: hello_ack reports it, an
+    /// ordinary runtime frame is WITHHELD as a content-free `passkey_locked` settlement rather than
+    /// executed, and a passkey ceremony with no principal relay fails closed with a sanitized
+    /// `authentication_failed`. (The full ceremony→grant→unlock state machine is covered
+    /// deterministically by the authority and relay unit suites.)
+    func testRequiredPolicyBindsLockedWithholdsRuntimeAndFailsClosedCeremony() async throws {
+        await disposeServer()
+        try await makeServer(requiredDevices: [device])
+        try await server.start()
+        port = try XCTUnwrap(server.localAddress?.port)
+
+        let ticket = try GatewayAuthTestSupport.mintTicket(
+            hostSigner: hostSigner,
+            deviceID: device.deviceID,
+            scopes: [GatewayRemoteScope.sessionsObserve]
+        )
+        let socket = openSocket()
+        defer { socket.cancel(with: .normalClosure, reason: nil) }
+
+        // 1. Hello admits but binds LOCKED; the ack says so and the connection stays open to unlock.
+        let helloAck = try await performTicketHello(socket, ticket: ticket, deviceKey: device.signer)
+        XCTAssertEqual(helloAck.type, "hello_ack")
+        XCTAssertEqual(helloAck.payload?.objectValue?["device_id"]?.stringValue, device.deviceID)
+        XCTAssertEqual(helloAck.payload?.objectValue?["locked"]?.boolValue, true)
+
+        // 2. An ordinary runtime frame is withheld with a content-free lock settlement, not executed.
+        let listFrame = try GatewayAuthTestSupport.signedFrameData(
+            object: GatewayAuthTestSupport.frameObject(type: "list_sessions"),
+            ticketID: ticket.ticketID,
+            deviceID: device.deviceID,
+            counter: 2,
+            deviceKey: device.signer
+        )
+        try await send(listFrame, over: socket)
+        let listResult = try await receiveFrame(socket)
+        XCTAssertEqual(listResult.type, "command_error")
+        XCTAssertEqual(listResult.payload?.objectValue?["code"]?.stringValue, "passkey_locked")
+
+        // 3. A passkey ceremony with no configured relay fails closed (no crash, sanitized failure).
+        let beginFrame = try GatewayAuthTestSupport.signedFrameData(
+            object: GatewayAuthTestSupport.frameObject(type: "passkey_unlock_begin", requestID: "req-unlock-1"),
+            ticketID: ticket.ticketID,
+            deviceID: device.deviceID,
+            counter: 3,
+            deviceKey: device.signer
+        )
+        try await send(beginFrame, over: socket)
+        let beginResult = try await receiveFrame(socket)
+        XCTAssertEqual(beginResult.type, "command_error")
+        XCTAssertEqual(beginResult.payload?.objectValue?["code"]?.stringValue, "authentication_failed")
+    }
+
+    // MARK: - Loopback companion (Step 4)
+
+    /// The rule follows the actual bound address: a companion is added only when the primary does
+    /// not already accept IPv4 `127.0.0.1`; unknown coverage fails instead of silently omitting it.
+    func testLoopbackCompanionCoverageFollowsThePrimaryBoundAddress() throws {
+        func needs(_ ip: String, ipv6Only: Bool? = nil) throws -> Bool {
+            try GatewayHTTPServer.needsLoopbackCompanion(
+                primary: SocketAddress(ipAddress: ip, port: 47392),
+                isIPv6Only: ipv6Only
+            )
+        }
+        XCTAssertFalse(try needs("127.0.0.1"))
+        XCTAssertFalse(try needs("0.0.0.0"), "An opted-in IPv4 wildcard already covers loopback")
+        XCTAssertTrue(try needs("100.64.0.8"), "A tailnet address does not")
+        XCTAssertTrue(try needs("127.0.0.2"))
+        XCTAssertTrue(try needs("::1"))
+        XCTAssertTrue(try needs("fd7a:115c:a1e0::1"))
+        XCTAssertFalse(try needs("::", ipv6Only: false), "A dual-stack IPv6 wildcard covers loopback")
+        XCTAssertTrue(try needs("::", ipv6Only: true))
+        XCTAssertThrowsError(try needs("::"), "Unknown IPv6-only state")
+        XCTAssertThrowsError(try GatewayHTTPServer.needsLoopbackCompanion(primary: nil, isIPv6Only: nil))
+    }
+
+    func testLoopbackCompanionListensOnThePrimaryPortOnlyWithABrowserOrigin() async throws {
+        XCTAssertNil(server.companionLocalAddress, "Default 127.0.0.1 primary without a browser origin")
+
+        try await restartServer(extraArguments: ["--bind-host", "::1"])
+        XCTAssertNil(server.companionLocalAddress, "No browser origin: only the primary")
+
+        try await restartServer(extraArguments: ["--browser-origin", Self.browserOrigin])
+        XCTAssertNil(server.companionLocalAddress, "A 127.0.0.1 primary is not bound twice")
+        let loopbackPrimaryHealth = try await healthStatus(host: "127.0.0.1")
+        XCTAssertEqual(loopbackPrimaryHealth, 200)
+
+        try await restartWithLoopbackCompanion()
+        let primaryHealth = try await healthStatus(host: "[::1]")
+        let companionHealth = try await healthStatus(host: "127.0.0.1")
+        XCTAssertEqual(primaryHealth, 200)
+        XCTAssertEqual(companionHealth, 200)
+    }
+
+    /// The companion is not a localhost bypass: ticket auth, its rejection, and revocation through
+    /// it behave exactly as on the primary.
+    func testLoopbackCompanionUsesTheSameTicketAuthAndRevocation() async throws {
+        try await restartWithLoopbackCompanion()
+
+        let unticketed = openSocket()
+        defer { unticketed.cancel(with: .normalClosure, reason: nil) }
+        try await send(
+            GatewayAuthTestSupport.unsignedFrameData(
+                object: GatewayAuthTestSupport.frameObject(type: "hello", payload: .object([:]))
+            ),
+            over: unticketed
+        )
+        let rejected = try await receiveFrame(unticketed)
+        XCTAssertEqual(rejected.payload?.objectValue?["code"]?.stringValue, "ticket_required")
+
+        let ticket = try GatewayAuthTestSupport.mintTicket(
+            hostSigner: hostSigner,
+            deviceID: device.deviceID,
+            scopes: [GatewayRemoteScope.sessionsObserve]
+        )
+        let socket = openSocket()
+        defer { socket.cancel(with: .normalClosure, reason: nil) }
+        let helloAck = try await performTicketHello(socket, ticket: ticket, deviceKey: device.signer)
+        XCTAssertEqual(helloAck.type, "hello_ack")
+
+        await watchManager.teardownDevice(deviceID: device.deviceID, reason: "device_revoked", message: "revoked")
+        server.closeConnections(forDevice: device.deviceID)
+        let closing = try await receiveFrame(socket)
+        XCTAssertEqual(closing.type, "channel_closing")
+        XCTAssertEqual(closing.payload?.objectValue?["reason"]?.stringValue, "device_revoked")
+    }
+
+    func testCompanionBindFailureFailsStartAndReleasesThePrimary() async throws {
+        try GatewayTestHelpers.requireIPv6Loopback()
+        let blocker = try await bindProbe(host: "127.0.0.1", port: 0)
+        addTeardownBlock { try? await blocker.close().get() }
+        let blockedPort = try XCTUnwrap(blocker.localAddress?.port)
+        await disposeServer()
+        try await makeServer(extraArguments: [
+            "--bind-host", "::1",
+            "--port", String(blockedPort),
+            "--browser-origin", Self.browserOrigin
+        ])
+        do {
+            try await server.start()
+            XCTFail("A browser origin whose companion cannot bind must fail the start")
+        } catch let error as IOError {
+            XCTAssertEqual(error.errnoCode, EADDRINUSE)
+        }
+        try await blocker.close().get()
+        XCTAssertNil(server.localAddress)
+        XCTAssertNil(server.companionLocalAddress)
+        let primaryReleased = try await bindProbe(host: "::1", port: blockedPort)
+        try await primaryReleased.close().get()
+    }
+
+    func testShutdownReleasesPrimaryAndCompanionListeners() async throws {
+        try await restartWithLoopbackCompanion()
+        let boundPort = try XCTUnwrap(port)
+        await server.shutdown()
+        XCTAssertNil(server.localAddress)
+        XCTAssertNil(server.companionLocalAddress)
+        for host in ["::1", "127.0.0.1"] {
+            let probe = try await bindProbe(host: host, port: boundPort)
+            try await probe.close().get()
+        }
+    }
+
+    private func healthStatus(host: String) async throws -> Int {
+        let sessionConfiguration = URLSessionConfiguration.ephemeral
+        sessionConfiguration.connectionProxyDictionary = [:]
+        sessionConfiguration.timeoutIntervalForRequest = 5
+        let session = URLSession(configuration: sessionConfiguration)
+        defer { session.invalidateAndCancel() }
+        let (_, response) = try await session.data(from: XCTUnwrap(URL(string: "http://\(host):\(port!)/healthz")))
+        return (response as? HTTPURLResponse)?.statusCode ?? -1
+    }
+
+    /// A throwaway listener; it binds only while no other listener owns exactly `host:port`.
+    private func bindProbe(host: String, port: Int) async throws -> Channel {
+        try await ServerBootstrap(group: MultiThreadedEventLoopGroup.singleton)
+            .serverChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
+            .bind(host: host, port: port)
+            .get()
     }
 
     // MARK: - Audit assertions

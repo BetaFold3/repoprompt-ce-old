@@ -79,6 +79,16 @@ Use direct `swift test` for these explicit opt-in scale checks so the environmen
 
 Existing higher-scale overrides remain separate opt-ins, such as `RPCE_RUN_MILLION_RECORD_GIT_AUTHORITY_TESTS=1`, `RPCE_RUN_MILLION_ENTRY_TESTS=1`, and `REPOPROMPT_NAMESPACE_MANIFEST_SCALE_ENTRY_COUNT=<count>`.
 
+### Workspace store isolation
+
+Tests must never write the live `~/Library/Application Support/RepoPrompt CE/Workspaces` store. `WorkspaceStorageRoot` (in `Sources/RepoPromptWorkspace/Persistence/`) is the single authority for the default `Workspaces` root used by `WorkspaceStoragePaths.defaultRoot`, `AgentSessionDataService`, `ChatHistoryManager`, and `HistorySessionScanner`. Precedence: an explicit root (custom storage path, global custom location, or injected test root); then `RPCE_WORKSPACES_ROOT_OVERRIDE` (absolute path, honored only in DEBUG builds or under XCTest); then, under XCTest, one per-process temp root `$TMPDIR/RepoPromptCE-XCTest/Workspaces-<pid>-<uuid>` (stale roots of dead processes older than 24 h are swept on first use); then the production root. Only the `Workspaces` tree is redirected; sockets, events, and the rest of Application Support stay on `applicationSupportRootURL()`. A workspace's explicit `customStoragePath` is not redirected under XCTest. The global custom location goes through `WorkspaceGlobalCustomStorageLocation`: in the app it persists in `UserDefaults.standard["GlobalCustomStorageURL"]`. Under XCTest it is a process-local value that starts empty and is never read from or written to user defaults, because the `xctest` defaults domain persists across test processes and once leaked a temp location into every test run. Tests set it through that type, never through `UserDefaults`.
+
+Never-saved ephemeral workspaces are not persisted, and `AgentSessionDataService` metadata reads never create folders or empty indexes. `WorkspaceStorageIsolationTests` holds a leak canary. The SwiftLint rule `no_hardcoded_workspaces_store_path` rejects hardcoded `Workspaces` store joins outside `WorkspaceStorageRoot.swift`. Leaked fixtures already in a live store can be quarantined reversibly with `Scripts/quarantine_fixture_workspaces.py` (dry run by default; `--apply` and `--restore` require the app, helpers, and tests to be quit).
+
+### History timing diagnostic
+
+`HistoryTimingDiagnosticTests` is skipped unless `RPCE_HISTORY_TIMING_ROOT` points at an Application Support root to measure read-only. `make dev-test` and `Scripts/canonical_swift.sh` run XCTest under an environment allowlist that drops this variable, so run the built test bundle directly with `xcrun xctest` and the variable set.
+
 ## Authoritative executable IDs
 
 Never derive the executable census from source text or a stale build. Use:

@@ -63,6 +63,19 @@ final class WindowCloseCoordinator {
     private var pendingAuthorization: WindowCloseAuthorization?
     private var pendingConfirmation: PendingCloseAttempt?
     private var presentedAlert: NSAlert?
+    /// One-shot permission for the close that follows a completed two-stage close (Stage B ran;
+    /// the forwarded delegate was asked before the point of no return).
+    private var finalizedCloseAuthorized = false
+
+    func authorizeFinalizedClose() {
+        finalizedCloseAuthorized = true
+    }
+
+    /// Consumes the one-shot finalized-close permission.
+    func consumeFinalizedCloseAuthorization() -> Bool {
+        defer { finalizedCloseAuthorized = false }
+        return finalizedCloseAuthorized
+    }
 
     init(windowState: WindowState? = nil) {
         self.windowState = windowState

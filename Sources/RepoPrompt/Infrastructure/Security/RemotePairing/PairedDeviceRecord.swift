@@ -16,7 +16,10 @@ struct WebPushSubscriptionRecord: Codable, Equatable {
 }
 
 struct PairedDeviceRecord: Codable, Identifiable, Equatable {
-    static let currentSchemaVersion = 1
+    /// Schema 2 adds the required `passkey` policy field (remote passkey unlock, Step 2). Version 1
+    /// registries are migrated in memory by `RemotePairingRegistryCodec`; this type only ever
+    /// encodes/decodes schema 2.
+    static let currentSchemaVersion = 2
 
     var schemaVersion: Int
     var id: String
@@ -28,6 +31,10 @@ struct PairedDeviceRecord: Codable, Identifiable, Equatable {
     var revokedAt: Date?
     var counterFloor: UInt64
     var pushSubscription: WebPushSubscriptionRecord?
+    /// Per-device passkey policy. Required key in schema 2 (synthesized `Codable` makes the key
+    /// mandatory because the property is non-optional with no default in `init(from:)`). Defaults
+    /// to `.off` in the memberwise initializer so existing non-passkey call sites keep compiling.
+    var passkey: RemotePasskeyPolicyRecord
 
     init(
         schemaVersion: Int = PairedDeviceRecord.currentSchemaVersion,
@@ -39,7 +46,8 @@ struct PairedDeviceRecord: Codable, Identifiable, Equatable {
         lastSeenAt: Date? = nil,
         revokedAt: Date? = nil,
         counterFloor: UInt64 = 0,
-        pushSubscription: WebPushSubscriptionRecord? = nil
+        pushSubscription: WebPushSubscriptionRecord? = nil,
+        passkey: RemotePasskeyPolicyRecord = .off
     ) {
         self.schemaVersion = schemaVersion
         self.id = id
@@ -51,6 +59,7 @@ struct PairedDeviceRecord: Codable, Identifiable, Equatable {
         self.revokedAt = revokedAt
         self.counterFloor = counterFloor
         self.pushSubscription = pushSubscription
+        self.passkey = passkey
     }
 
     var isRevoked: Bool {
@@ -63,7 +72,7 @@ struct PairedDeviceRecord: Codable, Identifiable, Equatable {
 }
 
 struct PairedDeviceRegistry: Codable, Equatable {
-    static let currentSchemaVersion = 1
+    static let currentSchemaVersion = 2
 
     var schemaVersion: Int
     var hostPublicKeyFingerprint: String

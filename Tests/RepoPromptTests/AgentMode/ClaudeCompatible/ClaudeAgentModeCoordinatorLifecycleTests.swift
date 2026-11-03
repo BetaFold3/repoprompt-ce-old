@@ -1,4 +1,5 @@
 import Foundation
+import os
 @testable import RepoPromptAgentCore
 @testable import RepoPromptPlatform
 @testable import RepoPromptUI
@@ -481,7 +482,7 @@ extension AgentModeRunServiceLifecycleTests {
             XCTFail("The initial turn must be registered before steering")
             observeTerminalPublication = false
             await harness.service.cancelRun(
-                tabID: session.tabID, session: session, completion: .terminalTeardownCompleted
+                tabID: session.tabID, session: session, cause: .userCancel, completion: .terminalTeardownCompleted
             )
             await agentTask?.value
             return
@@ -522,7 +523,7 @@ extension AgentModeRunServiceLifecycleTests {
 
         observeTerminalPublication = false
         await harness.service.cancelRun(
-            tabID: session.tabID, session: session, completion: .terminalTeardownCompleted
+            tabID: session.tabID, session: session, cause: .userCancel, completion: .terminalTeardownCompleted
         )
         await agentTask?.value
     }
@@ -640,7 +641,7 @@ extension AgentModeRunServiceLifecycleTests {
         let drainRun: () async -> Void = {
             await self.awaitWithinLifecycleBound("Runner task drains", operation: { _ = await agentTask?.value }) {
                 await harness.service.cancelRun(
-                    tabID: session.tabID, session: session, completion: .terminalTeardownCompleted
+                    tabID: session.tabID, session: session, cause: .userCancel, completion: .terminalTeardownCompleted
                 )
                 agentTask?.cancel()
             }
@@ -649,7 +650,7 @@ extension AgentModeRunServiceLifecycleTests {
             observeTerminalPublication = false
             if session.runState.isActive {
                 await harness.service.cancelRun(
-                    tabID: session.tabID, session: session, completion: .terminalTeardownCompleted
+                    tabID: session.tabID, session: session, cause: .userCancel, completion: .terminalTeardownCompleted
                 )
             }
             await drainRun()
@@ -799,7 +800,7 @@ extension AgentModeRunServiceLifecycleTests {
         case .runCancelled:
             observeTerminalPublication = false
             await harness.service.cancelRun(
-                tabID: session.tabID, session: session, completion: .terminalTeardownCompleted
+                tabID: session.tabID, session: session, cause: .userCancel, completion: .terminalTeardownCompleted
             )
             // The injected deadline is 60 s, so a flush that finishes within this bound
             // was interrupted by cancellation/ownership loss, not by the timeout.
@@ -2793,8 +2794,15 @@ private final class IsolatedPreferencesClaudeCoordinatorHost: ClaudeAgentModeCoo
         )
     }
 
-    func prependPendingHandoffIfNeeded(_ text: String, session: AgentTabSession) -> String {
-        base.prependPendingHandoffIfNeeded(text, session: session)
+    func stagePendingHandoffIfNeeded(_ text: String, session: AgentTabSession) -> AgentStagedProviderText {
+        base.stagePendingHandoffIfNeeded(text, session: session)
+    }
+
+    func stagePendingHandoffForDurableDispatch(
+        _ text: String,
+        session: AgentTabSession
+    ) async -> AgentPendingHandoffDispatchStaging {
+        await base.stagePendingHandoffForDurableDispatch(text, session: session)
     }
 
     @discardableResult
@@ -2868,6 +2876,8 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
     private let shutdownGate: LifecycleAsyncGate?
     private let emittedAssistantTextOnSend: String?
     private let interruptOutcome: NativeAgentRuntimeInterruptOutcome
+    /// Opt-in: `interruptTurn` waits here before returning its outcome.
+    private let interruptGate: LifecycleAsyncGate?
     private let rejectsEffortApplicationWhileTurnInFlight: Bool
     private let applyGate: LifecycleAsyncGate?
     private var sentMessages: [String] = []
@@ -2885,6 +2895,29 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
     private var maxConcurrentStartInvocationCount = 0
     private var pendingTurnCompletionID: UUID?
     private var pendingTurnCompletionWaiters: [CheckedContinuation<UUID, Never>] = []
+    private var sentTurnIDs: [UUID] = []
+    /// O49: the turn tests declare the provider has begun (`startedTurnID`); never set implicitly.
+    private nonisolated let startedTurnIDSnapshot = OSAllocatedUnfairLock<UUID?>(initialState: nil)
+    /// R6: a registered fake joins the tab's retained runtime retirements before it starts.
+    nonisolated let joinsRetirementBeforeSuccessor: Bool
+    /// Opt-in: behaves like a managed transport at the write (the real controller's
+    /// `sendUserMessage`): evaluates the task-local write admission before the recorded write, and
+    /// a refusal or a cancellation during it is a proven non-write (`processNotRunning`).
+    private let invokesWriteAdmission: Bool
+    private var admissionOwners: [AgentRuntimeSessionScope] = []
+    /// Opt-in (with `invokesWriteAdmission`): the eligibility this fake's launch reports to the
+    /// admission, like the real controller's launch identity check.
+    private let outboundIdentityEligible: Bool
+    /// Exact user frames this fake wrote, encoded by the production codec with the UUID its own
+    /// admission returned (managed-transport mode only).
+    private var writtenUserFrames: [Data] = []
+    private var repoPromptMCPHealthValue: NativeAgentRuntimeRepoPromptMCPHealth = .unknown
+    private var repoPromptMCPProbeOutcome: NativeAgentRuntimeRepoPromptMCPProbeOutcome = .connected
+    private var repoPromptMCPProbeGate: LifecycleAsyncGate?
+    private var repoPromptMCPHealthGate: LifecycleAsyncGate?
+    private var repoPromptMCPHealthReadCount = 0
+    private var repoPromptMCPProbeCount = 0
+    private var repoPromptMCPLaunchAgentPIDValue: pid_t?
 
     init(
         recorder: LifecycleRecorder,
@@ -2904,12 +2937,19 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         shutdownGate: LifecycleAsyncGate? = nil,
         emittedAssistantTextOnSend: String? = nil,
         interruptOutcome: NativeAgentRuntimeInterruptOutcome = .noTurnInFlight,
+        interruptGate: LifecycleAsyncGate? = nil,
         rejectsEffortApplicationWhileTurnInFlight: Bool = false,
         applyGate: LifecycleAsyncGate? = nil,
         sessionID: String = "lifecycle-claude-session",
-        promptCacheRetention: AgentMCPWaitPolicy.ParentPromptCacheRetention = .standard
+        promptCacheRetention: AgentMCPWaitPolicy.ParentPromptCacheRetention = .standard,
+        joinsRetirementBeforeSuccessor: Bool = false,
+        invokesWriteAdmission: Bool = false,
+        outboundIdentityEligible: Bool = false
     ) {
         self.recorder = recorder
+        self.joinsRetirementBeforeSuccessor = joinsRetirementBeforeSuccessor
+        self.invokesWriteAdmission = invokesWriteAdmission
+        self.outboundIdentityEligible = outboundIdentityEligible
         self.label = label
         activeSession = hasActiveSession
         turnInFlight = hasTurnInFlight
@@ -2926,6 +2966,7 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         self.shutdownGate = shutdownGate
         self.emittedAssistantTextOnSend = emittedAssistantTextOnSend
         self.interruptOutcome = interruptOutcome
+        self.interruptGate = interruptGate
         self.rejectsEffortApplicationWhileTurnInFlight = rejectsEffortApplicationWhileTurnInFlight
         self.applyGate = applyGate
         self.sessionID = sessionID
@@ -3052,6 +3093,12 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         )))
     }
 
+    /// Forwards an event verbatim (for example one a real controller emitted) into this
+    /// controller's stream.
+    func emitRuntimeEvent(_ event: NativeAgentRuntimeEvent) {
+        streamContinuation.yield(event)
+    }
+
     func currentSessionRef() async -> NativeAgentRuntimeSessionRef {
         if let currentSessionRefGate {
             recorder.record("\(label):current-ref")
@@ -3119,6 +3166,23 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
     }
 
     func sendUserMessage(_ text: String) async throws -> UUID {
+        var outboundUserMessageUUID: UUID?
+        if invokesWriteAdmission {
+            recorder.record("\(label):admission")
+            admissionOwners.append(AgentRuntimeOperationOwner.current)
+            if let admission = AgentRuntimeOperationOwner.writeAdmission {
+                let eligible = outboundIdentityEligible
+                guard case let .admitted(admittedUUID) = await admission(eligible) else {
+                    recorder.record("\(label):admission-refused")
+                    throw NativeAgentRuntimeControllerError.processNotRunning
+                }
+                guard !Task.isCancelled else {
+                    recorder.record("\(label):admission-cancelled")
+                    throw NativeAgentRuntimeControllerError.processNotRunning
+                }
+                outboundUserMessageUUID = eligible ? admittedUUID : nil
+            }
+        }
         recorder.record("\(label):send")
         if let sendUserMessageGate {
             await sendUserMessageGate.arriveAndWait()
@@ -3132,6 +3196,14 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         }
         let turnID = UUID()
         sentMessages.append(text)
+        sentTurnIDs.append(turnID)
+        if invokesWriteAdmission {
+            try writtenUserFrames.append(ClaudeSDKProtocolCodec.encodeUserMessage(
+                text: text,
+                sessionID: nil,
+                messageUUID: outboundUserMessageUUID
+            ))
+        }
         if let emittedAssistantTextOnSend {
             streamContinuation.yield(.stream(AIStreamResult(
                 type: "assistant",
@@ -3156,6 +3228,10 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         }
     }
 
+    func currentPendingTurnCompletionID() -> UUID? {
+        pendingTurnCompletionID
+    }
+
     func emitPendingTurnCompletion() {
         guard let turnID = pendingTurnCompletionID else { return }
         pendingTurnCompletionID = nil
@@ -3166,17 +3242,110 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         sentMessages
     }
 
+    /// Turn IDs returned by successful writes, in write order.
+    func recordedSentTurnIDs() -> [UUID] {
+        sentTurnIDs
+    }
+
+    nonisolated var startedTurnID: UUID? {
+        startedTurnIDSnapshot.withLock { $0 }
+    }
+
+    /// Declares that the provider began `turnID` (output attributed to it), or clears it.
+    func setStartedTurnID(_ turnID: UUID?) {
+        startedTurnIDSnapshot.withLock { $0 = turnID }
+    }
+
+    private func clearStartedTurnID(ifEqualTo turnID: UUID) {
+        startedTurnIDSnapshot.withLock { started in
+            if started == turnID { started = nil }
+        }
+    }
+
+    /// The owner scope bound for each write admission this fake evaluated.
+    func recordedAdmissionOwners() -> [AgentRuntimeSessionScope] {
+        admissionOwners
+    }
+
+    /// Exact encoded user frames written in managed-transport mode.
+    func recordedUserFrames() -> [Data] {
+        writtenUserFrames
+    }
+
+    /// A (possibly late) successful completion for a specific earlier turn.
+    func emitCompletedTurnCompletion(turnID: UUID) {
+        turnInFlight = false
+        if pendingTurnCompletionID == turnID {
+            pendingTurnCompletionID = nil
+        }
+        clearStartedTurnID(ifEqualTo: turnID)
+        streamContinuation.yield(.turnCompleted(turnID: turnID, status: .completed))
+    }
+
     func emitCancelledTurnCompletion(turnID: UUID) {
         turnInFlight = false
         if pendingTurnCompletionID == turnID {
             pendingTurnCompletionID = nil
         }
+        clearStartedTurnID(ifEqualTo: turnID)
         streamContinuation.yield(.turnCompleted(turnID: turnID, status: .cancelled))
+    }
+
+    /// Step 12: the CLI's own `.cancelled` result for `turnID`, classified on the real
+    /// controller's result path. The evidence is what the real controller records when it processes
+    /// the result (see ClaudeNativeTurnTeardownTests): `soleOutstandingTurn`, whether `turnID` was
+    /// its only written turn without a result; `reportsInterruption`, whether the payload itself
+    /// reports an interrupted turn; `messageIdentity`, the result's `user_message_uuid(s)` against
+    /// the turn's outbound UUID (default: the result names exactly that UUID).
+    func emitProviderCancelledTurnCompletion(
+        turnID: UUID,
+        soleOutstandingTurn: Bool = true,
+        reportsInterruption: Bool = true,
+        messageIdentity: NativeAgentRuntimeTurnCompletionOrigin.MessageIdentity = .namesTurn
+    ) {
+        turnInFlight = false
+        if pendingTurnCompletionID == turnID {
+            pendingTurnCompletionID = nil
+        }
+        clearStartedTurnID(ifEqualTo: turnID)
+        streamContinuation.yield(.turnCompleted(
+            turnID: turnID,
+            status: .cancelled,
+            origin: .providerResult(.init(
+                soleOutstandingTurn: soleOutstandingTurn,
+                reportsInterruption: reportsInterruption,
+                messageIdentity: messageIdentity
+            ))
+        ))
+    }
+
+    /// Step 12: a completion the real controller emits without a CLI boundary for `turnID`
+    /// (process exit, protocol failure, idle-fallback timer, or shutdown/EOF flush).
+    func emitControllerSynthesizedTurnCompletion(turnID: UUID, status: NativeAgentRuntimeTurnStatus) {
+        turnInFlight = false
+        if pendingTurnCompletionID == turnID {
+            pendingTurnCompletionID = nil
+        }
+        clearStartedTurnID(ifEqualTo: turnID)
+        streamContinuation.yield(.turnCompleted(turnID: turnID, status: status, origin: .controllerSynthesized))
+    }
+
+    /// A failed completion, like the real controller's on process loss.
+    func emitFailedTurnCompletion(turnID: UUID) {
+        turnInFlight = false
+        if pendingTurnCompletionID == turnID {
+            pendingTurnCompletionID = nil
+        }
+        clearStartedTurnID(ifEqualTo: turnID)
+        streamContinuation.yield(.turnCompleted(turnID: turnID, status: .failed))
     }
 
     func interruptTurn(reason: String) async -> NativeAgentRuntimeInterruptOutcome {
         recorder.record("\(label):interrupt:\(reason)")
         interruptCount += 1
+        if let interruptGate {
+            await interruptGate.arriveAndWait()
+        }
         return interruptOutcome
     }
 
@@ -3188,4 +3357,64 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
     }
 
     func respondToPermissionRequest(id: String, decision: AgentApprovalDecision) async {}
+
+    var currentRepoPromptMCPHealth: NativeAgentRuntimeRepoPromptMCPHealth {
+        get async {
+            repoPromptMCPHealthReadCount += 1
+            if let repoPromptMCPHealthGate {
+                await repoPromptMCPHealthGate.arriveAndWait()
+            }
+            return repoPromptMCPHealthValue
+        }
+    }
+
+    func awaitRepoPromptMCPConnectedEvidence(
+        timeoutSeconds: TimeInterval,
+        pollIntervalSeconds: TimeInterval
+    ) async -> NativeAgentRuntimeRepoPromptMCPProbeOutcome {
+        recorder.record("\(label):mcp-probe")
+        repoPromptMCPProbeCount += 1
+        if let repoPromptMCPProbeGate {
+            await repoPromptMCPProbeGate.arriveAndWait()
+        }
+        if case .connected = repoPromptMCPProbeOutcome {
+            repoPromptMCPHealthValue = .connected
+        }
+        return repoPromptMCPProbeOutcome
+    }
+
+    func setRepoPromptMCPHealth(_ health: NativeAgentRuntimeRepoPromptMCPHealth) {
+        repoPromptMCPHealthValue = health
+    }
+
+    func setRepoPromptMCPProbe(
+        outcome: NativeAgentRuntimeRepoPromptMCPProbeOutcome,
+        gate: LifecycleAsyncGate? = nil
+    ) {
+        repoPromptMCPProbeOutcome = outcome
+        repoPromptMCPProbeGate = gate
+    }
+
+    func recordedRepoPromptMCPProbeCount() -> Int {
+        repoPromptMCPProbeCount
+    }
+
+    /// Holds every health read until the gate is released.
+    func setRepoPromptMCPHealthGate(_ gate: LifecycleAsyncGate?) {
+        repoPromptMCPHealthGate = gate
+    }
+
+    func recordedRepoPromptMCPHealthReadCount() -> Int {
+        repoPromptMCPHealthReadCount
+    }
+
+    /// The agent PID of the launch whose helper serves this session (nil by default, like a
+    /// controller without a launch identity).
+    var repoPromptMCPLaunchAgentPID: pid_t? {
+        repoPromptMCPLaunchAgentPIDValue
+    }
+
+    func setRepoPromptMCPLaunchAgentPID(_ pid: pid_t?) {
+        repoPromptMCPLaunchAgentPIDValue = pid
+    }
 }

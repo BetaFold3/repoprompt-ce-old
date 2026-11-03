@@ -1,8 +1,31 @@
 import Foundation
+import OSLog
 import RepoPromptAgentCore
 
+/// Always-on composer submit rejection reasons (unified logging, persisted at `.notice`), for
+/// after-the-fact diagnosis in a normal run. Logs only fixed reason strings and identifiers, never
+/// draft text or other user content.
+enum AgentComposerSubmitDiagnostics {
+    private static let logger = Logger(subsystem: "com.repoprompt.agents", category: "ComposerSubmit")
+
+    /// A rejection in the composer view (`AgentInputBar.sendMessage()` / `scheduleMessage(...)`).
+    static func viewRejected(reason: String, currentTabID: UUID?, propsTabID: UUID?, targetTabID: UUID?) {
+        logger.notice(
+            "view_rejected reason=\(reason, privacy: .public) currentTab=\(currentTabID?.uuidString ?? "nil", privacy: .public) propsTab=\(propsTabID?.uuidString ?? "nil", privacy: .public) targetTab=\(targetTabID?.uuidString ?? "nil", privacy: .public)"
+        )
+    }
+
+    /// A rejection in the view model's composer submit path (`executeComposerSubmitAttempt`).
+    static func submitRejected(reason: String, route: String, targetTabID: UUID, currentTabID: UUID?) {
+        logger.notice(
+            "submit_rejected reason=\(reason, privacy: .public) route=\(route, privacy: .public) targetTab=\(targetTabID.uuidString, privacy: .public) currentTab=\(currentTabID?.uuidString ?? "nil", privacy: .public)"
+        )
+    }
+}
+
 extension AgentModeViewModel {
-    func makeComposerProps(tabID explicitTabID: UUID? = nil) -> AgentComposerProps {
+    /// `materializingSession: false` never creates a session: a tab without one gets no submit target.
+    func makeComposerProps(tabID explicitTabID: UUID? = nil, materializingSession: Bool = true) -> AgentComposerProps {
         let tabID = explicitTabID ?? currentTabID
         let session = tabID.flatMap { sessions[$0] }
         let isMCPControlled = isMCPControlled(tabID: tabID)
@@ -23,7 +46,9 @@ extension AgentModeViewModel {
             else { return nil }
             return makeRunCancelTarget(tabID: tabID, session: session)
         }()
-        let submitTarget = makeComposerSubmitTarget(tabID: tabID, session: session)
+        let submitTarget = session != nil || materializingSession
+            ? makeComposerSubmitTarget(tabID: tabID, session: session)
+            : nil
         let remoteCatalog = remoteHostCatalogSnapshot(for: session)
         let isRemoteSession = session?.remoteHost != nil
         let scheduledSend: AgentScheduledSendProps? = session.flatMap { session in
@@ -43,7 +68,8 @@ extension AgentModeViewModel {
                     recoveryPhase: session.scheduledSendPendingFinalization?.status,
                     pendingConfirmation: session.activeAgentSessionID.flatMap { sessionID in
                         scheduledSendCoordinator?.pendingConfirmationStatus(sessionID: sessionID)
-                    }.flatMap { $0.scheduleID == record.id ? $0 : nil }
+                    }.flatMap { $0.scheduleID == record.id ? $0 : nil },
+                    recoveryBlocker: scheduledSendCoordinator?.recoveryBlocker(scheduleID: record.id)
                 )
             }
         }
@@ -94,7 +120,9 @@ extension AgentModeViewModel {
             stagedSlashCommand: stagedSlashCommandProps(tabID: tabID),
             draftRestorationEvent: draftRestorationEvent.map(AgentDraftRestorationProps.init),
             fileTagLookupContextIdentity: agentWorkspaceLookupContextIdentity(tabID: tabID, session: session),
-            delegatedQuestions: delegatedQuestionBannerRows(forParentTabID: tabID)
+            delegatedQuestions: delegatedQuestionBannerRows(forParentTabID: tabID),
+            recoveryList: recoveryListProps(forActiveSession: session),
+            isShutdownFrozen: isShutdownFrozen
         )
     }
 
@@ -191,8 +219,15 @@ extension AgentModeViewModel {
         #if DEBUG
             test_syncComposerCallCount += 1
         #endif
-        ui.composer.update(makeComposerProps(tabID: tabID))
-        if let observedTabID = tabID ?? currentTabID {
+        // The composer store holds one tab's props: the current tab's (F7). Props built for another
+        // tab mix that tab's state with the visible session's, so an explicit non-current tab never
+        // publishes; its scheduler busy state is still reported. With no current tab, the no-tab
+        // props are published so another tab's props never linger.
+        let ownerTabID = currentTabID
+        if tabID == nil || tabID == ownerTabID || ownerTabID == nil {
+            ui.composer.update(makeComposerProps(tabID: ownerTabID))
+        }
+        if let observedTabID = tabID ?? ownerTabID {
             notifyScheduledSendBusyStateMayHaveChanged(tabIDs: [observedTabID])
         }
     }

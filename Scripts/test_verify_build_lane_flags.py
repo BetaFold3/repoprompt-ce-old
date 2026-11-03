@@ -210,12 +210,39 @@ def lane_manifest(*, replace: dict[str, str] | None = None, drop: tuple[str, ...
     return manifest(blocks)
 
 
-def run_verifier(text: str) -> tuple[int, str, str]:
+INCREMENTAL_FIRST_PARTY_DEFINES = LANE_FIRST_PARTY_DEFINES + ["-DRPCE_OPTIMIZED_INCREMENTAL"]
+# The root manifest's App-only unsafeFlags, in manifest order.
+APP_ONLY_FLAGS = ["-no-whole-module-optimization", "-incremental", "-enable-batch-mode"]
+
+
+def incremental_first_party(module: str, *, defines: list[str] | None = None, extra: list[str] | None = None) -> str:
+    """Optimized-incremental lane compile: SwiftPM's release WMO first; manifest settings (defines, then
+    RepoPromptApp's unsafeFlags) follow -swift-version, as observed in the lab plan."""
+    if extra is None:
+        extra = APP_ONLY_FLAGS if module in vbl.INCREMENTAL_APP_MODULES else []
+    defines = INCREMENTAL_FIRST_PARTY_DEFINES if defines is None else defines
+    return compile_block(
+        module, compile_args(module, conf="release", mode_flags=release_mode(), defines=[*defines, *extra])
+    )
+
+
+def incremental_manifest(
+    *, replace: dict[str, str] | None = None, drop: tuple[str, ...] = (), extra: tuple[str, ...] = ()
+) -> str:
+    replace = replace or {}
+    blocks = [replace.get(module, incremental_first_party(module)) for module in FIRST_PARTY if module not in drop]
+    blocks += [replace.get(module, lane_third_party(module)) for module in THIRD_PARTY if module not in drop]
+    blocks += lane_links()
+    blocks += list(extra)
+    return manifest(blocks)
+
+
+def run_verifier(text: str, lane: str = vbl.LANE_OPTIMIZED) -> tuple[int, str, str]:
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "release.yaml"
         path.write_text(text, encoding="utf-8")
         stdout, stderr = io.StringIO(), io.StringIO()
-        code = vbl.run(str(path), stdout=stdout, stderr=stderr)
+        code = vbl.run(str(path), stdout=stdout, stderr=stderr, lane=lane)
     return code, stdout.getvalue(), stderr.getvalue()
 
 
@@ -475,6 +502,178 @@ class MalformedPlanTests(unittest.TestCase):
         )
 
 
+class IncrementalLaneTests(unittest.TestCase):
+    """--lane optimized-incremental: App-only effective non-WMO, rest WMO, lane label everywhere first-party."""
+
+    LANE = vbl.LANE_INCREMENTAL
+    APP = "RepoPromptApp"
+    APP_KEY = "[C.RepoPromptApp-arm64-apple-macosx-release.module]"
+
+    def assertPasses(self, text: str) -> str:
+        code, out, err = run_verifier(text, self.LANE)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(err, "")
+        self.assertTrue(out.rstrip().endswith("result: PASS"), out)
+        return out
+
+    def assertFails(self, text: str, *needles: str, lane: str | None = None) -> str:
+        code, out, err = run_verifier(text, lane or self.LANE)
+        self.assertEqual(code, 1, out)
+        self.assertTrue(out.rstrip().endswith("result: FAIL"), out)
+        for needle in needles:
+            self.assertIn(needle, err)
+        return err
+
+    def app(self, extra: list[str], defines: list[str] | None = None) -> dict[str, str]:
+        return {self.APP: incremental_first_party(self.APP, defines=defines, extra=extra)}
+
+    def test_incremental_lane_plan_passes_and_reports_the_lane(self) -> None:
+        self.assertEqual(vbl.INCREMENTAL_APP_MODULES, frozenset({"RepoPromptApp"}))
+        self.assertLessEqual(vbl.INCREMENTAL_APP_MODULES, vbl.FIRST_PARTY_MODULES)
+        out = self.assertPasses(incremental_manifest(extra=(lane_test("RepoPromptTests"),)))
+        self.assertIn("lane: optimized-incremental", out)
+        self.assertIn("RepoPromptApp effective non-WMO incremental batch, rest WMO): 13 modules of 13 expected", out)
+        self.assertIn("third-party (no DEBUG, no lane markers, WMO, no App-only flags): 4 modules", out)
+        summary = vbl.parse_build_plan(incremental_manifest())
+        app = next(command for command in summary.compiles if command.module == self.APP)
+        self.assertEqual((app.whole_module, app.no_whole_module, app.effective_whole_module), (True, True, False))
+        self.assertEqual((app.incremental, app.effective_batch_mode), (True, True))
+        others = [command for command in summary.compiles if command.module != self.APP]
+        self.assertTrue(all(command.effective_whole_module is True for command in others))
+
+    def test_no_wmo_alias_and_split_defines_are_accepted(self) -> None:
+        self.assertPasses(incremental_manifest(replace=self.app(["-no-wmo", "-incremental", "-enable-batch-mode"])))
+        spaced = ["-D", "DEBUG", "-D", "RPCE_OPTIMIZED_DIAGNOSTICS", "-D", "RPCE_OPTIMIZED_INCREMENTAL"]
+        self.assertPasses(incremental_manifest(replace=self.app(APP_ONLY_FLAGS, defines=spaced)))
+
+    def test_default_lane_rejects_an_incremental_plan(self) -> None:
+        err = self.assertFails(
+            incremental_manifest(),
+            f"FAIL first-party RepoPromptApp {self.APP_KEY}: has -no-whole-module-optimization",
+            "has -DRPCE_OPTIMIZED_INCREMENTAL (optimized-incremental lane label)",
+            lane=vbl.LANE_OPTIMIZED,
+        )
+        self.assertEqual(err.count("has -DRPCE_OPTIMIZED_INCREMENTAL"), len(FIRST_PARTY))
+
+    def test_default_lane_rejects_the_label_on_any_module(self) -> None:
+        self.assertFails(
+            lane_manifest(replace={"RepoPromptUI": lane_first_party("RepoPromptUI", defines=INCREMENTAL_FIRST_PARTY_DEFINES)}),
+            "FAIL first-party RepoPromptUI [C.RepoPromptUI-arm64-apple-macosx-release.module]: has -DRPCE_OPTIMIZED_INCREMENTAL",
+            lane=vbl.LANE_OPTIMIZED,
+        )
+        self.assertFails(
+            lane_manifest(replace={"Logging": lane_third_party("Logging", defines=["-DRPCE_OPTIMIZED_INCREMENTAL"])}),
+            "third-party module has -DRPCE_OPTIMIZED_INCREMENTAL",
+            lane=vbl.LANE_OPTIMIZED,
+        )
+
+    def test_incremental_lane_rejects_a_plain_optimized_plan(self) -> None:
+        err = self.assertFails(
+            lane_manifest(),
+            "missing -DRPCE_OPTIMIZED_INCREMENTAL",
+            f"FAIL first-party RepoPromptApp {self.APP_KEY}: missing -no-whole-module-optimization",
+            f"FAIL first-party RepoPromptApp {self.APP_KEY}: missing -incremental",
+            f"FAIL first-party RepoPromptApp {self.APP_KEY}: missing -enable-batch-mode",
+        )
+        self.assertEqual(err.count("missing -DRPCE_OPTIMIZED_INCREMENTAL"), len(FIRST_PARTY))
+
+    def test_app_override_must_follow_swiftpm_wmo(self) -> None:
+        for later in (["-whole-module-optimization"], ["-wmo"]):
+            with self.subTest(later=later):
+                self.assertFails(
+                    incremental_manifest(replace=self.app(APP_ONLY_FLAGS + later)),
+                    f"{self.APP_KEY}: -whole-module-optimization follows -no-whole-module-optimization (effective WMO)",
+                )
+        # Without SwiftPM's release WMO the plan is not the expected release plan; the override is unproven.
+        args = [
+            token
+            for token in compile_args(self.APP, conf="release", mode_flags=["-O"], defines=INCREMENTAL_FIRST_PARTY_DEFINES + APP_ONLY_FLAGS)
+            if token != "-whole-module-optimization"
+        ]
+        self.assertFails(
+            incremental_manifest(replace={self.APP: compile_block(self.APP, args)}),
+            "missing SwiftPM's release -whole-module-optimization (the override is unproven)",
+        )
+
+    def test_app_requires_incremental_and_effective_batch_mode(self) -> None:
+        cases = (
+            (["-no-whole-module-optimization", "-enable-batch-mode"], "missing -incremental"),
+            (["-no-whole-module-optimization", "-incremental"], "missing -enable-batch-mode"),
+            (APP_ONLY_FLAGS + ["-disable-batch-mode"], "-disable-batch-mode follows -enable-batch-mode (batch mode off)"),
+            (["-incremental", "-enable-batch-mode"], "missing -no-whole-module-optimization"),
+        )
+        for extra, needle in cases:
+            with self.subTest(extra=extra):
+                self.assertFails(incremental_manifest(replace=self.app(extra)), f"{self.APP_KEY}: {needle}")
+        # A disable that the later enable overrides is effective batch mode.
+        self.assertPasses(
+            incremental_manifest(replace=self.app(["-disable-batch-mode", *APP_ONLY_FLAGS]))
+        )
+
+    def test_app_keeps_the_shared_first_party_rules(self) -> None:
+        self.assertFails(
+            incremental_manifest(replace=self.app(APP_ONLY_FLAGS + ["-Onone"])), f"{self.APP_KEY}: has -Onone"
+        )
+        self.assertFails(
+            incremental_manifest(replace=self.app(APP_ONLY_FLAGS + ["-enable-testing"])), f"{self.APP_KEY}: has -enable-testing"
+        )
+        self.assertFails(
+            incremental_manifest(replace=self.app(APP_ONLY_FLAGS, defines=LANE_FIRST_PARTY_DEFINES)),
+            f"{self.APP_KEY}: missing -DRPCE_OPTIMIZED_INCREMENTAL",
+        )
+        self.assertFails(incremental_manifest(drop=(self.APP,)), "FAIL first-party RepoPromptApp: no Swift compile command")
+
+    def test_app_only_flags_on_any_other_first_party_module_fail(self) -> None:
+        for module in ("RepoPromptWorkspace", "RepoPromptAgentCore", "RepoPrompt", "RepoPromptShared"):
+            key = f"[C.{module}-arm64-apple-macosx-release.module]"
+            cases = (
+                (APP_ONLY_FLAGS, "has -no-whole-module-optimization"),
+                (["-no-wmo"], "has -no-whole-module-optimization"),
+                (["-incremental"], "has -incremental (App-only)"),
+                (["-enable-batch-mode"], "has a batch-mode flag (App-only)"),
+            )
+            for extra, needle in cases:
+                with self.subTest(module=module, extra=extra):
+                    self.assertFails(
+                        incremental_manifest(replace={module: incremental_first_party(module, extra=extra)}),
+                        f"FAIL first-party {module} {key}: {needle}",
+                    )
+
+    def test_third_party_and_test_modules_stay_untouched(self) -> None:
+        def third(defines: list[str] | None = None, mode: list[str] | None = None) -> str:
+            return compile_block(
+                "NIOCore",
+                compile_args("NIOCore", conf="release", mode_flags=mode or release_mode(), defines=defines or []),
+            )
+
+        cases = (
+            (third(defines=["-DRPCE_OPTIMIZED_INCREMENTAL"]), "third-party module has -DRPCE_OPTIMIZED_INCREMENTAL"),
+            (third(defines=["-DDEBUG"]), "third-party module has -DDEBUG"),
+            (third(mode=release_mode() + ["-no-whole-module-optimization"]), "third-party module has -no-whole-module-optimization"),
+            (third(mode=release_mode() + ["-incremental"]), "third-party module has -incremental (App-only)"),
+            (third(mode=release_mode() + ["-enable-batch-mode"]), "third-party module has a batch-mode flag (App-only)"),
+        )
+        for block, needle in cases:
+            with self.subTest(needle=needle):
+                self.assertFails(incremental_manifest(replace={"NIOCore": block}), "FAIL third-party NIOCore", needle)
+        args = [token for token in compile_args("NIOCore", conf="release", mode_flags=["-O"], defines=[])
+                if token != "-whole-module-optimization"]
+        self.assertFails(
+            incremental_manifest(replace={"NIOCore": compile_block("NIOCore", args)}),
+            "third-party module missing -whole-module-optimization",
+        )
+        self.assertFails(
+            incremental_manifest(extra=(lane_test("RepoPromptTests", defines=["-DRPCE_OPTIMIZED_INCREMENTAL"]),)),
+            "FAIL test RepoPromptTests [C.RepoPromptTests-arm64-apple-macosx-release.module]: "
+            "test module has -DRPCE_OPTIMIZED_INCREMENTAL",
+        )
+
+    def test_unknown_lane_is_rejected(self) -> None:
+        command = vbl.parse_build_plan(incremental_manifest()).compiles[0]
+        with self.assertRaises(ValueError):
+            vbl.command_violations(command, "optimized")
+
+
 class CommandLineTests(unittest.TestCase):
     SCRIPT = str(SCRIPT_DIR / "verify_build_lane_flags.py")
 
@@ -510,6 +709,28 @@ class CommandLineTests(unittest.TestCase):
         result = self.invoke()
         self.assertEqual(result.returncode, 2)
         self.assertIn("--build-yaml", result.stderr)
+
+    def test_lane_selector(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            optimized = Path(tmp) / "optimized.yaml"
+            optimized.write_text(lane_manifest(), encoding="utf-8")
+            incremental = Path(tmp) / "incremental.yaml"
+            incremental.write_text(incremental_manifest(), encoding="utf-8")
+            # The default lane is the original contract; an explicit spelling is the same lane.
+            for argv in ((), ("--lane", "optimized-diagnostics")):
+                with self.subTest(argv=argv):
+                    self.assertEqual(self.invoke("--build-yaml", str(optimized), *argv).returncode, 0)
+                    self.assertEqual(self.invoke("--build-yaml", str(incremental), *argv).returncode, 1)
+            result = self.invoke("--build-yaml", str(incremental), "--lane", "optimized-incremental")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("lane: optimized-incremental", result.stdout)
+            self.assertEqual(len([line for line in result.stdout.splitlines() if ": " in line and "modules" in line]), 4)
+            self.assertEqual(self.invoke("--build-yaml", str(optimized), "--lane", "optimized-incremental").returncode, 1)
+            for bad in (("--lane", "debug-optimized-incremental"), ("--lane",), ("--lane", "")):
+                with self.subTest(bad=bad):
+                    result = self.invoke("--build-yaml", str(incremental), *bad)
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn("--lane", result.stderr)
 
     def test_verifier_does_not_modify_its_input(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

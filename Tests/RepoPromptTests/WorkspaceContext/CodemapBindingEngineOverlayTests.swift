@@ -561,6 +561,167 @@ final class CodemapBindingEngineOverlayTests: CodemapBindingEngineTestCase {
         XCTAssertEqual(limit, budget.limit)
     }
 
+    func testStaleProjectionCatalogRetainsTerminalSupersededCoverageWithoutRestart() async throws {
+        let repository = try makeRepositoryFixture(name: #function)
+        let root = try repository.makeRepository(
+            named: "repository",
+            files: ["Sources/Stale.swift": SwiftFixtureSource.emptyStruct("Stale")]
+        )
+        let runtime = try CodeMapArtifactRuntime(
+            rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts"),
+            builder: CodeMapArtifactBuilderClient(build: { _, _, _ in .readyNoSymbols })
+        )
+        let recorder = EngineProjectionRecorder()
+        let fixture = try await makeEngineFixture(
+            root: root,
+            runtime: runtime,
+            projectionCatalogFactory: { _, _ in
+                WorkspaceCodemapBindingCatalogClient {
+                    _, _ in nil
+                } readProjectionCatalogPage: { _ in
+                    .stale
+                } revalidateProjectionCatalogToken: { _, _ in
+                    .stale
+                } publishProjection: { snapshot in
+                    await recorder.publish(snapshot)
+                }
+            }
+        )
+        _ = await fixture.engine.registerRoot(fixture.registration)
+        let scheduled = await fixture.engine.scheduleProjectionPreload(rootEpoch: fixture.rootEpoch)
+        XCTAssertEqual(scheduled, .handedOff)
+        let retained = await waitForEngineCondition {
+            let accounting = await fixture.engine.accounting()
+            let jobID = await fixture.engine.retainedSupersededProjectionJobID(rootEpoch: fixture.rootEpoch)
+            return accounting.projectionRoots.first?.phase == .superseded &&
+                accounting.activeProjectionBatchCount == 0 &&
+                jobID != nil
+        }
+        XCTAssertTrue(retained)
+
+        // The selected source has no resolved binding, so no provisional plan can stand in.
+        let request = WorkspaceCodemapBindingAutomaticSelectionPlanRequest(
+            rootEpoch: fixture.rootEpoch,
+            sourceTickets: [unresolvedSourceTicket(fixture, path: "Sources/Stale.swift")],
+            candidates: [],
+            maximumMatchedCandidateCount: 0
+        )
+        let disposition = await fixture.engine.planAutomaticSelectionCandidates(request)
+        guard case .unavailable(.projectionSuperseded) = disposition else {
+            return XCTFail("Expected retained superseded coverage to be terminal, got \(disposition).")
+        }
+        // Provisional control: a request a provisional plan can satisfy keeps that plan.
+        let provisional = await fixture.engine.planAutomaticSelectionCandidates(
+            WorkspaceCodemapBindingAutomaticSelectionPlanRequest(
+                rootEpoch: fixture.rootEpoch,
+                sourceTickets: [],
+                candidates: [],
+                maximumMatchedCandidateCount: 0
+            )
+        )
+        guard case .provisional = provisional else {
+            return XCTFail("Expected a satisfiable provisional plan to take precedence, got \(provisional).")
+        }
+        let repeatedSchedule = await fixture.engine.scheduleProjectionPreload(rootEpoch: fixture.rootEpoch)
+        XCTAssertEqual(repeatedSchedule, .superseded)
+        let accounting = await fixture.engine.accounting()
+        XCTAssertEqual(accounting.counters.projectionPreloadsScheduled, 1)
+        XCTAssertEqual(accounting.counters.projectionCoveragesSuperseded, 1)
+        XCTAssertEqual(accounting.activeProjectionBatchCount, 0)
+
+        await fixture.engine.unloadRoot(rootEpoch: fixture.rootEpoch)
+        let afterUnloadJobID = await fixture.engine.retainedSupersededProjectionJobID(rootEpoch: fixture.rootEpoch)
+        XCTAssertNil(afterUnloadJobID)
+        guard case .unavailable(.rootUnloaded) = await fixture.engine.planAutomaticSelectionCandidates(request) else {
+            return XCTFail("Expected an unloaded root to stop reporting retained superseded coverage.")
+        }
+    }
+
+    func testActiveProjectionCoverageRemainsIncompleteRatherThanTerminal() async throws {
+        let repository = try makeRepositoryFixture(name: #function)
+        let root = try repository.makeRepository(
+            named: "repository",
+            files: ["Sources/Active.swift": SwiftFixtureSource.emptyStruct("Active")]
+        )
+        let runtime = try CodeMapArtifactRuntime(
+            rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts"),
+            builder: CodeMapArtifactBuilderClient(build: { _, _, _ in .readyNoSymbols })
+        )
+        let recorder = EngineProjectionRecorder()
+        let pageGate = EngineAsyncGate()
+        addTeardownBlock { pageGate.release() }
+        let fixture = try await makeEngineFixture(
+            root: root,
+            runtime: runtime,
+            projectionCatalogFactory: { rootEpoch, fileIDs in
+                let path = "Sources/Active.swift"
+                return EngineProjectionCatalogStub(
+                    rootEpoch: rootEpoch,
+                    entries: [WorkspaceCodemapProjectionCatalogCandidate(
+                        identity: WorkspaceCodemapArtifactBindingIdentity(
+                            rootID: rootEpoch.rootID,
+                            rootLifetimeID: rootEpoch.rootLifetimeID,
+                            fileID: fileIDs.id(for: path),
+                            standardizedRootPath: root.path,
+                            standardizedRelativePath: path,
+                            standardizedFullPath: root.appendingPathComponent(path).path
+                        )!,
+                        language: .swift,
+                        requestGeneration: 1,
+                        pathGeneration: 1
+                    )],
+                    recorder: recorder,
+                    pageGate: pageGate
+                ).client
+            }
+        )
+        _ = await fixture.engine.registerRoot(fixture.registration)
+        _ = await fixture.engine.scheduleProjectionPreload(rootEpoch: fixture.rootEpoch)
+        let pageEntered = await pageGate.waitUntilEntered()
+        XCTAssertTrue(pageEntered)
+
+        let disposition = await fixture.engine.planAutomaticSelectionCandidates(
+            WorkspaceCodemapBindingAutomaticSelectionPlanRequest(
+                rootEpoch: fixture.rootEpoch,
+                sourceTickets: [unresolvedSourceTicket(fixture, path: "Sources/Active.swift")],
+                candidates: [],
+                maximumMatchedCandidateCount: 0
+            )
+        )
+        guard case .incomplete = disposition else {
+            pageGate.release()
+            return XCTFail("Expected active projection work to remain incomplete, got \(disposition).")
+        }
+        let activeJobID = await fixture.engine.retainedSupersededProjectionJobID(rootEpoch: fixture.rootEpoch)
+        XCTAssertNil(activeJobID)
+        pageGate.release()
+        let completed = await waitForEngineCondition {
+            let accounting = await fixture.engine.accounting()
+            return accounting.projectionRoots.first?.phase == .complete &&
+                accounting.activeProjectionBatchCount == 0
+        }
+        XCTAssertTrue(completed)
+        let completedJobID = await fixture.engine.retainedSupersededProjectionJobID(rootEpoch: fixture.rootEpoch)
+        XCTAssertNil(completedJobID)
+    }
+
+    /// A current-generation source ticket with no resolved overlay binding (never demanded).
+    private func unresolvedSourceTicket(
+        _ fixture: EngineFixture,
+        path: String
+    ) -> WorkspaceCodemapArtifactDemandTicket {
+        WorkspaceCodemapArtifactDemandTicket(
+            retainID: UUID(),
+            requestID: UUID(),
+            rootEpoch: fixture.rootEpoch,
+            fileID: fixture.fileIDs.id(for: path),
+            requestGeneration: 1,
+            catalogGeneration: fixture.registration.catalogGeneration,
+            pathGeneration: 1,
+            ingressGeneration: fixture.registration.ingressGeneration
+        )
+    }
+
     func testProjectionCompletenessDoesNotUseManifestAdoptionRetentionCap() async throws {
         let repository = try makeRepositoryFixture(name: #function)
         let paths = ["Sources/One.swift", "Sources/Two.swift"]

@@ -131,6 +131,10 @@ actor RemoteGatewayRuntime {
     }
 
     func removeSink(deviceID: String, sinkID: UUID) async {
+        // Drop any pending subscription validations owned by this connection so a deferred watch
+        // activation can never fire against a torn-down sink. Keyed on the sink's unique incarnation
+        // id, so a different connection reusing the same client requestID keeps its own pending entry.
+        pendingSubscriptionValidations = pendingSubscriptionValidations.filter { $0.key.sinkID != sinkID }
         await watchManager.removeSink(deviceID: deviceID, sinkID: sinkID)
     }
 
@@ -178,6 +182,47 @@ actor RemoteGatewayRuntime {
         }
     }
 
+    /// Discard a deferred subscription validation WITHOUT activating its watch. Called when the
+    /// correlated response was dropped or lock-replaced (`sendResponse` returned anything other than
+    /// `.originalEnqueued`), so the deferred validation for that request never ACTIVATES its session
+    /// watch (the activation path `validateSubscription` is simply never run for it). Pops exactly one
+    /// pending VALIDATION under the same FIFO key as `didQueueResponse`, so a duplicate client
+    /// requestID cannot discard the wrong pending entry. It does NOT tear down any device-wide
+    /// observation already registered for OTHER live subscriptions of the same device (S3-A-09): the
+    /// shared watch is a device-scoped resource, and withholding one request's correlated result only
+    /// cancels THAT request's pending activation, not an unrelated sibling's established watch.
+    ///
+    /// It also does NOT remove the withheld request's OWN observation intent: `handle` already called
+    /// `watchManager.registerSubscription` for this subscribe before the response was withheld, and that
+    /// registration (its per-session token) persists until an explicit unsubscribe or the connection
+    /// disconnects — only its deferred catch-up validation is cancelled here, so no catch-up frame is
+    /// emitted. Nothing leaks while the intent lingers: the sink still gates every delivery on current
+    /// access, so a locked connection receives no frames (S3-A-09, deferred to Step 4).
+    func discardQueuedResponse(
+        for request: RemoteClientFrame,
+        deviceID: String,
+        sinkID: UUID
+    ) {
+        guard request.type == "subscribe" else { return }
+        let sessionIDs = (try? sessionIDs(from: request)) ?? []
+        let key = subscriptionValidationKey(
+            deviceID: deviceID,
+            sinkID: sinkID,
+            requestID: request.requestID,
+            sessionIDs: sessionIDs
+        )
+        guard var validations = pendingSubscriptionValidations[key], !validations.isEmpty else {
+            pendingSubscriptionValidations.removeValue(forKey: key)
+            return
+        }
+        validations.removeFirst()
+        if validations.isEmpty {
+            pendingSubscriptionValidations.removeValue(forKey: key)
+        } else {
+            pendingSubscriptionValidations[key] = validations
+        }
+    }
+
     func handle(
         _ frame: RemoteClientFrame,
         deviceID: String,
@@ -202,6 +247,8 @@ actor RemoteGatewayRuntime {
             await handlePushSubscribe(frame, deviceID: deviceID)
         case "push_unsubscribe":
             await handlePushUnsubscribe(frame, deviceID: deviceID)
+        case "list_workspaces":
+            await handleListWorkspaces(frame, deviceID: deviceID)
         default:
             await handleToolMappedCommand(frame, deviceID: deviceID)
         }
@@ -382,6 +429,45 @@ actor RemoteGatewayRuntime {
             requestID: frame.requestID,
             payload: .object(["status": .string(removed ? "unsubscribed" : "not_subscribed")])
         )
+    }
+
+    /// Read-only discovery of the open Mac windows' active workspaces for the browser workspace
+    /// chooser. Always a FRESH `bind_context list` read through the existing eligible-window helper:
+    /// no cached window details are ever returned, and no workspace is opened, focused, or bound.
+    /// Failures use one fixed, sanitized error so no raw app or transport text reaches the browser.
+    private func handleListWorkspaces(_ frame: RemoteClientFrame, deviceID: String) async -> RemoteServerFrame {
+        let payloadIsEmpty: Bool = switch frame.payload {
+        case nil, .null: true
+        case let .object(object): object.isEmpty
+        default: false
+        }
+        guard payloadIsEmpty else {
+            audit(frame: frame, deviceID: deviceID, outcome: "failure", code: "invalid_payload")
+            return .commandError(
+                requestID: frame.requestID,
+                sessionID: frame.sessionID,
+                code: "invalid_payload",
+                message: "list_workspaces takes no arguments."
+            )
+        }
+        switch await eligibleStartTargetWindowInfoLookup(deviceID: deviceID) {
+        case let .available(info):
+            let payload = JSONValue.object(["windows": info.details])
+            audit(frame: frame, deviceID: deviceID, outcome: "success")
+            return .commandResult(requestID: frame.requestID, payload: payload)
+        case .unavailable(.emptyWindowList):
+            // The app answered authoritatively with no open windows: an honest empty inventory.
+            audit(frame: frame, deviceID: deviceID, outcome: "success")
+            return .commandResult(requestID: frame.requestID, payload: .object(["windows": .array([])]))
+        case .unavailable:
+            audit(frame: frame, deviceID: deviceID, outcome: "failure", code: "workspace_discovery_unavailable")
+            return .commandError(
+                requestID: frame.requestID,
+                sessionID: frame.sessionID,
+                code: "workspace_discovery_unavailable",
+                message: "Open workspaces are unavailable. Retry."
+            )
+        }
     }
 
     private func handleToolMappedCommand(_ frame: RemoteClientFrame, deviceID: String) async -> RemoteServerFrame {
@@ -1315,7 +1401,11 @@ actor RemoteGatewayRuntime {
     private func ledgerOutcome(for error: Error, frame: RemoteClientFrame) -> CommandLedger.RecordedOutcome {
         if let appLinkError = error as? AppLinkError {
             switch appLinkError {
-            case .toolCallTimedOut, .appLinkLost:
+            // An authoritative RPC error proves a response arrived but not the execution outcome, and
+            // an uncertain failure's provenance is unknown; both are IN DOUBT exactly like a timeout
+            // or lost link — never a definite failure and never a safe-retry signal. (Step 3 Oracle
+            // plan §3: response provenance does not prove execution outcome.)
+            case .toolCallTimedOut, .appLinkLost, .authoritativeToolFailure, .uncertainToolFailure:
                 return .inDoubt
             default:
                 break

@@ -25,6 +25,10 @@ package enum MCPToolCapability: CaseIterable, Hashable {
     case gitReviewSnapshot
     case worktreeManage
     case appSettings
+    /// Cross-workspace steering of owner-granted target workspaces (`workspace_steer`). Granted to
+    /// every Agent Mode run, including delegation leaves, explore and Knowledge sessions; it is
+    /// deliberately not an agent-control capability, so leaf restrictions and role hiding skip it.
+    case workspaceSteering
     /// `code_mode`: scripts over the four exploration tools, gated by per-run eligibility.
     case codeMode
 
@@ -51,6 +55,7 @@ package enum MCPToolCapability: CaseIterable, Hashable {
         case .gitReviewSnapshot: "git_review_snapshot"
         case .worktreeManage: "worktree_manage"
         case .appSettings: "app_settings"
+        case .workspaceSteering: "workspace_steering"
         case .codeMode: "code_mode"
         }
     }
@@ -122,6 +127,9 @@ package enum MCPToolCapabilities {
         ],
         .appSettings: [
             "app_settings"
+        ],
+        .workspaceSteering: [
+            "workspace_steer"
         ],
         .codeMode: [
             "code_mode"

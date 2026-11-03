@@ -538,6 +538,9 @@ final class CodemapAutomaticSelectionBusyTests: WorkspaceFileContextStoreCodemap
             ticket: warmSourceTicket
         )
         _ = await store.cancelCodemapArtifactDemand(warmSourceTicket)
+        // Released ready demands stay warm; evict them so the selection phase issues fresh source
+        // demands that reach the busy hook.
+        _ = await store.evictIdleReadyCodemapDemandsForTesting(rootEpoch: warmSourceTicket.rootEpoch)
         selectionPhase.increment()
         let service = WorkspaceSelectionMutationService(
             store: store,
@@ -697,6 +700,9 @@ final class CodemapAutomaticSelectionBusyTests: WorkspaceFileContextStoreCodemap
         _ = try await readyResult(settledResult(store: store, ticket: warmSourceTicket))
         _ = await store.cancelCodemapArtifactDemand(warmSourceTicket)
         _ = await store.cancelCodemapArtifactDemand(setupTicket)
+        // Released ready demands stay warm; evict them so the selection phase issues fresh source
+        // demands that reach the busy hook.
+        _ = await store.evictIdleReadyCodemapDemandsForTesting(rootEpoch: warmSourceTicket.rootEpoch)
         selectionPhase.increment()
         let service = WorkspaceSelectionMutationService(
             store: store,
@@ -843,6 +849,9 @@ final class CodemapAutomaticSelectionBusyTests: WorkspaceFileContextStoreCodemap
         _ = try await readyResult(settledResult(store: store, ticket: warmSourceTicket))
         _ = await store.cancelCodemapArtifactDemand(warmSourceTicket)
         _ = await store.cancelCodemapArtifactDemand(setupTicket)
+        // Released ready demands stay warm; evict them so the selection phase issues fresh source
+        // demands that reach the busy hook.
+        _ = await store.evictIdleReadyCodemapDemandsForTesting(rootEpoch: warmSourceTicket.rootEpoch)
         selectionPhase.increment()
         let service = WorkspaceSelectionMutationService(
             store: store,
@@ -1095,7 +1104,11 @@ final class CodemapAutomaticSelectionBusyTests: WorkspaceFileContextStoreCodemap
         XCTAssertTrue(released)
         let finalRetainCount = await store.codemapArtifactDemandRetainCountForTesting(joinedTicket)
         XCTAssertEqual(finalRetainCount, 0)
-        XCTAssertEqual(cancelledTickets.values, [joinedTicket])
+        // The final release of a ready demand keeps it warm; only eviction runs demand cleanup.
+        XCTAssertTrue(cancelledTickets.values.isEmpty)
+        let evicted = await store.evictIdleReadyCodemapDemandsForTesting(rootEpoch: joinedTicket.rootEpoch)
+        XCTAssertEqual(evicted, 1)
+        XCTAssertEqual(cancelledTickets.values.map(\.requestID), [joinedTicket.requestID])
         let releasedStatus = await store.codemapArtifactDemandStatus(joinedTicket)
         guard case .unavailable(.staleCurrentness) = releasedStatus else {
             return XCTFail("Expected the released caller token to become stale")

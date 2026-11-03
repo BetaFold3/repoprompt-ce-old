@@ -298,6 +298,9 @@ package enum WorkspaceCodemapSelectionGraphUnavailableReason: Hashable {
     case policyMismatch
     case invalidCompletenessProof
     case accountingOverflow
+    /// The root's projection was superseded and retained with no worker; ordinary scheduling
+    /// refuses to restart it, so coverage cannot advance until the root session is replaced.
+    case projectionSuperseded
 }
 
 package enum WorkspaceCodemapSelectionGraphDefinitionUniverseCoverage: Hashable {

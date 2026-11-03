@@ -298,3 +298,158 @@ struct AgentWorktreeMergeReviewCard: View {
         diffExcerpt = provider()
     }
 }
+
+// MARK: - Historical Worktree Merge Review Card (Step 5c)
+
+//
+// Read-only card for a preserved merge review whose request ended without being merged
+// (lifecycle end, timeout, replacement, an unsaved rejection, an unstarted approval, or an app
+// relaunch). It has no Merge action and never
+// resumes the old request: View and Copy read the retained saved patch, Discard durably
+// withdraws the review. The recorded conflict prediction is past proposal metadata; the "Now"
+// line is a separate read-only fingerprint observation.
+//
+// SEARCH-HELPER: historical worktree merge review card, preserved merge proposal.
+struct AgentWorktreeMergeHistoricalReviewCard: View {
+    let operation: AgentSessionWorktreeMergeOperation
+    let isDisabled: Bool
+    let loadPastPrediction: () async -> GitWorktreeMergeConflictPrediction?
+    let loadCurrentState: () async -> String
+    let loadSavedPatch: () async -> WorktreeMergeSavedProposal
+    let onCopy: () async -> String?
+    /// Session-owned Discard state (survives this card being removed and recreated).
+    let isDiscarding: Bool
+    let discardMessage: String?
+    /// Starts Discard; progress and any failure message come back through the session state.
+    let onDiscard: () -> Void
+
+    @State private var pastPrediction: GitWorktreeMergeConflictPrediction?
+    @State private var currentState: String?
+    @State private var savedPatch: WorktreeMergeSavedProposal?
+    @State private var isShowingPatch = false
+    @State private var copyMessage: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: "clock.arrow.circlepath")
+                    .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Ended Worktree Merge Review")
+                        .font(.headline)
+                    Text("\(operation.source.displayName) → \(operation.target.displayName) · operation \(operation.id)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                Spacer()
+            }
+
+            Text(endedText)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if let summary = operation.summary {
+                Text("\(summary.commits) commit\(summary.commits == 1 ? "" : "s") · \(summary.files) file\(summary.files == 1 ? "" : "s") · +\(summary.insertions) -\(summary.deletions)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Text(pastPredictionText)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Text(currentState ?? "Now: checking source and target…")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+
+            if isShowingPatch {
+                savedPatchBlock
+            }
+            if let copyMessage {
+                Text(copyMessage)
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+            }
+            if let discardMessage {
+                Text(discardMessage)
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            HStack {
+                Button(isDiscarding ? "Discarding…" : "Discard") {
+                    onDiscard()
+                }
+                .buttonStyle(.bordered)
+                .disabled(isDiscarding)
+                .hoverTooltip("Remove this ended review. Git is not changed.")
+                Spacer()
+                Button("Copy patch") {
+                    Task { @MainActor in copyMessage = await onCopy() }
+                }
+                .buttonStyle(.bordered)
+                .disabled(isDiscarding)
+                Button(isShowingPatch ? "Hide patch" : "View patch") {
+                    isShowingPatch.toggle()
+                    guard isShowingPatch, savedPatch == nil else { return }
+                    Task { @MainActor in savedPatch = await loadSavedPatch() }
+                }
+                .buttonStyle(.bordered)
+                .disabled(isDiscarding)
+            }
+            .disabled(isDisabled)
+        }
+        .padding(12)
+        .background(Color.secondary.opacity(0.06))
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(Color.secondary.opacity(0.3), lineWidth: 1)
+        )
+        .task(id: operation.id) {
+            pastPrediction = await loadPastPrediction()
+            currentState = await loadCurrentState()
+        }
+    }
+
+    private var endedText: String {
+        AgentModeViewModel.historicalWorktreeMergeReviewEndedText(reason: operation.reviewPreservation?.endedReason)
+    }
+
+    private var pastPredictionText: String {
+        guard let pastPrediction else { return "When proposed: conflict prediction unavailable." }
+        switch pastPrediction.status {
+        case .clean:
+            return "When proposed: predicted clean."
+        case .conflicts:
+            return pastPrediction.files.isEmpty
+                ? "When proposed: predicted conflicts."
+                : "When proposed: predicted conflicts (\(pastPrediction.files.count))."
+        case .unavailable:
+            return "When proposed: conflict prediction unavailable."
+        }
+    }
+
+    @ViewBuilder
+    private var savedPatchBlock: some View {
+        switch savedPatch {
+        case nil:
+            Text("Loading saved patch…")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        case let .patch(text):
+            UnifiedDiffView(diff: text, largeBodyMaxHeight: 220)
+        case .noPatch:
+            Text("This proposal has no saved patch content.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        case let .unavailable(message):
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+}

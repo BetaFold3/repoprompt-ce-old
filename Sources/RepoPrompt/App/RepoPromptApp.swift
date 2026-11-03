@@ -169,6 +169,9 @@ struct RepoPromptSwiftUIApp: App {
             // ➜ View-menu command for the Agent Mode right utility panel (⌥⌘0)
             AgentUtilityPanelCommands(windowStatesManager: windowStatesManager)
 
+            // ➜ View-menu command for the app-wide Needs Attention sheet (recovery catalog)
+            AgentRecoveryNeedsAttentionCommands(windowStatesManager: windowStatesManager)
+
             CommandGroup(before: .saveItem) {
                 Button("Close Window") {
                     NSApplication.shared.keyWindow?.performClose(nil)

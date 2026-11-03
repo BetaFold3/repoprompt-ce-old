@@ -5,6 +5,13 @@ import Foundation
 /// Attempts are independent: dispatch authorization, delivery resolution, timeout, and
 /// cancellation are all keyed by attempt ID. Terminal attempts remain tombstoned so a late
 /// provider result cannot be buffered for, or accidentally resolve, a newer attempt.
+///
+/// The acknowledgement is bounded; the submission operation is not. Once the caller marks the
+/// operation started (`markOperationStarted`), it may still save, queue, or deliver the input after
+/// its caller stops waiting, so the acknowledgement deadline or caller cancellation then settles as
+/// non-retryable `deliveryUnknown` (never `timedOut`/`cancelled`) and leaves the operation's dispatch
+/// authorization intact. Before the operation starts they settle as `timedOut`/`cancelled` and the
+/// operation never begins.
 @MainActor
 package final class CodexSteerAckTracker {
     nonisolated static let defaultTimeoutSeconds: TimeInterval = 2.5
@@ -31,7 +38,12 @@ package final class CodexSteerAckTracker {
         case steerAccepted
         case startAccepted
         case controlAccepted
-        case durablyQueued(queueID: UUID)
+        /// Held in the Codex fallback queue under its store-issued queue receipt (restart-held, not
+        /// provider-accepted). The queue ID is the receipt's recovery intent ID.
+        case durablyQueued(receipt: AgentRecoveryQueueReceipt)
+        /// The handoff began but its result is not proven (or its durable evidence could not be
+        /// written). Never retried automatically; the caller must not resend.
+        case deliveryUnknown(message: String)
         case failed(message: String)
         case cancelled
         case stale(reason: String)
@@ -41,15 +53,26 @@ package final class CodexSteerAckTracker {
             switch self {
             case .steerAccepted, .startAccepted, .controlAccepted, .durablyQueued:
                 true
-            case .failed, .cancelled, .stale, .timedOut:
+            case .deliveryUnknown, .failed, .cancelled, .stale, .timedOut:
                 false
             }
+        }
+
+        package var queueID: UUID? {
+            if case let .durablyQueued(receipt) = self {
+                return receipt.intent.intentID
+            }
+            return nil
         }
 
         package var failureDescriptionForMCP: String? {
             switch self {
             case .steerAccepted, .startAccepted, .controlAccepted, .durablyQueued:
                 nil
+            case let .deliveryUnknown(message):
+                message.isEmpty
+                    ? "Codex may have received this message, but delivery could not be confirmed. Do not resend it; recovery keeps it for review."
+                    : message
             case let .failed(message):
                 message.isEmpty
                     ? "Codex steer failed before reaching the active run."
@@ -61,13 +84,19 @@ package final class CodexSteerAckTracker {
                     ? "Codex steer was dropped because the active run changed before delivery."
                     : reason
             case .timedOut:
-                "Timed out waiting for Codex to acknowledge the steer message. The run may have changed state."
+                "Codex did not start this instruction before the acknowledgement deadline; it was not submitted."
             }
         }
     }
 
+    /// Acknowledgement expiry or caller cancellation after the submission operation started.
+    package nonisolated static let unconfirmedOutcomeMessage =
+        "The submission outcome could not be confirmed before the acknowledgement deadline. It may still be saved, queued, or delivered. Do not resend it automatically; inspect recovery."
+
     private struct AttemptRecord {
         let cancellationFlag = CancellationFlag()
+        /// Set immediately before the submission operation's first potentially committing await.
+        var operationMayComplete = false
         var isDispatchAuthorized = false
         var dispatchContinuation: CheckedContinuation<Bool, Never>?
         var terminalState: TerminalState?
@@ -99,7 +128,31 @@ package final class CodexSteerAckTracker {
         func test_setTerminalStateTimeoutSeconds(_ timeoutSeconds: TimeInterval) {
             terminalStateTimeoutSeconds = timeoutSeconds
         }
+
+        var test_terminalStateTimeoutSeconds: TimeInterval {
+            terminalStateTimeoutSeconds
+        }
+
+        /// Deterministic deadlines for tests: no wall-clock timer is armed; an attempt's deadline
+        /// fires only through `test_fireDeadline`.
+        private var usesManualDeadlines = false
+
+        func test_useManualDeadlines() {
+            usesManualDeadlines = true
+        }
+
+        func test_fireDeadline(attemptID: UUID) {
+            expireDeadline(attemptID: attemptID)
+        }
     #endif
+
+    private var armsWallClockDeadlines: Bool {
+        #if DEBUG
+            !usesManualDeadlines
+        #else
+            true
+        #endif
+    }
 
     package func beginAttempt() -> UUID {
         let attemptID = UUID()
@@ -110,11 +163,30 @@ package final class CodexSteerAckTracker {
         return attemptID
     }
 
-    package func authorizeDispatch(attemptID: UUID) {
+    /// Marks the submission operation started, before its first potentially committing await.
+    /// Returns false for a missing, terminal, or cancelled attempt; the caller must then submit nothing.
+    /// This makes no claim that the provider received anything.
+    package func markOperationStarted(attemptID: UUID) -> Bool {
         guard var record = attempts[attemptID],
               record.terminalState == nil
-        else { return }
+        else { return false }
         if record.cancellationFlag.isCancelled {
+            resolve(attemptID: attemptID, state: .cancelled)
+            return false
+        }
+        record.operationMayComplete = true
+        attempts[attemptID] = record
+        return true
+    }
+
+    /// A started operation keeps its authorization even after its acknowledgement settled as
+    /// uncertain: neither the deadline nor caller cancellation withdraws an admitted submission.
+    package func authorizeDispatch(attemptID: UUID) {
+        guard var record = attempts[attemptID],
+              !record.isDispatchAuthorized,
+              record.terminalState == nil || record.operationMayComplete
+        else { return }
+        if record.cancellationFlag.isCancelled, !record.operationMayComplete {
             resolve(attemptID: attemptID, state: .cancelled)
             return
         }
@@ -136,14 +208,16 @@ package final class CodexSteerAckTracker {
         }
         return await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
-                guard var record = attempts[attemptID],
-                      record.terminalState == nil
-                else {
+                guard var record = attempts[attemptID] else {
                     continuation.resume(returning: false)
                     return
                 }
                 if record.isDispatchAuthorized {
                     continuation.resume(returning: true)
+                    return
+                }
+                guard record.terminalState == nil || record.operationMayComplete else {
+                    continuation.resume(returning: false)
                     return
                 }
                 record.dispatchContinuation = continuation
@@ -153,34 +227,63 @@ package final class CodexSteerAckTracker {
             cancellationFlag.cancel()
             Task { @MainActor [weak self] in
                 self?.cancel(attemptID: attemptID)
+                // The cancelled dispatch waiter itself never proceeds, even for a started operation.
+                self?.releaseDispatchWait(attemptID: attemptID)
             }
         }
     }
 
+    private func releaseDispatchWait(attemptID: UUID) {
+        guard var record = attempts[attemptID],
+              let continuation = record.dispatchContinuation
+        else { return }
+        record.dispatchContinuation = nil
+        attempts[attemptID] = record
+        continuation.resume(returning: false)
+    }
+
+    /// The first terminal state is permanent. A caller-cancellation flag never overwrites a producer's
+    /// result: cancellation settles only through `cancel(attemptID:)`, in main-actor order.
     package func resolve(attemptID: UUID, state: TerminalState) {
         guard var record = attempts[attemptID],
               record.terminalState == nil
         else { return }
-        let resolvedState: TerminalState = record.cancellationFlag.isCancelled
-            ? .cancelled
-            : state
-        record.terminalState = resolvedState
+        record.terminalState = state
         record.timeoutTask?.cancel()
         record.timeoutTask = nil
-        let dispatchContinuation = record.dispatchContinuation
-        record.dispatchContinuation = nil
+        // A started operation that has not been authorized yet keeps waiting for its own
+        // authorization; only an operation that cannot proceed is released as unauthorized.
+        let dispatchContinuation = record.operationMayComplete ? nil : record.dispatchContinuation
+        if !record.operationMayComplete {
+            record.dispatchContinuation = nil
+        }
         let terminalContinuation = record.terminalContinuation
         record.terminalContinuation = nil
         attempts[attemptID] = record
         terminalAttemptOrder.append(attemptID)
         pruneTerminalTombstonesIfNeeded()
         dispatchContinuation?.resume(returning: false)
-        terminalContinuation?.resume(returning: resolvedState)
+        terminalContinuation?.resume(returning: state)
     }
 
+    /// Caller cancellation: `.cancelled` before the operation starts, non-retryable uncertainty after.
     package func cancel(attemptID: UUID) {
-        attempts[attemptID]?.cancellationFlag.cancel()
-        resolve(attemptID: attemptID, state: .cancelled)
+        guard let record = attempts[attemptID] else { return }
+        record.cancellationFlag.cancel()
+        let state: TerminalState = record.operationMayComplete
+            ? .deliveryUnknown(message: Self.unconfirmedOutcomeMessage)
+            : .cancelled
+        resolve(attemptID: attemptID, state: state)
+    }
+
+    /// Acknowledgement deadline: `.timedOut` (nothing submitted) before the operation starts,
+    /// non-retryable uncertainty after. Never stales or withdraws the operation itself.
+    private func expireDeadline(attemptID: UUID) {
+        guard let record = attempts[attemptID] else { return }
+        let state: TerminalState = record.operationMayComplete
+            ? .deliveryUnknown(message: Self.unconfirmedOutcomeMessage)
+            : .timedOut
+        resolve(attemptID: attemptID, state: state)
     }
 
     func markStale(attemptID: UUID, reason: String) {
@@ -197,7 +300,7 @@ package final class CodexSteerAckTracker {
         if Task.isCancelled {
             cancellationFlag.cancel()
             cancel(attemptID: attemptID)
-            return .cancelled
+            return attempts[attemptID]?.terminalState ?? .cancelled
         }
         return await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
@@ -212,10 +315,13 @@ package final class CodexSteerAckTracker {
                     return
                 }
                 record.terminalContinuation = continuation
-                let timeout = max(0.1, timeoutSeconds ?? terminalStateTimeoutSeconds)
-                record.timeoutTask = Task { @MainActor [weak self] in
-                    try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-                    self?.resolve(attemptID: attemptID, state: .timedOut)
+                if armsWallClockDeadlines {
+                    let timeout = max(0.1, timeoutSeconds ?? terminalStateTimeoutSeconds)
+                    record.timeoutTask = Task { @MainActor [weak self] in
+                        try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                        guard !Task.isCancelled else { return }
+                        self?.expireDeadline(attemptID: attemptID)
+                    }
                 }
                 attempts[attemptID] = record
             }

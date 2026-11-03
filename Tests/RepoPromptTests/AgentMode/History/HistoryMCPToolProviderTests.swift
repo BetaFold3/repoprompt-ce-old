@@ -84,6 +84,48 @@ final class HistoryMCPToolProviderTests: XCTestCase {
         XCTAssertNotNil(timeObject["total_sessions"])
         XCTAssertNotNil(timeObject["groups"])
     }
+
+    func testProviderReportsHistoryPhasesToTaskLocalRecorderWithSynchronousWatchdogClock() async throws {
+        let fixture = try HistoryTestFixture()
+        let workspace = try fixture.createWorkspace(name: "ProviderProject")
+        try fixture.install([HistoryTestFixture.textSearchSession(name: "S", activityText: "hello")], in: workspace)
+        let scanner = fixture.makeScanner()
+        let runtime = MCPWindowToolRuntime(windowID: 42) { name, _, arguments, implementation in
+            try await implementation(MCPWindowToolContext(toolName: name, windowID: 42), arguments)
+        }
+        let tool = try XCTUnwrap(MCPHistoryToolProvider(runtime: runtime, scannerFactory: { scanner }).buildTools().first)
+        let watchdogClock = SynchronousTestDuration(.seconds(3))
+        let recorder = MCPToolExecutionHandlerPhaseRecorder(
+            origin: .seconds(1),
+            now: { watchdogClock.value },
+            synchronousNow: { watchdogClock.value }
+        )
+
+        _ = try await MCPToolExecutionHandlerPhaseContext.$recorder.withValue(recorder) {
+            try await tool(["op": .string("list_sessions")])
+        }
+
+        // The provider binds the dispatch-scoped recorder and stamps phases with the
+        // watchdog's synchronous clock (3s - 1s origin), last phase closed by the call.
+        XCTAssertEqual(recorder.snapshot(), MCPToolExecutionHandlerPhaseSnapshot(
+            phase: .historyReplyConstruction,
+            transition: .completed,
+            elapsedMilliseconds: 2000
+        ))
+    }
+}
+
+private final class SynchronousTestDuration: @unchecked Sendable {
+    private let lock = NSLock()
+    private var current: Duration
+
+    init(_ initial: Duration) {
+        current = initial
+    }
+
+    var value: Duration {
+        lock.withLock { current }
+    }
 }
 
 private actor ProviderRuntimeCapture {

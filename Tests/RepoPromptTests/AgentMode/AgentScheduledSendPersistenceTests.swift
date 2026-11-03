@@ -226,7 +226,8 @@ final class AgentScheduledSendPersistenceTests: XCTestCase {
             AgentSessionMetadataIndex.self,
             from: Data(contentsOf: indexFile)
         )
-        XCTAssertEqual(rewritten.schemaVersion, 7)
+        // Phase 2 schema 8 (bounded recovery hint); a schema-6 index is still rebuilt.
+        XCTAssertEqual(rewritten.schemaVersion, 8)
         XCTAssertEqual(rewritten.entries.count, 3)
     }
 
@@ -249,6 +250,7 @@ final class AgentScheduledSendPersistenceTests: XCTestCase {
             preparation: .alreadyCanonicalTranscript,
             trustedCanonicalItemCount: 0
         )
+        staleSession = try await carryingLoadedLifecycle(staleSession, service: service, workspace: workspace)
 
         var newerSchedule = originalSchedule
         newerSchedule.updatedAt = originalSchedule.updatedAt.addingTimeInterval(60)
@@ -294,6 +296,7 @@ final class AgentScheduledSendPersistenceTests: XCTestCase {
             preparation: .alreadyCanonicalTranscript,
             trustedCanonicalItemCount: 0
         )
+        staleSession = try await carryingLoadedLifecycle(staleSession, service: service, workspace: workspace)
 
         _ = try await service.mutateScheduledSend(
             sessionID: staleSession.id,
@@ -517,6 +520,7 @@ final class AgentScheduledSendPersistenceTests: XCTestCase {
             preparation: .alreadyCanonicalTranscript,
             trustedCanonicalItemCount: 0
         )
+        staleSession = try await carryingLoadedLifecycle(staleSession, service: service, workspace: workspace)
         let acceptedItem = AgentChatItem.user(
             schedule.rawText,
             id: attempt.itemID,
@@ -614,7 +618,7 @@ final class AgentScheduledSendPersistenceTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: storagePath) }
 
         let (schedule, attempt) = makeDispatchingSchedule()
-        let session = AgentSession(
+        var session = AgentSession(
             id: UUID(),
             workspaceID: workspace.id,
             name: "Stamped Before Finalization",
@@ -626,6 +630,7 @@ final class AgentScheduledSendPersistenceTests: XCTestCase {
             preparation: .alreadyCanonicalTranscript,
             trustedCanonicalItemCount: 0
         )
+        session = try await carryingLoadedLifecycle(session, service: service, workspace: workspace)
         let receipt = makeProvenance(schedule: schedule, attempt: attempt)
         var stampedItem = AgentChatItem.user(
             schedule.rawText,
@@ -786,6 +791,7 @@ final class AgentScheduledSendPersistenceTests: XCTestCase {
             preparation: .alreadyCanonicalTranscript,
             trustedCanonicalItemCount: 0
         )
+        stalePreAcceptance = try await carryingLoadedLifecycle(stalePreAcceptance, service: service, workspace: workspace)
         let acceptedItem = AgentChatItem.user(
             schedule.rawText,
             id: attempt.itemID,
@@ -963,7 +969,7 @@ final class AgentScheduledSendPersistenceTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: storagePath) }
 
         let (schedule, attempt) = makeDispatchingSchedule()
-        let session = AgentSession(
+        var session = AgentSession(
             id: UUID(),
             workspaceID: workspace.id,
             name: "Reset Before Retry",
@@ -975,6 +981,7 @@ final class AgentScheduledSendPersistenceTests: XCTestCase {
             preparation: .alreadyCanonicalTranscript,
             trustedCanonicalItemCount: 0
         )
+        session = try await carryingLoadedLifecycle(session, service: service, workspace: workspace)
         let acceptedItem = AgentChatItem.user(
             schedule.rawText,
             id: attempt.itemID,
@@ -1016,7 +1023,7 @@ final class AgentScheduledSendPersistenceTests: XCTestCase {
         XCTAssertFalse(reloaded.toLiveItems().contains { $0.id == attempt.itemID })
     }
 
-    func testRecoveryPreparedBeforeDeleteCannotMutateRecreatedSessionIncarnation() async throws {
+    func testRecoveryPreparedBeforeDeleteSettlesAsDeletedAndSessionIDCannotBeRecreated() async throws {
         let service = AgentSessionDataService()
         let workspace = makeTemporaryWorkspace()
         let storagePath = try XCTUnwrap(workspace.customStoragePath)
@@ -1035,12 +1042,17 @@ final class AgentScheduledSendPersistenceTests: XCTestCase {
             workspaceID: workspace.id,
             name: "Replacement Incarnation"
         ).withItems([replacementItem])
-        _ = try await service.saveAgentSession(
-            replacement,
-            for: workspace,
-            preparation: .alreadyCanonicalTranscript,
-            trustedCanonicalItemCount: 1
-        )
+        do {
+            _ = try await service.saveAgentSession(
+                replacement,
+                for: workspace,
+                preparation: .alreadyCanonicalTranscript,
+                trustedCanonicalItemCount: 1
+            )
+            XCTFail("A tombstoned session UUID must not be recreated")
+        } catch {
+            XCTAssertEqual(error as? AgentScheduledSendMutationError, .sessionDeleted(fixture.session.id))
+        }
 
         let outcome = try await service.finalizeScheduledSend(recovery: fixture.payload)
         guard case .explicitlyDeleted = outcome else {
@@ -1050,12 +1062,8 @@ final class AgentScheduledSendPersistenceTests: XCTestCase {
             id: fixture.session.id,
             for: workspace
         )
-        let reloaded = try XCTUnwrap(loaded)
-        XCTAssertEqual(reloaded.name, "Replacement Incarnation")
-        XCTAssertNil(reloaded.scheduledSend)
-        XCTAssertNil(reloaded.lastScheduledDispatch)
-        XCTAssertEqual(reloaded.toLiveItems().map(\.id), [replacementItem.id])
-        XCTAssertFalse(reloaded.toLiveItems().contains { $0.id == fixture.attempt.itemID })
+        XCTAssertNil(loaded)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.fileURL.path))
     }
 
     func testRecoveryFinalizationBeforeDeleteRemainsTerminatedByDeletion() async throws {
@@ -1110,6 +1118,9 @@ final class AgentScheduledSendPersistenceTests: XCTestCase {
             priorItems: [unscheduledHistory, priorScheduledItem]
         )
         let resetReceipt = AgentSessionTranscriptResetReceipt(id: UUID())
+        // Resets commit only through editable persistence-state authority.
+        let loadedEditable = try await service.loadAgentSessionForEditing(id: fixture.session.id, for: workspace)
+        let editable = try XCTUnwrap(loadedEditable)
         _ = try await service.saveAgentSession(
             fixture.session.withItems([]),
             for: workspace,
@@ -1126,7 +1137,8 @@ final class AgentScheduledSendPersistenceTests: XCTestCase {
                 )
             ],
             committingTranscriptReset: resetReceipt,
-            fileCreationPolicy: .requireExisting
+            fileCreationPolicy: .requireExisting,
+            persistenceState: editable.persistenceState
         )
 
         // External loss is not an explicit deletion: generation and reset authority remain.
@@ -1178,21 +1190,28 @@ final class AgentScheduledSendPersistenceTests: XCTestCase {
             )
             XCTFail("An existing-incarnation save must not recreate an explicitly deleted file")
         } catch {
+            // Durable deletion evidence is reported before file absence.
             XCTAssertEqual(
                 error as? AgentScheduledSendMutationError,
-                .sessionNotFound(session.id)
+                .sessionDeleted(session.id)
             )
         }
         XCTAssertFalse(FileManager.default.fileExists(atPath: fileURL.path))
 
-        _ = try await service.saveAgentSession(
-            session,
-            for: workspace,
-            preparation: .alreadyCanonicalTranscript,
-            trustedCanonicalItemCount: 0,
-            fileCreationPolicy: .createIfMissing
-        )
-        XCTAssertTrue(FileManager.default.fileExists(atPath: fileURL.path))
+        // `.createIfMissing` never overrides the durable tombstone.
+        do {
+            _ = try await service.saveAgentSession(
+                session,
+                for: workspace,
+                preparation: .alreadyCanonicalTranscript,
+                trustedCanonicalItemCount: 0,
+                fileCreationPolicy: .createIfMissing
+            )
+            XCTFail("A tombstoned session UUID must not be recreated by a compatibility save")
+        } catch {
+            XCTAssertEqual(error as? AgentScheduledSendMutationError, .sessionDeleted(session.id))
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fileURL.path))
     }
 
     func testCommittedResetIgnoresStaleRemovalWithoutPoisoningLaterSaves() async throws {
@@ -1222,6 +1241,8 @@ final class AgentScheduledSendPersistenceTests: XCTestCase {
             sentAt: fixture.receipt.sentAt
         )
 
+        let loadedEditable = try await service.loadAgentSessionForEditing(id: fixture.session.id, for: workspace)
+        let editable = try XCTUnwrap(loadedEditable)
         _ = try await service.saveAgentSession(
             finalized.withItems([]),
             for: workspace,
@@ -1234,7 +1255,8 @@ final class AgentScheduledSendPersistenceTests: XCTestCase {
                 )
             ],
             committingTranscriptReset: AgentSessionTranscriptResetReceipt(id: UUID()),
-            fileCreationPolicy: .requireExisting
+            fileCreationPolicy: .requireExisting,
+            persistenceState: editable.persistenceState
         )
 
         let loadedAfterReset = try await service.loadAgentSession(
@@ -1270,20 +1292,23 @@ final class AgentScheduledSendPersistenceTests: XCTestCase {
             name: "Original Lifetime",
             scheduledSend: .v1(originalSchedule)
         )
-        let initialState = try await service.prepareInitialAgentSessionPersistence(
-            sessionID: sessionID,
-            for: workspace
+        let initialLoad = try await service.prepareInitialAgentSessionPersistence(
+            initialSession: original,
+            for: workspace,
+            preparation: .alreadyCanonicalTranscript,
+            trustedCanonicalItemCount: 0
         )
         let originalCommit = try await service.saveAgentSession(
             original,
             for: workspace,
             preparation: .alreadyCanonicalTranscript,
             trustedCanonicalItemCount: 0,
-            persistenceState: initialState
+            persistenceState: initialLoad.persistenceState
         )
 
         try await service.deleteAgentSession(id: sessionID, for: workspace)
 
+        // Same-ID replacement is refused: the durable tombstone retires the UUID permanently.
         let replacementSchedule = makeSchedule()
         let replacementItem = AgentChatItem.user("Replacement", sequenceIndex: 0)
         let replacement = AgentSession(
@@ -1292,17 +1317,17 @@ final class AgentScheduledSendPersistenceTests: XCTestCase {
             name: "Replacement Lifetime",
             scheduledSend: .v1(replacementSchedule)
         ).withItems([replacementItem])
-        let replacementState = try await service.prepareInitialAgentSessionPersistence(
-            sessionID: sessionID,
-            for: workspace
-        )
-        _ = try await service.saveAgentSession(
-            replacement,
-            for: workspace,
-            preparation: .alreadyCanonicalTranscript,
-            trustedCanonicalItemCount: 1,
-            persistenceState: replacementState
-        )
+        do {
+            _ = try await service.prepareInitialAgentSessionPersistence(
+                initialSession: replacement,
+                for: workspace,
+                preparation: .alreadyCanonicalTranscript,
+                trustedCanonicalItemCount: 1
+            )
+            XCTFail("A tombstoned session UUID must not be recreated")
+        } catch {
+            XCTAssertEqual(error as? AgentScheduledSendMutationError, .sessionDeleted(sessionID))
+        }
 
         do {
             _ = try await service.saveAgentSession(
@@ -1343,10 +1368,8 @@ final class AgentScheduledSendPersistenceTests: XCTestCase {
             id: sessionID,
             for: workspace
         )
-        let reloaded = try XCTUnwrap(loaded)
-        XCTAssertEqual(reloaded.name, "Replacement Lifetime")
-        XCTAssertEqual(reloaded.scheduledSend, .v1(replacementSchedule))
-        XCTAssertEqual(reloaded.toLiveItems().map(\.id), [replacementItem.id])
+        XCTAssertNil(loaded, "Neither the stale owner nor a replacement recreated the deleted session")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: originalCommit.fileURL.path))
     }
 
     func testResetWithoutVisibleMarkersRemovesProtectedItemAndRecoveryCannotRestoreIt() async throws {
@@ -1449,16 +1472,18 @@ final class AgentScheduledSendPersistenceTests: XCTestCase {
             workspaceID: workspace.id,
             name: "Before Reset"
         ).withItems([oldItem])
-        let initialState = try await service.prepareInitialAgentSessionPersistence(
-            sessionID: sessionID,
-            for: workspace
+        let initialLoad = try await service.prepareInitialAgentSessionPersistence(
+            initialSession: original,
+            for: workspace,
+            preparation: .alreadyCanonicalTranscript,
+            trustedCanonicalItemCount: 1
         )
         let initialCommit = try await service.saveAgentSession(
             original,
             for: workspace,
             preparation: .alreadyCanonicalTranscript,
             trustedCanonicalItemCount: 1,
-            persistenceState: initialState
+            persistenceState: initialLoad.persistenceState
         )
 
         let resetReceipt = AgentSessionTranscriptResetReceipt(id: UUID())
@@ -1595,6 +1620,8 @@ final class AgentScheduledSendPersistenceTests: XCTestCase {
             preparation: .alreadyCanonicalTranscript,
             trustedCanonicalItemCount: 0
         )
+        // Load-modify-save: the compatibility save carries the loaded lifecycle authority.
+        session = try await service.loadAgentSession(from: fileURL)
         try Data("{".utf8).write(to: fileURL, options: .atomic)
 
         session.name = "Recovered From Cached Authority"
@@ -1610,7 +1637,7 @@ final class AgentScheduledSendPersistenceTests: XCTestCase {
         XCTAssertEqual(reloaded.scheduledSend, .v1(schedule))
     }
 
-    func testFailedFilesystemDeletionDoesNotCommitOrDiscardRecoveryResetAndProtectionAuthority() async throws {
+    func testUnlinkFailureAfterTombstoneCommitKeepsDeletionEffectiveForSavesAndRecovery() async throws {
         let service = AgentSessionDataService()
         let workspace = makeTemporaryWorkspace()
         let storagePath = try XCTUnwrap(workspace.customStoragePath)
@@ -1646,45 +1673,53 @@ final class AgentScheduledSendPersistenceTests: XCTestCase {
         await service.test_setAgentSessionDeletionFailureInjector { _ in
             InjectedDeletionFailure()
         }
-        do {
-            try await service.deleteAgentSession(id: fixture.session.id, for: workspace)
-            XCTFail("Expected the injected unlink failure")
-        } catch is InjectedDeletionFailure {
-            // Expected.
-        } catch {
-            XCTFail("Unexpected deletion error: \(error)")
-        }
+        // The tombstone is the commit point: an unlink failure afterwards is cleanup residue,
+        // not a failed deletion.
+        try await service.deleteAgentSession(id: fixture.session.id, for: workspace)
         await service.test_setAgentSessionDeletionFailureInjector(nil)
 
-        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.fileURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.fileURL.path), "Residue remains after unlink failure")
+        let residueBytes = try Data(contentsOf: fixture.fileURL)
         let generationAfterFailure = await service.scheduledSendDeletionGeneration(for: fixture.fileURL)
-        XCTAssertEqual(generationAfterFailure, generationBeforeFailure)
+        XCTAssertEqual(generationAfterFailure, generationBeforeFailure + 1)
 
-        // The committed reset converted the finalized item protection into an exact tombstone.
-        // A stale compatibility save must still be unable to resurrect that item after unlink fails.
+        // A stale compatibility save cannot rewrite or resurrect the logically deleted session.
         let staleSession = fixture.session.withItems([fixture.acceptedItem])
-        _ = try await service.saveAgentSession(
-            staleSession,
-            for: workspace,
-            preparation: .alreadyCanonicalTranscript,
-            trustedCanonicalItemCount: 1
-        )
-        let afterStaleSave = try await service.loadAgentSession(from: fixture.fileURL)
-        XCTAssertNil(afterStaleSave.scheduledSend)
-        XCTAssertEqual(afterStaleSave.lastScheduledDispatch, fixture.receipt)
-        XCTAssertFalse(afterStaleSave.toLiveItems().contains { $0.id == fixture.attempt.itemID })
+        do {
+            _ = try await service.saveAgentSession(
+                staleSession,
+                for: workspace,
+                preparation: .alreadyCanonicalTranscript,
+                trustedCanonicalItemCount: 1
+            )
+            XCTFail("A save must not target a tombstoned session")
+        } catch {
+            XCTAssertEqual(error as? AgentScheduledSendMutationError, .sessionDeleted(fixture.session.id))
+        }
+        XCTAssertEqual(try Data(contentsOf: fixture.fileURL), residueBytes)
+        let loadedAfterDeletion = try await service.loadAgentSession(id: fixture.session.id, for: workspace)
+        XCTAssertNil(loadedAfterDeletion, "Residue is never served as a session")
 
         let retry = try await service.finalizeScheduledSend(recovery: fixture.payload)
-        guard case .committed = retry else {
-            return XCTFail("Failed deletion must leave accepted recovery usable")
+        guard case .explicitlyDeleted = retry else {
+            return XCTFail("Recovery after a committed deletion must be terminal")
         }
-        let reloaded = try await service.loadAgentSession(from: fixture.fileURL)
-        XCTAssertNil(reloaded.scheduledSend)
-        XCTAssertEqual(reloaded.lastScheduledDispatch, fixture.receipt)
-        XCTAssertFalse(reloaded.toLiveItems().contains { $0.id == fixture.attempt.itemID })
+        XCTAssertEqual(try Data(contentsOf: fixture.fileURL), residueBytes)
+
+        // Repeated deletion retries cleanup of the residue without publishing the logical
+        // deletion again (one generation bump and one notification per tombstone commit).
+        let republished = expectation(forNotification: .agentSessionDeletionDidCommit, object: nil) { notification in
+            notification.userInfo?["sessionID"] as? UUID == fixture.session.id
+        }
+        republished.isInverted = true
+        try await service.deleteAgentSession(id: fixture.session.id, for: workspace)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.fileURL.path))
+        await fulfillment(of: [republished], timeout: 0.2)
+        let generationAfterRetry = await service.scheduledSendDeletionGeneration(for: fixture.fileURL)
+        XCTAssertEqual(generationAfterRetry, generationAfterFailure)
     }
 
-    func testDeleteClearsProtectedFinalizationAuthorityBeforeSameIDIsRecreated() async throws {
+    func testDeleteRetiresSessionIDSoFinalizedAuthorityCannotReachARecreation() async throws {
         let service = AgentSessionDataService()
         let workspace = makeTemporaryWorkspace()
         let storagePath = try XCTUnwrap(workspace.customStoragePath)
@@ -1721,24 +1756,23 @@ final class AgentScheduledSendPersistenceTests: XCTestCase {
             workspaceID: workspace.id,
             name: "Replacement"
         )
-        _ = try await service.saveAgentSession(
-            replacement,
-            for: workspace,
-            preparation: .alreadyCanonicalTranscript,
-            trustedCanonicalItemCount: 0
-        )
-        _ = try await service.saveAgentSession(
-            replacement,
-            for: workspace,
-            preparation: .alreadyCanonicalTranscript,
-            trustedCanonicalItemCount: 0
-        )
+        // The tombstone retires the UUID: neither a first nor a repeated replacement save creates it.
+        for _ in 0 ..< 2 {
+            do {
+                _ = try await service.saveAgentSession(
+                    replacement,
+                    for: workspace,
+                    preparation: .alreadyCanonicalTranscript,
+                    trustedCanonicalItemCount: 0
+                )
+                XCTFail("A tombstoned session UUID must not be recreated")
+            } catch {
+                XCTAssertEqual(error as? AgentScheduledSendMutationError, .sessionDeleted(sessionID))
+            }
+        }
 
         let loaded = try await service.loadAgentSession(id: sessionID, for: workspace)
-        let reloaded = try XCTUnwrap(loaded)
-        XCTAssertNil(reloaded.scheduledSend)
-        XCTAssertNil(reloaded.lastScheduledDispatch)
-        XCTAssertTrue(reloaded.toLiveItems().isEmpty)
+        XCTAssertNil(loaded)
     }
 
     private struct InjectedDeletionFailure: Error {}
@@ -1858,6 +1892,19 @@ final class AgentScheduledSendPersistenceTests: XCTestCase {
             scheduledFor: schedule.notBefore,
             sentAt: schedule.notBefore.addingTimeInterval(30)
         )
+    }
+
+    /// Load-modify-save owners carry the lifecycle authority they loaded. Adopts only that
+    /// authority onto an otherwise unchanged (possibly stale) in-memory snapshot.
+    private func carryingLoadedLifecycle(
+        _ session: AgentSession,
+        service: AgentSessionDataService,
+        workspace: WorkspaceModel
+    ) async throws -> AgentSession {
+        let loaded = try await service.loadAgentSession(id: session.id, for: workspace)
+        var carrier = session
+        carrier.lifecycle = try XCTUnwrap(loaded?.lifecycle)
+        return carrier
     }
 
     private func makeTemporaryWorkspace() -> WorkspaceModel {

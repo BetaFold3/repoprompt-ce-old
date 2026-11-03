@@ -820,7 +820,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         var service = AgentRunMCPToolService(
             toolName: MCPWindowToolName.agentRun,
             captureRequestMetadata: {
-                MCPServerViewModel.RequestMetadata(connectionID: nil, clientName: "worktree-api-smoke", windowID: window.windowID)
+                MCPServerViewModel.RequestMetadata(connectionID: nil, clientName: "worktree-api-smoke", windowID: window.windowID, actorRoutedRunTab: nil)
             },
             requireTargetWindow: { window },
             resolveRequestedTabID: { _ in targetTabID },

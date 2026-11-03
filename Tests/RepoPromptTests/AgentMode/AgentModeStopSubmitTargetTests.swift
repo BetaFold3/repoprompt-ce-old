@@ -93,7 +93,7 @@ final class AgentModeStopSubmitTargetTests: XCTestCase {
         vm.test_setCurrentTabIDOverride(otherTabID)
         defer { vm.test_setCurrentTabIDOverride(nil) }
 
-        let accepted = await vm.cancelAgentRun(target: cancelTarget, completion: .terminalPublished)
+        let accepted = await vm.cancelAgentRun(target: cancelTarget, cause: .userCancel, completion: .terminalPublished)
 
         XCTAssertTrue(accepted)
         XCTAssertEqual(cancelledRunIDs, [targetRunID])
@@ -118,7 +118,7 @@ final class AgentModeStopSubmitTargetTests: XCTestCase {
         let newerRunID = UUID()
         session.runID = newerRunID
 
-        let accepted = await vm.cancelAgentRun(target: staleTarget, completion: .terminalPublished)
+        let accepted = await vm.cancelAgentRun(target: staleTarget, cause: .userCancel, completion: .terminalPublished)
 
         XCTAssertFalse(accepted)
         XCTAssertEqual(session.runState, .running)
@@ -141,7 +141,7 @@ final class AgentModeStopSubmitTargetTests: XCTestCase {
         let staleTarget = vm.makeRunCancelTarget(tabID: tabID, session: session)
         session.testInstallPersistentSessionBinding(sessionID: UUID())
 
-        let accepted = await vm.cancelAgentRun(target: staleTarget, completion: .terminalPublished)
+        let accepted = await vm.cancelAgentRun(target: staleTarget, cause: .userCancel, completion: .terminalPublished)
 
         XCTAssertFalse(accepted)
         XCTAssertEqual(session.runState, .running)
@@ -164,7 +164,7 @@ final class AgentModeStopSubmitTargetTests: XCTestCase {
         let staleTarget = vm.makeRunCancelTarget(tabID: tabID, session: session)
         session.beginRunAttempt(source: "test.rotated")
 
-        let accepted = await vm.cancelAgentRun(target: staleTarget, completion: .terminalPublished)
+        let accepted = await vm.cancelAgentRun(target: staleTarget, cause: .userCancel, completion: .terminalPublished)
 
         XCTAssertFalse(accepted)
         XCTAssertEqual(session.runState, .running)

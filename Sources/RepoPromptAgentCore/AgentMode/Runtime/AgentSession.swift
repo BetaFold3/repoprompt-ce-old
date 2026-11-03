@@ -214,6 +214,9 @@ package struct PersistedRemoteResendPayload: Codable, Sendable, Equatable {
 package struct AgentSession: Codable, Identifiable {
     static let currentSerializationVersion = 7
     static let legacyUnversionedSerializationVersion = 0
+    /// Envelopes this build may normalize or rewrite: legacy unversioned through current. Future
+    /// and negative versions are preserved untouched and never receive editable authority.
+    static let supportedSerializationVersions = legacyUnversionedSerializationVersion ... currentSerializationVersion
 
     package let id: UUID
     package var serializationVersion: Int
@@ -326,11 +329,25 @@ package struct AgentSession: Codable, Identifiable {
     package var pendingHandoffPayload: String?
     package var pendingHandoffCreatedAt: Date?
     package var pendingHandoffSourceItemID: UUID?
+    /// Durable identity of the pending payload (`AgentPendingHandoffState.payloadID`). Optional v7
+    /// member: absent on legacy payloads, which are assigned an ID before any dispatch.
+    package var pendingHandoffPayloadID: UUID?
     package var pendingHandoffDefersProviderLockUntilSend: Bool
 
     /// Pending delayed send and the most recent accepted scheduled dispatch.
     package var scheduledSend: AgentScheduledSendMember?
     package var lastScheduledDispatch: AgentScheduledSendProvenance?
+
+    /// Durable lifecycle authority (incarnation and reset identity). A missing member is a legacy
+    /// session awaiting migration; explicit `null` or unknown content is `.unreadable` and is
+    /// never writable. Only `AgentSessionDataService` assigns or advances typed values.
+    package var lifecycle: AgentSessionLifecycleMember?
+
+    /// Provider-history reconciliation ledger and latest import receipt (lossless restart Phase 4).
+    /// Optional v7 member, absent when empty; committed only through
+    /// `AgentSessionDataService.commitProviderHistoryImport`, and an older snapshot can never replace
+    /// a newer committed import (`AgentSessionDataService` stale-import guard).
+    package var providerHistoryRecovery: AgentSessionProviderHistoryRecovery?
 
     package init(
         id: UUID = UUID(),
@@ -370,6 +387,7 @@ package struct AgentSession: Codable, Identifiable {
         pendingHandoffPayload: String? = nil,
         pendingHandoffCreatedAt: Date? = nil,
         pendingHandoffSourceItemID: UUID? = nil,
+        pendingHandoffPayloadID: UUID? = nil,
         pendingHandoffDefersProviderLockUntilSend: Bool = false,
         scheduledSend: AgentScheduledSendMember? = nil,
         lastScheduledDispatch: AgentScheduledSendProvenance? = nil,
@@ -377,8 +395,11 @@ package struct AgentSession: Codable, Identifiable {
         origin: AgentSessionOrigin? = nil,
         profile: AgentSessionProfile = .standard,
         worktreeBindings: [AgentSessionWorktreeBinding] = [],
-        worktreeMergeOperations: [AgentSessionWorktreeMergeOperation] = []
+        worktreeMergeOperations: [AgentSessionWorktreeMergeOperation] = [],
+        lifecycle: AgentSessionLifecycleMember? = nil,
+        providerHistoryRecovery: AgentSessionProviderHistoryRecovery? = nil
     ) {
+        self.providerHistoryRecovery = providerHistoryRecovery?.nilIfEmpty
         self.id = id
         self.serializationVersion = serializationVersion
         self.workspaceID = workspaceID
@@ -416,6 +437,7 @@ package struct AgentSession: Codable, Identifiable {
         self.pendingHandoffPayload = pendingHandoffPayload
         self.pendingHandoffCreatedAt = pendingHandoffCreatedAt
         self.pendingHandoffSourceItemID = pendingHandoffSourceItemID
+        self.pendingHandoffPayloadID = pendingHandoffPayloadID
         self.pendingHandoffDefersProviderLockUntilSend = pendingHandoffDefersProviderLockUntilSend
         self.scheduledSend = scheduledSend
         self.lastScheduledDispatch = lastScheduledDispatch
@@ -425,6 +447,7 @@ package struct AgentSession: Codable, Identifiable {
         self.profile = profile
         self.worktreeBindings = worktreeBindings
         self.worktreeMergeOperations = worktreeMergeOperations
+        self.lifecycle = lifecycle
     }
 
     enum CodingKeys: String, CodingKey {
@@ -465,6 +488,7 @@ package struct AgentSession: Codable, Identifiable {
         case pendingHandoffPayload
         case pendingHandoffCreatedAt
         case pendingHandoffSourceItemID
+        case pendingHandoffPayloadID
         case pendingHandoffDefersProviderLockUntilSend
         case scheduledSend
         case lastScheduledDispatch
@@ -473,6 +497,8 @@ package struct AgentSession: Codable, Identifiable {
         case profile
         case worktreeBindings
         case worktreeMergeOperations
+        case lifecycle
+        case providerHistoryRecovery
     }
 
     package init(from decoder: Decoder) throws {
@@ -530,6 +556,7 @@ package struct AgentSession: Codable, Identifiable {
         pendingHandoffPayload = try container.decodeIfPresent(String.self, forKey: .pendingHandoffPayload)
         pendingHandoffCreatedAt = try container.decodeIfPresent(Date.self, forKey: .pendingHandoffCreatedAt)
         pendingHandoffSourceItemID = try container.decodeIfPresent(UUID.self, forKey: .pendingHandoffSourceItemID)
+        pendingHandoffPayloadID = try container.decodeIfPresent(UUID.self, forKey: .pendingHandoffPayloadID)
         pendingHandoffDefersProviderLockUntilSend = try container.decodeIfPresent(Bool.self, forKey: .pendingHandoffDefersProviderLockUntilSend) ?? false
         scheduledSend = try container.decodeIfPresent(AgentScheduledSendMember.self, forKey: .scheduledSend)
         lastScheduledDispatch = try container.decodeIfPresent(
@@ -557,6 +584,23 @@ package struct AgentSession: Codable, Identifiable {
         }
         worktreeBindings = try container.decodeIfPresent([AgentSessionWorktreeBinding].self, forKey: .worktreeBindings) ?? []
         worktreeMergeOperations = try container.decodeIfPresent([AgentSessionWorktreeMergeOperation].self, forKey: .worktreeMergeOperations) ?? []
+        lifecycle = try Self.decodeLifecycleMember(from: container, forKey: .lifecycle)
+        providerHistoryRecovery = try container.decodeIfPresent(
+            AgentSessionProviderHistoryRecovery.self,
+            forKey: .providerHistoryRecovery
+        )?.nilIfEmpty
+    }
+
+    /// Key-presence decoding: absent is legacy (`nil`); explicit `null` is unreadable.
+    static func decodeLifecycleMember<Key: CodingKey>(
+        from container: KeyedDecodingContainer<Key>,
+        forKey key: Key
+    ) throws -> AgentSessionLifecycleMember? {
+        guard container.contains(key) else { return nil }
+        if try container.decodeNil(forKey: key) {
+            return .unreadable(.null)
+        }
+        return try container.decode(AgentSessionLifecycleMember.self, forKey: key)
     }
 
     /// Coalesces whitespace and falls back to "Agent Session" when empty.

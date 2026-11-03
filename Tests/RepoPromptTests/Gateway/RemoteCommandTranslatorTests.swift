@@ -186,6 +186,33 @@ final class RemoteCommandTranslatorTests: XCTestCase {
         }
     }
 
+    func testCancelForwardsObservedRunIDAndStillRejectsOtherKeys() throws {
+        let sid = "11111111-1111-1111-1111-111111111111"
+        let runID = "33333333-3333-3333-3333-333333333333"
+        let call = try RemoteCommandTranslator().translate(RemoteClientFrame(
+            type: "cancel",
+            requestID: "req-stop",
+            sessionID: sid,
+            payload: .object(["run_id": .string(runID)])
+        ))
+        XCTAssertEqual(call.toolName, "agent_run")
+        XCTAssertEqual(call.arguments["op"], .string("cancel"))
+        XCTAssertEqual(call.arguments["session_id"], .string(sid))
+        XCTAssertEqual(call.arguments["run_id"], .string(runID))
+
+        XCTAssertThrowsError(try RemoteCommandTranslator().translate(RemoteClientFrame(
+            type: "cancel",
+            requestID: "req-stop-2",
+            sessionID: sid,
+            payload: .object(["message": .string("stop")])
+        ))) { error in
+            XCTAssertEqual(
+                error as? RemoteCommandTranslatorError,
+                .unsupportedPayloadKey(operation: "cancel", key: "message")
+            )
+        }
+    }
+
     func testHandoffFramesRejectUnknownKeysAndMissingSessionID() throws {
         for type in ["fork_session", "extract_handoff"] {
             XCTAssertThrowsError(try RemoteCommandTranslator().translate(RemoteClientFrame(

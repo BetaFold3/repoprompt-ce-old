@@ -101,6 +101,95 @@ final class AgentSessionWorktreeMergePersistenceTests: XCTestCase {
         XCTAssertTrue(reconciled.lastError?.contains("approval") == true)
     }
 
+    // MARK: - Step 5c preserved reviews
+
+    func testReconciliationKeepsPreservedReviewAsHistoryWithoutContinuationOrInspection() async {
+        var live = makeOperation(status: .awaitingApproval)
+        live.reviewPreservation = .live
+
+        let reconciled = await reconcile(live) { _ in
+            XCTFail("A preserved review is never inspected or resumed on cold restore")
+            throw NSError(domain: "AgentSessionWorktreeMergePersistenceTests", code: 2)
+        }
+
+        XCTAssertEqual(reconciled.status, .awaitingApproval, "Kept as history, not cancelled")
+        XCTAssertTrue(reconciled.isHistoricalReview)
+        XCTAssertEqual(reconciled.reviewPreservation?.endedReason, AgentSessionWorktreeMergeReconciler.relaunchEndedReviewReason)
+        XCTAssertEqual(reconciled.reviewPreservation?.endedAt, reconciliationNow)
+        XCTAssertEqual(reconciled.updatedAt, reconciliationNow)
+        XCTAssertNil(reconciled.completedAt)
+        XCTAssertEqual(reconciled.previewArtifacts, live.previewArtifacts, "Retained refs are kept unchanged")
+        XCTAssertEqual(reconciled.activeSummary?.isHistoricalReview, true)
+
+        let again = await reconcile(reconciled) { _ in
+            XCTFail("History is never inspected")
+            throw NSError(domain: "AgentSessionWorktreeMergePersistenceTests", code: 3)
+        }
+        XCTAssertEqual(again, reconciled, "An already-historical review is unchanged by later restores")
+    }
+
+    func testPreservationMarkerRoundTripsAndLegacyOperationsDecodeWithoutIt() throws {
+        var historical = makeOperation(status: .awaitingApproval)
+        historical.reviewPreservation = .historical(reason: "Ended", at: Date(timeIntervalSinceReferenceDate: 50))
+        let decoded = try JSONDecoder().decode(
+            AgentSessionWorktreeMergeOperation.self,
+            from: JSONEncoder().encode(historical)
+        )
+        XCTAssertEqual(decoded, historical)
+        XCTAssertTrue(decoded.isHistoricalReview)
+
+        let legacy = makeOperation(status: .awaitingApproval)
+        let legacyData = try JSONEncoder().encode(legacy)
+        let legacyObject = try XCTUnwrap(JSONSerialization.jsonObject(with: legacyData) as? [String: Any])
+        XCTAssertNil(legacyObject["reviewPreservation"], "An unmarked operation writes no marker")
+        let legacyDecoded = try JSONDecoder().decode(AgentSessionWorktreeMergeOperation.self, from: legacyData)
+        XCTAssertNil(legacyDecoded.reviewPreservation)
+        XCTAssertFalse(legacyDecoded.isHistoricalReview)
+    }
+
+    func testColdLoadRewritesPreservedReviewAsDiscoverableHistory() async throws {
+        let workspace = makeTemporaryWorkspace()
+        let storage = try XCTUnwrap(workspace.customStoragePath)
+        let tombstones = storage.appendingPathComponent("tombstones", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: storage) }
+        let service = AgentSessionDataService(tombstoneRoot: tombstones)
+        var live = makeOperation(status: .awaitingApproval)
+        live.reviewPreservation = .live
+        let sessionID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000205"))
+        let session = AgentSession(
+            id: sessionID,
+            workspaceID: workspace.id,
+            composeTabID: UUID(),
+            name: "Preserved Merge Review",
+            savedAt: Date(timeIntervalSinceReferenceDate: 20),
+            itemCount: 0,
+            autoEditEnabled: true,
+            worktreeMergeOperations: [live]
+        )
+        let fileURL = try await service.saveAgentSession(
+            session,
+            for: workspace,
+            preparation: .alreadyCanonicalTranscript,
+            trustedCanonicalItemCount: 0
+        )
+
+        let loaded = try await service.loadAgentSession(from: fileURL)
+        let restored = try XCTUnwrap(loaded.worktreeMergeOperations.first)
+        XCTAssertEqual(restored.status, .awaitingApproval)
+        XCTAssertTrue(restored.isHistoricalReview, "Cold restore keeps the approval as history, never live")
+        XCTAssertEqual(restored.previewArtifacts, live.previewArtifacts)
+
+        let stub = try await service.loadAgentSessionStub(from: fileURL)
+        XCTAssertEqual(stub.worktreeMergeOperations, loaded.worktreeMergeOperations, "The historical marker is written back")
+        XCTAssertEqual(stub.worktreeMergeOperations.activeWorktreeMergeSummaries.map(\.isHistoricalReview), [true])
+        let metadata = try await service.listAgentSessionsMeta(for: workspace)
+        XCTAssertEqual(
+            metadata.first { $0.id == sessionID }?.activeWorktreeMergeSummaries.map(\.isHistoricalReview),
+            [true],
+            "Discoverable from session metadata without opening the transcript"
+        )
+    }
+
     func testReconciliationMapsApplyingConflictStateToConflicted() async {
         let operation = makeOperation(status: .applying)
 

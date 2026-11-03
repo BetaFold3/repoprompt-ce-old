@@ -1536,6 +1536,81 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         }
     }
 
+    /// A root session repair replaces the session that held an idle (released, warm) ready record:
+    /// the old token stays stale and the next request for that file is a fresh demand in the
+    /// replacement session instead of joining old cached state.
+    func testSessionRepairRejectsIdleReadyRecordFromReplacedSession() async throws {
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositories.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/First.swift": "struct First { func first() {} }\n",
+                "Sources/Second.swift": "struct Second { func second() {} }\n",
+                "Notes.txt": "notes\n"
+            ]
+        )
+        defer { repositories.cleanup() }
+        try repositories.write("notes changed\n", to: "Notes.txt", at: root)
+        try repositories.settleIndex(at: root)
+        let window = try await makeWindow(root: root)
+        let store = window.workspaceFileContextStore
+        let first = try await fileRecord(
+            at: root.appendingPathComponent("Sources/First.swift"),
+            store: store,
+            rootScope: .visibleWorkspace
+        )
+        let second = try await fileRecord(
+            at: root.appendingPathComponent("Sources/Second.swift"),
+            store: store,
+            rootScope: .visibleWorkspace
+        )
+        let idleTicket = try await readyTicket(store: store, fileID: first.id)
+        let released = await store.cancelCodemapArtifactDemand(idleTicket)
+        XCTAssertTrue(released)
+        let idleBeforeRepair = await store.codemapIdleReadyDemandFileIDsForTesting(rootEpoch: idleTicket.rootEpoch)
+        XCTAssertEqual(idleBeforeRepair, [first.id])
+
+        try repositories.stage("Notes.txt", at: root)
+        let requested = await store.requestCodemapArtifactWithOwnership(forFileID: second.id)
+        guard case let .pending(driftTicket) = requested.result else {
+            return XCTFail("Expected a pending demand, got \(requested.result)")
+        }
+        let rejected = await waitForDemandResult(store: store, ticket: driftTicket) {
+            if case .unavailable(.rejected(.repositoryAuthorityChanged)) = $0 { return true }
+            return false
+        }
+        XCTAssertTrue(rejected)
+        let repaired = await store.prepareCodemapRootSessionRetry(
+            driftTicket,
+            rejection: .repositoryAuthorityChanged,
+            priority: .demand,
+            deadline: ContinuousClock.now.advanced(by: .seconds(5))
+        )
+        let replacement = try XCTUnwrap(repaired)
+        let replacementTicket = try XCTUnwrap(demandTicket(from: replacement.result))
+        addTeardownBlock { _ = await store.cancelCodemapArtifactDemand(replacementTicket) }
+        let repairCount = await store.codemapRootSessionRepairCountForTesting()
+        XCTAssertEqual(repairCount, 1)
+
+        let oldStatus = await store.codemapArtifactDemandStatus(idleTicket)
+        guard case .unavailable(.staleCurrentness) = oldStatus else {
+            return XCTFail("The released pre-repair token must stay stale: \(oldStatus)")
+        }
+        let idleAfterRepair = await store.codemapIdleReadyDemandFileIDsForTesting(rootEpoch: idleTicket.rootEpoch)
+        XCTAssertTrue(idleAfterRepair.isEmpty)
+        let fresh = await store.requestCodemapArtifactWithOwnership(forFileID: first.id)
+        guard case let .created(freshTicket) = fresh.ownership else {
+            return XCTFail("The replacement session must create a fresh demand: \(fresh.ownership)")
+        }
+        addTeardownBlock { _ = await store.cancelCodemapArtifactDemand(freshTicket) }
+        XCTAssertNotEqual(freshTicket.requestID, idleTicket.requestID)
+        let freshReady = await waitForDemandResult(store: store, ticket: freshTicket) {
+            if case .ready = $0 { return true }
+            return false
+        }
+        XCTAssertTrue(freshReady)
+    }
+
     func testOldTicketCannotResetReplacementSession() async throws {
         let repositories = try ReviewGitRepositoryFixture(name: #function)
         let root = try repositories.makeRepository(
@@ -1883,6 +1958,23 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         try await assertReferrersExpansionRecoversAfterRepositoryMutation(.createUnstaged)
     }
 
+    /// Production path: nothing evicts the idle ready seeds after a Git mutation, so the recovery
+    /// request joins them warm. Every mutation must still answer ready with the expected files;
+    /// the root-session repair counts are the ones production actually produces.
+    func testReferrersExpansionWithoutIdleEvictionStaysReadyAfterRepositoryMutations() async throws {
+        for mutation in [
+            ReferrersRecoveryMutation.stageExistingNonSource,
+            .emptyCommit,
+            .createAndStage,
+            .createUnstaged
+        ] {
+            try await assertReferrersExpansionRecoversAfterRepositoryMutation(
+                mutation,
+                evictIdleSeedsBeforeRecovery: false
+            )
+        }
+    }
+
     /// Live catalog-only lane counterpart: MCP `apply_edits` creates a third top-level source and, as
     /// in production, selects it, so the window's automatic codemap consumer works the same root while
     /// the next MCP referrers expansion publishes. That expansion and an unchanged repeat must return
@@ -2066,8 +2158,10 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
             XCTAssertGreaterThanOrEqual(try XCTUnwrap(baseline.capabilityResolutions), 1)
         }
 
-        // An authority change and session repair on B leave A's attribution untouched.
+        // An authority change and session repair on B leave A's attribution untouched. Evicting B's
+        // idle ready records makes the next request take the cold path that observes the drift.
         try repositories.stage("Notes.txt", at: rootB)
+        _ = try await evictIdleCodemapDemands(store: store, rootID: targetB.rootID)
         let repairedB = try await referrersDTO(window: window, record: targetB)
         XCTAssertEqual(repairedB.status, "ready", "B repair \(repairedB.issues)")
         let afterBAttributionA = await store.debugCodemapRootAttribution(rootID: targetA.rootID)
@@ -2081,6 +2175,7 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
 
         // A's replacement session keeps A's cumulative counts and still leaves B untouched.
         try repositories.stage("Notes.txt", at: rootA)
+        _ = try await evictIdleCodemapDemands(store: store, rootID: targetA.rootID)
         let repairedA = try await referrersDTO(window: window, record: targetA)
         XCTAssertEqual(repairedA.status, "ready", "A repair \(repairedA.issues)")
         let afterAAttributionB = await store.debugCodemapRootAttribution(rootID: targetB.rootID)
@@ -3501,10 +3596,13 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
     /// contribution watermark.
     private func assertReferrersExpansionRecoversAfterRepositoryMutation(
         _ mutation: ReferrersRecoveryMutation,
+        evictIdleSeedsBeforeRecovery: Bool = true,
         file: StaticString = #filePath,
         line: UInt = #line
     ) async throws {
-        let repositories = try ReviewGitRepositoryFixture(name: "referrers-recovery-\(mutation.rawValue)")
+        let repositories = try ReviewGitRepositoryFixture(
+            name: "referrers-recovery-\(mutation.rawValue)\(evictIdleSeedsBeforeRecovery ? "" : "-warm")"
+        )
         var files = [
             "Sources/Source.swift": "struct Source {\n    let target: Target\n}\n",
             "Sources/Target.swift": "struct Target { func targetMethod() {} }\n"
@@ -3532,7 +3630,14 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         XCTAssertEqual(baseline.files.map(\.path), referrerPaths, file: file, line: line)
         let baselineRepairs = await store.codemapRootSessionRepairCountForTesting()
         XCTAssertEqual(baselineRepairs, 0, "The baseline must not reset.", file: file, line: line)
-        let expectedRepairs = mutation == .createUnstaged ? 0 : 1
+        // Cold seeds (idle records evicted) detect every Git authority mutation except the unstaged
+        // create and repair once. Warm seeds join without probing Git, so only the staged create
+        // repairs: its new referrer is a cold demand that observes the advanced index.
+        let expectedRepairs = if evictIdleSeedsBeforeRecovery {
+            mutation == .createUnstaged ? 0 : 1
+        } else {
+            mutation == .createAndStage ? 1 : 0
+        }
         let gitStateBefore = try mutation == .createUnstaged
             ? referrersGitState(repositories, root: root)
             : nil
@@ -3564,6 +3669,22 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
             expected.insert("repository/\(addedPath)")
         }
 
+        if mutation == .stageExistingNonSource || mutation == .emptyCommit {
+            // Released ready seeds and the published graph stay warm, so an unchanged-content
+            // repeat is ready without probing Git and without a reset.
+            let warm = try await referrersDTO(window: window, record: target)
+            let warmRepairs = await store.codemapRootSessionRepairCountForTesting()
+            let warmDiagnostics = "mutation=\(mutation.rawValue) warm status=\(warm.status) " +
+                "repairs=\(warmRepairs) issues=\(warm.issues)"
+            XCTAssertEqual(warm.status, "ready", warmDiagnostics, file: file, line: line)
+            XCTAssertEqual(Set(warm.files.map(\.path)), expected, warmDiagnostics, file: file, line: line)
+            XCTAssertEqual(warmRepairs, 0, "Warm repeat must not reset: \(warmDiagnostics)", file: file, line: line)
+        }
+        if evictIdleSeedsBeforeRecovery {
+            // Evicting the idle ready records forces the cold seed path, which must detect the drift.
+            _ = try await evictIdleCodemapDemands(store: store, rootID: target.rootID)
+        }
+
         let clock = ContinuousClock()
         let started = clock.now
         let recovered = try await referrersDTO(window: window, record: target)
@@ -3593,6 +3714,16 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
                 line: line
             )
         }
+    }
+
+    /// Evicts every idle ready codemap demand for the root's current epoch, awaiting cleanup.
+    @discardableResult
+    private func evictIdleCodemapDemands(store: WorkspaceFileContextStore, rootID: UUID) async throws -> Int {
+        let rootEpoch = try await WorkspaceCodemapRootEpoch(
+            rootID: rootID,
+            rootLifetimeID: store.rootLifetimeIDForTesting(rootID: rootID)
+        )
+        return await store.evictIdleReadyCodemapDemandsForTesting(rootEpoch: rootEpoch)
     }
 
     /// HEAD, HEAD tree, index SHA-256, and index lstat identity (size, inode, mtime, ctime).

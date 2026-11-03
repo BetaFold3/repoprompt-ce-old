@@ -968,7 +968,8 @@ class PhaseTimingIntegrationTests(unittest.TestCase):
         status = state.status_payload()
         self.assertEqual(status["conductorDigest"], conductor.CONDUCTOR_DIGEST)
         self.assertTrue(status["timingEnabled"])
-        self.assertEqual(status["protocolVersion"], 19)
+        self.assertEqual(status["protocolVersion"], conductor.PROTOCOL_VERSION)
+        self.assertEqual(status["protocolVersion"], 20)
         self.assertFalse(self.make_state("off", timing="off").status_payload()["timingEnabled"])
 
     def test_observed_pump_preserves_raw_bytes_tail_and_progress_for_every_stream(self) -> None:

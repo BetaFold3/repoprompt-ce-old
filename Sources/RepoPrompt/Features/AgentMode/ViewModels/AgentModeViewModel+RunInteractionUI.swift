@@ -19,6 +19,8 @@ extension AgentModeViewModel {
             pendingApplyEditsReview: pendingApplyEditsReview(for: tabID),
             pendingWorktreeMergeReview: pendingWorktreeMergeReview(for: tabID),
             activeWorktreeMergeConflict: activeWorktreeMergeConflictOperation(for: tabID),
+            historicalWorktreeMergeReview: historicalWorktreeMergeReviewOperation(for: tabID),
+            historicalWorktreeMergeReviewDiscard: historicalWorktreeMergeReviewDiscard(for: tabID),
             activeRunID: session?.runID,
             activeAgentSessionID: session?.activeAgentSessionID,
             activeRunAttemptID: session?.activeRunAttemptID,
@@ -26,7 +28,8 @@ extension AgentModeViewModel {
             canForkCurrentSession: canForkCurrentSession,
             selectedAgent: selectedAgent,
             selectedModelRaw: selectedModelRaw,
-            selectedReasoningEffortRaw: selectedReasoningEffortRaw
+            selectedReasoningEffortRaw: selectedReasoningEffortRaw,
+            isShutdownFrozen: isShutdownFrozen
         )
     }
 

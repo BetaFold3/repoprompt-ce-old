@@ -208,6 +208,11 @@ actor ExecMCPService: Service {
 
     // MARK: - Connection
 
+    /// 500 ms between connect attempts. Uses the nanosecond `Task.sleep` overload: the generic
+    /// `Task.sleep(for:)` specialization aborts in `swift_task_dealloc` in helper binaries
+    /// (swiftlang/swift#86204).
+    private static let retryPollIntervalNanoseconds: UInt64 = 500_000_000
+
     private static func timeoutPolicy(from seconds: Double?) -> ToolCallTimeoutPolicy {
         guard let seconds else { return .default }
         return seconds == 0 ? .none : .seconds(seconds)
@@ -237,13 +242,13 @@ actor ExecMCPService: Service {
                         if options.verbose {
                             fputs("Waiting for RepoPrompt app (attempt \(attempt))...\n", stderr)
                         }
-                        try await Task.sleep(for: .milliseconds(500))
+                        try await Task.sleep(nanoseconds: Self.retryPollIntervalNanoseconds)
                         continue
                     case .bootstrapResponseTimeout where Date() < deadline:
                         if options.verbose {
                             fputs("Retrying stalled RepoPrompt bootstrap handshake (attempt \(attempt))...\n", stderr)
                         }
-                        try await Task.sleep(for: .milliseconds(500))
+                        try await Task.sleep(nanoseconds: Self.retryPollIntervalNanoseconds)
                         continue
                     default:
                         break
@@ -252,7 +257,7 @@ actor ExecMCPService: Service {
 
                 // For other errors, retry if we have time
                 if Date() < deadline {
-                    try await Task.sleep(for: .milliseconds(500))
+                    try await Task.sleep(nanoseconds: Self.retryPollIntervalNanoseconds)
                     continue
                 }
 

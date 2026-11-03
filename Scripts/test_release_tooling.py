@@ -453,7 +453,7 @@ APP_SIGN_ARGS=(){app_signing_body}
         wrapper.write_text(
             """#!/usr/bin/env bash
 set -euo pipefail
-[[ -z "${RPCE_OPTIMIZED_DIAGNOSTICS+set}" ]] || exit 42
+[[ -z "${RPCE_OPTIMIZED_DIAGNOSTICS+set}" && -z "${RPCE_OPTIMIZED_INCREMENTAL+set}" ]] || exit 42
 [[ "$1" == "swift" && "$2" == "build" ]]
 shift 2
 scratch=""
@@ -479,7 +479,8 @@ if (( show )); then printf '%s\\n' "$bin"; fi
         )
         patch = tools / "patch-keyboard-shortcuts"
         patch.write_text(
-            "#!/usr/bin/env bash\nset -euo pipefail\n[[ -z \"${RPCE_OPTIMIZED_DIAGNOSTICS+set}\" ]] || exit 42\n"
+            "#!/usr/bin/env bash\nset -euo pipefail\n"
+            "[[ -z \"${RPCE_OPTIMIZED_DIAGNOSTICS+set}\" && -z \"${RPCE_OPTIMIZED_INCREMENTAL+set}\" ]] || exit 42\n"
             "printf '%s\\n' \"$REPOPROMPT_SWIFTPM_SCRATCH_PATH\" >> \"$PATCH_LOG\"\n",
             encoding="utf-8",
         )
@@ -517,8 +518,9 @@ printf 'arm64 x86_64\\n' > "$output"
                 "REPOPROMPT_SWIFTPM_RESOURCE_COMPARATOR": str(comparator),
                 "PATCH_LOG": str(patch_log),
                 "LIPO": str(lipo),
-                # The builder unsets the optimized-diagnostics gate; the stubs exit 42 if it leaks.
+                # The builder unsets both optimized-lane gates; the stubs exit 42 if either leaks.
                 "RPCE_OPTIMIZED_DIAGNOSTICS": "1",
+                "RPCE_OPTIMIZED_INCREMENTAL": "1",
             }
         )
         result = subprocess.run(
@@ -1832,9 +1834,9 @@ fi
             encoding="utf-8",
         )
         calls = temp_dir / "calls.log"
-        # Every stub fails (exit 42) if the optimized-diagnostics manifest gate leaks into it: the
-        # caller exports RPCE_OPTIMIZED_DIAGNOSTICS=1 below and package_app.sh must unset it.
-        gate_guard = '[[ -z "${RPCE_OPTIMIZED_DIAGNOSTICS+set}" ]] || exit 42\n'
+        # Every stub fails (exit 42) if an optimized-lane manifest gate leaks into it: the caller
+        # exports both gates below and package_app.sh must unset them.
+        gate_guard = '[[ -z "${RPCE_OPTIMIZED_DIAGNOSTICS+set}" && -z "${RPCE_OPTIMIZED_INCREMENTAL+set}" ]] || exit 42\n'
         stubs = {
             "doctor.sh": gate_guard + "exit 0\n",
             "patch_keyboard_shortcuts_resource_lookup.sh": (
@@ -1867,6 +1869,7 @@ fi
                 "REPOPROMPT_RELEASE_SOURCE_ROOT": str(root),
                 "STUB_CALLS": str(calls),
                 "RPCE_OPTIMIZED_DIAGNOSTICS": "1",
+                "RPCE_OPTIMIZED_INCREMENTAL": "1",
                 "PATH": self.install_empty_security_stub(temp_dir / "tools", security_calls) + ":" + os.environ["PATH"],
             }
         )
@@ -1887,6 +1890,16 @@ fi
                     "swift --rpce-optimized-diagnostics build -c release --show-bin-path",
                 ],
                 ["Building debug products (debug-optimized, host-native)"],
+            ),
+            # Same rules; only the wrapper's lane flag and the scratch folder differ.
+            "debug-optimized-incremental": (
+                {"SIGN_IDENTITY": "Apple Development: Stub"},
+                [
+                    f"patch {root / '.build' / 'optimized-incremental'}",
+                    "swift --rpce-optimized-incremental build -c release",
+                    "swift --rpce-optimized-incremental build -c release --show-bin-path",
+                ],
+                ["Building debug products (debug-optimized-incremental, host-native)"],
             ),
             "release": (
                 {
@@ -1913,9 +1926,14 @@ fi
         echoed_bin_path = {
             "debug": f"+ {canonical} build -c debug --show-bin-path ",
             "debug-optimized": f"+ {canonical} --rpce-optimized-diagnostics build -c release --show-bin-path ",
+            "debug-optimized-incremental": f"+ {canonical} --rpce-optimized-incremental build -c release --show-bin-path ",
             "release": f"+ {canonical} build -c release --show-bin-path ",
         }
         lane_banner = "*** OPTIMIZED DIAGNOSTICS LANE: swift -c release, first-party DEBUG, debug identity ***"
+        incremental_banner = (
+            "*** OPTIMIZED INCREMENTAL APP LANE: swift -c release, first-party DEBUG, "
+            "RepoPromptApp non-WMO incremental, rest WMO, debug identity ***"
+        )
         # The default bash and macOS /bin/bash 3.2 (empty-array expansion under set -u).
         for interpreter in ([], ["/bin/bash"]):
             for conf, (extra_env, expected_calls, expected_build_phases) in cases.items():
@@ -1931,7 +1949,10 @@ fi
                     self.assertEqual(calls.read_text(encoding="utf-8").splitlines(), expected_calls)
                     self.assertIn(echoed_bin_path[conf] + "\n", result.stdout)
                     self.assertEqual(result.stdout.count(lane_banner), 1 if conf == "debug-optimized" else 0)
-                    if conf == "debug-optimized":
+                    self.assertEqual(
+                        result.stdout.count(incremental_banner), 1 if conf == "debug-optimized-incremental" else 0
+                    )
+                    if conf.startswith("debug-optimized"):
                         # The identity listing came from the empty stub, never the host keychain.
                         self.assertIn("security find-identity -v -p codesigning", security_calls.read_text(encoding="utf-8"))
                     timing_prefix = '[package-timing] phase="Building '
@@ -1966,7 +1987,7 @@ fi
         manifest.parent.mkdir(parents=True)
         manifest.write_text("stale\n", encoding="utf-8")
         calls = temp_dir / "calls.log"
-        gate_guard = '[[ -z "${RPCE_OPTIMIZED_DIAGNOSTICS+set}" ]] || exit 42\n'
+        gate_guard = '[[ -z "${RPCE_OPTIMIZED_DIAGNOSTICS+set}" && -z "${RPCE_OPTIMIZED_INCREMENTAL+set}" ]] || exit 42\n'
         stubs = {
             "doctor.sh": gate_guard + "exit 0\n",
             "patch_keyboard_shortcuts_resource_lookup.sh": (
@@ -2020,6 +2041,7 @@ fi
                 "STUB_VERIFY_STATUS": "0",
                 "SIGN_IDENTITY": "Apple Development: Stub",
                 "RPCE_OPTIMIZED_DIAGNOSTICS": "1",
+                "RPCE_OPTIMIZED_INCREMENTAL": "1",
                 "PATH": self.install_empty_security_stub(temp_dir / "tools", temp_dir / "security.log")
                 + ":"
                 + os.environ["PATH"],
@@ -2048,11 +2070,17 @@ fi
 
     def test_package_app_rejects_unknown_configurations_before_any_mutation(self) -> None:
         package_script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
-        validation = package_script.index('case "$CONF" in\n    debug|debug-optimized|release) ;;\n')
+        validation = package_script.index(
+            'case "$CONF" in\n    debug|debug-optimized|debug-optimized-incremental|release) ;;\n'
+        )
         self.assertLess(package_script.index('case "$FAST_PACKAGE_MARKER" in'), validation)
         self.assertLess(validation, package_script.index('case "${REPOPROMPT_DEBUG_PACKAGE_CACHE-on}" in'))
-        self.assertIn('fail "Too many arguments. Usage: $0 [debug|debug-optimized|release] [fast]"', package_script)
-        for conf in ("Debug", "debug-opt", "release-optimized", "optimized"):
+        self.assertIn(
+            'fail "Too many arguments. Usage: $0 [debug|debug-optimized|debug-optimized-incremental|release] [fast]"',
+            package_script,
+        )
+        for conf in ("Debug", "debug-opt", "release-optimized", "optimized", "optimized-incremental",
+                     "debug-incremental", "debug-optimized-incremental-app", "Debug-Optimized-Incremental"):
             with self.subTest(conf=conf):
                 root, calls, env = self.make_optimized_lane_stub_root()
                 result = subprocess.run(
@@ -2060,7 +2088,7 @@ fi
                 )
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 self.assertIn(f"Unknown configuration '{conf}'. Usage: ", result.stderr)
-                self.assertIn("[debug|debug-optimized|release] [fast]", result.stderr)
+                self.assertIn("[debug|debug-optimized|debug-optimized-incremental|release] [fast]", result.stderr)
                 self.assertNotIn("Loading release metadata", result.stdout)
                 self.assertTrue((root / ".build" / "release" / "RepoPrompt-artifact-manifest.json").exists())
                 self.assertEqual(self.stub_calls(calls), [])
@@ -2084,32 +2112,37 @@ fi
             "sentry linking empty": ({"REPOPROMPT_ENABLE_SENTRY": ""}, [], "does not support Sentry"),
             "sentry upload": ({"REPOPROMPT_UPLOAD_SENTRY_SYMBOLS": "0"}, [], "does not support Sentry"),
         }
-        for name, (extra_env, removed, message) in cases.items():
-            with self.subTest(case=name):
-                root, calls, env = self.make_optimized_lane_stub_root()
-                env.update(extra_env)
-                for key in removed:
-                    env.pop(key, None)
+        # The optimized-incremental App lane takes the same preconditions under its own name.
+        for conf in ("debug-optimized", "debug-optimized-incremental"):
+            for name, (extra_env, removed, message) in cases.items():
+                with self.subTest(conf=conf, case=name):
+                    root, calls, env = self.make_optimized_lane_stub_root()
+                    env.update(extra_env)
+                    for key in removed:
+                        env.pop(key, None)
+                    result = subprocess.run(
+                        [str(SCRIPT_DIR / "package_app.sh"), conf], env=env, text=True, capture_output=True
+                    )
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertIn(f"ERROR: {conf} ", result.stderr)
+                    self.assertIn(message, result.stderr)
+                    # Environment preconditions run before metadata, manifest removal, doctor or any build.
+                    self.assertNotIn("Loading release metadata", result.stdout)
+                    self.assertTrue((root / ".build" / "release" / "RepoPrompt-artifact-manifest.json").exists())
+                    self.assertEqual(self.stub_calls(calls), [])
+                    self.assertNotIn("OPTIMIZED DIAGNOSTICS LANE", result.stdout)
+                    self.assertNotIn("OPTIMIZED INCREMENTAL APP LANE", result.stdout)
+            # A metadata bundle ID that does not resolve to the debug bundle ID fails before any build.
+            with self.subTest(conf=conf, case="metadata bundle id"):
+                root, calls, env = self.make_optimized_lane_stub_root(bundle_id="com.example.other")
                 result = subprocess.run(
-                    [str(SCRIPT_DIR / "package_app.sh"), "debug-optimized"], env=env, text=True, capture_output=True
+                    [str(SCRIPT_DIR / "package_app.sh"), conf], env=env, text=True, capture_output=True
                 )
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-                self.assertIn(message, result.stderr)
-                # Environment preconditions run before metadata, manifest removal, doctor or any build.
-                self.assertNotIn("Loading release metadata", result.stdout)
-                self.assertTrue((root / ".build" / "release" / "RepoPrompt-artifact-manifest.json").exists())
+                self.assertIn(f"{conf} requires the debug bundle ID com.pvncher.repoprompt.ce.debug; "
+                              "resolved 'com.example.other.debug'", result.stderr)
+                self.assertNotIn("Checking build environment", result.stdout)
                 self.assertEqual(self.stub_calls(calls), [])
-                self.assertNotIn("OPTIMIZED DIAGNOSTICS LANE", result.stdout)
-        # A metadata bundle ID that does not resolve to the debug bundle ID fails before any build.
-        root, calls, env = self.make_optimized_lane_stub_root(bundle_id="com.example.other")
-        result = subprocess.run(
-            [str(SCRIPT_DIR / "package_app.sh"), "debug-optimized"], env=env, text=True, capture_output=True
-        )
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn("requires the debug bundle ID com.pvncher.repoprompt.ce.debug; resolved 'com.example.other.debug'",
-                      result.stderr)
-        self.assertNotIn("Checking build environment", result.stdout)
-        self.assertEqual(self.stub_calls(calls), [])
         # The plain debug lane keeps today's rules: ad-hoc, overrides and Sentry stay its own business.
         root, calls, env = self.make_optimized_lane_stub_root()
         env.pop("SIGN_IDENTITY")
@@ -2147,6 +2180,35 @@ fi
                     self.assertNotIn("Computing debug package keys", result.stdout)
                 self.assertFalse(Path(env["REPOPROMPT_DEBUG_APP_BUNDLE"]).exists())
                 self.assertFalse(Path(env["REPOPROMPT_DEBUG_APP_BUNDLE"]).parent.exists())
+        # The optimized-incremental App lane verifies its own scratch plan under its own contract.
+        incremental_calls = [
+            "swift --rpce-optimized-incremental build -c release",
+            "swift --rpce-optimized-incremental build -c release --show-bin-path",
+        ]
+        for status in (0, 1, 2):
+            with self.subTest(lane="debug-optimized-incremental", verify_status=status):
+                root, calls, env = self.make_optimized_lane_stub_root()
+                env["STUB_VERIFY_STATUS"] = str(status)
+                env["STUB_BIN_DIR"] = str(root / ".build" / "optimized-incremental" / "arm64-apple-macosx" / "release")
+                result = subprocess.run(
+                    [str(SCRIPT_DIR / "package_app.sh"), "debug-optimized-incremental"],
+                    env=env, text=True, capture_output=True,
+                )
+                scratch = (root / ".build" / "optimized-incremental").resolve()
+                verify = f"verify --build-yaml {scratch / 'release.yaml'} --lane optimized-incremental"
+                expected = [f"patch {root / '.build' / 'optimized-incremental'}", *incremental_calls, verify]
+                self.assertIn(f"COMPAT_APP_BUNDLE={root / '.build' / 'debug' / 'RepoPrompt.app'}\n", result.stdout)
+                self.assertIn('[package-timing] phase="Verifying optimized-incremental lane flags"', result.stdout)
+                self.assertFalse((root / ".build" / "optimized-diagnostics").exists())
+                if status == 0:
+                    self.assert_reached_cache(result)
+                    self.assertEqual(self.stub_calls(calls), [*expected, "cache resolve-identity"])
+                else:
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertEqual(self.stub_calls(calls), expected)
+                    self.assertIn(f"verify_build_lane_flags.py exited with status {status}; the build plan does not "
+                                  "prove the optimized-incremental lane flags.", result.stderr)
+                    self.assertNotIn("Computing debug package keys", result.stdout)
         # The plain debug lane never runs the verifier.
         root, calls, env = self.make_optimized_lane_stub_root()
         env.pop("SIGN_IDENTITY")
@@ -2205,14 +2267,35 @@ fi
         self.assert_reached_cache(result)
         scratch = (root / ".build" / "optimized-diagnostics").resolve()
         self.assertEqual(self.stub_calls(calls)[-2:], [f"verify --build-yaml {scratch / 'release.yaml'}", "cache resolve-identity"])
+        # Each optimized lane accepts only its own scratch tree: never the other lane's plan.
+        for conf, own, other in (
+            ("debug-optimized", "optimized-diagnostics", "optimized-incremental"),
+            ("debug-optimized-incremental", "optimized-incremental", "optimized-diagnostics"),
+        ):
+            with self.subTest(conf=conf, bin_dir=other):
+                root, calls, env = self.make_optimized_lane_stub_root()
+                (root / ".build" / own).mkdir(parents=True, exist_ok=True)
+                env["STUB_BIN_DIR"] = str(root / ".build" / other / "arm64-apple-macosx" / "release")
+                result = subprocess.run([str(SCRIPT_DIR / "package_app.sh"), conf], env=env, text=True, capture_output=True)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(f"{conf} BUILD_DIR must lie under {root / '.build' / own};", result.stderr)
+                self.assertFalse([call for call in self.stub_calls(calls) if call.startswith(("verify", "cache"))])
 
     def test_optimized_lane_verifier_is_ordered_before_the_plan_and_outside_reuse(self) -> None:
         package_script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
-        start = package_script.index("if (( IS_OPTIMIZED_LANE )); then\n    phase \"Verifying optimized-diagnostics lane flags\"\n")
+        start = package_script.index("if (( IS_OPTIMIZED_LANE )); then\n    phase \"Verifying $LANE_VERIFY_LABEL lane flags\"\n")
         block = package_script[start:].split("\nfi\n", 1)[0]
-        # Isolated interpreter (-I -S), like the other control-plane Python helpers.
-        executed = '    python3 -I -S "$CONTROL_PLANE_SCRIPTS_DIR/verify_build_lane_flags.py" --build-yaml "$LANE_BUILD_YAML" || LANE_VERIFY_STATUS=$?\n'
-        echoed = '    echo_cmd python3 -I -S "$CONTROL_PLANE_SCRIPTS_DIR/verify_build_lane_flags.py" --build-yaml "$LANE_BUILD_YAML"\n'
+        # Isolated interpreter (-I -S), like the other control-plane Python helpers. The lane argument
+        # list is empty for debug-optimized (its verifier argv is unchanged) and --lane for the App lane.
+        lane_args = '${LANE_VERIFY_ARGS[@]+"${LANE_VERIFY_ARGS[@]}"}'
+        executed = (
+            '    python3 -I -S "$CONTROL_PLANE_SCRIPTS_DIR/verify_build_lane_flags.py" --build-yaml "$LANE_BUILD_YAML" '
+            + lane_args + ' || LANE_VERIFY_STATUS=$?\n'
+        )
+        echoed = (
+            '    echo_cmd python3 -I -S "$CONTROL_PLANE_SCRIPTS_DIR/verify_build_lane_flags.py" --build-yaml "$LANE_BUILD_YAML" '
+            + lane_args + '\n'
+        )
         self.assertIn(echoed, block + "\n")
         self.assertEqual(package_script.count("python3 -I -S \"$CONTROL_PLANE_SCRIPTS_DIR/verify_build_lane_flags.py\""), 2)
         self.assertEqual(package_script.count("verify_build_lane_flags.py\" --build-yaml"), 2)  # echo and call
@@ -2239,10 +2322,12 @@ fi
         )[0]
         probe = (
             "set -euo pipefail\nROOT_DIR=/repo\n"
-            'for CONF in debug debug-optimized release; do\nIS_RELEASE=0\n[[ "$CONF" == "release" ]] && IS_RELEASE=1\n'
+            'for CONF in debug debug-optimized debug-optimized-incremental release; do\nIS_RELEASE=0\n'
+            '[[ "$CONF" == "release" ]] && IS_RELEASE=1\n'
             + derived
-            + '\nprintf "%s|%s|%s|%s|%s|%s|%s\\n" "$CONF" "$BUILD_LANE" "$SWIFT_CONF" '
-            '"${CANONICAL_PREFIX[*]+${CANONICAL_PREFIX[*]}}" "$IS_RELEASE" "$COMPAT_CONF" "$IS_OPTIMIZED_LANE"\ndone\n'
+            + '\nprintf "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\\n" "$CONF" "$BUILD_LANE" "$SWIFT_CONF" '
+            '"${CANONICAL_PREFIX[*]+${CANONICAL_PREFIX[*]}}" "$IS_RELEASE" "$COMPAT_CONF" "$IS_OPTIMIZED_LANE" '
+            '"$OPTIMIZED_SCRATCH_DIR" "${LANE_VERIFY_ARGS[*]+${LANE_VERIFY_ARGS[*]}}" "$LANE_VERIFY_LABEL"\ndone\n'
         )
         for shell in ("bash", "/bin/bash"):
             with self.subTest(shell=shell):
@@ -2251,9 +2336,12 @@ fi
                 self.assertEqual(
                     result.stdout.splitlines(),
                     [
-                        "debug|debug|debug||0|debug|0",
-                        "debug-optimized|debug-optimized|release|--rpce-optimized-diagnostics|0|debug|1",
-                        "release|release|release||1|release|0",
+                        "debug|debug|debug||0|debug|0|/repo/.build/optimized-diagnostics||optimized-diagnostics",
+                        "debug-optimized|debug-optimized|release|--rpce-optimized-diagnostics|0|debug|1"
+                        "|/repo/.build/optimized-diagnostics||optimized-diagnostics",
+                        "debug-optimized-incremental|debug-optimized-incremental|release|--rpce-optimized-incremental"
+                        "|0|debug|1|/repo/.build/optimized-incremental|--lane optimized-incremental|optimized-incremental",
+                        "release|release|release||1|release|0|/repo/.build/optimized-diagnostics||optimized-diagnostics",
                     ],
                 )
         self.assertIn('SWIFT_BUILD_ARGS=(-c "$SWIFT_CONF")\n', package_script)
@@ -2274,6 +2362,10 @@ fi
                 lines = (SCRIPT_DIR / name).read_text(encoding="utf-8").splitlines()
                 unsets = [index for index, line in enumerate(lines) if line.startswith("unset RPCE_OPTIMIZED_DIAGNOSTICS")]
                 self.assertEqual(len(unsets), 1)
+                self.assertEqual(
+                    lines[unsets[0]].split("#", 1)[0].split(),
+                    ["unset", "RPCE_OPTIMIZED_DIAGNOSTICS", "RPCE_OPTIMIZED_INCREMENTAL"],
+                )
                 code_before = [
                     line for line in lines[: unsets[0]] if line.strip() and not line.lstrip().startswith("#")
                 ]
@@ -2299,6 +2391,11 @@ fi
             ("debug-optimized", "1"): {"buildLane": "debug-optimized", "swiftConfiguration": "release",
                                        "optimization": "O", "assertConfiguration": "Release", "laneFlagsVerified": True},
             ("debug-optimized", "0"): None,
+            ("debug-optimized-incremental", "1"): {
+                "buildLane": "debug-optimized-incremental", "swiftConfiguration": "release", "optimization": "O",
+                "assertConfiguration": "Release", "laneFlagsVerified": True,
+            },
+            ("debug-optimized-incremental", "0"): None,
             ("release", "0"): None,
         }
         for (lane, verified), labels in expected.items():

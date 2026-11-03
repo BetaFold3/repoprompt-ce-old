@@ -721,7 +721,7 @@ final class ClaudeNativeUsageAttributionTests: XCTestCase {
         // The legacy completion lifecycle still consumes the interrupt marker exactly once.
         var completedStatus: ClaudeNativeProcessSessionController.TurnStatus?
         for await event in lifecycle {
-            if case let .turnCompleted(turnID, status) = event {
+            if case let .turnCompleted(turnID, status, _) = event {
                 XCTAssertEqual(turnID, turn)
                 completedStatus = status
                 break
@@ -839,7 +839,7 @@ final class ClaudeNativeUsageAttributionTests: XCTestCase {
         await expectNext(usage, .turnClosed(launchToken: launch.token, turnID: turn, status: .completed))
         var completedTurnID: UUID?
         while let event = await lifecycle.next() {
-            if case let .turnCompleted(turnID, _) = event {
+            if case let .turnCompleted(turnID, _, _) = event {
                 completedTurnID = turnID
                 break
             }
@@ -943,7 +943,7 @@ final class ClaudeNativeUsageAttributionTests: XCTestCase {
         await controller.test_handleStdoutChunk(line, launchToken: launch.token)
         var completed: UUID?
         for await event in lifecycle {
-            if case let .turnCompleted(turnID, _) = event {
+            if case let .turnCompleted(turnID, _, _) = event {
                 completed = turnID
                 break
             }

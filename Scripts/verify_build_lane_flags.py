@@ -1,10 +1,19 @@
 #!/usr/bin/env python3
-"""Verify the optimized-diagnostics lane's Swift compile flags from SwiftPM's build plan.
+"""Verify an optimized Dev lane's Swift compile flags from SwiftPM's build plan.
 
-Contract: docs/context/workflows/development.md#optimized-diagnostics-lane-opt-in.
-Read-only, Python 3 standard library only.
+Contract: docs/context/workflows/development.md#optimized-diagnostics-lane-opt-in and
+#optimized-incremental-app-lane-opt-in. Read-only, Python 3 standard library only.
 
-Usage: verify_build_lane_flags.py --build-yaml <scratch>/release.yaml
+Usage: verify_build_lane_flags.py --build-yaml <scratch>/release.yaml [--lane optimized-diagnostics|optimized-incremental]
+
+The default lane, optimized-diagnostics, keeps its original contract: every first-party
+compile is -O with an effective whole-module optimization. The optimized-incremental lane
+additionally requires the RPCE_OPTIMIZED_INCREMENTAL label on every first-party compile and
+proves that only RepoPromptApp is effectively non-WMO: SwiftPM's release
+-whole-module-optimization must be present and overridden by a later
+-no-whole-module-optimization (the driver honors the last of the pair), with -incremental and
+an effective -enable-batch-mode. Every other module must be effectively WMO and carry none of
+those App-only flags.
 
 The input is SwiftPM's llbuild manifest. This parser reads only the dialect
 SwiftPM writes: a column-0 ``commands:`` section whose blocks are
@@ -35,7 +44,14 @@ import sys
 from dataclasses import dataclass, field
 
 LANE_MARKER = "RPCE_OPTIMIZED_DIAGNOSTICS"
+INCREMENTAL_MARKER = "RPCE_OPTIMIZED_INCREMENTAL"
 DEBUG_DEFINE = "DEBUG"
+LANE_OPTIMIZED = "optimized-diagnostics"
+LANE_INCREMENTAL = "optimized-incremental"
+LANES = (LANE_OPTIMIZED, LANE_INCREMENTAL)
+# The only module the optimized-incremental lane compiles non-WMO (a FIRST_PARTY_MODULES member, so a
+# plan without it already fails the first-party presence check).
+INCREMENTAL_APP_MODULES = frozenset({"RepoPromptApp"})
 
 FIRST_PARTY_MODULES = frozenset(
     {
@@ -61,6 +77,9 @@ TEST_MODULE_SUFFIX = "Tests"
 FOREIGN_VALUE_OPTIONS = frozenset({"-Xcc", "-Xlinker", "-Xclang-linker"})
 WMO_FLAGS = frozenset({"-whole-module-optimization", "-wmo"})
 NO_WMO_FLAGS = frozenset({"-no-whole-module-optimization", "-no-wmo"})
+INCREMENTAL_FLAG = "-incremental"
+ENABLE_BATCH_FLAG = "-enable-batch-mode"
+DISABLE_BATCH_FLAG = "-disable-batch-mode"
 OPTIMIZATION_FLAG = re.compile(r"^-O[A-Za-z]*$")
 SOURCES_RESPONSE_BASENAME = "sources"
 LINK_RESPONSE_BASENAME = "Objects.LinkFileList"
@@ -82,6 +101,10 @@ class CompileCommand:
     whole_module: bool
     no_whole_module: bool
     enable_testing: bool
+    # Last-wins driver state, recorded in argv order (all False/None when the flags are absent).
+    effective_whole_module: bool | None = None
+    incremental: bool = False
+    effective_batch_mode: bool | None = None
 
 
 @dataclass
@@ -176,7 +199,9 @@ def _response_files(tokens: list[str]) -> list[str]:
 def _classify_compile(key: str, module: str, tokens: list[str]) -> CompileCommand:
     defines: set[str] = set()
     optimization: list[str] = []
-    whole_module = no_whole_module = enable_testing = False
+    whole_module = no_whole_module = enable_testing = incremental = False
+    effective_whole_module: bool | None = None
+    effective_batch_mode: bool | None = None
     index = 0
     while index < len(tokens):
         token = tokens[index]
@@ -192,8 +217,16 @@ def _classify_compile(key: str, module: str, tokens: list[str]) -> CompileComman
             optimization.append(token)
         elif token in WMO_FLAGS:
             whole_module = True
+            effective_whole_module = True
         elif token in NO_WMO_FLAGS:
             no_whole_module = True
+            effective_whole_module = False
+        elif token == INCREMENTAL_FLAG:
+            incremental = True
+        elif token == ENABLE_BATCH_FLAG:
+            effective_batch_mode = True
+        elif token == DISABLE_BATCH_FLAG:
+            effective_batch_mode = False
         elif token == "-enable-testing":
             enable_testing = True
         elif token.startswith("@"):
@@ -210,6 +243,9 @@ def _classify_compile(key: str, module: str, tokens: list[str]) -> CompileComman
         whole_module=whole_module,
         no_whole_module=no_whole_module,
         enable_testing=enable_testing,
+        effective_whole_module=effective_whole_module,
+        incremental=incremental,
+        effective_batch_mode=effective_batch_mode,
     )
 
 
@@ -266,35 +302,85 @@ def module_class(module: str) -> str:
     return "third-party"
 
 
-def command_violations(command: CompileCommand) -> list[str]:
+def _whole_module_violations(command: CompileCommand) -> list[str]:
+    """A module that must stay WMO: the default lane's original rules plus no App-only flags."""
+    problems: list[str] = []
+    if not command.whole_module:
+        problems.append("missing -whole-module-optimization")
+    if command.no_whole_module:
+        problems.append("has -no-whole-module-optimization")
+    return problems
+
+
+def _incremental_app_violations(command: CompileCommand) -> list[str]:
+    """RepoPromptApp in the optimized-incremental lane: effective non-WMO incremental batch mode."""
+    problems: list[str] = []
+    if not command.whole_module:
+        problems.append("missing SwiftPM's release -whole-module-optimization (the override is unproven)")
+    if not command.no_whole_module:
+        problems.append("missing -no-whole-module-optimization")
+    elif command.effective_whole_module is not False:
+        problems.append("-whole-module-optimization follows -no-whole-module-optimization (effective WMO)")
+    if not command.incremental:
+        problems.append("missing -incremental")
+    if command.effective_batch_mode is None:
+        problems.append("missing -enable-batch-mode")
+    elif not command.effective_batch_mode:
+        problems.append("-disable-batch-mode follows -enable-batch-mode (batch mode off)")
+    return problems
+
+
+def _incremental_batch_flag_violations(command: CompileCommand) -> list[str]:
+    """The optimized-incremental lane's App-only incremental and batch-mode flags on any other module."""
+    problems: list[str] = []
+    if command.incremental:
+        problems.append(f"has {INCREMENTAL_FLAG} (App-only)")
+    if command.effective_batch_mode is not None:
+        problems.append("has a batch-mode flag (App-only)")
+    return problems
+
+
+def command_violations(command: CompileCommand, lane: str = LANE_OPTIMIZED) -> list[str]:
+    if lane not in LANES:
+        raise ValueError(f"unknown lane {lane!r}")
+    incremental_lane = lane == LANE_INCREMENTAL
+    lane_defines = (DEBUG_DEFINE, LANE_MARKER, INCREMENTAL_MARKER) if incremental_lane else (DEBUG_DEFINE, LANE_MARKER)
     kind = module_class(command.module)
     problems: list[str] = []
     if kind == "first-party":
-        for name in (DEBUG_DEFINE, LANE_MARKER):
+        for name in lane_defines:
             if name not in command.defines:
                 problems.append(f"missing -D{name}")
+        if not incremental_lane and INCREMENTAL_MARKER in command.defines:
+            problems.append(f"has -D{INCREMENTAL_MARKER} (optimized-incremental lane label)")
         if "-O" not in command.optimization_flags:
             problems.append("missing -O")
         for flag in sorted(set(command.optimization_flags) - {"-O"}):
             problems.append(f"has {flag}")
-        if not command.whole_module:
-            problems.append("missing -whole-module-optimization")
-        if command.no_whole_module:
-            problems.append("has -no-whole-module-optimization")
+        if incremental_lane and command.module in INCREMENTAL_APP_MODULES:
+            problems.extend(_incremental_app_violations(command))
+        else:
+            problems.extend(_whole_module_violations(command))
+            if incremental_lane:
+                problems.extend(_incremental_batch_flag_violations(command))
         if command.enable_testing:
             problems.append("has -enable-testing")
     elif kind in ("test", "third-party"):
         # Rule 4 covers every non-first-party module; tests are exempt only from the
         # first-party requirements and the unknown-module rule.
-        for name in (DEBUG_DEFINE, LANE_MARKER):
+        for name in (DEBUG_DEFINE, LANE_MARKER, INCREMENTAL_MARKER):
             if name in command.defines:
                 problems.append(f"{kind} module has -D{name}")
+        if incremental_lane:
+            # App-only proof: every other module keeps SwiftPM's release WMO untouched.
+            for problem in _whole_module_violations(command) + _incremental_batch_flag_violations(command):
+                problems.append(f"{kind} module {problem}")
     else:
         problems.append("unclassified RepoPrompt* module (not in the expected first-party set)")
     return problems
 
 
-def verify(summary: PlanSummary) -> tuple[list[str], list[str]]:
+def verify(summary: PlanSummary, lane: str = LANE_OPTIMIZED) -> tuple[list[str], list[str]]:
     """Return (summary lines, failure lines)."""
     by_class: dict[str, dict[str, list[CompileCommand]]] = {
         "first-party": {},
@@ -307,7 +393,7 @@ def verify(summary: PlanSummary) -> tuple[list[str], list[str]]:
     for command in summary.compiles:
         kind = module_class(command.module)
         by_class[kind].setdefault(command.module, []).append(command)
-        for problem in command_violations(command):
+        for problem in command_violations(command, lane):
             failures.append(f"FAIL {kind} {command.module} [{command.key}]: {problem}")
             failed_modules[kind].add(command.module)
     missing = sorted(FIRST_PARTY_MODULES - set(by_class["first-party"]))
@@ -321,6 +407,21 @@ def verify(summary: PlanSummary) -> tuple[list[str], list[str]]:
         status = "FAIL" if bad else "OK"
         return f"{label}: {len(modules)} modules{extra}, {commands} compile commands, {bad} failing: {status}"
 
+    if lane == LANE_INCREMENTAL:
+        lines = [
+            f"lane: {LANE_INCREMENTAL}",
+            line(
+                "first-party",
+                "first-party (DEBUG + lane marker + incremental label, -O, no -enable-testing; "
+                f"{', '.join(sorted(INCREMENTAL_APP_MODULES))} effective non-WMO incremental batch, rest WMO)",
+                f" of {len(FIRST_PARTY_MODULES)} expected",
+            ),
+            line("third-party", "third-party (no DEBUG, no lane markers, WMO, no App-only flags)"),
+            line("test", "test modules (no DEBUG, no lane markers, WMO, no App-only flags)"),
+            line("unknown", "unclassified RepoPrompt* modules (must be none)"),
+            f"link commands ignored: {summary.ignored_links}",
+        ]
+        return lines, failures
     lines = [
         line(
             "first-party",
@@ -335,7 +436,7 @@ def verify(summary: PlanSummary) -> tuple[list[str], list[str]]:
     return lines, failures
 
 
-def run(build_yaml: str, stdout=sys.stdout, stderr=sys.stderr) -> int:
+def run(build_yaml: str, stdout=sys.stdout, stderr=sys.stderr, lane: str = LANE_OPTIMIZED) -> int:
     try:
         with open(build_yaml, "rb") as handle:
             raw = handle.read()
@@ -350,7 +451,7 @@ def run(build_yaml: str, stdout=sys.stdout, stderr=sys.stderr) -> int:
         print(f"verify_build_lane_flags: malformed build plan {build_yaml}: {error}", file=stderr)
         print("result: FAIL (malformed build plan)", file=stdout)
         return 1
-    lines, failures = verify(summary)
+    lines, failures = verify(summary, lane)
     print(f"verify_build_lane_flags: {build_yaml}", file=stdout)
     for entry in lines:
         print(entry, file=stdout)
@@ -363,8 +464,9 @@ def run(build_yaml: str, stdout=sys.stdout, stderr=sys.stderr) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     parser.add_argument("--build-yaml", required=True, help="SwiftPM llbuild manifest, e.g. <scratch>/release.yaml")
+    parser.add_argument("--lane", choices=LANES, default=LANE_OPTIMIZED, help="lane contract to verify")
     options = parser.parse_args(argv)
-    return run(options.build_yaml)
+    return run(options.build_yaml, lane=options.lane)
 
 
 if __name__ == "__main__":

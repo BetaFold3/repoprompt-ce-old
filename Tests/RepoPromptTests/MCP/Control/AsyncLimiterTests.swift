@@ -346,7 +346,8 @@ import XCTest
             let metadata = MCPServerViewModel.RequestMetadata(
                 connectionID: connectionID,
                 clientName: "server-shutdown-cancellation-test",
-                windowID: window.windowID
+                windowID: window.windowID,
+                actorRoutedRunTab: nil
             )
             let ordinaryExecution = await window.mcpServer.test_beginResolvedToolExecution(
                 metadata: metadata,
@@ -601,7 +602,8 @@ import XCTest
                 metadata: MCPServerViewModel.RequestMetadata(
                     connectionID: firstConnectionID,
                     clientName: "unbound-first",
-                    windowID: window.windowID
+                    windowID: window.windowID,
+                    actorRoutedRunTab: nil
                 ),
                 resolvedContext: nil,
                 toolName: MCPWindowToolName.readFile
@@ -612,7 +614,8 @@ import XCTest
                 metadata: MCPServerViewModel.RequestMetadata(
                     connectionID: secondConnectionID,
                     clientName: "unbound-second",
-                    windowID: window.windowID
+                    windowID: window.windowID,
+                    actorRoutedRunTab: nil
                 ),
                 resolvedContext: nil,
                 toolName: MCPWindowToolName.readFile

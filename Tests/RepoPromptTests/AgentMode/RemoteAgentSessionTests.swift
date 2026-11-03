@@ -2490,7 +2490,11 @@ final class RemoteAgentSessionTests: XCTestCase {
         )
 
         // The first steer must self-heal observation: subscribe + catch-up, then send.
-        try await fixture.coordinator.steer(session: session, text: "Continue")
+        try await fixture.coordinator.steer(
+            session: session,
+            text: "Continue",
+            dispatch: RemoteInputDispatch(input: .inactiveForTesting(in: session))
+        )
 
         let subscribeCount = await connection.subscribeCallCount()
         let steerCount = await connection.commandCount(type: "steer")
@@ -2524,7 +2528,11 @@ final class RemoteAgentSessionTests: XCTestCase {
         )
 
         do {
-            try await fixture.coordinator.steer(session: session, text: "Continue")
+            try await fixture.coordinator.steer(
+                session: session,
+                text: "Continue",
+                dispatch: RemoteInputDispatch(input: .inactiveForTesting(in: session))
+            )
             XCTFail("Expected steer to be withheld when observation attach fails hard")
         } catch {
             // Hard (non-transient) attach failure must surface as a send failure.
@@ -2647,7 +2655,9 @@ final class RemoteAgentSessionTests: XCTestCase {
         let runningTool = try XCTUnwrap(session.items.first { $0.kind == .toolCall })
         XCTAssertNil(runningTool.toolResultJSON)
         XCTAssertNil(runningTool.toolIsError)
-        XCTAssertEqual(ToolCallCardStateResolver.status(for: runningTool), .running)
+        // Step 4d6: an unresolved call renders neutral but stays eligible for run-scoped cancel.
+        XCTAssertEqual(ToolCallCardStateResolver.status(for: runningTool), .neutral)
+        XCTAssertTrue(ToolCallCardStateResolver.allowsRunScopedCancel(for: runningTool))
 
         fixture.coordinator.test_handleEvent(.terminal(status: "completed"), tabID: fixture.tabID)
 
@@ -2655,6 +2665,8 @@ final class RemoteAgentSessionTests: XCTestCase {
         XCTAssertNotNil(settledTool.toolResultJSON)
         XCTAssertEqual(settledTool.toolIsError, false)
         XCTAssertNotEqual(ToolCallCardStateResolver.status(for: settledTool), .running)
+        XCTAssertEqual(ToolCallCardStateResolver.status(for: settledTool), .success)
+        XCTAssertFalse(ToolCallCardStateResolver.allowsRunScopedCancel(for: settledTool))
         XCTAssertEqual(session.runState, .completed)
     }
 
@@ -2675,6 +2687,8 @@ final class RemoteAgentSessionTests: XCTestCase {
         XCTAssertNotNil(settledTool.toolResultJSON)
         XCTAssertEqual(settledTool.toolIsError, false)
         XCTAssertNotEqual(ToolCallCardStateResolver.status(for: settledTool), .running)
+        XCTAssertEqual(ToolCallCardStateResolver.status(for: settledTool), .success)
+        XCTAssertFalse(ToolCallCardStateResolver.allowsRunScopedCancel(for: settledTool))
     }
 
     @MainActor

@@ -546,7 +546,8 @@ final class AgentTranscriptBackgroundRefreshDeferralTests: XCTestCase {
                 MCPServerViewModel.RequestMetadata(
                     connectionID: connectionID,
                     clientName: "d7-deferral",
-                    windowID: window.windowID
+                    windowID: window.windowID,
+                    actorRoutedRunTab: nil
                 )
             },
             requireTargetWindow: { window },

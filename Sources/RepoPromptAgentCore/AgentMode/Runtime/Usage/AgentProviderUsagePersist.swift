@@ -237,8 +237,9 @@ package struct AgentProviderUsageRecord: Codable, Equatable {
     /// bytes remain lossless). Counts are deltas of the app-server's cumulative `total`.
     struct CodexUsageInterval: Codable, Equatable {
         /// Compact applied pricing basis frozen at dispatch (plan §4.1): basis, source, capture
-        /// and validation dates, dispatch-time staleness, and the rates actually applied (lower
-        /// and upper differ only for an envelope). Historical amounts are never repriced from it.
+        /// and validation dates, dispatch-time staleness, and the rates actually applied (current
+        /// builds write equal lower/upper; older builds wrote a short/long envelope). Historical
+        /// amounts are never repriced from it.
         struct AppliedPricing: Codable, Equatable {
             var basis: String
             var sourceKind: String
@@ -331,6 +332,8 @@ package struct AgentProviderUsageRecord: Codable, Equatable {
         var requestedModelID: String?
         var resolvedModelID: String?
         var bandKind: String?
+        /// Current builds write a point (lower == upper). Legacy ranged intervals are projected
+        /// from the lower bound.
         var estimatedCostLowerUSD: Decimal?
         var estimatedCostUpperUSD: Decimal?
         /// Present only on priced intervals written by builds that record applied pricing.

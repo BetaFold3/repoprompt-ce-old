@@ -50,6 +50,10 @@ package struct AgentSessionWorktreeMergeOperation: Codable, Equatable, Identifia
     package var updatedAt: Date
     package var completedAt: Date?
     package var lastError: String?
+    /// Step 5c: set only on an `.awaitingApproval` review whose retained preview bundle and refs
+    /// were installed and covered by a written session save before the review was shown. `nil` for
+    /// every other operation (including reviews recorded before this field existed).
+    package var reviewPreservation: AgentSessionWorktreeMergeReviewPreservation?
 
     package init(
         id: String,
@@ -69,7 +73,8 @@ package struct AgentSessionWorktreeMergeOperation: Codable, Equatable, Identifia
         createdAt: Date = Date(),
         updatedAt: Date = Date(),
         completedAt: Date? = nil,
-        lastError: String? = nil
+        lastError: String? = nil,
+        reviewPreservation: AgentSessionWorktreeMergeReviewPreservation? = nil
     ) {
         self.id = id
         self.source = source
@@ -89,11 +94,61 @@ package struct AgentSessionWorktreeMergeOperation: Codable, Equatable, Identifia
         self.updatedAt = updatedAt
         self.completedAt = completedAt
         self.lastError = lastError
+        self.reviewPreservation = reviewPreservation
     }
 
     var activeSummary: AgentSessionWorktreeMergeSummary? {
         guard status.isActive else { return nil }
         return AgentSessionWorktreeMergeSummary(operation: self)
+    }
+
+    /// A preserved review whose request ended (lifecycle, timeout, replacement, or relaunch)
+    /// without an explicit decision: read-only history. It can never be applied or resumed.
+    package var isHistoricalReview: Bool {
+        status == .awaitingApproval && reviewPreservation?.state == .historical
+    }
+}
+
+/// Step 5c: preservation marker of a worktree merge review. `live` means the retained proposal is
+/// shown (or about to be shown) to a waiting request in this process; `historical` means that
+/// request ended without an explicit Merge, Reject, or Discard. The operation's
+/// `previewArtifacts` are the retained refs; nothing else records the proposal.
+package struct AgentSessionWorktreeMergeReviewPreservation: Codable, Equatable {
+    package enum State: String, Codable, Equatable {
+        case live
+        case historical
+    }
+
+    package var state: State
+    package var endedReason: String?
+    package var endedAt: Date?
+
+    package init(state: State, endedReason: String? = nil, endedAt: Date? = nil) {
+        self.state = state
+        self.endedReason = endedReason
+        self.endedAt = endedAt
+    }
+
+    package static let live = AgentSessionWorktreeMergeReviewPreservation(state: .live)
+
+    package static func historical(reason: String, at date: Date) -> AgentSessionWorktreeMergeReviewPreservation {
+        AgentSessionWorktreeMergeReviewPreservation(state: .historical, endedReason: reason, endedAt: date)
+    }
+}
+
+/// Step 5c: in-memory presentation of a Discard of an ended merge review, owned by the session so
+/// it survives the card being removed and recreated. While `isDiscarding`, `review` (the value
+/// Discard started from) stays the visible, read-only historical review; afterwards `message`
+/// explains a Discard that wasn't acknowledged. Never persisted.
+package struct AgentWorktreeMergeReviewDiscardState: Equatable {
+    package let review: AgentSessionWorktreeMergeOperation
+    package var isDiscarding: Bool
+    package var message: String?
+
+    package init(review: AgentSessionWorktreeMergeOperation, isDiscarding: Bool, message: String?) {
+        self.review = review
+        self.isDiscarding = isDiscarding
+        self.message = message
     }
 }
 
@@ -114,6 +169,9 @@ package struct AgentSessionWorktreeMergeSummary: Codable, Equatable, Identifiabl
     let repoKey: String
     package let conflictFileCount: Int
     package let updatedAt: Date
+    /// Step 5c: `true` for an ended, read-only preserved review (status stays awaiting approval);
+    /// absent otherwise.
+    package let isHistoricalReview: Bool?
 
     package init(
         id: String,
@@ -129,7 +187,8 @@ package struct AgentSessionWorktreeMergeSummary: Codable, Equatable, Identifiabl
         repositoryID: String,
         repoKey: String,
         conflictFileCount: Int,
-        updatedAt: Date
+        updatedAt: Date,
+        isHistoricalReview: Bool? = nil
     ) {
         self.id = id
         self.status = status
@@ -145,6 +204,7 @@ package struct AgentSessionWorktreeMergeSummary: Codable, Equatable, Identifiabl
         self.repoKey = repoKey
         self.conflictFileCount = max(0, conflictFileCount)
         self.updatedAt = updatedAt
+        self.isHistoricalReview = isHistoricalReview == true ? true : nil
     }
 
     init(operation: AgentSessionWorktreeMergeOperation) {
@@ -162,7 +222,8 @@ package struct AgentSessionWorktreeMergeSummary: Codable, Equatable, Identifiabl
             repositoryID: operation.source.repositoryID,
             repoKey: operation.source.repoKey,
             conflictFileCount: operation.conflictFiles.count,
-            updatedAt: operation.updatedAt
+            updatedAt: operation.updatedAt,
+            isHistoricalReview: operation.isHistoricalReview
         )
     }
 }
@@ -242,6 +303,8 @@ struct AgentSessionWorktreeMergeReconciliationHooks {
 }
 
 enum AgentSessionWorktreeMergeReconciler {
+    static let relaunchEndedReviewReason = "RepoPrompt closed before this merge review was answered."
+
     static func reconcile(
         _ operations: [AgentSessionWorktreeMergeOperation],
         now: Date = Date(),
@@ -265,6 +328,13 @@ enum AgentSessionWorktreeMergeReconciler {
         var updated = operation
         switch operation.status {
         case .awaitingApproval:
+            // Step 5c: a preserved review becomes read-only history; no continuation is resumed.
+            if let preservation = operation.reviewPreservation {
+                guard preservation.state == .live else { return operation }
+                updated.reviewPreservation = .historical(reason: Self.relaunchEndedReviewReason, at: now)
+                updated.updatedAt = now
+                return updated
+            }
             updated.status = .cancelled
             updated.updatedAt = now
             updated.completedAt = now

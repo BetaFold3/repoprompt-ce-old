@@ -106,7 +106,7 @@ final class AgentModeWorkspaceSwitchSessionProvider: WorkspaceSwitchSessionProvi
         agentModeViewModel.discardStaleResetRecoveriesForConfirmedLifecycle()
         let activeTabs = agentModeViewModel.tabsWithActiveAgentRun
         for tabID in activeTabs {
-            await agentModeViewModel.cancelAgentRun(tabID: tabID, completion: .terminalPublished)
+            await agentModeViewModel.cancelAgentRun(tabID: tabID, cause: .ordinary, completion: .terminalPublished)
         }
     }
 

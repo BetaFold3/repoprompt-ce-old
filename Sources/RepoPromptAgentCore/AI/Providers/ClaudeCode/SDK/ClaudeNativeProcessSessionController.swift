@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import os
 import OSLog
 import RepoPromptPlatform
 import RepoPromptShared
@@ -33,6 +34,91 @@ package final actor ClaudeNativeProcessSessionController {
         case completed
         case cancelled
         case failed
+    }
+
+    /// Step 12: where a turn completion came from. Only a completion emitted on the CLI's own
+    /// boundary for this FIFO position is provider evidence for the turn.
+    package enum TurnCompletionOrigin: Equatable {
+        /// Emitted on the CLI's own `result` for this turn: immediately, or (deferred mode) at the
+        /// CLI's own `idle` that follows it. The status is `determineTurnStatus`'s classification
+        /// of that result; the evidence is what the result itself and the FIFO showed when it was
+        /// processed.
+        case providerResult(ProviderResultEvidence)
+        /// Emitted by the controller rather than on a CLI boundary: stdout EOF (process exit), a
+        /// protocol failure, the deferred-completion idle-fallback timer, or the shutdown/EOF flush
+        /// of deferred completions. The last two carry a status classified from a CLI result, but
+        /// the controller timed the completion, so it is never provider-result evidence.
+        case controllerSynthesized
+
+        /// What a CLI `result` showed about the turn it was FIFO-credited to.
+        package struct ProviderResultEvidence: Equatable {
+            /// When the result was processed, this turn was the controller's only written turn
+            /// without a result, and no earlier result was still waiting for `idle`. Attribution is
+            /// FIFO, so a message the CLI skipped (no result) shifts later results one turn early;
+            /// with no other turn outstanding, no skipped message can sit ahead of this one.
+            package var soleOutstandingTurn: Bool
+            /// The result payload itself reports an aborted or interrupted turn (its `subtype` is
+            /// `error_during_execution`, or its `subtype`, `stop_reason`, `terminal_reason` or
+            /// `errors` name a cancellation), independent of the controller's interrupt marker. A
+            /// `success` result never does.
+            package var reportsInterruption: Bool
+            /// The result's own consumed-user attribution (`user_message_uuid(s)`) against the
+            /// outbound UUID this controller wrote for the credited turn.
+            package var messageIdentity: MessageIdentity
+
+            package init(
+                soleOutstandingTurn: Bool,
+                reportsInterruption: Bool,
+                messageIdentity: MessageIdentity
+            ) {
+                self.soleOutstandingTurn = soleOutstandingTurn
+                self.reportsInterruption = reportsInterruption
+                self.messageIdentity = messageIdentity
+            }
+        }
+
+        package enum MessageIdentity: Equatable {
+            /// The result carries no (non-null) `user_message_uuid` / `user_message_uuids`.
+            case notReported
+            /// Every attribution the result carries names exactly the credited turn's outbound UUID
+            /// (`user_message_uuids` exactly that singleton).
+            case namesTurn
+            /// The result names another message, more than one, or a turn written without an
+            /// outbound UUID: it is not this turn's result.
+            case contradictsTurn
+        }
+
+        /// The CLI's own interrupted-turn result, attributed while no other written turn was
+        /// outstanding, and affirmatively attributed by the CLI to exactly this turn's outbound
+        /// message. Unattributed results never qualify: an unrelated interrupted or failed result
+        /// (for example an aborted background continuation) carries no consumed user message, and
+        /// a turn written without an outbound UUID can never be named, so it stays uncertain.
+        package var isExclusiveInterruptedResult: Bool {
+            guard case let .providerResult(evidence) = self else { return false }
+            return evidence.soleOutstandingTurn
+                && evidence.reportsInterruption
+                && evidence.messageIdentity == .namesTurn
+        }
+    }
+
+    /// RepoPrompt MCP health of the current launch. Transient and launch-scoped: every spawn starts
+    /// `unknown`; fresh evidence (a `system/init` or `mcp_status` report of `connected`) makes it
+    /// `connected`; an app-initiated loss of this launch's connection makes it `unhealthy` for the
+    /// rest of the launch, and no later evidence on that launch restores `connected`.
+    package enum RepoPromptMCPHealth: Equatable {
+        case unknown
+        case connected
+        case unhealthy(reason: String)
+
+        var isUnhealthy: Bool {
+            if case .unhealthy = self { true } else { false }
+        }
+    }
+
+    /// Outcome of waiting for fresh RepoPrompt MCP connected evidence on the current launch.
+    package enum RepoPromptMCPConnectionProbeOutcome: Equatable {
+        case connected
+        case notConnected(String)
     }
 
     package struct RuntimeInitStatus: Equatable {
@@ -70,8 +156,11 @@ package final actor ClaudeNativeProcessSessionController {
 
         let sessionID: String?
         let tools: [String]
+        /// Reported statuses with the launch's authoritative RepoPrompt health overlaid: an
+        /// unhealthy launch reports RepoPrompt as `disconnected` whatever the runtime last said.
         let mcpServerStatuses: [String: String]
         let initializeResponse: InitializeResponseSnapshot?
+        var repoPromptMCPHealth: RepoPromptMCPHealth = .unknown
 
         var repoPromptServerStatus: String? {
             mcpServerStatuses.first {
@@ -92,7 +181,7 @@ package final actor ClaudeNativeProcessSessionController {
         case runtimeInit(RuntimeInitStatus)
         case approvalRequest(AgentApprovalRequest)
         case approvalCancelled(requestID: String)
-        case turnCompleted(turnID: UUID, status: TurnStatus)
+        case turnCompleted(turnID: UUID, status: TurnStatus, origin: TurnCompletionOrigin = .controllerSynthesized)
         case error(String)
         /// In-band position marker requested by the consumer (`emitEventMarker`); carries no
         /// provider output.
@@ -386,6 +475,9 @@ package final actor ClaudeNativeProcessSessionController {
         case inputWriteFailed(String)
         case controlRequestTimedOut(requestID: String, detail: String?)
         case liveModelSwitchRequiresRestart
+        /// The launch's RepoPrompt MCP connection was lost; it must be restarted (resuming its
+        /// conversation) before it can take another turn. Thrown before any write.
+        case repoPromptMCPRecoveryRequired(String)
 
         var errorDescription: String? {
             switch self {
@@ -405,6 +497,8 @@ package final actor ClaudeNativeProcessSessionController {
                 }
             case .liveModelSwitchRequiresRestart:
                 "Changing to the selected model requires restarting Claude because its launch environment changes."
+            case let .repoPromptMCPRecoveryRequired(reason):
+                "RepoPrompt MCP is disconnected from this Claude process (\(reason)); Claude must restart and resume this conversation before the next turn."
             }
         }
     }
@@ -412,6 +506,9 @@ package final actor ClaudeNativeProcessSessionController {
     private struct PendingPermissionRequest {
         let requestID: String
         let request: [String: Any]
+        /// R6: the runtime launch whose transport issued the request (`nil` while registration is
+        /// off). Its reply goes only to that transport, never to a replacement.
+        let issuingLaunch: AgentRuntimeLaunch?
     }
 
     private struct LaunchEnvironmentSignature: Equatable {
@@ -442,6 +539,41 @@ package final actor ClaudeNativeProcessSessionController {
     private var hasWrittenRawEventLogHeader = false
 
     private var process: SpawnedProcess?
+    /// Runtime ownership of `process` (spec R6); `nil` while Phase 3 registration is off.
+    private var runtimeLaunch: AgentRuntimeLaunch?
+    /// Whether the current transport was spawned under a runtime launch; every stdin write then
+    /// requires `runtimeLaunch` to be that committed launch (synchronous transport-owner check).
+    private var runtimeManagedTransport = false
+    private var runtimeCommittedLaunch: AgentRuntimeLaunch?
+    /// R6: the native conversation durably associated with the current launch. Authorize-only
+    /// writes (replies, interrupts, settings) are checked against it, never against an observed
+    /// but not yet associated session ID.
+    private var runtimeAssociatedConversationID: String?
+    /// R6: the owner scope of the latest owner write on the current launch: the operation whose
+    /// output reports a fresh session ID owns that conversation's association.
+    private var runtimeLastOwnerScope: AgentRuntimeSessionScope?
+    /// R6: owned exact-root reaps of registered launches (one per pid), joined by shutdown and
+    /// before a successor launch reserves. Never populated while registration is off.
+    private var pendingRootReaps: [pid_t: Task<Void, Never>] = [:]
+    /// R6 (managed transports): an automatic reply (auto-approval or unsupported-request error),
+    /// bound to the launch whose transport delivered its request.
+    private struct QueuedAutomaticReply {
+        let receivingLaunch: AgentRuntimeLaunch?
+        let requestID: String
+        let encoded: Data
+        let failureMessage: String
+    }
+
+    /// R6: automatic replies awaiting the authorize-only fence. They are written in order after the
+    /// inbound line that produced them, only to their receiving transport.
+    private var queuedAutomaticReplies: [QueuedAutomaticReply] = []
+    private let launchAuthority: AgentRuntimeLaunchAuthority
+    /// R6: this controller's one launch pair (native standard, or the compatible backend's actual
+    /// variant), derived once from its immutable config and used for every launch decision.
+    private nonisolated let launchFamily: AgentRuntimeFamily
+    private nonisolated let launchProvider: AgentRuntimeProvider
+    /// R6 subset activation: whether that pair registers its launches.
+    private nonisolated let registersLaunches: Bool
     private var registeredExpectedAgentPID: pid_t?
     private var stdoutFramer = LineFramer()
     private var stderrTail = Data()
@@ -480,6 +612,17 @@ package final actor ClaudeNativeProcessSessionController {
     private var pendingTurnIDBuffer: ContiguousArray<UUID> = []
     private var pendingTurnIDHead: Int = 0
     private var turnWasInterrupted = false
+    /// O49: snapshot of `startedTurnID`, readable without an actor hop (Stop and quit mark the
+    /// started turn synchronously, before the run detaches). Written only on this actor.
+    private nonisolated let startedTurnIDSnapshot = OSAllocatedUnfairLock<UUID?>(initialState: nil)
+
+    /// O49: the written turn that model output, reasoning, or a tool call was last attributed to,
+    /// while it is still queued here. Attribution is this controller's own FIFO: output belongs to
+    /// the first turn whose `result` has not arrived. Cleared when that turn is dequeued and
+    /// whenever the queue is cleared, so a queued turn the CLI has not begun is never reported.
+    package nonisolated var startedTurnID: UUID? {
+        startedTurnIDSnapshot.withLock { $0 }
+    }
 
     // MARK: - Authoritative lifecycle (session_state_changed)
 
@@ -488,10 +631,22 @@ package final actor ClaudeNativeProcessSessionController {
     /// timeout) rather than completing immediately on `result/message_stop`.
     private var observedSessionStateChangedEvents = false
 
-    /// FIFO queue of result-derived turn statuses waiting for an `idle` signal.
+    /// A result-derived completion waiting for `idle`, with the origin fixed when its result was
+    /// processed (Step 12).
+    private struct DeferredTurnCompletion {
+        let status: TurnStatus
+        let origin: TurnCompletionOrigin
+    }
+
+    /// Step 12: the outbound user-message UUID each still-queued turn was written with, when its
+    /// frame carried one (identity-eligible launches only). Compared with a result's own
+    /// `user_message_uuid(s)`; cleared with the FIFO entry.
+    private var outboundUserMessageUUIDByTurnID: [UUID: UUID] = [:]
+
+    /// FIFO queue of result-derived turn completions waiting for an `idle` signal.
     /// Turn IDs remain in `pendingTurnIDBuffer` until the deferred completion fires
     /// so that `turnInFlight` stays true during the result→idle window.
-    private var pendingAuthoritativeTurnStatuses: [TurnStatus] = []
+    private var pendingAuthoritativeTurnCompletions: [DeferredTurnCompletion] = []
 
     /// Fallback task that fires when `idle` does not arrive within the expected window.
     private var authoritativeIdleFallbackTask: Task<Void, Never>?
@@ -517,8 +672,68 @@ package final actor ClaudeNativeProcessSessionController {
     /// The last emitted runtime init status, used to deduplicate emissions.
     private var lastEmittedRuntimeInitStatus: RuntimeInitStatus?
 
+    // MARK: - RepoPrompt MCP health (launch-scoped)
+
+    private var repoPromptMCPHealth: RepoPromptMCPHealth = .unknown
+    /// `async` to match `NativeAgentRuntimeControlling` exactly, so the protocol default never
+    /// becomes the witness.
+    package var currentRepoPromptMCPHealth: RepoPromptMCPHealth {
+        get async { repoPromptMCPHealth }
+    }
+
+    /// The spawned process's PID bound to the current launch token (`currentLaunchAgentPID`) while
+    /// the launch is initialized, healthy and not shutting down. It may not be registered as the
+    /// run's expected agent yet. `async` to match `NativeAgentRuntimeControlling` exactly (see
+    /// `currentRepoPromptMCPHealth`).
+    package var repoPromptMCPLaunchAgentPID: pid_t? {
+        get async {
+            guard process != nil, isInitialized, !isShuttingDown,
+                  !repoPromptMCPHealth.isUnhealthy
+            else { return nil }
+            return currentLaunchAgentPID
+        }
+    }
+
+    /// The agent PID bound to the current launch token: the spawned process's PID installed
+    /// together with `repoPromptMCPLaunchToken` (`installSpawnLaunchTokens`), while that token is
+    /// still the current one and that process is still attached. Independent of the loss-observer
+    /// registration. `registeredExpectedAgentPID` is not reset at a spawn (only at shutdown or a
+    /// failed registration), so right after a respawn it still names the previous process until
+    /// the new registration; this never does. The manager still fails closed for this PID until
+    /// it is registered with a readable identity.
+    private var currentLaunchAgentPID: pid_t? {
+        guard let token = repoPromptMCPLaunchToken,
+              let launch = spawnedLaunchAgent,
+              launch.token == token,
+              process?.pid == launch.pid
+        else { return nil }
+        return launch.pid
+    }
+
+    /// The spawned process's PID, installed with its launch token in one synchronous step.
+    private var spawnedLaunchAgent: (token: UUID, pid: pid_t)?
+
+    /// Connection IDs whose loss this launch already applied (duplicate deliveries are ignored).
+    private var repoPromptMCPLostConnectionIDs: Set<UUID> = []
+    private var runConnectionLossObserverToken: UUID?
+    /// The launch identity the current loss observer is registered for.
+    private var runConnectionLossObserverLaunch: AgentMCPRunLaunchIdentity?
+    /// Unique per spawned process; set at spawn, cleared at shutdown. A loss is applied only when
+    /// it is addressed to this token and proves ownership by the registered launch identity.
+    private var repoPromptMCPLaunchToken: UUID?
+    #if DEBUG
+        /// Every loss decision (connection ID, `applied` or the ignore reason), in delivery order.
+        private var debugRepoPromptMCPLossDecisions: [(connectionID: UUID, decision: String)] = []
+    #endif
+
     #if DEBUG
         private var decodeSkippedWarningCount = 0
+        /// Test-only suspension at R6 fence checkpoints (`launchCaptured` before the first await,
+        /// `associated`, `authorized`), so fixtures can replace the transport inside a write's awaits.
+        private var testRuntimeFenceCheckpoint: (@Sendable (String) async -> Void)?
+        /// Test-only: records a protocol failure instead of shutting the (pipe-only) fixture
+        /// transport down, so no placeholder PID is ever signalled.
+        private var testProtocolFailureInterceptor: (@Sendable (String) -> Void)?
     #endif
 
     private var eventsContinuation: AsyncStream<Event>.Continuation?
@@ -535,6 +750,19 @@ package final actor ClaudeNativeProcessSessionController {
     /// bytes/EOF is keyed on this token, never on accounting state (`usageLaunchState`), so
     /// transcript and control delivery cannot depend on the usage feature (OracleB P1#4).
     private var activeStdoutLaunchToken: UUID?
+    /// The launch whose stdout reached EOF. Its RepoPrompt MCP loss events are ignored: the
+    /// launch is already ending, and `process` stays set through the EOF handler's awaited tail.
+    private var repoPromptMCPStdoutRetiredLaunchToken: UUID?
+    /// Step 4d3b (inactive): injected live-identity qualification; `false` by default and set by no
+    /// production caller.
+    private let liveTranscriptQualificationEnabled: Bool
+    /// Step 4d3b: the current stdout producer's monotonic qualification state. Created only where an
+    /// actual stdout launch token is installed (never by a consumer reset, turn, `system/init` or
+    /// router change) and read only while its token is still current; `nil` when disabled.
+    private var liveTranscriptQualification: ClaudeLiveTranscriptProducerState?
+    /// Step 4d3b: the launch whose buffered stdout tail `handleStdoutEOF` is draining (only during
+    /// that drain, after the stdout token was cleared).
+    private var liveTranscriptEOFDrainLaunchToken: UUID?
     /// Lives for the controller's lifetime: a reusable controller keeps one stream across
     /// shutdown/relaunch cycles, so `shutdown()` only reports `launchEnded`. The stream is
     /// finished explicitly in `deinit` cleanup (after a final `launchEnded` if a launch was still
@@ -661,8 +889,12 @@ package final actor ClaudeNativeProcessSessionController {
         let pid = registeredExpectedAgentPID
         let runID = runID
         let mcpHost = mcpHost
+        let lossObserverToken = runConnectionLossObserverToken
         Task {
             await mcpHost.clearExpectedAgentPID(pid, for: clientName, runID: runID)
+            if let lossObserverToken {
+                await mcpHost.unregisterRunConnectionLossObserver(for: runID, token: lossObserverToken)
+            }
         }
     }
 
@@ -700,8 +932,15 @@ package final actor ClaudeNativeProcessSessionController {
         commandSelection: CLICommandSelection? = nil,
         environmentResolver: any ClaudeCodeLaunchEnvironmentResolving = ClaudeCodeLaunchEnvironmentResolver(),
         managedSettingsURL: URL? = ClaudePromptCacheRetentionResolver.defaultManagedSettingsURL,
-        authoritativeTurnIdleFallbackSeconds: TimeInterval = 1.0
+        authoritativeTurnIdleFallbackSeconds: TimeInterval = 1.0,
+        launchAuthority: AgentRuntimeLaunchAuthority = .production,
+        liveTranscriptQualificationEnabled: Bool = false
     ) {
+        self.launchAuthority = launchAuthority
+        launchFamily = Self.runtimeFamily(config.runtimeVariant)
+        launchProvider = .claude(config.runtimeVariant)
+        registersLaunches = launchAuthority.isRegistrationActive(family: launchFamily, provider: launchProvider)
+        self.liveTranscriptQualificationEnabled = liveTranscriptQualificationEnabled
         self.runID = runID
         self.tabID = tabID
         self.windowID = windowID
@@ -763,6 +1002,12 @@ package final actor ClaudeNativeProcessSessionController {
     ) async throws -> SessionRef {
         let initializationGenerationAtEntry = initializationGeneration
         if process != nil, isInitialized {
+            // An unhealthy launch is never silently reused: the owner restarts it (resuming the
+            // conversation) at a turn boundary.
+            if case let .unhealthy(reason) = repoPromptMCPHealth {
+                writeRawEventLogRecord(kind: "session.startOrResume.mcpRecoveryRequired", payload: ["reason": reason])
+                throw ControllerError.repoPromptMCPRecoveryRequired(reason)
+            }
             return SessionRef(
                 sessionID: sessionID,
                 configuredContextWindow: configuredContextWindow,
@@ -881,22 +1126,73 @@ package final actor ClaudeNativeProcessSessionController {
         activeFlagSettingsBaseModel = nextBaseModel
     }
 
+    /// Whether the current launch may carry an outbound user-message `uuid`: an automatically
+    /// resolved command, or a configured exact path (owner decision 2026-10-29, e.g. a
+    /// pass-through wrapper the owner controls, such as the rotator shim), on the first-party
+    /// backend with no backend-routing environment keys. A wrapper that drops or rewrites the
+    /// frame's `uuid` leaves the native entry under another ID, so the claim never matches and
+    /// Reconcile refuses safely. Programmatic overrides and compatible backends never qualify.
+    /// Neither provenance proves an authenticated binary; capture stays gated OFF.
+    private var outboundUserMessageIdentityEligible: Bool {
+        guard let identity = usageLaunchState?.identity else { return false }
+        return [.automaticResolved, .configuredOverride].contains(identity.commandProvenance)
+            && identity.backend == .defaultClaude
+            && identity.environmentOverrideKeys.isEmpty
+    }
+
+    /// The permission configuration a launch or `set_permission_mode` request asks for.
+    private static func runtimePermission(mode: String?) -> AgentRuntimePermissionSnapshot {
+        let trimmed = mode?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return .claude(permissionMode: trimmed?.isEmpty == false ? trimmed : nil)
+    }
+
     @discardableResult
     package func sendUserMessage(_ text: String) async throws -> UUID {
         guard process != nil else {
             throw ControllerError.processNotRunning
+        }
+        if case let .unhealthy(reason) = repoPromptMCPHealth {
+            throw ControllerError.repoPromptMCPRecoveryRequired(reason)
         }
         guard isInitialized else {
             throw ControllerError.initializationFailed(
                 "Cannot send a user message before initialization completes."
             )
         }
-        let payload = try ClaudeSDKProtocolCodec.encodeUserMessage(text: text, sessionID: sessionID)
-        try sendLine(payload)
+        // R6 owner operation: the user turn associates with the scope its owner captured.
+        let writeOwner = try await fenceRuntimeWrite(association: .owner(AgentRuntimeOperationOwner.current))
+        // Omitted unless this write's own admission newly committed a baseline claiming it.
+        var outboundUserMessageUUID: UUID?
+        if writeOwner != nil {
+            // The fence suspended: a cancelled operation or a superseded owner writes nothing
+            // (reported as a proven non-write).
+            guard !Task.isCancelled else { throw ControllerError.processNotRunning }
+            if let admission = AgentRuntimeOperationOwner.writeAdmission {
+                // Decided from this transport's own launch before the await; a replacement launch
+                // during it gets zero bytes from `sendLine`'s owner check.
+                let identityEligible = outboundUserMessageIdentityEligible
+                guard case let .admitted(admittedUUID) = await admission(identityEligible) else {
+                    throw ControllerError.processNotRunning
+                }
+                // The admission check suspended too: cancellation during it also writes nothing.
+                guard !Task.isCancelled else { throw ControllerError.processNotRunning }
+                outboundUserMessageUUID = identityEligible ? admittedUUID : nil
+            }
+        }
+        guard isInitialized else {
+            throw ControllerError.processNotRunning
+        }
+        let payload = try ClaudeSDKProtocolCodec.encodeUserMessage(
+            text: text,
+            sessionID: sessionID,
+            messageUUID: outboundUserMessageUUID
+        )
+        try sendLine(payload, writeOwner: writeOwner)
         // The write succeeded: register the turn and its launch-local dispatch ordinal in this
         // same non-suspending actor step so no result can interleave between write and ordinal.
-        let turnID = beginTurnTracking()
+        let turnID = beginTurnTracking(outboundUserMessageUUID: outboundUserMessageUUID)
         registerUsageDispatch(turnID: turnID)
+        noteLiveTranscriptOutbound(uuid: outboundUserMessageUUID, text: text)
         return turnID
     }
 
@@ -941,7 +1237,12 @@ package final actor ClaudeNativeProcessSessionController {
         guard let pending = pendingPermissionRequests.removeValue(forKey: id) else {
             return
         }
+        let issuingLaunch = pending.issuingLaunch
         do {
+            // A reply to the CLI's own request creates no ownership: authorize only, and only on
+            // the transport that issued the request.
+            let writeOwner = try await fenceRuntimeWrite(association: nil)
+            guard writeOwner === issuingLaunch else { throw ControllerError.processNotRunning }
             let response = permissionResponsePayload(decision: decision, pendingRequest: pending.request)
             writeRawEventLogRecord(kind: "approval.response.sent", payload: [
                 "requestID": id,
@@ -952,8 +1253,17 @@ package final actor ClaudeNativeProcessSessionController {
                 requestID: id,
                 response: response
             )
-            try sendLine(encoded, shutdownOnFailure: false)
+            try sendLine(encoded, shutdownOnFailure: false, writeOwner: writeOwner)
         } catch {
+            // R6: the issuing transport was replaced (before or during the fence); the stale reply
+            // is dropped and never shuts down the replacement.
+            guard runtimeLaunch === issuingLaunch else {
+                writeRawEventLogRecord(kind: "approval.response.dropped", payload: [
+                    "requestID": id,
+                    "reason": "issuing transport replaced"
+                ] as [String: Any])
+                return
+            }
             await failProtocolAndShutdown(
                 message: "Failed to submit Claude approval decision: \(error.localizedDescription)"
             )
@@ -961,12 +1271,18 @@ package final actor ClaudeNativeProcessSessionController {
     }
 
     package func shutdown() async {
-        guard !isShuttingDown else { return }
+        guard !isShuttingDown else {
+            // A concurrent caller still waits for the owned reaps (and their post-reap discovery)
+            // so it never returns while this launch's ownership is unresolved.
+            await joinPendingRootReaps()
+            return
+        }
         isShuttingDown = true
         writeRawEventLogRecord(kind: "session.shutdown")
 
         failPendingControlRequests(with: ControllerError.processNotRunning)
         pendingPermissionRequests.removeAll()
+        queuedAutomaticReplies.removeAll()
         // Flush observed deferred completions before clearing the queue. The flush inside
         // cancelAuthoritativeLifecycleState() is gated on `hasPendingTurnIDs`, so clearing
         // first made it dead code and silently dropped turns whose result had already been
@@ -982,15 +1298,33 @@ package final actor ClaudeNativeProcessSessionController {
 
         closeOutputChannelsAndInput()
 
+        let launch = runtimeLaunch
+        runtimeLaunch = nil
         if let process {
             let pid = process.pid
-            _ = await ProcessTermination.terminateAndReap(
-                pid: pid,
-                processGroupID: process.processGroupID,
-                logger: config.enableDebugLogging ? { print("[ClaudeNativeSession] \($0)") } : { _ in }
-            )
+            if let launch {
+                // R6: one owned reap per exact root, visible to concurrent shutdown callers.
+                await ownedRootReap(
+                    launch: launch,
+                    pid: pid,
+                    processGroupID: process.processGroupID,
+                    waitBeforeTerminating: nil
+                ).value
+            } else {
+                _ = await ProcessTermination.terminateAndReap(
+                    pid: pid,
+                    processGroupID: process.processGroupID,
+                    logger: config.enableDebugLogging ? { print("[ClaudeNativeSession] \($0)") } : { _ in }
+                )
+            }
         }
+        // Includes an EOF-path reap of an earlier root of this controller.
+        await joinPendingRootReaps()
         await clearExpectedAgentPIDIfNeeded()
+        await unregisterRunConnectionLossObserverIfNeeded()
+        resetRepoPromptMCPHealthForLaunch()
+        repoPromptMCPLaunchToken = nil
+        spawnedLaunchAgent = nil
         process = nil
         configuredContextWindow = nil
         promptCacheRetention = .standard
@@ -1144,11 +1478,39 @@ package final actor ClaudeNativeProcessSessionController {
         storeFlagSettingsRequest(resolvedFlags.request)
         activeFlagSettingsBaseModel = Self.flagSettingsBaseModel(from: resolvedFlags.request)
         activeLaunchEnvironmentSignature = LaunchEnvironmentSignature(launchEnvironment)
+        let requestedSessionID = existingSessionID?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resumeSessionID = (requestedSessionID?.isEmpty == false) ? requestedSessionID : nil
+        let family = launchFamily
+        // Fresh `--session-id` is its own qualified gate and never combined with `--resume`.
+        let provider = launchProvider
+        let freshSessionID = resumeSessionID == nil && launchAuthority.allowsFreshSessionID(family, provider: provider)
+            ? UUID().uuidString.lowercased()
+            : nil
+        let launch: AgentRuntimeLaunch? = if registersLaunches {
+            launchAuthority.makeLaunch(AgentRuntimeLaunchContext(
+                family: family,
+                provider: provider,
+                // R6: the starting operation's owner-captured scope (fails closed when none).
+                session: AgentRuntimeOperationOwner.current,
+                worktreePath: workspacePath,
+                conversationID: resumeSessionID ?? freshSessionID,
+                permission: Self.runtimePermission(mode: config.permissionMode)
+            ))
+        } else {
+            nil
+        }
         let arguments = buildArguments(
             existingSessionID: existingSessionID,
-            model: nil
+            model: nil,
+            freshSessionID: freshSessionID
         )
 
+        // R6: the previous registered root's owned reap and post-reap discovery finish before this
+        // launch reserves, so a successor never races the app's own just-ended launch.
+        if launch != nil {
+            await joinPendingRootReaps()
+            guard process == nil else { return }
+        }
         let workingDirectory = resolvedWorkingDirectory()
         configuredContextWindow = ClaudeEffectiveContextWindowResolver.resolveConfiguredContextWindow(
             launchEnvironment: environment,
@@ -1159,12 +1521,22 @@ package final actor ClaudeNativeProcessSessionController {
             workingDirectory: workingDirectory
         )
         let launchToken = UUID()
-        let spawned = try ProcessLauncher.spawn(
-            command: resolvedCommand,
-            arguments: arguments,
-            environment: environment,
-            workingDirectory: workingDirectory
-        )
+        // R6: reservation immediately before the spawn; a refusal spawns nothing and never falls
+        // back to an unregistered launch.
+        guard case let .proceed(runtimeID) = try await reserveSpawn(launch: launch) else { return }
+        let spawned: SpawnedProcess
+        do {
+            spawned = try ProcessLauncher.spawn(
+                command: resolvedCommand,
+                arguments: arguments,
+                environment: environment,
+                workingDirectory: workingDirectory,
+                runtimeID: runtimeID
+            )
+        } catch {
+            await launch?.spawnFailed()
+            throw error
+        }
         if let lastSpawnedCommand, lastSpawnedCommand != resolvedCommand {
             Self.processLogger.notice(
                 "Claude executable changed between controller spawns from \(lastSpawnedCommand, privacy: .private) to \(resolvedCommand, privacy: .private)"
@@ -1193,21 +1565,56 @@ package final actor ClaudeNativeProcessSessionController {
         latestRuntimeInitTools = []
         latestRuntimeInitMcpServerStatuses = [:]
         lastEmittedRuntimeInitStatus = nil
+        resetRepoPromptMCPHealthForLaunch()
+        installSpawnLaunchTokens(launchToken, agentPID: spawned.pid)
         process = spawned
-        activeStdoutLaunchToken = launchToken
+        runtimeLaunch = launch
+        runtimeManagedTransport = launch != nil
+        runtimeCommittedLaunch = nil
+        // The reservation associated the requested conversation (resume or fresh preallocation).
+        runtimeAssociatedConversationID = launch == nil ? nil : (resumeSessionID ?? freshSessionID)
+        runtimeLastOwnerScope = launch?.context.session
+        installLiveTranscriptQualification(launchToken: launchToken)
         do {
             try startStdoutReader(handle: spawned.stdout, launchToken: launchToken)
             try startStderrReader(handle: spawned.stderr)
+            // R6: the birth identity is committed before initialization or any stdin write.
+            try await launch?.commitSpawn(pid: spawned.pid, processGroupID: spawned.processGroupID)
+            guard process?.pid == spawned.pid, runtimeLaunch === launch else {
+                throw ControllerError.processNotRunning
+            }
+            runtimeCommittedLaunch = launch
         } catch {
             spawned.stdout.readabilityHandler = nil
             spawned.stderr.readabilityHandler = nil
             spawned.stdin?.closeFile()
-            process = nil
-            _ = await ProcessTermination.terminateAndReap(
-                pid: spawned.pid,
-                processGroupID: spawned.processGroupID,
-                logger: config.enableDebugLogging ? { print("[ClaudeNativeSession] \($0)") } : { _ in }
-            )
+            if process?.pid == spawned.pid {
+                process = nil
+                activeStdoutLaunchToken = nil
+            }
+            if runtimeLaunch === launch {
+                runtimeLaunch = nil
+            }
+            if let launch {
+                // R6: never a second reap of the same child. If the EOF path already owns this
+                // root's reap, join it; otherwise this path is the single owned reap.
+                let reap = pendingRootReaps[spawned.pid] ?? ownedRootReap(
+                    launch: launch,
+                    pid: spawned.pid,
+                    processGroupID: spawned.processGroupID,
+                    waitBeforeTerminating: nil
+                )
+                await reap.value
+            } else {
+                _ = await ProcessTermination.terminateAndReap(
+                    pid: spawned.pid,
+                    processGroupID: spawned.processGroupID,
+                    logger: config.enableDebugLogging ? { print("[ClaudeNativeSession] \($0)") } : { _ in }
+                )
+            }
+            if error is AgentProcessRegistryError {
+                throw error
+            }
             throw ControllerError.initializationFailed("Failed to start Claude process readers: \(error.localizedDescription)")
         }
         let resumedSessionID = existingSessionID?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1231,6 +1638,7 @@ package final actor ClaudeNativeProcessSessionController {
             configuredEnvironmentOverrideKeys: environmentEvidence.configuredEnvironmentOverrideKeys,
             spawnedAt: Date()
         ))
+        resolveLiveTranscriptEligibility(launchToken: launchToken)
         await registerExpectedAgentPIDIfNeeded(spawned.pid)
     }
 
@@ -1239,11 +1647,13 @@ package final actor ClaudeNativeProcessSessionController {
 
         let request = Self.buildInitializeRequest(systemPromptOverride: systemPromptOverride)
 
+        let initializingLaunch = runtimeLaunch
         let initializeResult = try await sendControlRequest(request: request)
         if let returnedSessionID = (initializeResult["session_id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
            !returnedSessionID.isEmpty
         {
             recordObservedSessionID(returnedSessionID)
+            await associateObservedConversationIfNeeded(originLaunch: initializingLaunch)
         }
 
         let snapshot = Self.parseInitializeResponseSnapshot(from: initializeResult)
@@ -1437,12 +1847,80 @@ package final actor ClaudeNativeProcessSessionController {
         ]
     }
 
+    /// How a fenced write relates to ownership: an owner operation associates the scope its owner
+    /// captured (and any permission it requests); `nil` (callbacks, replies, interrupts, live
+    /// settings) only authorizes on the already-associated conversation.
+    private enum RuntimeWriteAssociation {
+        case owner(AgentRuntimeSessionScope, permission: AgentRuntimePermissionSnapshot? = nil)
+    }
+
+    /// R6 fence before an awaited outgoing write. The committed launch is captured before the first
+    /// suspension; an owner write associates its owner-captured session and run attempt, the known
+    /// conversation and any requested permission change (two-writer check; persisted before the
+    /// request that changes the permission); every write then authorizes, and the captured launch
+    /// is rechecked after each suspension. Returns that launch: the final synchronous `sendLine`
+    /// writes only while it still owns the transport, so a replacement made during any await
+    /// receives zero bytes. A missing owner scope fails an owner write. No-op (nil) while
+    /// registration is off.
+    private func fenceRuntimeWrite(association: RuntimeWriteAssociation?) async throws -> AgentRuntimeLaunch? {
+        guard runtimeManagedTransport else { return nil }
+        guard let launch = runtimeLaunch, runtimeCommittedLaunch === launch else {
+            throw ControllerError.processNotRunning
+        }
+        let conversationID = sessionID
+        #if DEBUG
+            if let checkpoint = testRuntimeFenceCheckpoint { await checkpoint("launchCaptured") }
+        #endif
+        // Authorize-only writes are checked against the durably associated conversation; an owner
+        // write associates the known one first and is then checked against it.
+        var authorizedConversationID = runtimeAssociatedConversationID
+        if case let .owner(session, permission) = association {
+            try await launch.associate(session: session, conversationID: conversationID, permission: permission)
+            #if DEBUG
+                if let checkpoint = testRuntimeFenceCheckpoint { await checkpoint("associated") }
+            #endif
+            guard process != nil, runtimeLaunch === launch, runtimeCommittedLaunch === launch else {
+                throw ControllerError.processNotRunning
+            }
+            runtimeLastOwnerScope = session
+            if let conversationID {
+                runtimeAssociatedConversationID = conversationID
+            }
+            authorizedConversationID = conversationID
+        }
+        try await launch.authorizeWrite(conversationID: authorizedConversationID)
+        #if DEBUG
+            if let checkpoint = testRuntimeFenceCheckpoint { await checkpoint("authorized") }
+        #endif
+        guard process != nil, runtimeLaunch === launch, runtimeCommittedLaunch === launch else {
+            throw ControllerError.processNotRunning
+        }
+        return launch
+    }
+
     private func sendControlRequest(
         request: [String: Any],
         timeoutSeconds: TimeInterval? = nil
     ) async throws -> [String: Any] {
         guard process != nil else {
             throw ControllerError.processNotRunning
+        }
+        // R6: a permission change is an owner write (persisted before the request, for the scope
+        // its owner captured); other control requests (initialize, flag settings, interrupt)
+        // create no ownership and only authorize.
+        let association: RuntimeWriteAssociation? = if request["subtype"] as? String == "set_permission_mode" {
+            .owner(
+                AgentRuntimeOperationOwner.current,
+                permission: Self.runtimePermission(mode: request["mode"] as? String)
+            )
+        } else {
+            nil
+        }
+        let writeOwner = try await fenceRuntimeWrite(association: association)
+        if writeOwner != nil, request["subtype"] as? String != "interrupt" {
+            // The fence suspended: a cancelled operation writes nothing. An interrupt is exempt:
+            // it is how cancel and stop paths (often already cancelled) end the turn.
+            try Task.checkCancellation()
         }
         let requestID = makeControlRequestID()
         let payload = try ClaudeSDKProtocolCodec.encodeControlRequest(requestID: requestID, request: request)
@@ -1471,7 +1949,7 @@ package final actor ClaudeNativeProcessSessionController {
                 }
             }
             do {
-                try sendLine(payload)
+                try sendLine(payload, writeOwner: writeOwner)
             } catch {
                 // Writing failed — clean up the continuation and timeout, then resume with error.
                 pendingControlRequests.removeValue(forKey: requestID)
@@ -1499,9 +1977,26 @@ package final actor ClaudeNativeProcessSessionController {
         try sendLine(payload)
     }
 
-    private func sendLine(_ lineData: Data, shutdownOnFailure: Bool = true) throws {
+    /// `writeOwner`: the launch a preceding fence captured and authorized; the write goes only to
+    /// the transport that launch still owns.
+    private func sendLine(
+        _ lineData: Data,
+        shutdownOnFailure: Bool = true,
+        writeOwner: AgentRuntimeLaunch? = nil
+    ) throws {
         guard let process else {
             throw ControllerError.processNotRunning
+        }
+        // R6 final synchronous check: a managed transport writes only while its committed launch
+        // still owns it (never before the birth commit, never after the launch was released), and
+        // a fenced write only while the launch its fence captured is that owner.
+        if runtimeManagedTransport || writeOwner != nil {
+            guard let launch = runtimeLaunch, runtimeCommittedLaunch === launch else {
+                throw ControllerError.processNotRunning
+            }
+            if let writeOwner, writeOwner !== launch {
+                throw ControllerError.processNotRunning
+            }
         }
         writeRawEventLogRecord(kind: "protocol.outbound.raw", payload: lineRecordPayload(from: lineData))
         do {
@@ -1613,9 +2108,188 @@ package final actor ClaudeNativeProcessSessionController {
         }) { line in
             lines.append(line)
         }
+        // R6: the chunk belongs to the transport (stdout reader and launch) that delivered it. Every
+        // line is handled only while that transport is still current, so output buffered from a
+        // transport replaced during an earlier line's awaits never reaches its replacement.
+        let originLaunch = runtimeLaunch
         for line in lines {
+            guard isCurrentStdoutLaunch(launchToken), runtimeLaunch === originLaunch else {
+                writeRawEventLogRecord(kind: "protocol.inbound.replacedTransportDiscarded", payload: [
+                    "launchToken": launchToken.uuidString
+                ] as [String: Any])
+                return
+            }
             await handleLine(line)
+            // R6: a newly observed conversation is durably associated before the next line (a
+            // permission request, for example) can depend on it.
+            await associateObservedConversationIfNeeded(originLaunch: originLaunch)
+            await flushQueuedAutomaticReplies()
         }
+    }
+
+    /// R6: writes queued automatic replies in order, each only to the transport that delivered its
+    /// request, after the authorize-only registry fence (on the associated conversation) and the
+    /// final synchronous transport check. A reply whose transport was replaced is dropped; a
+    /// refused reply on the still-current transport shuts it down, as a failed reply always has.
+    private func flushQueuedAutomaticReplies() async {
+        while !queuedAutomaticReplies.isEmpty {
+            let reply = queuedAutomaticReplies.removeFirst()
+            do {
+                guard let receivingLaunch = reply.receivingLaunch, runtimeLaunch === receivingLaunch else {
+                    throw ControllerError.processNotRunning
+                }
+                let writeOwner = try await fenceRuntimeWrite(association: nil)
+                guard writeOwner === receivingLaunch else { throw ControllerError.processNotRunning }
+                try sendLine(reply.encoded, shutdownOnFailure: false, writeOwner: receivingLaunch)
+            } catch {
+                guard let receivingLaunch = reply.receivingLaunch, runtimeLaunch === receivingLaunch, !isShuttingDown else {
+                    writeRawEventLogRecord(kind: "control.autoReply.dropped", payload: [
+                        "requestID": reply.requestID,
+                        "reason": "receiving transport replaced"
+                    ] as [String: Any])
+                    continue
+                }
+                queuedAutomaticReplies.removeAll()
+                await failProtocolAndShutdown(message: "\(reply.failureMessage): \(error.localizedDescription)")
+                return
+            }
+        }
+    }
+
+    /// An automatic reply to a runtime-initiated request. Unmanaged transports write it at once
+    /// (unchanged); a managed transport queues it for `flushQueuedAutomaticReplies`.
+    private func sendAutomaticReply(
+        _ encoded: Data,
+        requestID: String,
+        receivingLaunch: AgentRuntimeLaunch?,
+        failureMessage: String
+    ) {
+        guard runtimeManagedTransport else {
+            do {
+                try sendLine(encoded, shutdownOnFailure: false, writeOwner: receivingLaunch)
+            } catch {
+                failProtocolAndShutdownSoon(message: "\(failureMessage): \(error.localizedDescription)")
+            }
+            return
+        }
+        queuedAutomaticReplies.append(QueuedAutomaticReply(
+            receivingLaunch: receivingLaunch,
+            requestID: requestID,
+            encoded: encoded,
+            failureMessage: failureMessage
+        ))
+    }
+
+    /// R6 (managed transports only): durably associates a newly observed native conversation with
+    /// the launch whose transport reported it, for the owner whose operation produced it (the
+    /// latest owner write, else the launch's own scope). A failure shuts the transport down rather
+    /// than letting replies or interrupts target an unowned conversation.
+    private func associateObservedConversationIfNeeded(originLaunch: AgentRuntimeLaunch?) async {
+        guard runtimeManagedTransport, !isShuttingDown, let launch = originLaunch, runtimeLaunch === launch,
+              runtimeCommittedLaunch === launch,
+              let observed = sessionID, observed != runtimeAssociatedConversationID
+        else { return }
+        let scope = runtimeLastOwnerScope ?? launch.context.session
+        do {
+            #if DEBUG
+                if let checkpoint = testRuntimeFenceCheckpoint { await checkpoint("observedAssociating") }
+            #endif
+            try await launch.associate(session: scope, conversationID: observed)
+            guard runtimeLaunch === launch else { return }
+            runtimeAssociatedConversationID = observed
+        } catch {
+            guard runtimeLaunch === launch, !isShuttingDown else { return }
+            await failProtocolAndShutdown(
+                message: "Claude conversation could not be associated with its runtime: \(error.localizedDescription)"
+            )
+        }
+    }
+
+    /// R6: the single owned reap of a registered launch's exact root, registered for joining.
+    /// `waitBeforeTerminating` lets an exited root (stdout EOF) exit on its own for a bounded time
+    /// before escalation; `nil` terminates now. Always bounded; reports the reap (confirmed only when
+    /// this wait reaped the root) and its post-reap discovery before completing.
+    private func ownedRootReap(
+        launch: AgentRuntimeLaunch,
+        pid: pid_t,
+        processGroupID: pid_t?,
+        waitBeforeTerminating: TimeInterval?
+    ) -> Task<Void, Never> {
+        if let existing = pendingRootReaps[pid] { return existing }
+        let debugLogging = config.enableDebugLogging
+        let reap = Task { [weak self] in
+            let logger: (String) -> Void = { message in
+                if debugLogging { print("[ClaudeNativeSession] \(message)") }
+            }
+            var confirmed = false
+            if let waitBeforeTerminating {
+                do {
+                    let result = try await ProcessTermination.waitForTerminationReportingRoot(
+                        pid: pid,
+                        processGroupID: processGroupID,
+                        timeout: waitBeforeTerminating,
+                        logger: logger
+                    )
+                    confirmed = result.rootReaped
+                } catch {
+                    confirmed = false
+                }
+            } else {
+                let result = await ProcessTermination.terminateAndReapReportingRoot(
+                    pid: pid,
+                    processGroupID: processGroupID,
+                    logger: logger
+                )
+                confirmed = result.rootReaped
+            }
+            await launch.rootReaped(pid: pid, confirmed: confirmed)
+            await self?.finishOwnedRootReap(pid: pid)
+        }
+        pendingRootReaps[pid] = reap
+        return reap
+    }
+
+    private func finishOwnedRootReap(pid: pid_t) {
+        pendingRootReaps[pid] = nil
+    }
+
+    private func joinPendingRootReaps() async {
+        while let entry = pendingRootReaps.first {
+            await entry.value.value
+            pendingRootReaps[entry.key] = nil
+        }
+    }
+
+    private enum SpawnReservation {
+        case proceed(runtimeID: UUID?)
+        case alreadyRunning
+    }
+
+    /// R6: reserves `launch` (when registered) immediately before the spawn. A start that lost the
+    /// slot, or whose task was cancelled by the time the reservation returned, releases it
+    /// (`spawnFailed`) and spawns nothing.
+    private func reserveSpawn(launch: AgentRuntimeLaunch?) async throws -> SpawnReservation {
+        let runtimeID = try await launch?.prepareSpawn()
+        guard process == nil else {
+            // Another start installed a process while the reservation was awaited.
+            await launch?.spawnFailed()
+            return .alreadyRunning
+        }
+        if let launch, Task.isCancelled {
+            await launch.spawnFailed()
+            throw CancellationError()
+        }
+        return .proceed(runtimeID: runtimeID)
+    }
+
+    /// R6: registered launches join the tab's retained runtime retirements before a start.
+    package nonisolated var joinsRetirementBeforeSuccessor: Bool {
+        registersLaunches
+    }
+
+    /// The launch family of a Claude runtime variant: native for standard, compatible otherwise.
+    private static func runtimeFamily(_ variant: ClaudeCodeRuntimeVariant) -> AgentRuntimeFamily {
+        variant == .standard ? .claudeNative : .claudeCompatible
     }
 
     private func handleLine(_ lineData: Data) async {
@@ -1624,6 +2298,8 @@ package final actor ClaudeNativeProcessSessionController {
             guard let inbound = try ClaudeSDKProtocolCodec.decodeLine(lineData) else { return }
             routeInboundMessage(inbound)
         } catch let codecError as ClaudeSDKProtocolCodec.CodecError {
+            // Step 4d3b: an undecodable line (whatever recovery follows) ends live qualification.
+            disqualifyLiveTranscript(.malformedLine)
             if case .invalidJSON = codecError {
                 if recoverConcatenatedInboundMessagesIfNeeded(from: lineData)
                     || recoverEmbeddedInboundTailIfNeeded(from: lineData)
@@ -1654,6 +2330,8 @@ package final actor ClaudeNativeProcessSessionController {
             if config.enableDebugLogging {
                 print("[ClaudeNativeSession] failed decoding line: \(preview) | error=\(error)")
             }
+            // Step 4d3b: refused (and its owner told) before the shutdown suspends.
+            disqualifyLiveTranscript(.malformedLine)
             await failProtocolAndShutdown(message: "Claude protocol decode failure: \(preview)")
         }
     }
@@ -1958,6 +2636,9 @@ package final actor ClaudeNativeProcessSessionController {
         if let (tools, mcpStatuses) = Self.parseSystemInitFields(from: payload) {
             latestRuntimeInitTools = tools
             latestRuntimeInitMcpServerStatuses = mcpStatuses
+            if Self.repoPromptStatus(in: mcpStatuses)?.lowercased() == "connected" {
+                noteRepoPromptMCPConnectedEvidence(source: "system_init")
+            }
             writeRawEventLogRecord(kind: "runtime.init.stream", payload: [
                 "sessionID": sessionID ?? "",
                 "tools": tools,
@@ -1983,9 +2664,13 @@ package final actor ClaudeNativeProcessSessionController {
         }
 
         guard let data = try? JSONSerialization.data(withJSONObject: payload, options: []) else {
+            disqualifyLiveTranscript(.malformedPayload)
             return
         }
-        let streamResults = translator.parseNDJSONLine(data)
+        var streamResults = translator.parseNDJSONLine(data)
+        // Step 4d3b: the raw payload (the exact bytes the translator read) is classified before any
+        // translated result is filtered or suppressed below.
+        let liveTranscriptCarrier = classifyLiveTranscriptPayload(envelope: data, streamResults: &streamResults)
         #if DEBUG
             if ClaudeReasoningExtractionFeature.isEnabled {
                 let debugPayloadType = (payload["type"] as? String) ?? "<missing>"
@@ -2019,8 +2704,17 @@ package final actor ClaudeNativeProcessSessionController {
         // arrive per turn.
         let payloadType = (payload["type"] as? String) ?? ""
         let isResultPayload = payloadType == "result"
+        // O49: only the model's own live output starts a turn. A `result` payload closes a turn,
+        // so text it carries is never credited (it may be processed after the finishing turn left
+        // the FIFO head, which would credit the queued turn behind it).
+        let creditsStartedTurn = payloadType == "assistant" || payloadType == "stream_event"
         if payloadType == "assistant" {
             emitMainRequestUsageIfOwned(payload: payload, streamResults: streamResults)
+        }
+        if let liveTranscriptCarrier {
+            // Metadata only: no text, no usage, never a turn boundary; it reaches the owner before
+            // this payload's own results, even when they are empty or suppressed.
+            emit(.stream(liveTranscriptCarrier))
         }
 
         for result in streamResults {
@@ -2060,6 +2754,9 @@ package final actor ClaudeNativeProcessSessionController {
                 continue
             }
             writeRawEventLogRecord(kind: "translator.streamResult", payload: logPayload)
+            if creditsStartedTurn, AgentProviderHandoff.streamResultProvesProviderAcceptance(result) {
+                noteOutputAttributedToProducingTurn()
+            }
             emit(.stream(result))
             if isResultPayload, result.type == "message_stop" {
                 // Accounting ownership is decided against launch-local dispatch ordinals, not the
@@ -2080,17 +2777,32 @@ package final actor ClaudeNativeProcessSessionController {
                     continue
                 }
                 let status = determineTurnStatus(from: payload, stopReasonHint: result.stopReason)
+                // Step 12: fixed now, against the FIFO as this result finds it (a later write must
+                // not make an earlier result look exclusive, nor the reverse). The credited turn is
+                // the first queued one whose result has not arrived.
+                // (Surplus results can outnumber queued turns in deferred mode: no credited turn.)
+                let creditedIndex = pendingTurnIDHead + pendingAuthoritativeTurnCompletions.count
+                let creditedTurnID = creditedIndex < pendingTurnIDBuffer.count ? pendingTurnIDBuffer[creditedIndex] : nil
+                let origin = TurnCompletionOrigin.providerResult(.init(
+                    soleOutstandingTurn: pendingTurnIDBuffer.count - pendingTurnIDHead == 1
+                        && pendingAuthoritativeTurnCompletions.isEmpty,
+                    reportsInterruption: Self.resultPayloadReportsInterruption(payload),
+                    messageIdentity: Self.resultMessageIdentity(
+                        payload,
+                        outbound: creditedTurnID.flatMap { outboundUserMessageUUIDByTurnID[$0] }
+                    )
+                ))
                 if observedSessionStateChangedEvents {
                     // Defer completion until `idle` arrives or fallback timer fires.
                     // Do NOT dequeue the turn ID yet — keep turnInFlight == true so
                     // callers (e.g. coordinator steering) don't send a new user message
                     // before the authoritative idle boundary.
-                    pendingAuthoritativeTurnStatuses.append(status)
+                    pendingAuthoritativeTurnCompletions.append(DeferredTurnCompletion(status: status, origin: origin))
                     scheduleAuthoritativeIdleFallbackIfNeeded()
                 } else {
                     // Legacy mode: complete immediately on result/message_stop.
                     let completedTurnID = dequeueTurnID()
-                    emitTurnCompleted(turnID: completedTurnID, status: status)
+                    emitTurnCompleted(turnID: completedTurnID, status: status, origin: origin)
                 }
             }
         }
@@ -2100,8 +2812,8 @@ package final actor ClaudeNativeProcessSessionController {
     /// the fallback timer as needed. Dequeues the turn ID from `pendingTurnIDBuffer` at
     /// this point so `turnInFlight` transitions to false.
     private func completeNextDeferredTurnIfPending() {
-        guard !pendingAuthoritativeTurnStatuses.isEmpty else { return }
-        let status = pendingAuthoritativeTurnStatuses.removeFirst()
+        guard !pendingAuthoritativeTurnCompletions.isEmpty else { return }
+        let completion = pendingAuthoritativeTurnCompletions.removeFirst()
         authoritativeIdleFallbackTask?.cancel()
         authoritativeIdleFallbackTask = nil
         guard hasPendingTurnIDs else {
@@ -2109,7 +2821,8 @@ package final actor ClaudeNativeProcessSessionController {
             return
         }
         let turnID = dequeueTurnID()
-        emitTurnCompleted(turnID: turnID, status: status)
+        // The CLI's own `idle` boundary: the result's origin stands.
+        emitTurnCompleted(turnID: turnID, status: completion.status, origin: completion.origin)
         // If more deferred completions remain, schedule a new fallback.
         scheduleAuthoritativeIdleFallbackIfNeeded()
     }
@@ -2119,7 +2832,7 @@ package final actor ClaudeNativeProcessSessionController {
     /// the turn completes anyway. Each task carries a generation token so stale
     /// tasks that wake after cancellation are safely ignored.
     private func scheduleAuthoritativeIdleFallbackIfNeeded() {
-        guard !pendingAuthoritativeTurnStatuses.isEmpty else {
+        guard !pendingAuthoritativeTurnCompletions.isEmpty else {
             authoritativeIdleFallbackTask?.cancel()
             authoritativeIdleFallbackTask = nil
             return
@@ -2140,8 +2853,8 @@ package final actor ClaudeNativeProcessSessionController {
         // Ignore stale firings from superseded tasks.
         guard generation == authoritativeIdleFallbackGeneration else { return }
         authoritativeIdleFallbackTask = nil
-        guard !pendingAuthoritativeTurnStatuses.isEmpty else { return }
-        let status = pendingAuthoritativeTurnStatuses.removeFirst()
+        guard !pendingAuthoritativeTurnCompletions.isEmpty else { return }
+        let status = pendingAuthoritativeTurnCompletions.removeFirst().status
         guard hasPendingTurnIDs else {
             noteMissingPendingTurnID(context: "idle fallback")
             return
@@ -2151,7 +2864,8 @@ package final actor ClaudeNativeProcessSessionController {
             "turnID": turnID.uuidString,
             "status": String(describing: status)
         ] as [String: Any])
-        emitTurnCompleted(turnID: turnID, status: status)
+        // Step 12: timed by the controller's fallback, not by the CLI.
+        emitTurnCompleted(turnID: turnID, status: status, origin: .controllerSynthesized)
         scheduleAuthoritativeIdleFallbackIfNeeded()
     }
 
@@ -2163,12 +2877,13 @@ package final actor ClaudeNativeProcessSessionController {
         authoritativeIdleFallbackTask = nil
         // Emit deferred completions with their original status — the result/message_stop
         // already established the correct turn outcome; only idle was missing.
-        for status in pendingAuthoritativeTurnStatuses {
+        for completion in pendingAuthoritativeTurnCompletions {
             guard hasPendingTurnIDs else { break }
             let turnID = dequeueTurnID()
-            emitTurnCompleted(turnID: turnID, status: status)
+            // Step 12: a shutdown/EOF flush, timed by the controller.
+            emitTurnCompleted(turnID: turnID, status: completion.status, origin: .controllerSynthesized)
         }
-        pendingAuthoritativeTurnStatuses.removeAll()
+        pendingAuthoritativeTurnCompletions.removeAll()
     }
 
     /// Records a turn-completion signal that arrived with no pending turn ID.
@@ -2193,7 +2908,7 @@ package final actor ClaudeNativeProcessSessionController {
             "context": context,
             "isShuttingDown": isShuttingDown,
             "turnWasInterrupted": turnWasInterrupted,
-            "pendingAuthoritativeStatusCount": pendingAuthoritativeTurnStatuses.count
+            "pendingAuthoritativeStatusCount": pendingAuthoritativeTurnCompletions.count
         ] as [String: Any])
         if config.enableDebugLogging {
             print("[ClaudeNativeSession] \(context) with no pending turn IDs — recovered (shutting_down=\(isShuttingDown))")
@@ -2248,6 +2963,316 @@ package final actor ClaudeNativeProcessSessionController {
         return (tools: tools, mcpStatuses: mcpStatuses)
     }
 
+    // MARK: - RepoPrompt MCP health helpers
+
+    static let repoPromptMCPDisconnectedStatus = "disconnected"
+
+    /// The reported statuses as published: an unhealthy launch reports RepoPrompt `disconnected`
+    /// (never `connected`, and never `failed`, which ends the run as a startup failure).
+    static func overlayingRepoPromptMCPHealth(
+        _ health: RepoPromptMCPHealth,
+        on statuses: [String: String]
+    ) -> [String: String] {
+        guard health.isUnhealthy else { return statuses }
+        var overlaid = statuses
+        let key = statuses.keys.first {
+            $0.compare(MCPIntegrationHelper.repoPromptMCPServerName, options: .caseInsensitive) == .orderedSame
+        } ?? MCPIntegrationHelper.repoPromptMCPServerName
+        overlaid[key] = repoPromptMCPDisconnectedStatus
+        return overlaid
+    }
+
+    static func repoPromptStatus(in statuses: [String: String]) -> String? {
+        statuses.first {
+            $0.key.compare(MCPIntegrationHelper.repoPromptMCPServerName, options: .caseInsensitive) == .orderedSame
+        }?.value.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// The RepoPrompt entry of an `mcp_status` control response (`{"mcpServers": [{name, status}]}`).
+    static func repoPromptStatus(inMCPStatusResponse response: [String: Any]) -> String? {
+        guard let servers = response["mcpServers"] as? [[String: Any]] else { return nil }
+        var statuses: [String: String] = [:]
+        for server in servers {
+            guard let name = server["name"] as? String else { continue }
+            statuses[name] = (server["status"] as? String) ?? ""
+        }
+        return repoPromptStatus(in: statuses)
+    }
+
+    static func repoPromptMCPDisconnectedMessage(toolName: String) -> String {
+        "RepoPrompt MCP disconnected from Claude: tool '\(toolName)' did not stop after its deadline, so RepoPrompt closed the connection. RepoPrompt tools are unavailable for the rest of this turn; Claude restarts and resumes this conversation before your next message."
+    }
+
+    /// The non-terminal transcript error for a loss, worded by its reason in plain words. The raw
+    /// close code stays in the `mcp.health.unhealthy` log payload only.
+    static func repoPromptMCPDisconnectedMessage(for loss: AgentMCPRunConnectionLoss) -> String {
+        let consequence = "RepoPrompt tools are unavailable for the rest of this turn; before your next message is sent, Claude restarts and resumes this conversation to reconnect them."
+        switch loss.reason {
+        case .toolExecutionWatchdog:
+            return repoPromptMCPDisconnectedMessage(toolName: loss.toolName ?? "unknown")
+        case .helperExited:
+            let cause = repoPromptMCPAppSideCloseDescription(loss.closeReason)
+                .map { "\($0), and the RepoPrompt MCP helper process exited" }
+                ?? "the RepoPrompt MCP helper process exited"
+            return "RepoPrompt MCP disconnected from Claude: \(cause). \(consequence)"
+        case .routeNotRestored:
+            let cause = repoPromptMCPAppSideCloseDescription(loss.closeReason)
+                ?? "the RepoPrompt MCP helper lost its connection to RepoPrompt"
+            return "RepoPrompt MCP disconnected from Claude: \(cause), and the helper has not reconnected. \(consequence)"
+        }
+    }
+
+    /// Plain words for a close RepoPrompt itself initiated or detected as a transport failure;
+    /// `nil` when the helper side closed (or the code is unknown), which the caller words as a
+    /// helper-side close.
+    static func repoPromptMCPAppSideCloseDescription(_ closeReason: String) -> String? {
+        switch closeReason {
+        case "idle_timeout":
+            "RepoPrompt closed the idle connection"
+        case "user_boot_from_dashboard":
+            "RepoPrompt disconnected it from the dashboard"
+        case "approval_denied":
+            "RepoPrompt denied the connection"
+        case "local_disconnect":
+            "RepoPrompt closed the connection"
+        case "read_error", "write_failure", "write_stall", "write_hangup", "receive_buffer_overflow":
+            "the connection to RepoPrompt failed"
+        default:
+            nil
+        }
+    }
+
+    private func resetRepoPromptMCPHealthForLaunch() {
+        repoPromptMCPHealth = .unknown
+        repoPromptMCPLostConnectionIDs.removeAll()
+    }
+
+    /// The single place a spawn installs its launch token: the stdout reader generation and the
+    /// RepoPrompt MCP loss gate always share it, so `handleStdoutEOF`'s retirement (keyed on the
+    /// stdout token) is compared with the same value in `noteRepoPromptMCPConnectionLost`.
+    private func installSpawnLaunchTokens(_ launchToken: UUID, agentPID: pid_t) {
+        repoPromptMCPLaunchToken = launchToken
+        activeStdoutLaunchToken = launchToken
+        spawnedLaunchAgent = (launchToken, agentPID)
+    }
+
+    /// Retires the current stdout reader generation. `handleStdoutEOF` does this before its
+    /// awaited tail, while `process` is still set, so the launch is marked retired for loss
+    /// handling at the same synchronous point.
+    private func retireActiveStdoutLaunch(_ launchToken: UUID) {
+        activeStdoutLaunchToken = nil
+        repoPromptMCPStdoutRetiredLaunchToken = launchToken
+    }
+
+    private func noteRepoPromptMCPConnectedEvidence(source: String) {
+        // Evidence on an unhealthy launch is retained raw but never restores `connected`.
+        guard repoPromptMCPHealth == .unknown else { return }
+        repoPromptMCPHealth = .connected
+        writeRawEventLogRecord(kind: "mcp.health.connected", payload: ["source": source])
+    }
+
+    /// Applies an app-initiated loss of a RepoPrompt MCP connection. Only a loss of this
+    /// controller's run that proves ownership by its current registered launch counts: it must be
+    /// addressed to the current launch token, and either carry that launch's registered agent PID
+    /// (proven ancestry) or concern a connection admitted after that launch registered. Another
+    /// run, an earlier or later launch, no running launch, an unproven pre-existing connection,
+    /// and repeated deliveries are ignored. Never blocks: it only updates state and publishes the
+    /// degraded status.
+    package func noteRepoPromptMCPConnectionLost(_ loss: AgentMCPRunConnectionLoss) {
+        func ignore(_ why: String) {
+            #if DEBUG
+                debugRepoPromptMCPLossDecisions.append((loss.connectionID, why))
+            #endif
+            writeRawEventLogRecord(kind: "mcp.health.lossIgnored", payload: [
+                "reason": why,
+                "connectionID": loss.connectionID.uuidString,
+                "lossRunID": loss.runID.uuidString,
+                "lossLaunchToken": loss.launchToken.uuidString,
+                "lossReason": loss.reason.rawValue,
+                "closeReason": loss.closeReason
+            ])
+        }
+        guard loss.runID == runID else { return ignore("run_mismatch") }
+        guard process != nil, !isShuttingDown else { return ignore("no_current_launch") }
+        // stdout EOF retires the launch before its awaited tail, while `process` is still set.
+        if let retired = repoPromptMCPStdoutRetiredLaunchToken, retired == repoPromptMCPLaunchToken {
+            return ignore("stdout_retired")
+        }
+        guard let currentToken = repoPromptMCPLaunchToken,
+              let launch = runConnectionLossObserverLaunch,
+              launch.token == currentToken,
+              loss.launchToken == currentToken
+        else {
+            return ignore("stale_launch")
+        }
+        guard loss.provesOwnership(by: launch) else {
+            return ignore(loss.agentProcessID == nil ? "unproven_predates_launch" : "agent_pid_mismatch")
+        }
+        guard repoPromptMCPLostConnectionIDs.insert(loss.connectionID).inserted else {
+            return ignore("duplicate")
+        }
+        guard !repoPromptMCPHealth.isUnhealthy else { return ignore("already_unhealthy") }
+        #if DEBUG
+            debugRepoPromptMCPLossDecisions.append((loss.connectionID, "applied"))
+        #endif
+        repoPromptMCPHealth = .unhealthy(reason: loss.reason.rawValue)
+        var payload: [String: Any] = [
+            "reason": loss.reason.rawValue,
+            "closeReason": loss.closeReason,
+            "connectionID": loss.connectionID.uuidString,
+            "agentProcessIDProven": loss.agentProcessID != nil,
+            "reportedMcpServerStatuses": latestRuntimeInitMcpServerStatuses
+        ]
+        if let toolName = loss.toolName {
+            payload["toolName"] = toolName
+        }
+        writeRawEventLogRecord(kind: "mcp.health.unhealthy", payload: payload)
+        emit(.error(Self.repoPromptMCPDisconnectedMessage(for: loss)))
+        publishRuntimeInitIfChanged()
+    }
+
+    static let repoPromptMCPProbeSupersededReason = "Claude restarted while waiting for RepoPrompt MCP"
+
+    /// Waits (bounded) for fresh evidence that this launch's RepoPrompt MCP server is connected,
+    /// before a turn is submitted on it. Polls `mcp_status` (a read-only control request); a CLI
+    /// that rejects it or never answers it falls back to the app's authoritative live run route for
+    /// this run. A missing RepoPrompt entry or `pending` keeps waiting until the deadline; only an
+    /// explicit `failed` / `needs-auth` ends the wait early.
+    ///
+    /// The evidence is bound to the launch current at entry: after every suspension the probe
+    /// re-checks that launch, and if it was replaced it reports not connected and records nothing,
+    /// so one launch's evidence can never mark its successor connected.
+    package func awaitRepoPromptMCPConnectedEvidence(
+        timeoutSeconds: TimeInterval,
+        pollIntervalSeconds: TimeInterval = 0.25
+    ) async -> RepoPromptMCPConnectionProbeOutcome {
+        guard let probeLaunchToken = repoPromptMCPLaunchToken else {
+            return .notConnected("Claude process is not running")
+        }
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .milliseconds(Int64(max(0, timeoutSeconds) * 1000)))
+        var lastStatus = "unreported"
+        var useAppRoute = false
+        /// The probed launch is no longer the current one (shut down or replaced).
+        func launchReplaced() -> Bool {
+            repoPromptMCPLaunchToken != probeLaunchToken
+        }
+        func superseded() -> RepoPromptMCPConnectionProbeOutcome {
+            writeRawEventLogRecord(kind: "mcp.health.probeSuperseded", payload: [
+                "probeLaunchToken": probeLaunchToken.uuidString
+            ])
+            return .notConnected(Self.repoPromptMCPProbeSupersededReason)
+        }
+        while true {
+            guard !launchReplaced() else { return superseded() }
+            guard process != nil, isInitialized, !isShuttingDown else {
+                return .notConnected("Claude process is not running")
+            }
+            if case let .unhealthy(reason) = repoPromptMCPHealth {
+                return .notConnected(reason)
+            }
+            if repoPromptMCPHealth == .connected {
+                return .connected
+            }
+            if useAppRoute {
+                let hasRoute: Bool = if let clientName = config.runtimeVariant.agentKind.mcpClientNameHint,
+                                        let agentPID = currentLaunchAgentPID
+                {
+                    // The run's route must belong to this launch's own agent instance (the PID it
+                    // registered, at the start time read then): a helper route retained across
+                    // turns from an earlier launch never certifies a restart. The launch-token
+                    // checks before and after this call bracket it.
+                    await mcpHost.hasAuthoritativeLiveRunRoute(
+                        runID: runID,
+                        expectedClientName: clientName,
+                        requiredAgentPID: agentPID
+                    )
+                } else {
+                    false
+                }
+                guard !launchReplaced() else { return superseded() }
+                if hasRoute {
+                    noteRepoPromptMCPConnectedEvidence(source: "app_run_route")
+                    continue
+                }
+                lastStatus = "no live run route"
+            } else {
+                let remaining = clock.now.duration(to: deadline)
+                let requestTimeout = max(0.5, min(5.0, Double(remaining.components.seconds) + 0.5))
+                let response: [String: Any]
+                do {
+                    response = try await sendControlRequest(
+                        request: ["subtype": "mcp_status"],
+                        timeoutSeconds: requestTimeout
+                    )
+                } catch ControllerError.invalidControlResponse {
+                    guard !launchReplaced() else { return superseded() }
+                    // An older CLI without `mcp_status`: use the app-side admission evidence.
+                    useAppRoute = true
+                    continue
+                } catch ControllerError.controlRequestTimedOut {
+                    guard !launchReplaced() else { return superseded() }
+                    // A CLI that ignores unknown control requests: same fallback.
+                    lastStatus = "mcp_status unanswered"
+                    useAppRoute = true
+                    continue
+                } catch {
+                    guard !launchReplaced() else { return superseded() }
+                    return .notConnected("mcp_status failed: \(error.localizedDescription)")
+                }
+                guard !launchReplaced() else { return superseded() }
+                let status = Self.repoPromptStatus(inMCPStatusResponse: response)
+                lastStatus = status ?? "absent"
+                switch status?.lowercased() {
+                case "connected":
+                    noteRepoPromptMCPConnectedEvidence(source: "mcp_status")
+                    continue
+                case "failed", "needs-auth", "needs_auth":
+                    return .notConnected("RepoPrompt MCP status \(lastStatus)")
+                default:
+                    // `pending`, not yet listed, or not yet reported: keep waiting.
+                    break
+                }
+            }
+            guard clock.now < deadline else {
+                return .notConnected("timed out waiting for RepoPrompt MCP (last status: \(lastStatus))")
+            }
+            do {
+                try await Task.sleep(for: .milliseconds(Int64(max(0.01, pollIntervalSeconds) * 1000)))
+            } catch {
+                return .notConnected("cancelled")
+            }
+        }
+    }
+
+    /// Registers the loss observer for the current launch (token + the PID registered as the
+    /// run's expected agent process). A registration for an earlier launch is replaced.
+    private func registerRunConnectionLossObserverIfNeeded(expectedAgentPID pid: pid_t) async {
+        // Only Agent Mode run launches (owned by the Claude Agent Mode coordinator, which has the
+        // recovery path) observe connection loss.
+        guard config.toolContext == .agentRun, let launchToken = repoPromptMCPLaunchToken else { return }
+        let launch = AgentMCPRunLaunchIdentity(token: launchToken, agentProcessID: pid)
+        guard runConnectionLossObserverLaunch != launch else { return }
+        await unregisterRunConnectionLossObserverIfNeeded()
+        let token = await mcpHost.registerRunConnectionLossObserver(for: runID, launch: launch) { [weak self] loss in
+            await self?.noteRepoPromptMCPConnectionLost(loss)
+        }
+        // The launch may have been replaced, or another registration won, across the await.
+        guard runConnectionLossObserverToken == nil, repoPromptMCPLaunchToken == launchToken else {
+            await mcpHost.unregisterRunConnectionLossObserver(for: runID, token: token)
+            return
+        }
+        runConnectionLossObserverToken = token
+        runConnectionLossObserverLaunch = launch
+    }
+
+    private func unregisterRunConnectionLossObserverIfNeeded() async {
+        guard let token = runConnectionLossObserverToken else { return }
+        runConnectionLossObserverToken = nil
+        runConnectionLossObserverLaunch = nil
+        await mcpHost.unregisterRunConnectionLossObserver(for: runID, token: token)
+    }
+
     // MARK: - Runtime init aggregation helpers
 
     /// Builds and emits a merged `RuntimeInitStatus` from all available sources.
@@ -2256,8 +3281,12 @@ package final actor ClaudeNativeProcessSessionController {
         let status = RuntimeInitStatus(
             sessionID: sessionID,
             tools: latestRuntimeInitTools,
-            mcpServerStatuses: latestRuntimeInitMcpServerStatuses,
-            initializeResponse: initializeResponseSnapshot
+            mcpServerStatuses: Self.overlayingRepoPromptMCPHealth(
+                repoPromptMCPHealth,
+                on: latestRuntimeInitMcpServerStatuses
+            ),
+            initializeResponse: initializeResponseSnapshot,
+            repoPromptMCPHealth: repoPromptMCPHealth
         )
         guard status != lastEmittedRuntimeInitStatus else { return }
         lastEmittedRuntimeInitStatus = status
@@ -2407,6 +3436,11 @@ package final actor ClaudeNativeProcessSessionController {
             handleStreamPayload(payload)
         }
 
+        /// R6: launch arguments for a resume or a (gated) fresh `--session-id` start.
+        func test_buildArguments(existingSessionID: String?, freshSessionID: String?) -> [String] {
+            buildArguments(existingSessionID: existingSessionID, model: nil, freshSessionID: freshSessionID)
+        }
+
         func test_resolveCapturedCommandForLaunch(
             environment: [String: String],
             additionalPaths: [String] = []
@@ -2496,8 +3530,13 @@ package final actor ClaudeNativeProcessSessionController {
         }
 
         @discardableResult
-        func test_beginTurnTracking() -> UUID {
-            beginTurnTracking()
+        func test_beginTurnTracking(outboundUserMessageUUID: UUID? = nil) -> UUID {
+            beginTurnTracking(outboundUserMessageUUID: outboundUserMessageUUID)
+        }
+
+        /// The production stdout-EOF path (process loss) for the given launch's reader.
+        func test_handleStdoutEOF(launchToken: UUID) async {
+            await handleStdoutEOF(launchToken: launchToken)
         }
 
         /// Installs a synthetic process launch (no subprocess) so attribution can be exercised
@@ -2527,7 +3566,9 @@ package final actor ClaudeNativeProcessSessionController {
             )
             // A synthetic launch stands in for a spawn: the stdout reader generation is that launch.
             activeStdoutLaunchToken = identity.token
+            installLiveTranscriptQualification(launchToken: identity.token)
             beginUsageLaunch(identity)
+            resolveLiveTranscriptEligibility(launchToken: identity.token)
             return identity
         }
 
@@ -2570,6 +3611,21 @@ package final actor ClaudeNativeProcessSessionController {
             endUsageLaunch()
         }
 
+        /// Step 4d3b: the outbound step `sendUserMessage` performs after a successful write.
+        func test_noteLiveTranscriptOutbound(uuid: UUID?, text: String) {
+            noteLiveTranscriptOutbound(uuid: uuid, text: text)
+        }
+
+        func test_liveTranscriptQualification() -> ClaudeLiveTranscriptProducerState? {
+            liveTranscriptQualification
+        }
+
+        /// Step 4d3b: routes one raw line through the production `handleLine` path (decode failures
+        /// included).
+        func test_handleLine(_ lineData: Data) async {
+            await handleLine(lineData)
+        }
+
         /// Attaches an already-spawned harmless child (for example `/bin/cat`) as the controller's
         /// process so `sendUserMessage` performs its production stdin write against a real pipe.
         /// Readers are not started; `shutdown()` terminates the child normally.
@@ -2577,13 +3633,40 @@ package final actor ClaudeNativeProcessSessionController {
             _ spawned: SpawnedProcess,
             initialized: Bool = true
         ) {
+            // As at a production spawn: a new launch starts with fresh health and a new token.
+            resetRepoPromptMCPHealthForLaunch()
             process = spawned
+            installSpawnLaunchTokens(UUID(), agentPID: spawned.pid)
             if initialized {
                 completeInitialization()
             } else {
                 isInitialized = false
             }
             isShuttingDown = false
+        }
+
+        func test_currentRepoPromptMCPLaunchToken() -> UUID? {
+            repoPromptMCPLaunchToken
+        }
+
+        /// The synchronous first step of `handleStdoutEOF` for the attached launch: the stdout
+        /// generation is retired while `process` is still set (the EOF tail has not run yet).
+        func test_retireActiveStdoutLaunchForCurrentLaunch() {
+            guard let token = repoPromptMCPLaunchToken else { return }
+            retireActiveStdoutLaunch(token)
+        }
+
+        func test_currentRunConnectionLossObserverLaunch() -> AgentMCPRunLaunchIdentity? {
+            runConnectionLossObserverLaunch
+        }
+
+        func test_repoPromptMCPLossDecisions() -> [(connectionID: UUID, decision: String)] {
+            debugRepoPromptMCPLossDecisions
+        }
+
+        /// Runs the production expected-PID + loss-observer registration for the attached launch.
+        func test_registerExpectedAgentPID(_ pid: pid_t) async {
+            await registerExpectedAgentPIDIfNeeded(pid)
         }
 
         func test_currentUsageLaunchToken() -> UUID? {
@@ -2594,15 +3677,46 @@ package final actor ClaudeNativeProcessSessionController {
             await handleStdoutChunk(data, launchToken: launchToken)
         }
 
+        /// Stores a pending permission request as if the current transport had issued it.
         func test_storePendingPermissionRequest(id: String, request: [String: Any]) {
-            pendingPermissionRequests[id] = PendingPermissionRequest(requestID: id, request: request)
+            pendingPermissionRequests[id] = PendingPermissionRequest(requestID: id, request: request, issuingLaunch: runtimeLaunch)
+        }
+
+        /// Attaches a fixture runtime launch to the current (test-attached) transport, committed or
+        /// not, as a registered spawn would, so the production fences run without a real spawn.
+        func test_installRuntimeLaunch(_ launch: AgentRuntimeLaunch, committed: Bool) {
+            runtimeLaunch = launch
+            runtimeManagedTransport = true
+            runtimeCommittedLaunch = committed ? launch : nil
+        }
+
+        func test_setRuntimeFenceCheckpoint(_ checkpoint: (@Sendable (String) async -> Void)?) {
+            testRuntimeFenceCheckpoint = checkpoint
+        }
+
+        func test_setProtocolFailureInterceptor(_ interceptor: (@Sendable (String) -> Void)?) {
+            testProtocolFailureInterceptor = interceptor
+        }
+
+        /// Forgets a fixture transport that has no child process (pipes only), so neither `deinit`
+        /// nor `shutdown()` signals or reaps its placeholder PID.
+        func test_detachFixtureTransport() {
+            process = nil
+            runtimeLaunch = nil
+            runtimeManagedTransport = false
+            runtimeCommittedLaunch = nil
+        }
+
+        /// The production initial permission-mode request (`set_permission_mode` owner write).
+        func test_applyInitialPermissionMode() async throws {
+            try await applyInitialPermissionModeIfNeeded()
         }
 
         func test_handleControlRequest(
             requestID: String,
             subtype: String,
             request: [String: Any]
-        ) {
+        ) async {
             handleControlRequest(
                 ClaudeSDKProtocolCodec.ControlRequest(
                     requestID: requestID,
@@ -2610,6 +3724,15 @@ package final actor ClaudeNativeProcessSessionController {
                     subtype: subtype
                 )
             )
+            // As after an inbound line: queued automatic replies pass their fence and are written.
+            await flushQueuedAutomaticReplies()
+        }
+
+        /// The production launch reservation step (cancellation and slot rechecks included).
+        /// Returns whether the start would go on to spawn.
+        func test_reserveSpawn(launch: AgentRuntimeLaunch) async throws -> Bool {
+            guard case .proceed = try await reserveSpawn(launch: launch) else { return false }
+            return true
         }
     #endif
 
@@ -2630,6 +3753,45 @@ package final actor ClaudeNativeProcessSessionController {
         }
     }
 
+    /// Step 12 (P1-A): whether a result payload itself reports an aborted or interrupted turn,
+    /// independent of the sticky `turnWasInterrupted` marker (which classifies whatever result comes
+    /// next). The CLI's subtype for an aborted turn is `error_during_execution` (SDK: "API failure OR
+    /// cancelled request"; observed on interrupts with `aborted_streaming`). A `success` result, the
+    /// shape of an ordinary or background-continuation turn, never qualifies.
+    private static func resultPayloadReportsInterruption(_ payload: [String: Any]) -> Bool {
+        guard (payload["type"] as? String) == "result" else { return false }
+        let subtype = ((payload["subtype"] as? String) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard subtype != "success" else { return false }
+        if subtype == "error_during_execution" { return true }
+        return isCancelledTurnSignal(subtype)
+            || isCancelledTurnSignal(payload["stop_reason"] as? String)
+            || isCancelledTurnSignal(payload["terminal_reason"] as? String)
+            || extractResultErrors(from: payload).contains(where: { isCancelledTurnSignal($0) })
+    }
+
+    /// Step 12 (P1-A): a result's consumed-user attribution against `outbound`, the UUID the credited
+    /// turn's frame was written with (nil when written without one). JSON `null` counts as absent.
+    private static func resultMessageIdentity(
+        _ payload: [String: Any],
+        outbound: UUID?
+    ) -> TurnCompletionOrigin.MessageIdentity {
+        let single = payload["user_message_uuid"].flatMap { $0 is NSNull ? nil : $0 }
+        let list = payload["user_message_uuids"].flatMap { $0 is NSNull ? nil : $0 }
+        guard single != nil || list != nil else { return .notReported }
+        guard let outbound else { return .contradictsTurn }
+        if let single {
+            guard let value = single as? String, UUID(uuidString: value) == outbound else { return .contradictsTurn }
+        }
+        if let list {
+            guard let values = list as? [Any], values.count == 1, let value = values[0] as? String,
+                  UUID(uuidString: value) == outbound
+            else { return .contradictsTurn }
+        }
+        return .namesTurn
+    }
+
     private static func isCancelledTurnSignal(_ value: String?) -> Bool {
         guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
               !value.isEmpty
@@ -2643,6 +3805,8 @@ package final actor ClaudeNativeProcessSessionController {
     }
 
     private func handleControlRequest(_ request: ClaudeSDKProtocolCodec.ControlRequest) {
+        // R6: replies go only to the launch whose transport delivered this request.
+        let receivingLaunch = runtimeLaunch
         writeRawEventLogRecord(kind: "control.request.received", payload: [
             "requestID": request.requestID,
             "subtype": request.subtype,
@@ -2671,7 +3835,12 @@ package final actor ClaudeNativeProcessSessionController {
                         requestID: request.requestID,
                         response: allowResponse
                     )
-                    try sendLine(encoded, shutdownOnFailure: false)
+                    sendAutomaticReply(
+                        encoded,
+                        requestID: request.requestID,
+                        receivingLaunch: receivingLaunch,
+                        failureMessage: "Failed auto-approving RepoPrompt Claude permission request"
+                    )
                 } catch {
                     failProtocolAndShutdownSoon(
                         message: "Failed auto-approving RepoPrompt Claude permission request: \(error.localizedDescription)"
@@ -2682,7 +3851,8 @@ package final actor ClaudeNativeProcessSessionController {
             if let approval = buildApprovalRequest(from: request) {
                 pendingPermissionRequests[request.requestID] = PendingPermissionRequest(
                     requestID: request.requestID,
-                    request: payload
+                    request: payload,
+                    issuingLaunch: runtimeLaunch
                 )
                 writeRawEventLogRecord(kind: "approval.request.emitted", payload: [
                     "requestID": request.requestID,
@@ -2705,7 +3875,12 @@ package final actor ClaudeNativeProcessSessionController {
                         requestID: request.requestID,
                         response: allowResponse
                     )
-                    try sendLine(encoded, shutdownOnFailure: false)
+                    sendAutomaticReply(
+                        encoded,
+                        requestID: request.requestID,
+                        receivingLaunch: receivingLaunch,
+                        failureMessage: "Failed auto-approving Claude permission request"
+                    )
                 } catch {
                     failProtocolAndShutdownSoon(
                         message: "Failed auto-approving Claude permission request: \(error.localizedDescription)"
@@ -2718,7 +3893,12 @@ package final actor ClaudeNativeProcessSessionController {
                     requestID: request.requestID,
                     error: "Unsupported control request subtype: \(request.subtype)"
                 )
-                try sendLine(encoded, shutdownOnFailure: false)
+                sendAutomaticReply(
+                    encoded,
+                    requestID: request.requestID,
+                    receivingLaunch: receivingLaunch,
+                    failureMessage: "Failed replying to unsupported Claude control request (\(request.subtype))"
+                )
             } catch {
                 failProtocolAndShutdownSoon(
                     message: "Failed replying to unsupported Claude control request (\(request.subtype)): \(error.localizedDescription)"
@@ -2771,6 +3951,21 @@ package final actor ClaudeNativeProcessSessionController {
         }
     }
 
+    /// How long an EOF'd registered root may take to exit on its own before its owned reap escalates.
+    private static let exitedRootReapWait: TimeInterval = 2.0
+
+    /// Turns failed by an unexpected stdout EOF (process loss), oldest first; bounded.
+    private var processLostTurnIDs: [UUID] = []
+    private static let processLostTurnIDLimit = 64
+
+    /// `async` to match `NativeAgentRuntimeControlling` exactly: a synchronous signature lets the
+    /// protocol extension's `false` default win both as the witness and in direct `await` calls.
+    package func turnEndedByProcessLoss(_ turnID: UUID) async -> Bool {
+        guard let index = processLostTurnIDs.firstIndex(of: turnID) else { return false }
+        processLostTurnIDs.remove(at: index)
+        return true
+    }
+
     private func handleStdoutEOF(launchToken: UUID) async {
         guard !isShuttingDown else { return }
         // An EOF from an already-replaced process must not tear down the current launch.
@@ -2780,25 +3975,51 @@ package final actor ClaudeNativeProcessSessionController {
             ])
             return
         }
-        activeStdoutLaunchToken = nil
+        retireActiveStdoutLaunch(launchToken)
         writeRawEventLogRecord(kind: "process.stdoutEOF")
         var remainingLines: [Data] = []
         stdoutFramer.flush { line in
             remainingLines.append(line)
         }
+        // Step 4d3b: the exiting launch's producer classifies its own buffered tail (scoped to this
+        // drain; the stdout token stays cleared), then retires.
+        liveTranscriptEOFDrainLaunchToken = launchToken
         for line in remainingLines {
             await handleLine(line)
         }
+        liveTranscriptEOFDrainLaunchToken = nil
+        retireLiveTranscriptQualification(launchToken: launchToken)
+        // The transport is gone: automatic replies queued for it are never written.
+        queuedAutomaticReplies.removeAll()
         failPendingControlRequests(with: ControllerError.processNotRunning)
         cancelAuthoritativeLifecycleState()
+        if let launch = runtimeLaunch, let exited = process {
+            // R6: the captured launch owns one bounded reap of its exact root (it closed stdout, so
+            // it normally exits on its own; escalation only after the bounded wait) and reports it
+            // (root-lifetime evidence only). The reap is retained and joined by shutdown and by the
+            // next launch's reservation. Only registered launches change reaping behavior.
+            runtimeLaunch = nil
+            _ = ownedRootReap(
+                launch: launch,
+                pid: exited.pid,
+                processGroupID: exited.processGroupID,
+                waitBeforeTerminating: Self.exitedRootReapWait
+            )
+        }
         process = nil
         isInitialized = false
         hasCompletedInitialFlagSettings = false
         let staleIDs = drainAllTurnIDs()
         if !staleIDs.isEmpty {
+            // Review A F06: these turns failed by provider-process loss (not a requested shutdown);
+            // recorded before their completions so the run's finalizer can type its cause. Bounded.
+            processLostTurnIDs.append(contentsOf: staleIDs)
+            if processLostTurnIDs.count > Self.processLostTurnIDLimit {
+                processLostTurnIDs.removeFirst(processLostTurnIDs.count - Self.processLostTurnIDLimit)
+            }
             emit(.error("Claude process exited unexpectedly."))
             for id in staleIDs {
-                emitTurnCompleted(turnID: id, status: .failed)
+                emitTurnCompleted(turnID: id, status: .failed, origin: .controllerSynthesized)
             }
         }
         endUsageLaunch()
@@ -2807,8 +4028,8 @@ package final actor ClaudeNativeProcessSessionController {
 
     /// Every completion-lifecycle exit emits the transcript event and, when a launch is active,
     /// the ordered accounting closure on the usage stream (after any attribution for the turn).
-    private func emitTurnCompleted(turnID: UUID, status: TurnStatus) {
-        emit(.turnCompleted(turnID: turnID, status: status))
+    private func emitTurnCompleted(turnID: UUID, status: TurnStatus, origin: TurnCompletionOrigin) {
+        emit(.turnCompleted(turnID: turnID, status: status, origin: origin))
         if let state = usageLaunchState {
             emitUsage(.turnClosed(launchToken: state.identity.token, turnID: turnID, status: status))
         }
@@ -2977,6 +4198,118 @@ package final actor ClaudeNativeProcessSessionController {
             requestID: requestID,
             observation: observation
         )))
+    }
+
+    // MARK: Step 4d3b live transcript qualification (inactive)
+
+    /// A fresh state for a newly installed stdout producer; called only where an actual stdout launch
+    /// token is installed. Disabled: none.
+    private func installLiveTranscriptQualification(launchToken: UUID) {
+        guard liveTranscriptQualificationEnabled else {
+            liveTranscriptQualification = nil
+            return
+        }
+        var state = ClaudeLiveTranscriptProducerState(launchToken: launchToken)
+        // Installed across an earlier launch's EOF drain (only its fatal-path shutdown suspends): its
+        // payloads during that drain are never classified, so it never qualifies.
+        if liveTranscriptEOFDrainLaunchToken != nil { state.disqualify(.launchDuringDrain) }
+        liveTranscriptQualification = state
+    }
+
+    /// Once the launch identity is recorded, only a launch eligible for an outbound user-message
+    /// identity (automatic or configured command, default backend, no routing overrides) keeps its state; an
+    /// ineligible producer drops it and never emits evidence. Eligibility is not installed-profile
+    /// qualification.
+    private func resolveLiveTranscriptEligibility(launchToken: UUID) {
+        guard var state = currentLiveTranscriptQualification(), state.launchToken == launchToken else { return }
+        guard outboundUserMessageIdentityEligible, usageLaunchState?.identity.token == launchToken else {
+            liveTranscriptQualification = nil
+            return
+        }
+        state.markEligible()
+        liveTranscriptQualification = state
+    }
+
+    /// The state of the producer whose stdout is current; a stale producer's state is never read.
+    /// While an EOF drain is active, only the exiting launch whose buffered tail it drains is ever
+    /// selected, never a replacement installed across the drain's (fatal-path) suspension.
+    private func currentLiveTranscriptQualification() -> ClaudeLiveTranscriptProducerState? {
+        guard let state = liveTranscriptQualification,
+              state.launchToken == (liveTranscriptEOFDrainLaunchToken ?? activeStdoutLaunchToken)
+        else {
+            return nil
+        }
+        return state
+    }
+
+    private func noteLiveTranscriptOutbound(uuid: UUID?, text: String) {
+        guard var state = currentLiveTranscriptQualification() else { return }
+        let wasQualifying = state.disqualification == nil
+        state.noteOutbound(uuid: uuid, text: text)
+        liveTranscriptQualification = state
+        emitDirectLiveTranscriptDisqualification(state, wasQualifying: wasQualifying)
+    }
+
+    private func disqualifyLiveTranscript(_ reason: ClaudeLiveTranscriptDisqualification) {
+        guard var state = currentLiveTranscriptQualification() else { return }
+        let wasQualifying = state.disqualification == nil
+        state.disqualify(reason)
+        liveTranscriptQualification = state
+        emitDirectLiveTranscriptDisqualification(state, wasQualifying: wasQualifying)
+    }
+
+    /// A producer disqualified outside payload classification (an undecodable line or payload, an
+    /// unidentified or overlapping outbound write) tells its owner at once with one metadata-only
+    /// carrier, so its owner invalidates proofs even when no later payload arrives; later payloads
+    /// still repeat it. Nothing for a disabled, ineligible or already disqualified producer.
+    private func emitDirectLiveTranscriptDisqualification(
+        _ state: ClaudeLiveTranscriptProducerState,
+        wasQualifying: Bool
+    ) {
+        guard wasQualifying, state.eligibility == .eligible, let reason = state.disqualification else { return }
+        emit(.stream(.claudeLiveTranscriptEvidenceCarrier(
+            ClaudeLiveTranscriptEvidence(producerLaunchToken: state.launchToken, kind: .disqualified(reason))
+        )))
+    }
+
+    /// After its stdout EOF drained the buffered tail, the exited launch's producer is retired (a
+    /// replacement launch installed meanwhile keeps its own).
+    private func retireLiveTranscriptQualification(launchToken: UUID) {
+        if liveTranscriptQualification?.launchToken == launchToken {
+            liveTranscriptQualification = nil
+        }
+    }
+
+    /// Classifies one raw payload of the current producer: complete-text and Step 4d5 Read row
+    /// evidence is attached to its one translated `content`/`tool_call`/`tool_result` result; any
+    /// other evidence is returned as a metadata-only carrier.
+    /// Nothing while disabled, stale or not (yet) eligible.
+    private func classifyLiveTranscriptPayload(
+        envelope: Data,
+        streamResults: inout [AIStreamResult]
+    ) -> AIStreamResult? {
+        guard var state = currentLiveTranscriptQualification() else { return nil }
+        let outcome = state.classify(envelope: envelope, translated: streamResults, turnInFlight: turnInFlight)
+        liveTranscriptQualification = state
+        guard state.eligibility == .eligible else { return nil }
+        switch outcome {
+        case .benign:
+            return nil
+        case let .attach(index, evidence):
+            // Step 4d5: evidence never rides on a result suppression would drop silently.
+            guard !Self.shouldSuppressUserFacingStreamResult(streamResults[index]) else {
+                state.disqualify(.attachmentSuppressed)
+                liveTranscriptQualification = state
+                return .claudeLiveTranscriptEvidenceCarrier(ClaudeLiveTranscriptEvidence(
+                    producerLaunchToken: state.launchToken,
+                    kind: .disqualified(state.disqualification ?? .attachmentSuppressed)
+                ))
+            }
+            streamResults[index].claudeLiveTranscriptEvidence = evidence
+            return nil
+        case let .standalone(evidence):
+            return .claudeLiveTranscriptEvidenceCarrier(evidence)
+        }
     }
 
     // MARK: Runtime provenance and child-activity evidence
@@ -3214,7 +4547,8 @@ package final actor ClaudeNativeProcessSessionController {
 
     private func buildArguments(
         existingSessionID: String?,
-        model: String?
+        model: String?,
+        freshSessionID: String? = nil
     ) -> [String] {
         var args: [String] = [
             "-p",
@@ -3235,6 +4569,9 @@ package final actor ClaudeNativeProcessSessionController {
             args.append(contentsOf: ["--resume", existingSessionID])
             // RepoPrompt instructions are delivered in provider-bound user messages,
             // so CLI prompt flags remain unused on both fresh starts and resumes.
+        } else if let freshSessionID, !freshSessionID.isEmpty {
+            // Qualified fresh preallocation only (R6); never combined with `--resume`.
+            args.append(contentsOf: ["--session-id", freshSessionID])
         }
 
         if config.permissionMode.caseInsensitiveCompare("bypassPermissions") == .orderedSame {
@@ -3409,7 +4746,31 @@ package final actor ClaudeNativeProcessSessionController {
         else {
             return
         }
+        let previousPID = registeredExpectedAgentPID.flatMap { $0 == pid ? nil : $0 }
         registeredExpectedAgentPID = pid
+        #if DEBUG
+            // Both launch paths (runtime-managed or not) register the spawned process installed
+            // with the current launch token; a different PID means the early-release proof would
+            // ask about a process the host never registered for this launch.
+            if let token = repoPromptMCPLaunchToken,
+               let launch = spawnedLaunchAgent,
+               launch.token == token,
+               launch.pid != pid
+            {
+                print("[ClaudeNativeSession] DEBUG expected-PID mismatch: registering pid=\(pid) but launch token=\(token.uuidString) spawned pid=\(launch.pid) runID=\(runID.uuidString)")
+            }
+        #endif
+        // The loss observer registers first, in the first manager call after spawn: this launch's
+        // helper only connects once Claude has booted and started it, so its connection is not
+        // recorded as predating this launch's observer (no extra hop for it to slip into).
+        await registerRunConnectionLossObserverIfNeeded(expectedAgentPID: pid)
+        // A same-controller respawn (after an unexpected stdout EOF, which never clears it) still
+        // has the previous process's PID registered. Clear it first, after the previous launch's
+        // loss observer was replaced above: the clear releases that instance, unrouting its
+        // dependents, and closes the window in which a reused PID passes the PID-only admission gate.
+        if let previousPID {
+            await mcpHost.clearExpectedAgentPID(previousPID, for: clientName, runID: runID)
+        }
         await mcpHost.registerExpectedAgentPID(
             pid,
             for: clientName,
@@ -3418,6 +4779,7 @@ package final actor ClaudeNativeProcessSessionController {
             expectedProcessExecutableIdentity: nil
         )
         if isShuttingDown {
+            await unregisterRunConnectionLossObserverIfNeeded()
             await mcpHost.clearExpectedAgentPID(pid, for: clientName, runID: runID)
             if registeredExpectedAgentPID == pid {
                 registeredExpectedAgentPID = nil
@@ -3448,12 +4810,18 @@ package final actor ClaudeNativeProcessSessionController {
 
     private func failProtocolAndShutdown(message: String) async {
         guard !isShuttingDown else { return }
+        #if DEBUG
+            if let testProtocolFailureInterceptor {
+                testProtocolFailureInterceptor(message)
+                return
+            }
+        #endif
         writeRawEventLogRecord(kind: "session.failProtocol", payload: ["message": message])
         emit(.error(message))
         let staleIDs = drainAllTurnIDs()
         if !staleIDs.isEmpty {
             for id in staleIDs {
-                emitTurnCompleted(turnID: id, status: .failed)
+                emitTurnCompleted(turnID: id, status: .failed, origin: .controllerSynthesized)
             }
         }
         await shutdown()
@@ -3498,9 +4866,11 @@ package final actor ClaudeNativeProcessSessionController {
         for (key, value) in resolverOverrides {
             env[key] = value
         }
+        // Managed launch boundary: an inherited runtime marker never reaches the child; a
+        // registered launch sets its own explicitly at spawn.
         return ProcessEnvironmentSanitizer.sanitizedForChildLaunch(
             env,
-            additionalRemovedKeys: Set(["NODE_OPTIONS"]).union(resolverRemovedKeys)
+            additionalRemovedKeys: Set(["NODE_OPTIONS", ProcessLauncher.runtimeMarkerEnvironmentKey]).union(resolverRemovedKeys)
         )
     }
 
@@ -3717,9 +5087,12 @@ package final actor ClaudeNativeProcessSessionController {
     }
 
     @discardableResult
-    private func beginTurnTracking() -> UUID {
+    private func beginTurnTracking(outboundUserMessageUUID: UUID? = nil) -> UUID {
         let id = UUID()
         pendingTurnIDBuffer.append(id)
+        if let outboundUserMessageUUID {
+            outboundUserMessageUUIDByTurnID[id] = outboundUserMessageUUID
+        }
         return id
     }
 
@@ -3734,8 +5107,22 @@ package final actor ClaudeNativeProcessSessionController {
     private func dequeueTurnID() -> UUID {
         let id = pendingTurnIDBuffer[pendingTurnIDHead]
         pendingTurnIDHead += 1
+        outboundUserMessageUUIDByTurnID.removeValue(forKey: id)
         compactTurnIDBufferIfNeeded()
+        startedTurnIDSnapshot.withLock { started in
+            if started == id { started = nil }
+        }
         return id
+    }
+
+    /// O49: the producing turn is the first queued turn whose `result` has not arrived (in deferred
+    /// mode, turns with a result awaiting `idle` are still queued ahead of it). No queued turn: the
+    /// output is attributed to nothing.
+    private func noteOutputAttributedToProducingTurn() {
+        let index = pendingTurnIDHead + pendingAuthoritativeTurnCompletions.count
+        guard index < pendingTurnIDBuffer.count else { return }
+        let id = pendingTurnIDBuffer[index]
+        startedTurnIDSnapshot.withLock { $0 = id }
     }
 
     /// Drain all remaining IDs and reset.
@@ -3750,6 +5137,8 @@ package final actor ClaudeNativeProcessSessionController {
     private func clearTurnIDQueue() {
         pendingTurnIDBuffer.removeAll(keepingCapacity: false)
         pendingTurnIDHead = 0
+        outboundUserMessageUUIDByTurnID.removeAll()
+        startedTurnIDSnapshot.withLock { $0 = nil }
     }
 
     private func compactTurnIDBufferIfNeeded() {

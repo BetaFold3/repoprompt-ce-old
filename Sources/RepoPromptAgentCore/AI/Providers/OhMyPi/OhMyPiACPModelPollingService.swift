@@ -40,7 +40,8 @@ package struct OhMyPiACPControllerModelDiscoveryClient: OhMyPiACPModelDiscoveryC
             workspacePath: workspacePath,
             resumeSessionID: nil,
             attachments: [],
-            taskLabelKind: nil
+            taskLabelKind: nil,
+            runtimeSession: .sessionless
         )
         guard let provider = providerFactory(.ohMyPi, nil) else { return nil }
         let support = try await provider.support(for: request)

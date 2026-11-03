@@ -15,7 +15,8 @@ final class KnowledgeSessionMCPPolicyTests: XCTestCase {
             MCPWindowToolName.oracleUtils,
             MCPWindowToolName.askOracle,
             MCPWindowToolName.oracleChatLog,
-            MCPWindowToolName.agentRun
+            MCPWindowToolName.agentRun,
+            MCPWindowToolName.workspaceSteer
         ]
 
         XCTAssertEqual(AgentModeMCPToolPolicy.knowledgeAllowedTools, expected)

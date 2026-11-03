@@ -645,6 +645,25 @@ package struct WorkspaceAppliedIndexBatchEvent: Equatable {
         self.requiresFullResync = requiresFullResync
         self.isRootUnload = isRootUnload
     }
+
+    /// True when the batch has no file-level change: no file added, removed, or modified, no full
+    /// resync, and no root unload. The codemap projection candidate set is files, so folder adds,
+    /// removes, and modifications alone cannot change it: `promoteFolderToDiscoverable` only un-hides
+    /// folders, never files, and shard patches for folder-only events touch only folder records.
+    /// Such batches still advance the applied-index generation and, for adds and removes, the catalog
+    /// (topology) generation inside the path-local catalog mutation, where sessions are not detached
+    /// and no codemap path command is issued. The codemap projection stamps therefore do not follow
+    /// them. The single producer derives `modifiedFileSourceSnapshotsByID` from `modifiedFileIDs`, so
+    /// requiring it empty only pins that contract for any future producer.
+    package var isCodemapProjectionNeutral: Bool {
+        !requiresFullResync
+            && !isRootUnload
+            && upsertedFiles.isEmpty
+            && removedFileIDs.isEmpty
+            && removedFilePaths.isEmpty
+            && modifiedFileIDs.isEmpty
+            && modifiedFileSourceSnapshotsByID.isEmpty
+    }
 }
 
 package struct WorkspacePathLookupRequest: Equatable {

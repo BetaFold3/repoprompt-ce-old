@@ -1,0 +1,109 @@
+//===----------------------------------------------------------------------===//
+//
+// This source file is part of the Swift WebAuthn open source project
+//
+// Copyright (c) 2022 the Swift WebAuthn project authors
+// Licensed under Apache License v2.0
+//
+// See LICENSE.txt for license information
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+//===----------------------------------------------------------------------===//
+
+#if canImport(FoundationEssentials)
+import FoundationEssentials
+#else
+import Foundation
+#endif
+import SwiftCBOR
+
+// RPCE local modification (bounded passkey verifier experiment, 2026-11-01): require the
+// attestation object to be exactly one complete CBOR item with no trailing bytes. See
+// Vendor/SwiftWebAuthn/PATCHES.md. Change is marked inline.
+
+/// The response from the authenticator device for the creation of a new public key credential.
+///
+/// When decoding using `Decodable`, `clientDataJSON` and `attestationObject` are decoded from base64url to bytes.
+public struct AuthenticatorAttestationResponse: Sendable {
+    /// The client data that was passed to the authenticator during the creation ceremony.
+    ///
+    /// When decoding using `Decodable`, this is decoded from base64url to bytes.
+    public let clientDataJSON: [UInt8]
+
+    /// Contains both attestation data and attestation statement.
+    ///
+    /// When decoding using `Decodable`, this is decoded from base64url to bytes.
+    public let attestationObject: [UInt8]
+}
+
+extension AuthenticatorAttestationResponse: Codable {
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+
+        clientDataJSON = try container.decodeBytesFromURLEncodedBase64(forKey: .clientDataJSON)
+        attestationObject = try container.decodeBytesFromURLEncodedBase64(forKey: .attestationObject)
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+
+        try container.encode(clientDataJSON.base64URLEncodedString(), forKey: .clientDataJSON)
+        try container.encode(attestationObject.base64URLEncodedString(), forKey: .attestationObject)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case clientDataJSON
+        case attestationObject
+    }
+}
+
+/// A parsed version of `AuthenticatorAttestationResponse`
+struct ParsedAuthenticatorAttestationResponse {
+    let clientData: CollectedClientData
+    let attestationObject: AttestationObject
+
+    init(from rawResponse: AuthenticatorAttestationResponse) throws {
+        // assembling clientData
+        let clientData = try JSONDecoder().decode(CollectedClientData.self, from: Data(rawResponse.clientDataJSON))
+        self.clientData = clientData
+
+        // Step 11. (assembling attestationObject)
+        // RPCE local modification: decode via a stream and require full consumption at the
+        // attestation-object boundary (exactly one complete CBOR item, no trailing bytes).
+        let attestationObjectBytes = [UInt8](Data(rawResponse.attestationObject))
+        let attestationStream = ByteInputStream(ArraySlice(attestationObjectBytes))
+        let maybeDecodedAttestationObject: CBOR?
+        do {
+            let decoder = CBORDecoder(stream: attestationStream, options: CBOROptions(maximumDepth: 16))
+            maybeDecodedAttestationObject = try decoder.decodeItem()
+        } catch {
+            throw WebAuthnError.invalidAttestationObject
+        }
+        guard let decodedAttestationObject = maybeDecodedAttestationObject,
+              attestationStream.remainingBytes == 0 else {
+            throw WebAuthnError.invalidAttestationObject
+        }
+
+        guard let authData = decodedAttestationObject["authData"],
+            case let .byteString(authDataBytes) = authData else {
+            throw WebAuthnError.invalidAuthData
+        }
+        guard let formatCBOR = decodedAttestationObject["fmt"],
+            case let .utf8String(format) = formatCBOR else {
+            throw WebAuthnError.invalidFmt
+        }
+        let attestationFormat = AttestationFormat(format)
+
+        guard let attestationStatement = decodedAttestationObject["attStmt"] else {
+            throw WebAuthnError.missingAttStmt
+        }
+
+        attestationObject = AttestationObject(
+            authenticatorData: try AuthenticatorData(bytes: authDataBytes),
+            rawAuthenticatorData: authDataBytes,
+            format: attestationFormat,
+            attestationStatement: attestationStatement
+        )
+    }
+}

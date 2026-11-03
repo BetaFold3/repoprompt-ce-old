@@ -16,14 +16,8 @@ struct AgentProviderUsageReadout: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(presentation.title)
-                .font(.system(size: 10))
-                .foregroundStyle(.tertiary)
-
-            Text(presentation.readoutText)
-                .font(.system(size: 13, weight: .semibold, design: .rounded))
-                .foregroundStyle(.primary)
-                .lineLimit(1)
+            metricRow(label: presentation.cacheHitRatioLabel, value: presentation.cacheHitRatioValue)
+            metricRow(label: presentation.costEstimateLabel, value: presentation.costEstimateValue)
 
             if showsVisibleNote, let expanded = presentation.expandedDetailText {
                 Text(expanded)
@@ -41,7 +35,24 @@ struct AgentProviderUsageReadout: View {
         .contentShape(Rectangle())
         .hoverTooltip(presentation.detailText)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(presentation.title)
-        .accessibilityValue(presentation.detailText)
+        .accessibilityLabel(presentation.accessibilityLabel)
+        .accessibilityValue("\(presentation.readoutText). \(presentation.detailText)")
+    }
+
+    /// One labelled value: small tertiary label, semibold rounded value on the same baseline.
+    private func metricRow(label: String, value: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(label)
+                .font(.system(size: 10))
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
+
+            Spacer(minLength: 8)
+
+            Text(value)
+                .font(.system(size: 13, weight: .semibold, design: .rounded))
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+        }
     }
 }

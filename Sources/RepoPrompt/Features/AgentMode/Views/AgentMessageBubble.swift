@@ -305,7 +305,7 @@ struct AgentMessageBubble: View {
             if isHiddenAgentTool(renderItem.toolName) {
                 EmptyView()
             } else if isAskUserTool(renderItem.toolName) {
-                askUserQuestionExchangeView
+                askUserQuestionExchangeView(for: renderItem)
             } else if normalizedToolName == "context_builder", let contextBuilderContext {
                 ContextBuilderResultCard(item: renderItem, context: contextBuilderContext)
                     .id(rawToolResultPayloadRenderRevision)
@@ -364,6 +364,12 @@ struct AgentMessageBubble: View {
                                     .buttonStyle(.plain)
                             }
                         }
+                    } else if let recoveryDelivery = item.recoveryDelivery {
+                        // Recovery evidence only: no resend action (that is the remote flag's).
+                        Text(Self.recoveryDeliveryLabel(recoveryDelivery))
+                            .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .semibold))
+                            .foregroundStyle(recoveryDelivery == .notSent ? Color.red : Color.orange)
+                            .hoverTooltip(Self.recoveryDeliveryHelp(recoveryDelivery))
                     }
                     if item.codexGoalMode != nil || item.workflow != nil {
                         HStack(spacing: 6) {
@@ -386,7 +392,7 @@ struct AgentMessageBubble: View {
                 .padding(12)
                 .background(BubbleColors.lightBlue)
                 .cornerRadius(20)
-                .opacity(item.isUndeliveredRemoteSend ? 0.65 : 1)
+                .opacity(item.isUndeliveredRemoteSend || item.recoveryDelivery != nil ? 0.65 : 1)
 
                 if let scheduledSend = item.scheduledSend {
                     scheduledSendMarker(scheduledSend)
@@ -397,12 +403,42 @@ struct AgentMessageBubble: View {
         }
     }
 
+    /// R1a label of a user bubble whose earlier-launch intent has no acceptance evidence.
+    static func recoveryDeliveryLabel(_ delivery: AgentUserItemRecoveryDelivery) -> String {
+        switch delivery {
+        case .notSent: "Not sent"
+        case .unconfirmed: "Delivery unconfirmed"
+        case .notConfirmedByAgent: "Not confirmed"
+        }
+    }
+
+    static func recoveryDeliveryHelp(_ delivery: AgentUserItemRecoveryDelivery) -> String {
+        switch delivery {
+        case .notSent:
+            // Verified non-delivery says nothing about how RepoPrompt exited (O50).
+            "This message was not delivered to the agent."
+        case .unconfirmed:
+            "RepoPrompt stopped before the agent confirmed this message. Sending it again might duplicate it."
+        case .notConfirmedByAgent:
+            "The agent didn't confirm it received this message. Sending it again might duplicate it."
+        }
+    }
+
+    /// Receipt-kind-aware schedule marker: only provider acceptance says "Sent". A saved-in-queue
+    /// receipt saved the input for sending; a legacy receipt proves neither.
+    static func scheduledSendMarkerText(_ provenance: AgentScheduledSendProvenance) -> String {
+        let sentAt = AgentScheduledSendDateFormatting.dateAndTime(provenance.sentAt)
+        let outcome = switch provenance.kind {
+        case .providerAccepted: "Sent \(sentAt)"
+        case .savedInQueue: "Saved for sending \(sentAt)"
+        case .legacyUnknown: "Dispatched \(sentAt)"
+        }
+        return "Scheduled for \(AgentScheduledSendDateFormatting.dateAndTime(provenance.scheduledFor)) · \(outcome)"
+    }
+
     private func scheduledSendMarker(_ provenance: AgentScheduledSendProvenance) -> some View {
         Label {
-            Text(
-                "Scheduled for \(AgentScheduledSendDateFormatting.dateAndTime(provenance.scheduledFor)) · "
-                    + "Sent \(AgentScheduledSendDateFormatting.dateAndTime(provenance.sentAt))"
-            )
+            Text(Self.scheduledSendMarkerText(provenance))
         } icon: {
             Image(systemName: "clock")
         }
@@ -724,10 +760,14 @@ struct AgentMessageBubble: View {
         }
     }
 
-    /// Completed question exchange (tool_result state) - shows Q&A grouped together
-    private var askUserQuestionExchangeView: some View {
-        let summary = parseAskUserQuestionSummaryRobust(args: item.toolArgsJSON, result: item.toolResultJSON)
-        let isExpanded = !summary.isHistoricalScalar && isAskUserExchangeExpanded
+    /// Completed question exchange (tool_result state) - shows Q&A grouped together.
+    /// Reads the enriched rendering item so the card uses the same raw result payload as other result cards.
+    private func askUserQuestionExchangeView(for exchangeItem: AgentChatItem) -> some View {
+        let summary = parseAskUserQuestionSummaryRobust(
+            args: exchangeItem.toolArgsJSON,
+            result: exchangeItem.toolResultJSON
+        )
+        let isExpanded = summary.allowsExpansion && isAskUserExchangeExpanded
         return HStack {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(alignment: .top, spacing: 8) {
@@ -764,7 +804,7 @@ struct AgentMessageBubble: View {
 
                         AskUserQuestionResultView(summary: summary, isExpanded: isExpanded)
 
-                        if !summary.isHistoricalScalar {
+                        if summary.allowsExpansion {
                             Button {
                                 if isExpanded {
                                     withAnimation(.easeInOut(duration: 0.2)) {
@@ -1315,14 +1355,54 @@ struct AskUserQuestionSummary {
         let skipped: Bool
     }
 
+    /// A saved answer whose ID matches no displayable question. Shown by its literal answer ID; question
+    /// text is never inferred and the answer is never attached to a question by position.
+    struct UnmatchedAnswer: Identifiable {
+        let id: String
+        let answer: String
+        let customResponse: String?
+        let skipped: Bool
+    }
+
     let title: String?
     let context: String?
     let questions: [Question]
     let skipped: Bool
     let timedOut: Bool
     let isHistoricalScalar: Bool
+    /// Saved answers not matched by a displayed question, sorted by answer ID.
+    var unmatchedAnswers: [UnmatchedAnswer] = []
+
+    /// Saved answers exist, but no question text survived to display them against.
+    var isQuestionTextUnavailable: Bool {
+        questions.isEmpty && !unmatchedAnswers.isEmpty
+    }
+
+    /// Genuine scalar-only exchanges keep their fixed preview; any surviving unmatched answers can expand in full.
+    var allowsExpansion: Bool {
+        !isHistoricalScalar || !unmatchedAnswers.isEmpty
+    }
+
+    var unmatchedAnswersCaption: String? {
+        guard !unmatchedAnswers.isEmpty else { return nil }
+        return questions.isEmpty
+            ? "Question text unavailable. Saved answers are shown by answer ID."
+            : "Saved answers that match none of the questions above, shown by answer ID."
+    }
+
+    /// Text for a displayed question without a matching saved answer. When other saved answers exist, the
+    /// card does not claim the user gave no response.
+    var missingAnswerText: String {
+        unmatchedAnswers.isEmpty ? "No response" : "No matching saved answer"
+    }
 
     var displayTitle: String {
+        if questions.isEmpty {
+            if let title, !title.isEmpty {
+                return title
+            }
+            return unmatchedAnswers.count == 1 ? "Saved answer" : "Saved answers (\(unmatchedAnswers.count))"
+        }
         if let title, !title.isEmpty {
             return questions.count > 1 ? "\(title) (\(questions.count) questions)" : title
         }
@@ -1513,7 +1593,26 @@ func parseAskUserQuestionSummaryRobust(args: String?, result: String?) -> AskUse
             questions: questions.isEmpty ? [fallbackQuestion()] : questions,
             skipped: skipped,
             timedOut: timedOut,
-            isHistoricalScalar: false
+            isHistoricalScalar: false,
+            unmatchedAnswers: unmatchedAskUserAnswers(
+                resultDTO,
+                excluding: Set(questions.map(\.id)),
+                skipped: skipped,
+                timedOut: timedOut
+            )
+        )
+    }
+
+    // Structured answers survived without usable question text (missing, malformed, or mismatched arguments).
+    if normalizedNonEmpty(argsDTO?.question) == nil, !(resultDTO?.answers?.isEmpty ?? true) {
+        return AskUserQuestionSummary(
+            title: normalizedNonEmpty(argsDTO?.title),
+            context: normalizedNonEmpty(argsDTO?.context),
+            questions: [],
+            skipped: skipped,
+            timedOut: timedOut,
+            isHistoricalScalar: false,
+            unmatchedAnswers: unmatchedAskUserAnswers(resultDTO, excluding: [], skipped: skipped, timedOut: timedOut)
         )
     }
 
@@ -1540,8 +1639,30 @@ func parseAskUserQuestionSummaryRobust(args: String?, result: String?) -> AskUse
         questions: [scalarQuestion],
         skipped: skipped,
         timedOut: timedOut,
-        isHistoricalScalar: true
+        isHistoricalScalar: true,
+        unmatchedAnswers: unmatchedAskUserAnswers(resultDTO, excluding: [], skipped: skipped, timedOut: timedOut)
     )
+}
+
+/// Saved answers whose IDs no displayed question owns, sorted by ID. Answers for malformed question siblings
+/// stay visible here instead of being attached to a surviving question by position.
+private func unmatchedAskUserAnswers(
+    _ resultDTO: AskUserQuestionResult?,
+    excluding matchedIDs: Set<String>,
+    skipped: Bool,
+    timedOut: Bool
+) -> [AskUserQuestionSummary.UnmatchedAnswer] {
+    guard let answers = resultDTO?.answers else { return [] }
+    return answers.keys.sorted().compactMap { answerID -> AskUserQuestionSummary.UnmatchedAnswer? in
+        guard !matchedIDs.contains(answerID), let answer = answers[answerID] else { return nil }
+        let answerSkipped = answer.skipped ?? skipped
+        return AskUserQuestionSummary.UnmatchedAnswer(
+            id: answerID,
+            answer: answerSkipped ? "Skipped" : (displayAnswer(from: answer, timedOut: timedOut) ?? "No response"),
+            customResponse: normalizedNonEmpty(answer.customResponse),
+            skipped: answerSkipped
+        )
+    }
 }
 
 private func parseAskUserQuestionSummary(args: String?, result: String?) -> AskUserQuestionSummary? {
@@ -1801,7 +1922,7 @@ private struct AskUserQuestionResultView: View {
                             .font(fontPreset.swiftUIFont(sizeAtNormal: 10, weight: .bold))
                             .foregroundColor(.secondary)
                             .frame(width: summary.questions.count == 1 ? 14 : 22, alignment: .leading)
-                        Text(question.answer ?? "No response")
+                        Text(question.answer ?? summary.missingAnswerText)
                             .font(fontPreset.standardFont)
                             .foregroundColor(question.skipped || summary.timedOut ? .secondary : .primary)
                             .lineLimit(isExpanded ? nil : 3)
@@ -1809,8 +1930,40 @@ private struct AskUserQuestionResultView: View {
                     }
                 }
             }
+
+            if let caption = summary.unmatchedAnswersCaption {
+                unmatchedAnswersSection(caption: caption)
+            }
         }
         .textSelection(.enabled)
+    }
+
+    private func unmatchedAnswersSection(caption: String) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(caption)
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                .foregroundColor(.secondary)
+                .textSelection(.enabled)
+            ForEach(summary.unmatchedAnswers) { entry in
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Answer ID: \(entry.id)")
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 10, weight: .medium))
+                        .foregroundColor(.secondary)
+                        .textSelection(.enabled)
+                    HStack(alignment: .top, spacing: 6) {
+                        Text("A")
+                            .font(fontPreset.swiftUIFont(sizeAtNormal: 10, weight: .bold))
+                            .foregroundColor(.secondary)
+                            .frame(width: 14, alignment: .leading)
+                        Text(entry.answer)
+                            .font(fontPreset.standardFont)
+                            .foregroundColor(entry.skipped || summary.timedOut ? .secondary : .primary)
+                            .lineLimit(isExpanded ? nil : 3)
+                            .textSelection(.enabled)
+                    }
+                }
+            }
+        }
     }
 }
 

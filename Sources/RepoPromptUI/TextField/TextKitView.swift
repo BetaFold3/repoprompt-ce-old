@@ -29,6 +29,9 @@ package struct TextKitView: NSViewRepresentable {
     var detectedMarkdownFileLinks: [MarkdownFilePathLinkDetector.Match] = []
     /// Routes opt-in detected links through the same policy as rendered Markdown links.
     var markdownFileLinkOpener: MarkdownFileLinkOpener?
+    /// Default-off content fitting. When set, `sizeThatFits` reports the laid-out content height
+    /// for the proposed width, capped at this value; when nil, SwiftUI's default sizing applies.
+    var contentFittingMaxHeight: CGFloat?
     /// Notifies parent when the user starts/stops editing so it can gate external writes.
     var onEditingChanged: ((Bool) -> Void)?
 
@@ -47,6 +50,7 @@ package struct TextKitView: NSViewRepresentable {
         scrollerStyle: NSScroller.Style? = nil,
         detectedMarkdownFileLinks: [MarkdownFilePathLinkDetector.Match] = [],
         markdownFileLinkOpener: MarkdownFileLinkOpener? = nil,
+        contentFittingMaxHeight: CGFloat? = nil,
         onEditingChanged: ((Bool) -> Void)? = nil
     ) {
         _text = text
@@ -63,8 +67,11 @@ package struct TextKitView: NSViewRepresentable {
         self.scrollerStyle = scrollerStyle
         self.detectedMarkdownFileLinks = detectedMarkdownFileLinks
         self.markdownFileLinkOpener = markdownFileLinkOpener
+        self.contentFittingMaxHeight = contentFittingMaxHeight
         self.onEditingChanged = onEditingChanged
     }
+
+    static let textContainerInset = NSSize(width: 8, height: 8)
 
     @ObservedObject private var fontScale = FontScaleManager.shared
 
@@ -101,6 +108,74 @@ package struct TextKitView: NSViewRepresentable {
         ParagraphStyleSignature(
             fontFingerprint: .fingerprint(of: font),
             wrapLines: wrapLines
+        )
+    }
+
+    static func codeParagraphStyle(for signature: ParagraphStyleSignature) -> NSParagraphStyle {
+        let metrics = TranscriptCodeFontResolver.resolve(
+            preferredPostScriptName: signature.fontFingerprint.faceIdentity,
+            pointSize: signature.fontFingerprint.pointSize
+        )
+        return metrics.makeCodeParagraphStyle(
+            lineBreakMode: signature.wrapLines ? .byWordWrapping : .byClipping
+        )
+    }
+
+    /// The default paragraph style the live text view applies (`nil` = AppKit default).
+    func resolvedParagraphStyle(font: NSFont) -> NSParagraphStyle? {
+        guard useMonospacedFont, useTranscriptCodeFont else { return nil }
+        return Self.codeParagraphStyle(for: Self.paragraphStyleSignature(font: font, wrapLines: wrapLines))
+    }
+
+    // MARK: - Opt-in content fitting
+
+    /// Synchronous, width-driven fitting for callers that set `contentFittingMaxHeight`.
+    /// Measurement uses a private layout stack and never mutates the displayed view.
+    @MainActor
+    package func sizeThatFits(
+        _ proposal: ProposedViewSize,
+        nsView: NSScrollView,
+        context: Context
+    ) -> CGSize? {
+        guard contentFittingMaxHeight != nil else { return nil }
+        return fittedSize(
+            for: proposal,
+            chrome: TextKitContentHeightMeasurer.ScrollChrome(scrollView: nsView)
+        )
+    }
+
+    /// The size reported to SwiftUI for an opted-in view.
+    ///
+    /// Only a concrete, finite proposed width is measured; its returned width is that proposal.
+    /// Unspecified (`nil`) or infinite width probes return nil, which keeps SwiftUI's default
+    /// representable sizing for them and never reports an infinite size back. Not opting in
+    /// always returns nil.
+    func fittedSize(
+        for proposal: ProposedViewSize,
+        chrome: TextKitContentHeightMeasurer.ScrollChrome
+    ) -> CGSize? {
+        guard let width = proposal.width, width.isFinite,
+              let measurement = contentFittingMeasurement(proposedWidth: width, chrome: chrome)
+        else { return nil }
+        return CGSize(width: max(width, 0), height: measurement.height)
+    }
+
+    /// Nil when fitting is not opted in, so default callers keep SwiftUI's default sizing.
+    func contentFittingMeasurement(
+        proposedWidth: CGFloat?,
+        chrome: TextKitContentHeightMeasurer.ScrollChrome
+    ) -> TextKitContentHeightMeasurer.Result? {
+        guard let maxHeight = contentFittingMaxHeight else { return nil }
+        let font = resolvedFont
+        return TextKitContentHeightMeasurer.fittedHeight(
+            text: text,
+            font: font,
+            paragraphStyle: resolvedParagraphStyle(font: font),
+            wrapLines: wrapLines,
+            frameWidth: proposedWidth,
+            textContainerInset: Self.textContainerInset,
+            chrome: chrome,
+            maxHeight: maxHeight
         )
     }
 
@@ -275,7 +350,7 @@ package struct TextKitView: NSViewRepresentable {
         return scrollView
     }
 
-    private func setupTextView(_ textView: NSTextView, coordinator: Coordinator) {
+    func setupTextView(_ textView: NSTextView, coordinator: Coordinator) {
         textView.isEditable = isEditable
         textView.isSelectable = true
         textView.allowsUndo = true
@@ -288,7 +363,7 @@ package struct TextKitView: NSViewRepresentable {
             font: resolvedFont
         )
 
-        textView.textContainerInset = NSSize(width: 8, height: 8)
+        textView.textContainerInset = Self.textContainerInset
         textView.delegate = coordinator
         textView.string = coordinator.internalText
 
@@ -560,13 +635,7 @@ package struct TextKitView: NSViewRepresentable {
         )
         guard coordinator.paragraphStyleSignature != signature else { return }
 
-        let metrics = TranscriptCodeFontResolver.resolve(
-            preferredPostScriptName: signature.fontFingerprint.faceIdentity,
-            pointSize: signature.fontFingerprint.pointSize
-        )
-        textView.defaultParagraphStyle = metrics.makeCodeParagraphStyle(
-            lineBreakMode: signature.wrapLines ? .byWordWrapping : .byClipping
-        )
+        textView.defaultParagraphStyle = Self.codeParagraphStyle(for: signature)
         coordinator.paragraphStyleSignature = signature
     }
 

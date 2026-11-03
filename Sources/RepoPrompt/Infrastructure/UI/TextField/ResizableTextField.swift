@@ -5,6 +5,9 @@ import RepoPromptUI
 import RepoPromptWorkspace
 import SwiftUI
 import UniformTypeIdentifiers
+#if DEBUG
+    import OSLog
+#endif
 
 enum ImagePasteboardTypes {
     static let legacyApplePNG = NSPasteboard.PasteboardType("Apple PNG pasteboard type")
@@ -61,6 +64,19 @@ final class ImageAwareTextView: NSTextView {
             let accepted = super.becomeFirstResponder()
             if accepted {
                 onDidBecomeFirstResponderForInteractionProbe?()
+            }
+            return accepted
+        }
+    #endif
+
+    #if DEBUG
+        /// Diagnostics-only notification of an accepted resignation. It never changes focus.
+        var onDidResignFirstResponderForFocusTrace: (() -> Void)?
+
+        override func resignFirstResponder() -> Bool {
+            let accepted = super.resignFirstResponder()
+            if accepted {
+                onDidResignFirstResponderForFocusTrace?()
             }
             return accepted
         }
@@ -249,6 +265,9 @@ struct ResizableTextFieldFeatures {
     var snippetPaletteItemsProvider: (() -> [SnippetPaletteItem])?
     var snippetPaletteScope: SnippetPaletteScope?
     var composerFocusToken: UUID?
+    /// Queried live at the text view's edit entry (typing, paste, drop, snippet insertion): `false`
+    /// refuses the change before the text view accepts it (e.g. the shutdown edit freeze).
+    var acceptsEdits: (() -> Bool)?
 
     static let plain = ResizableTextFieldFeatures()
 
@@ -263,7 +282,8 @@ struct ResizableTextFieldFeatures {
         slashSkillSuggestionsProvider: ((String) async -> [MentionSuggestion])?,
         snippetPaletteItemsProvider: (() -> [SnippetPaletteItem])? = nil,
         snippetPaletteScope: SnippetPaletteScope? = nil,
-        composerFocusToken: UUID? = nil
+        composerFocusToken: UUID? = nil,
+        acceptsEdits: (() -> Bool)? = nil
     ) -> ResizableTextFieldFeatures {
         ResizableTextFieldFeatures(
             enableFileTagOverlay: true,
@@ -279,7 +299,8 @@ struct ResizableTextFieldFeatures {
             enableSnippetPalette: snippetPaletteItemsProvider != nil,
             snippetPaletteItemsProvider: snippetPaletteItemsProvider,
             snippetPaletteScope: snippetPaletteScope,
-            composerFocusToken: composerFocusToken
+            composerFocusToken: composerFocusToken,
+            acceptsEdits: acceptsEdits
         )
     }
 }
@@ -443,6 +464,10 @@ struct CustomTextField: NSViewRepresentable {
         #if DEBUG || EDIT_FLOW_PERF
             context.coordinator.installInteractionProbeResponderObservation(on: textView)
         #endif
+        #if DEBUG
+            context.coordinator.traceComposerFocusSeed(features.composerFocusToken)
+            context.coordinator.installComposerFocusResignTrace(on: textView)
+        #endif
         textView.enablesImagePasteHandling = onImagePaste != nil
         context.coordinator.configureFileTagSupport(
             textView: textView,
@@ -479,6 +504,11 @@ struct CustomTextField: NSViewRepresentable {
     func updateNSView(_ nsView: NSScrollView, context: Context) {
         context.coordinator.parent = self
         guard let textView = nsView.documentView as? ImageAwareTextView else { return }
+        // `.disabled` (e.g. the shutdown edit freeze) makes the text read-only; it stays selectable.
+        let isEditable = context.environment.isEnabled
+        if textView.isEditable != isEditable {
+            textView.isEditable = isEditable
+        }
         textView.imagePasteHandler = onImagePaste
         textView.enablesImagePasteHandling = onImagePaste != nil
         if textView.font != fontPreset.nsFont {
@@ -558,6 +588,9 @@ struct CustomTextField: NSViewRepresentable {
         #if DEBUG || EDIT_FLOW_PERF
             textView.onDidBecomeFirstResponderForInteractionProbe = nil
         #endif
+        #if DEBUG
+            textView.onDidResignFirstResponderForFocusTrace = nil
+        #endif
         textView.isAutomaticSpellingCorrectionEnabled = false
         coordinator.clearUndoHistory()
         coordinator.dismissFileTagOverlay()
@@ -589,6 +622,16 @@ struct CustomTextField: NSViewRepresentable {
             self.parent = parent
         }
 
+        /// The edit entry: a refused change never reaches the text (or its binding), so nothing is
+        /// accepted on screen and then lost.
+        func textView(
+            _: NSTextView,
+            shouldChangeTextIn _: NSRange,
+            replacementString _: String?
+        ) -> Bool {
+            parent.features.acceptsEdits?() ?? true
+        }
+
         func scheduleComposerFocusToken(_ token: UUID?, for textView: ImageAwareTextView) {
             guard ComposerFocusTokenPolicy.shouldSchedule(
                 token: token,
@@ -596,15 +639,98 @@ struct CustomTextField: NSViewRepresentable {
                 pendingToken: pendingComposerFocusToken
             ) else { return }
             DispatchQueue.main.async { [weak self, weak textView] in
-                guard let self, isActive, let textView else { return }
+                guard let self else { return }
+                guard isActive, let textView else {
+                    #if DEBUG
+                        if let token, token != debugActedComposerFocusToken {
+                            traceComposerFocusDrop(token: token, cause: .inactive)
+                        }
+                    #endif
+                    return
+                }
                 let currentToken = parent.features.composerFocusToken
                 guard ComposerFocusTokenPolicy.scheduledTokenIsCurrent(
                     token,
                     currentToken: currentToken
-                ) else { return }
+                ) else {
+                    #if DEBUG
+                        if let token, token != debugActedComposerFocusToken {
+                            traceComposerFocusDrop(token: token, cause: .superseded)
+                        }
+                    #endif
+                    return
+                }
                 applyComposerFocusToken(currentToken, to: textView)
             }
         }
+
+        #if DEBUG
+            private enum ComposerFocusTraceCause: String {
+                case inactive
+                case superseded
+                case resign
+            }
+
+            private static let composerFocusLogger = Logger(
+                subsystem: "com.repoprompt.app",
+                category: "composer-focus"
+            )
+            /// Diagnostics only: the token this coordinator last attempted or dropped (never
+            /// read by focus policy).
+            private var debugActedComposerFocusToken: UUID?
+            /// Diagnostics only: the token whose attempt this coordinator saw end with the composer
+            /// as first responder; arms the resign trace (never read by focus policy).
+            private var debugFocusedComposerFocusToken: UUID?
+            /// Diagnostics only: (token, cause) dedupe so repeated view updates trace each pair once.
+            /// Bounded; tokens are per-request UUIDs, so clearing only risks a rare re-trace.
+            private var debugTracedComposerFocusKeys: Set<String> = []
+
+            private func shouldTraceComposerFocus(token: UUID, cause: ComposerFocusTraceCause) -> Bool {
+                if debugTracedComposerFocusKeys.count >= 64 {
+                    debugTracedComposerFocusKeys.removeAll(keepingCapacity: true)
+                }
+                return debugTracedComposerFocusKeys.insert("\(token.uuidString)|\(cause.rawValue)").inserted
+            }
+
+            /// Content-free: token UUID and cause only; no text, tab/session IDs, or model names.
+            private func traceComposerFocusDrop(token: UUID, cause: ComposerFocusTraceCause) {
+                guard shouldTraceComposerFocus(token: token, cause: cause) else { return }
+                Self.composerFocusLogger.debug(
+                    "drop token=\(token.uuidString, privacy: .public) cause=\(cause.rawValue, privacy: .public)"
+                )
+            }
+
+            /// A token already present at mount is seeded as applied and intentionally never
+            /// focused. It may have been delivered by an earlier text view; if no earlier
+            /// `delivery` exists for this UUID, this is where it was lost. Once per mount.
+            func traceComposerFocusSeed(_ token: UUID?) {
+                guard let token else { return }
+                Self.composerFocusLogger.debug(
+                    "seed token=\(token.uuidString, privacy: .public)"
+                )
+            }
+
+            func installComposerFocusResignTrace(on textView: ImageAwareTextView) {
+                textView.onDidResignFirstResponderForFocusTrace = { [weak self, weak textView] in
+                    guard let self, let textView else { return }
+                    traceComposerFocusResign(textView)
+                }
+            }
+
+            /// Makes a responder theft after `delivery ... firstResponder=true` visible. Traces the
+            /// first resignation per token that actually focused the composer; never changes
+            /// focus or token state.
+            private func traceComposerFocusResign(_ textView: ImageAwareTextView) {
+                guard isActive,
+                      let token = lastAppliedComposerFocusToken,
+                      token == debugFocusedComposerFocusToken,
+                      shouldTraceComposerFocus(token: token, cause: .resign)
+                else { return }
+                Self.composerFocusLogger.debug(
+                    "resign token=\(token.uuidString, privacy: .public) window=\(textView.window?.windowNumber ?? -1, privacy: .public)"
+                )
+            }
+        #endif
 
         func composerTextViewDidMoveToWindow(_ textView: ImageAwareTextView) {
             #if DEBUG || EDIT_FLOW_PERF
@@ -621,6 +747,21 @@ struct CustomTextField: NSViewRepresentable {
                 } ?? false
                 if pendingComposerFocusToken != nil || hasUnappliedCurrentToken {
                     AgentModePerfDiagnostics.increment("ui.composer.focusToken.dismantleDrop")
+                }
+                // The coordinator may be released before a queued attempt runs, so trace the
+                // loss here; dedupe keeps a later in-block trace from repeating it.
+                var lostTokens: [UUID] = []
+                if let pendingComposerFocusToken {
+                    lostTokens.append(pendingComposerFocusToken)
+                }
+                if hasUnappliedCurrentToken,
+                   let currentToken = parent.features.composerFocusToken,
+                   currentToken != pendingComposerFocusToken
+                {
+                    lostTokens.append(currentToken)
+                }
+                for lostToken in lostTokens where lostToken != debugActedComposerFocusToken {
+                    traceComposerFocusDrop(token: lostToken, cause: .inactive)
                 }
             #endif
             pendingComposerFocusToken = nil
@@ -663,6 +804,22 @@ struct CustomTextField: NSViewRepresentable {
                 lastAppliedToken: lastAppliedComposerFocusToken,
                 pendingToken: pendingComposerFocusToken
             )
+            #if DEBUG
+                // Read actual AppKit state after applying; no text, tab IDs, or model names.
+                defer {
+                    if let token, action != .none {
+                        Logger(subsystem: "com.repoprompt.app", category: "composer-focus").debug(
+                            "delivery token=\(token.uuidString, privacy: .public) action=\(String(describing: action), privacy: .public) window=\(textView.window?.windowNumber ?? -1, privacy: .public) key=\(textView.window?.isKeyWindow == true, privacy: .public) firstResponder=\(textView.window?.firstResponder === textView, privacy: .public)"
+                        )
+                    }
+                    if let token, action == .drop || action == .attempt {
+                        debugActedComposerFocusToken = token
+                    }
+                    if let token, action == .attempt, textView.window?.firstResponder === textView {
+                        debugFocusedComposerFocusToken = token
+                    }
+                }
+            #endif
 
             switch action {
             case .clearPending, .none, .waitForWindow:

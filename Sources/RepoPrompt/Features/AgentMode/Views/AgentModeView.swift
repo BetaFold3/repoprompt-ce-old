@@ -2745,12 +2745,15 @@ struct AgentModeChatDetailView: View {
                     agentModeVM.submitMCPElicitationResponse(tabID: tabID, requestID: request.id, response: response)
                 }
             )
+            .disabled(runInteractionSnapshot.isShutdownFrozen)
             .id("pendingMCPElicitation")
             .transition(.opacity)
         } else if let request = runInteractionSnapshot.pendingUserInputRequest {
             let cancelTarget = runInteractionSnapshot.pendingUserInputCancelTarget
             AgentRequestUserInputCard(
                 request: request,
+                initialDrafts: currentTabID.map { agentModeVM.userInputDrafts(tabID: $0, requestID: request.id) } ?? [:],
+                isFrozen: runInteractionSnapshot.isShutdownFrozen,
                 onSubmit: { response in
                     guard let tabID = currentTabID else { return }
                     agentModeVM.submitUserInputResponse(tabID: tabID, requestID: request.requestID, response: response)
@@ -2758,11 +2761,26 @@ struct AgentModeChatDetailView: View {
                 onStop: {
                     guard let cancelTarget else { return }
                     Task {
-                        _ = await agentModeVM.cancelAgentRun(target: cancelTarget, completion: .terminalPublished)
+                        _ = await agentModeVM.cancelAgentRun(
+                            target: cancelTarget,
+                            cause: .userCancel,
+                            completion: .terminalPublished
+                        )
                     }
+                },
+                onDraftChange: { questionID, draft in
+                    guard let tabID = currentTabID else { return }
+                    agentModeVM.updateUserInputDraft(
+                        tabID: tabID,
+                        requestID: request.id,
+                        questionID: questionID,
+                        draft: draft
+                    )
                 }
             )
-            .id("pendingUserInputRequest")
+            // Keyed by the request: switching requests (tabs) builds a card seeded from that
+            // request's session-owned drafts instead of reusing another request's state.
+            .id("pendingUserInputRequest-\(request.id.uuidString)")
             .transition(.opacity)
         } else if let pendingAskUser = runInteractionSnapshot.pendingAskUser {
             AgentAskUserWizardCard(
@@ -2797,6 +2815,7 @@ struct AgentModeChatDetailView: View {
                     agentModeVM.noteAskUserCardActivity(tabID: tabID, interactionID: pendingAskUser.interaction.id)
                 }
             )
+            .disabled(runInteractionSnapshot.isShutdownFrozen)
             .id("pendingAskUser")
             .transition(.opacity)
         } else if let conflict = runInteractionSnapshot.activeWorktreeMergeConflict {
@@ -2824,6 +2843,34 @@ struct AgentModeChatDetailView: View {
                 }
             )
             .id("activeWorktreeMergeConflict")
+            .transition(.opacity)
+        } else if let historical = runInteractionSnapshot.historicalWorktreeMergeReview,
+                  let tabID = currentTabID
+        {
+            AgentWorktreeMergeHistoricalReviewCard(
+                operation: historical,
+                isDisabled: runInteractionSnapshot.isShutdownFrozen,
+                loadPastPrediction: {
+                    await agentModeVM.historicalWorktreeMergePastPrediction(tabID: tabID, operationID: historical.id)
+                },
+                loadCurrentState: {
+                    await agentModeVM.historicalWorktreeMergeCurrentState(tabID: tabID, operationID: historical.id)
+                },
+                loadSavedPatch: {
+                    await agentModeVM.historicalWorktreeMergeSavedPatch(tabID: tabID, operationID: historical.id)
+                },
+                onCopy: {
+                    await agentModeVM.copyHistoricalWorktreeMergeSavedPatch(tabID: tabID, operationID: historical.id)
+                },
+                isDiscarding: runInteractionSnapshot.historicalWorktreeMergeReviewDiscard?.isDiscarding == true,
+                discardMessage: runInteractionSnapshot.historicalWorktreeMergeReviewDiscard?.message,
+                onDiscard: {
+                    Task { @MainActor in
+                        _ = await agentModeVM.discardHistoricalWorktreeMergeReview(tabID: tabID, operationID: historical.id)
+                    }
+                }
+            )
+            .id("historicalWorktreeMergeReview-\(historical.id)")
             .transition(.opacity)
         }
         bottomTarget

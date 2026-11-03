@@ -1,6 +1,6 @@
 import Foundation
 import MCP
-@testable import RepoPromptAgentCore
+@_spi(TestSupport) @testable import RepoPromptAgentCore
 @testable import RepoPromptWorkspace
 @_spi(TestSupport) @testable import RepoPromptApp
 @testable import RepoPromptPlatform
@@ -235,6 +235,102 @@ final class AgentDelegationServiceBoundaryTests: XCTestCase {
             )
             XCTAssertEqual(sibling.session.parentSessionID, fixture.main.sessionID)
             XCTAssertEqual(fixture.viewModel.mcpDelegationLineage(for: siblingChild), .resolved(depth: 2))
+        }
+    }
+
+    // MARK: - Delegated child links (lossless-restart Step 5b)
+
+    /// A recovery-tracked parent must link its child by the call's dispatcher invocation UUID under
+    /// its current run attempt; without either, start fails closed before any target or dispatch.
+    func testRecoveryTrackedParentStartFailsClosedBeforeCreatingAChild() async throws {
+        try await withFixture { fixture in
+            let knowledge = try await makeKnowledgeTree(fixture)
+            fixture.window.apiSettingsViewModel.isClaudeCodeConnected = true
+            fixture.window.apiSettingsViewModel.isCodexConnected = true
+            knowledge.root.session.recoveryAdmissionMode = .mandatory
+            let tabsBefore = composeTabIDs(fixture)
+            let sessionCountBefore = fixture.viewModel.sessions.count
+            let probe = KnowledgeStartProbe()
+            let withoutIdentity = makeKnowledgeStartService(fixture, source: knowledge.root, probe: probe)
+            await assertInvalidParams(contains: "MCP invocation identity", label: "no invocation identity") {
+                _ = try await withoutIdentity.execute(args: knowledgeStartArgs())
+            }
+            let withIdentity = makeKnowledgeStartService(
+                fixture,
+                source: knowledge.root,
+                probe: probe,
+                toolInvocationID: UUID()
+            )
+            await assertInvalidParams(contains: "no current run attempt", label: "no parent run attempt") {
+                _ = try await withIdentity.execute(args: knowledgeStartArgs())
+            }
+            XCTAssertTrue(probe.starts.isEmpty, "Nothing was dispatched")
+            XCTAssertEqual(composeTabIDs(fixture), tabsBefore, "No child target was created")
+            XCTAssertEqual(fixture.viewModel.sessions.count, sessionCountBefore)
+        }
+    }
+
+    /// The real routed new-target creator under a recovery-tracked parent: by the time the scoped
+    /// start runs, the new child is durable and the parent's link is committed under the exact
+    /// invocation and attempt, and the TaskLocal fence names that child. The fence is released once
+    /// the start returns. Fixture-only start; no provider.
+    func testRecoveryTrackedParentStartCommitsChildAndLinkBeforeTheScopedStart() async throws {
+        try await withFixture { fixture in
+            let knowledge = try await makeKnowledgeTree(fixture)
+            fixture.window.apiSettingsViewModel.isClaudeCodeConnected = true
+            fixture.window.apiSettingsViewModel.isCodexConnected = true
+            let viewModel = fixture.viewModel
+            let recovery = try await installRecoveryAndClaimLane(fixture, root: knowledge.root)
+            let root = knowledge.root.session
+            root.runID = UUID()
+            root.runState = .running
+            let ownership = root.beginRunAttempt(source: "test.delegatedChildLink")
+            let invocationID = UUID()
+            let observed = DelegatedChildStartObservation()
+            let service = makeKnowledgeStartService(
+                fixture,
+                source: knowledge.root,
+                probe: KnowledgeStartProbe(),
+                startRun: { target, _, _, _, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, _, _, _, _, _ in
+                    guard let sessionID = target.sessionID else {
+                        throw MCPError.internalError("The created target has no session ID.")
+                    }
+                    observed.starts += 1
+                    observed.childSessionID = sessionID
+                    observed.persistedParentSessionID = try await agentModeVM.test_dataService
+                        .loadAgentSession(id: sessionID, for: recovery.workspace)?.parentSessionID
+                    observed.links = await recovery.lane.store.read(sessionID: recovery.lane.sessionID).record?.delegatedChildLinks ?? []
+                    observed.fence = MCPDelegatedChildDispatchFence.current
+                    observed.fenceArmedForChild = agentModeVM.mcpDelegatedChildDispatchFence(for: sessionID) != nil
+                    return AgentExternalMCPRunStarter.StartOutcome(
+                        snapshot: Self.knowledgeWorkerSnapshot(
+                            sessionID: sessionID,
+                            tabID: target.tabID,
+                            parentSessionID: knowledge.root.sessionID,
+                            agentRaw: agentRaw,
+                            modelRaw: modelRaw,
+                            reasoningEffortRaw: reasoningEffortRaw
+                        ),
+                        delivery: .startedRun
+                    )
+                },
+                toolInvocationID: invocationID
+            )
+            _ = try await service.execute(args: knowledgeStartArgs())
+
+            XCTAssertEqual(observed.starts, 1, "Exactly one start")
+            let childSessionID = try XCTUnwrap(observed.childSessionID)
+            XCTAssertEqual(observed.persistedParentSessionID, knowledge.root.sessionID, "The child was durable before the start")
+            XCTAssertEqual(observed.links.map(\.invocationID), [invocationID], "The exact ingress invocation")
+            XCTAssertEqual(observed.links.map(\.parentRunAttemptID), [ownership.attemptID])
+            XCTAssertEqual(observed.links.map(\.childSessionID), [childSessionID], "Committed before the start")
+            let fence = try XCTUnwrap(observed.fence, "The start ran under the linked fence")
+            XCTAssertEqual(fence.linkedChildSessionID, childSessionID)
+            XCTAssertTrue(observed.fenceArmedForChild)
+            XCTAssertTrue(fence.isDispatchFenceReleased, "Released once the start returned")
+            XCTAssertNil(MCPDelegatedChildDispatchFence.$current.withValue(fence) {
+                viewModel.mcpDelegatedChildDispatchFence(for: childSessionID)
+            })
         }
     }
 
@@ -1503,11 +1599,13 @@ final class AgentDelegationServiceBoundaryTests: XCTestCase {
         )
     }
 
-    private func metadata(_ window: WindowState) -> MCPServerViewModel.RequestMetadata {
+    private func metadata(_ window: WindowState, toolInvocationID: UUID? = nil) -> MCPServerViewModel.RequestMetadata {
         MCPServerViewModel.RequestMetadata(
             connectionID: nil,
             clientName: "agent-delegation-boundary-tests",
-            windowID: window.windowID
+            windowID: window.windowID,
+            toolInvocationID: toolInvocationID,
+            actorRoutedRunTab: nil
         )
     }
 
@@ -1648,7 +1746,8 @@ final class AgentDelegationServiceBoundaryTests: XCTestCase {
         probe: KnowledgeStartProbe,
         hooks: CallerHookProbe? = nil,
         beforeLaunchSourceResolved: (@MainActor () -> Void)? = nil,
-        startRun: AgentRunMCPToolService.StartRun? = nil
+        startRun: AgentRunMCPToolService.StartRun? = nil,
+        toolInvocationID: UUID? = nil
     ) -> AgentRunMCPToolService {
         let window = fixture.window
         let recordingStartRun: AgentRunMCPToolService.StartRun = { target, _, _, _, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, taskLabelKind, _, workflow, expectedParentSessionID, _ in
@@ -1683,7 +1782,7 @@ final class AgentDelegationServiceBoundaryTests: XCTestCase {
             toolName: MCPWindowToolName.agentRun,
             captureRequestMetadata: {
                 hooks?.recordMetadataCapture()
-                return self.metadata(window)
+                return self.metadata(window, toolInvocationID: toolInvocationID)
             },
             requireTargetWindow: { window },
             resolveRequestedTabID: { _ in nil },
@@ -1895,6 +1994,66 @@ final class AgentDelegationServiceBoundaryTests: XCTestCase {
             activeWorktreeMerges: [],
             lastInteractionResolution: nil
         )
+    }
+
+    /// Composes a real temporary recovery store into the fixture's view model (mandatory admission,
+    /// as production composition does) and claims `root`'s lane through its first VM save.
+    private func installRecoveryAndClaimLane(
+        _ fixture: Fixture,
+        root: Node
+    ) async throws -> (lane: AgentRecoverySessionLane, workspace: WorkspaceModel) {
+        let storageURL = fixture.rootURL.appendingPathComponent("RecoveryWorkspace", isDirectory: true)
+        let recoveryRoot = fixture.rootURL.appendingPathComponent("AgentRecovery/v1", isDirectory: true)
+        try FileManager.default.createDirectory(at: storageURL, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: recoveryRoot, withIntermediateDirectories: true)
+        let store = AgentRecoveryStore(rootURL: recoveryRoot)
+        let service = AgentSessionDataService(
+            tombstoneRoot: recoveryRoot.appendingPathComponent("tombstones", isDirectory: true),
+            recoveryStore: store
+        )
+        let coordinator = try AgentRecoveryCoordinator(
+            store: store,
+            dataService: service,
+            reconcile: { _ in .empty },
+            makeComposerController: { store, gate in
+                AgentRecoveryComposerPersistenceController(
+                    store: store,
+                    gate: gate,
+                    sleep: { _ in try await Task.sleep(for: .seconds(3600)) }
+                )
+            }
+        )
+        coordinator.startIfNeeded()
+        let startup = await coordinator.awaitStartup()
+        XCTAssertEqual(startup, .ready)
+        let workspace = WorkspaceModel(
+            name: "Delegation Boundary Recovery",
+            repoPaths: [fixture.rootURL.path],
+            customStoragePath: storageURL
+        )
+        fixture.viewModel.installRecoveryCoordinator(coordinator, admissionMode: .mandatory)
+        // Session persistence goes to this temporary workspace (never the window's own storage).
+        fixture.viewModel.test_setActiveWorkspaceIDForSessionIndex(workspace.id)
+        fixture.viewModel.test_establishPersistenceWorkspace(workspace)
+        // The fixture marks every node loaded without captured persistence ownership; the root's
+        // first save here is its genuine initial creation instead (then it is loaded again).
+        root.session.hasLoadedPersistedState = false
+        root.session.appendItem(.user("Earlier turn"))
+        let outcome = await fixture.viewModel.flushSaveDetailed(for: root.tabID)
+        root.session.hasLoadedPersistedState = true
+        XCTAssertTrue(outcome.isCleanSuccess, "The root's first save: \(outcome)")
+        let lane = try XCTUnwrap(root.session.recoveryLane, "The first save claims the root's lane")
+        return (lane, workspace)
+    }
+
+    @MainActor
+    private final class DelegatedChildStartObservation {
+        var starts = 0
+        var childSessionID: UUID?
+        var persistedParentSessionID: UUID?
+        var links: [AgentRecoveryDelegatedChildLink] = []
+        var fence: MCPDelegatedChildLinkAdmission?
+        var fenceArmedForChild = false
     }
 
     private func composeTabIDs(_ fixture: Fixture) -> Set<UUID> {

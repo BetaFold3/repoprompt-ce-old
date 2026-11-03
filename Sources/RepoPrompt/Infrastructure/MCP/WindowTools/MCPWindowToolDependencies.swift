@@ -320,6 +320,7 @@ struct MCPWindowToolDependencies {
     let executeAgentExplore: ExecuteTool
     let executeAgentRun: ExecuteTool
     let executeAgentManage: ExecuteTool
+    let executeWorkspaceSteer: ExecuteTool
 
     let requireTargetWindow: RequireTargetWindow
     let requireCurrentTabContext: RequireCurrentTabContext

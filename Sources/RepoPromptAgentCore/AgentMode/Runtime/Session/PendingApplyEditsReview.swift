@@ -2,7 +2,7 @@ import Foundation
 
 package struct ApplyEditsApprovalScope: Hashable {
     package let windowID: Int
-    let tabID: UUID
+    package let tabID: UUID
 
     package init(
         windowID: Int,

@@ -2,7 +2,7 @@
 
 Scope: read when the task touches Agent Mode transcript links that open Markdown or HTML in the utility-panel Preview, including assistant or user path detection, tagged-file badges, tool-result path linkification, click-time resolution, and panel reveal.
 Authority: Authoritative
-Last-verified: 2026-08-30
+Last-verified: 2026-11-02
 
 ## Durable architecture and invariants
 
@@ -16,12 +16,14 @@ Last-verified: 2026-08-30
 
 ## M5 tool-result contract
 
-`ToolMarkdownExpandedContent` opts only its canonical expanded, verbatim monospaced tool-result body into path detection. `ToolResultMarkdownLinkifier` parses that body as Markdown and maps Markdown AST source ranges back to the original string:
+`ToolMarkdownExpandedContent` opts only its canonical expanded, verbatim monospaced tool-result body into path detection. `ToolResultMarkdownRenderer` types that body as `ToolResultBodyPresentation` (canonical text or structured JSON), and only canonical text opts in. `ToolResultMarkdownLinkifier` parses that body as Markdown and maps Markdown AST source ranges back to the original string:
 
 - prose and inline-code `md`/`markdown`/`html`/`htm` paths are eligible;
 - authored `Link` descendants and `CodeBlock` interiors, including fenced and indented blocks, are skipped;
 - the original tool-result text is not re-rendered or rewritten;
 - detected ranges are attributed by `TextKitView` and routed through `MarkdownFileLinkOpener` with auto-detected provenance.
+
+Structured-JSON exception: a JSON object or array body that comes from the app's own generic JSON presentation is shown without its fence, on the same `TextKitView` surface, with path detection off. The output must be exactly the synthetic `json` fence from `ToolOutputFormatter.formatGeneric` or the `_rawJSON` compact output for that value; any appended notice or other change disqualifies it. A JSON object or array body that produces no formatter text counts too. This is the same exclusion a fenced code block already gets, so JSON string values such as `"docs/x.md"` stay unlinked. It doesn't add link provenance, routing, or Preview security behavior. MCP transport text stays canonical, with every text block kept and authored fences unchanged. Transport text is read from the original JSON, never from the already-unwrapped `ToolRawJSON.object`. It's either a `content` array inside an `Ok`/`ok`/`Err`/`err` envelope or a bare call result with only `content`, `isError`, and `_meta`. Either shape defers to the existing `ToolJSON` extraction, with a raw-payload copy, when it carries non-null structured data. That means a `structuredContent`, `structured_content`, `structuredResult`, `structured_result`, `toolResult`, or `tool_result` sibling, or a content block with `json`, `structuredContent`, or `structured_content`. Explicit `null` values for those keys carry no data and are ignored. Narrow transport exception: when every transport text block is, on its own, a valid JSON object or array, the body is typed as structured JSON. The text is kept exactly (per-block trim, blocks joined with a blank line), nothing is reserialized, no raw-copy row is added, and path detection is off. If any block is prose, fenced text, a JSON scalar, or malformed JSON, the whole body stays canonical, including blocks that mix prose and JSON. Specialized formatter output, non-JSON text, and malformed JSON also stay canonical, with interior text unchanged. Surrounding whitespace on the body and on each transport text block is trimmed. When the shown JSON is reserialized or extracted (`ToolJSON.preferredStructuredResultJSON` extracts content; it doesn't preserve the whole payload), the card offers a copy of the untouched stored payload. The stored payload itself isn't changed.
 
 `TextKitView` remains default-off and attributes detected ranges only when a `MarkdownFileLinkOpener` is present. Bash-specific surfaces, unified diffs, compressed groups, header chips, and code-block contents do not opt in.
 
@@ -38,6 +40,7 @@ Last-verified: 2026-08-30
 - Resolution, fallback, cancellation, and reveal targeting: `make dev-test FILTER=AgentTranscriptPreviewLinkResolverTests` and `make dev-test FILTER=AgentUtilityPanelPresentationStoreTests`.
 - Tagged files and user prose: `make dev-test FILTER=TaggedFilesBadgeInteractionTests`, `make dev-test FILTER=CollapsibleUserMessageLinkificationTests`, and `make dev-test FILTER=AgentPreviewLinkRouterTests`.
 - Canonical tool-result detection and click provenance: `make dev-test FILTER=ToolResultMarkdownLinkifierTests`.
+- Tool-result body typing, the structured-JSON exception, and raw-copy policy: `make dev-test FILTER=ToolResultBodyPresentationTests`.
 
 ## Explicit non-goals
 

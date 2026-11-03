@@ -12,6 +12,22 @@ package protocol HeadlessAgentProvider: AnyObject {
     func dispose() async
 }
 
+/// A headless provider's process or transport ended without delivering the run's result (review A
+/// F06): the run's terminal cause is provider-process loss. Provider-reported failures (a CLI's
+/// error exit, an ACP failure response) are never wrapped in it. Its description is the provider's
+/// own message, so user-facing text is unchanged.
+package struct HeadlessProviderProcessLostError: LocalizedError, Equatable {
+    package let message: String
+
+    package init(message: String) {
+        self.message = message
+    }
+
+    package var errorDescription: String? {
+        message
+    }
+}
+
 /// Lifecycle events for agent session state (not user-facing chat content).
 enum AgentLifecycleEvent: Equatable {
     case initialized

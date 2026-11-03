@@ -194,11 +194,19 @@ package final class AgentTabSession: ObservableObject {
 
     @Published package var pendingUserInputRequest: AgentRequestUserInputRequest? = nil {
         didSet {
+            if pendingUserInputDrafts?.requestID != pendingUserInputRequest?.id {
+                pendingUserInputDrafts = nil
+            }
             notePendingQuestionUIAggregateChange(
                 from: pendingAskUser != nil || oldValue != nil || pendingMCPElicitationRequest != nil
             )
         }
     }
+
+    /// Partial answers of `pendingUserInputRequest`. Owned by the session (not the card) so
+    /// shutdown preparation snapshots non-secret answers and vetoes on a non-empty secret one.
+    /// Memory-only; dropped whenever the pending request changes.
+    package var pendingUserInputDrafts: AgentRequestUserInputDraftState?
 
     @Published package var pendingApproval: AgentApprovalRequest? = nil
     @Published package var pendingPermissionsRequest: AgentPermissionsRequest? = nil
@@ -217,6 +225,12 @@ package final class AgentTabSession: ObservableObject {
     package var transcriptViewportState: AgentTranscriptViewportState = .liveBottom
     package var transcriptAutoFollowArmingState: AgentTranscriptAutoFollowArmingState = .armed
     package var askUserContinuation: CheckedContinuation<AgentAskUserResponse, Error>?
+    /// An `ask_user` whose snapshot is being committed before it is published (plan §E): a
+    /// concurrent request is refused as if this one were already pending.
+    package var recoveryQuestionCreationReservation: UUID?
+    /// Interactions whose answer is flushing its latest snapshot before the reply is sent: further
+    /// edits, answers, and the timeout are refused for them meanwhile.
+    package var recoveryQuestionResolutionReservations: Set<UUID> = []
     package var askUserTimeoutTask: Task<Void, Never>?
     package var pendingAskUserTimeoutGeneration: UInt64 = 0
     package var hasPendingQuestionUI: Bool {
@@ -237,6 +251,12 @@ package final class AgentTabSession: ObservableObject {
     package var applyEditsApprovalSetupID: UUID?
     package var worktreeMergeReviewContinuation: CheckedContinuation<WorktreeMergeReviewDecision, Never>?
     package var worktreeMergeReviewTimeoutTask: Task<Void, Never>?
+    /// Step 5c: shown reviews whose decision was submitted (card cleared) but not yet processed by
+    /// the waiting request. A lifecycle end treats them as shown, so a same-turn run end, reset, or
+    /// replacement keeps them as history instead of withdrawing them. In memory only.
+    package var resolvingWorktreeMergeReviewOperationIDs: Set<String> = []
+    /// Step 5c: in-flight or unacknowledged Discard of an ended merge review. In memory only.
+    package var worktreeMergeReviewDiscard: AgentWorktreeMergeReviewDiscardState?
     package var mcpControlContext: AgentMCPControlContext?
     #if DEBUG
         package var ompQualificationStartContext: OhMyPiAgentModeSmokeGate.StartContext? {
@@ -337,8 +357,11 @@ package final class AgentTabSession: ObservableObject {
     /// when MCP control is active, `.userConfigured` otherwise.
     package var permissionProfile: AgentProviderPermissionProfile = .userConfigured
 
-    // Instruction queue for when user sends while agent is not waiting (shared across all runners)
-    package var pendingInstructions: [String] = []
+    /// Instruction queue for when user sends while agent is not waiting (shared across all runners).
+    /// Each entry carries the identity of the user input(s) it delivers.
+    package var pendingInstructions: [AgentPendingInstruction] = []
+    /// `.inactive` until recovery activation; `.mandatory` refuses untracked queued input.
+    package var recoveryAdmissionMode: AgentRecoveryAdmissionMode = .inactive
     package let codexSteerAckTracker = CodexSteerAckTracker()
 
     /// Claude-only steering queue — carries draft text for restoration on cancel/failure
@@ -354,8 +377,8 @@ package final class AgentTabSession: ObservableObject {
         let taggedFileAttachments: [AgentTaggedFileAttachment]
         /// The original user-typed text to restore into the composer on failure/cancel.
         let draftText: String
-        /// The optimistic user bubble we appended (for potential removal on failure).
-        let optimisticUserItemID: UUID?
+        /// The queued user input this steering delivers (its user item is the optimistic bubble).
+        package let identity: AgentQueuedInputIdentity
         let createdAt: Date
         /// Claude turn completions protected by this accepted steering instruction.
         var supersedingProtectedTurnIDs: Set<UUID> = []
@@ -368,7 +391,7 @@ package final class AgentTabSession: ObservableObject {
             attachments: [AgentImageAttachment],
             taggedFileAttachments: [AgentTaggedFileAttachment],
             draftText: String,
-            optimisticUserItemID: UUID?,
+            identity: AgentQueuedInputIdentity,
             createdAt: Date,
             supersedingProtectedTurnIDs: Set<UUID> = []
         ) {
@@ -379,9 +402,14 @@ package final class AgentTabSession: ObservableObject {
             self.attachments = attachments
             self.taggedFileAttachments = taggedFileAttachments
             self.draftText = draftText
-            self.optimisticUserItemID = optimisticUserItemID
+            self.identity = identity
             self.createdAt = createdAt
             self.supersedingProtectedTurnIDs = supersedingProtectedTurnIDs
+        }
+
+        /// The optimistic user bubble we appended (for potential removal on failure).
+        var optimisticUserItemID: UUID? {
+            identity.userItemID
         }
     }
 
@@ -408,8 +436,8 @@ package final class AgentTabSession: ObservableObject {
         let taggedFileAttachments: [AgentTaggedFileAttachment]
         /// The original user-typed text to restore into the composer on failure/cancel.
         let draftText: String
-        /// The optimistic user bubble we appended (for potential removal on failure).
-        let optimisticUserItemID: UUID?
+        /// The queued user input this steering delivers (its user item is the optimistic bubble).
+        package let identity: AgentQueuedInputIdentity
         let createdAt: Date
 
         package init(
@@ -421,7 +449,7 @@ package final class AgentTabSession: ObservableObject {
             attachments: [AgentImageAttachment],
             taggedFileAttachments: [AgentTaggedFileAttachment],
             draftText: String,
-            optimisticUserItemID: UUID?,
+            identity: AgentQueuedInputIdentity,
             createdAt: Date
         ) {
             self.id = id
@@ -432,8 +460,13 @@ package final class AgentTabSession: ObservableObject {
             self.attachments = attachments
             self.taggedFileAttachments = taggedFileAttachments
             self.draftText = draftText
-            self.optimisticUserItemID = optimisticUserItemID
+            self.identity = identity
             self.createdAt = createdAt
+        }
+
+        /// The optimistic user bubble we appended (for potential removal on failure).
+        var optimisticUserItemID: UUID? {
+            identity.userItemID
         }
     }
 
@@ -609,7 +642,8 @@ package final class AgentTabSession: ObservableObject {
         package let images: [AgentImageAttachment]
         package let taggedFileAttachments: [AgentTaggedFileAttachment]
         package let draftText: String
-        package let optimisticUserItemID: UUID?
+        /// The user input this submission delivers. A durable identity's intent ID is the queue ID.
+        package let identity: AgentQueuedInputIdentity
         package let origin: CodexFallbackOrigin
         package let dispatchTicket: UInt64?
 
@@ -619,18 +653,26 @@ package final class AgentTabSession: ObservableObject {
             images: [AgentImageAttachment],
             taggedFileAttachments: [AgentTaggedFileAttachment],
             draftText: String,
-            optimisticUserItemID: UUID?,
+            identity: AgentQueuedInputIdentity,
             origin: CodexFallbackOrigin,
             dispatchTicket: UInt64?
         ) {
+            assert(
+                identity.intentID == nil || identity.intentID == queueID,
+                "A durable Codex fallback submission is queued under its recovery intent ID"
+            )
             self.queueID = queueID
             self.providerText = providerText
             self.images = images
             self.taggedFileAttachments = taggedFileAttachments
             self.draftText = draftText
-            self.optimisticUserItemID = optimisticUserItemID
+            self.identity = identity
             self.origin = origin
             self.dispatchTicket = dispatchTicket
+        }
+
+        package var optimisticUserItemID: UUID? {
+            identity.userItemID
         }
     }
 
@@ -667,7 +709,8 @@ package final class AgentTabSession: ObservableObject {
         let reasoningEffort: String?
         let serviceTier: String?
         let attachmentReservationID: UUID?
-        let optimisticUserItemID: UUID?
+        /// The user input this entry delivers (copied from its submission context).
+        package let identity: AgentQueuedInputIdentity
         package var draftText: String
         let origin: CodexFallbackOrigin
         let fallbackReason: CodexFallbackReason
@@ -678,6 +721,10 @@ package final class AgentTabSession: ObservableObject {
         let originRunAttemptID: UUID
         var blockingTurn: CodexFallbackBlockingTurn?
         var state: CodexFallbackQueueState
+
+        var optimisticUserItemID: UUID? {
+            identity.userItemID
+        }
     }
 
     package var codexPendingTurnKind: CodexTurnKind?
@@ -686,6 +733,9 @@ package final class AgentTabSession: ObservableObject {
     package var codexAnonymousActiveTurn: CodexAnonymousTurnLiveness?
     package var codexRoutingObservedTurnID: String?
     var codexPendingSteerLifecycleReconciliation: CodexPendingSteerLifecycleReconciliation?
+    /// Tail of this session's provider-turn record writes (9-live R2): each write awaits the previous
+    /// one, so they commit in authoritative-install order. Never awaited by event handling.
+    package var codexProviderTurnWriteTask: Task<Void, Never>?
     package var codexFallbackQueue: [CodexFallbackQueueEntry] = []
     package var codexFallbackDispatchInFlight: CodexFallbackQueueEntry?
     var codexDeliveredMCPFallbackAttemptIDs: Set<UUID> = []
@@ -698,6 +748,10 @@ package final class AgentTabSession: ObservableObject {
     package var instructionContinuation: CheckedContinuation<UserInstructionResponse, Error>?
     package var instructionTimeoutTask: Task<Void, Never>?
     package var instructionWaitID: UUID?
+    /// The newest `wait_for_next_instruction` call (set at its entry, before any await). A queued-head
+    /// drain that suspends hands the head off only while it still owns the wait; a newer call
+    /// supersedes it.
+    package var instructionWaitOwnerID: UUID?
 
     /// Agent run
     package var runID: UUID? {
@@ -744,22 +798,144 @@ package final class AgentTabSession: ObservableObject {
         didSet {
             guard draftText != oldValue else { return }
             draftMutationGeneration &+= 1
+            notifyRecoveryComposerMutation()
         }
     }
 
     package private(set) var draftMutationGeneration: UInt64 = 0
 
     /// Selected workflow template for next message
-    package var selectedWorkflow: AgentWorkflowDefinition?
+    package var selectedWorkflow: AgentWorkflowDefinition? {
+        didSet {
+            guard selectedWorkflow != oldValue else { return }
+            notifyRecoveryComposerMutation()
+        }
+    }
 
-    // Pending image attachments for the next user turn
-    @Published package var pendingImageAttachments: [AgentImageAttachment] = []
-    @Published package var pendingTaggedFileAttachments: [AgentTaggedFileAttachment] = []
+    /// Composer interview-first choice for this session's next first message (per session, part of
+    /// the recoverable composer snapshot).
+    package var interviewFirst: Bool = false {
+        didSet {
+            guard interviewFirst != oldValue else { return }
+            notifyRecoveryComposerMutation()
+        }
+    }
+
+    /// Recovery lane owning this durable session's composer persistence and input admission, when
+    /// recovery is composed. Installed and replaced only through `AgentRecoveryCoordinator.claimLane`.
+    package var recoveryLane: AgentRecoverySessionLane?
+
+    /// The composed app-scoped recovery coordinator, also without a lane, so untracked input of an
+    /// inactive admission still honors its shared action holds (review A P1-01).
+    package weak var recoveryCoordinator: AgentRecoveryCoordinator?
+
+    // The launch authority this session's managed provider launchers resolve. Read once per run, at
+    // run start, only to derive the run-start registration mark
+    // (`AgentRuntimeLaunchAuthority.runStartRegistrationMark`). Outside DEBUG it is always
+    // `.production`, the same value every managed launcher uses (no production site passes a
+    // launcher another authority), and `.production` is fixed for the process lifetime
+    // (`AgentRecoveryActivation.production` and `AgentProcessRegistry.production` are `static let`).
+    // If activation ever becomes switchable at runtime, the mark and the launchers need one shared
+    // resolved authority instead.
+    #if DEBUG
+        /// The launchers' launch authority; settable so tests can inject one.
+        package var runtimeLaunchAuthority: AgentRuntimeLaunchAuthority = .production
+    #else
+        /// The launchers' launch authority: always `.production`.
+        package var runtimeLaunchAuthority: AgentRuntimeLaunchAuthority {
+            .production
+        }
+    #endif
+
+    /// The managed session context of this tab's provider work right now: the live lane's durable
+    /// lifecycle binding plus the current run attempt and process run when they exist. `unavailable`
+    /// (never a fabricated or sessionless identity) when no live recovery lane binds the session.
+    package var runtimeSessionScope: AgentRuntimeSessionScope {
+        runtimeSessionScope(processRunID: runID)
+    }
+
+    /// `runtimeSessionScope` for a process run the caller already holds (headless runs pass theirs).
+    package func runtimeSessionScope(processRunID: UUID?) -> AgentRuntimeSessionScope {
+        guard let lane = recoveryLane, !lane.isRetired else { return .unavailable }
+        return .session(AgentRuntimeSessionAssociation(
+            lifecycle: lane.binding,
+            runAttemptID: activeRunAttemptID,
+            processRunID: processRunID
+        ))
+    }
+
+    /// Runs `operation` as an owner operation of this session (R6): captures this session's scope
+    /// for `processRunID` now, synchronously, and binds it immutably for the operation's whole task
+    /// tree (`AgentRuntimeOperationOwner`). Writes the operation makes later, including from its
+    /// child tasks and late callbacks, carry this captured run attempt, never the one current when
+    /// they write.
+    package func withRuntimeOperation<T>(
+        processRunID: UUID?,
+        _ operation: () async throws -> T
+    ) async rethrows -> T {
+        try await AgentRuntimeOperationOwner.$session.withValue(
+            runtimeSessionScope(processRunID: processRunID),
+            operation: operation
+        )
+    }
+
+    /// Composite composer observation (text, images, tagged files, workflow, interview choice).
+    /// Called synchronously after each composer mutation while installed and not suppressed.
+    package var recoveryComposerObserver: (@MainActor (AgentTabSession) -> Void)?
+    private var recoveryComposerObservationSuppression = 0
+
+    /// Applies restored or programmatic composer state without reporting it as a new edit.
+    package func withRecoveryComposerObservationSuppressed(_ body: () -> Void) {
+        recoveryComposerObservationSuppression += 1
+        defer { recoveryComposerObservationSuppression -= 1 }
+        body()
+    }
+
+    private func notifyRecoveryComposerMutation() {
+        guard recoveryComposerObservationSuppression == 0, let recoveryComposerObserver else { return }
+        recoveryComposerObserver(self)
+    }
+
+    /// Pending image attachments for the next user turn
+    @Published package var pendingImageAttachments: [AgentImageAttachment] = [] {
+        didSet {
+            guard pendingImageAttachments != oldValue else { return }
+            notifyRecoveryComposerMutation()
+        }
+    }
+
+    @Published package var pendingTaggedFileAttachments: [AgentTaggedFileAttachment] = [] {
+        didSet {
+            guard pendingTaggedFileAttachments != oldValue else { return }
+            notifyRecoveryComposerMutation()
+        }
+    }
+
     package var attachmentsPendingProviderConsumptionCleanup: [AgentImageAttachment] = []
     package var attachmentTurnState: AgentAttachmentTurnState = .idle
 
-    // Provider session ID for resumption (e.g., Claude CLI session_id)
+    /// Provider session ID for resumption (e.g., Claude CLI session_id)
     package var providerSessionID: String?
+    /// Provider-history ledger and latest committed import receipt (lossless restart Phase 4).
+    /// Hydrated from and persisted with the session. Changed on the main actor by the history-only
+    /// merge (which commits only if the ledger still equals the one it read before its awaits),
+    /// dispatch-baseline admission and the Step 4d3b live owner (insert and proof invalidation);
+    /// cleared by a chat clear.
+    package var providerHistoryRecovery: AgentSessionProviderHistoryRecovery?
+    /// Recovery dispatch (Phase 4): the Claude conversation whose resume must not fall back to an
+    /// implicit fresh conversation. Runtime-only; set before a recovery dispatch, cleared by a
+    /// successful resume of that conversation or by an explicit new-conversation choice.
+    package var recoveryResumeFallbackSuppressedConversationID: String?
+    /// Recovery dispatch (Phase 4): the Claude conversation whose resume failed while the implicit
+    /// fresh fallback was suppressed. Offers the explicit "Continue in a new conversation" choice.
+    package var recoveryResumeUnavailableConversationID: String?
+    /// History-only merge (Phase 4): the import receipt the next owner save must commit together
+    /// with the imported rows and ledger (`AgentSessionDataService.saveAgentSession(...,
+    /// committingHistoryImport:)`). Runtime-only; cleared once that save committed it.
+    package var pendingHistoryImportCommit: AgentSessionProviderHistoryRecovery.ImportCommit?
+    /// The latest import receipt an owner save of this tab committed (runtime-only evidence the
+    /// cursor CAS waits for).
+    package var committedHistoryImportID: UUID?
     package var providerTokenUsageByTurn: [AgentTokenUsagePersist] = []
     package var claudeConfiguredContextWindow: Int?
     package var claudeConfiguredContextWindowKey: ClaudeProvisionalContextWindowResolver.Key?
@@ -1342,7 +1518,34 @@ package final class AgentTabSession: ObservableObject {
         usageAccounting?.endCodexExecution(executionID: codexControllerGeneration)
     }
 
+    /// R6: runs a retired controller's cleanup, retained until it completes so registered
+    /// successor starts on this tab can join it (`joinRuntimeRetirements`).
+    package func retainRuntimeRetirement(_ cleanup: @escaping @MainActor () async -> Void) {
+        let token = UUID()
+        let task = Task { @MainActor [weak self] in
+            await cleanup()
+            self?.runtimeRetirements[token] = nil
+        }
+        runtimeRetirements[token] = task
+    }
+
+    /// R6: waits for every retained retirement on this tab, including ones retained while joining.
+    package func joinRuntimeRetirements() async {
+        while let entry = runtimeRetirements.first {
+            await entry.value.value
+            runtimeRetirements[entry.key] = nil
+        }
+    }
+
+    package var hasPendingRuntimeRetirements: Bool {
+        !runtimeRetirements.isEmpty
+    }
+
     package var acpController: ACPAgentSessionController?
+    /// R6: cleanup of this tab's retired runtime controllers (any provider: replacement, reconnect
+    /// or provider switch), keyed by retirement token. Every registered successor start joins it
+    /// before reserving, so a session never races its own predecessor's still-active runtime.
+    private var runtimeRetirements: [UUID: Task<Void, Never>] = [:]
     package var codexEventTask: Task<Void, Never>?
     package var codexEventTaskRunID: UUID?
     package var codexLastEventAt: Date?
@@ -1354,6 +1557,17 @@ package final class AgentTabSession: ObservableObject {
     package var activeReasoningItemID: UUID?
     package var reasoningItemIDsByGroupID: [String: UUID] = [:]
     package var pendingAssistantDelta: String = ""
+    /// The flush of whichever producer (VM or Codex coordinator) armed the current buffer timer;
+    /// `drainPendingAssistantDelta()` applies the buffer through it, exactly as that timer would.
+    package var assistantDeltaDrain: ((AgentTabSession) -> Void)?
+
+    /// Applies buffered assistant text now through its producer's own flush, which clears the
+    /// buffer and invalidates the pending timer first, so the text lands exactly once.
+    package func drainPendingAssistantDelta() {
+        guard !pendingAssistantDelta.isEmpty, let assistantDeltaDrain else { return }
+        assistantDeltaDrain(self)
+    }
+
     /// Rows of any kind appended by background (between-run) delivery. A run never resumes or
     /// replaces them, even when they landed below its user row, and each delivery's lookups
     /// skip the other's rows. Not persisted.
@@ -1370,6 +1584,22 @@ package final class AgentTabSession: ObservableObject {
     /// session metadata. A replaced stream's output is still shown, but never overwrites the
     /// newer launch's provider session ID.
     package var claudeAuthoritativeEventSourceID: UUID?
+    /// Step 4d3b (inactive): Claude producer launches whose live identity this owner refused or saw
+    /// disqualified. The producer's own latch cannot hear owner-side conflicts, so their later
+    /// output is never identified here; a refusal before any proof exists needs this. Not
+    /// persisted (a relaunched producer has a new token; durable refusal is proof invalidation).
+    package var claudeLiveTranscriptRefusedProducers: Set<UUID> = []
+    /// Step 4d3c (inactive): per producer launch, the exact ledger keys that launch newly inserted
+    /// (written with the row and ledger entry in the same main-actor step). A duplicate, an imported
+    /// match or an agreeing result never acquires or transfers a key. Step 4d7: an exactly agreeing
+    /// result (single text, or a whole Read chain) removes its exchange's keys, so an agreed proof is
+    /// no longer revocable by this launch. A refusal invalidates only the remaining (unagreed) keys'
+    /// proofs. Reset only by clear chat, which also detaches the tab's Claude controller. It is
+    /// kept across run completion, cancellation, a new run, a merging import and persisted
+    /// hydration or rebinding, which do not detach a still-attached producer: exact keys (provider,
+    /// native session, entry) never match another conversation's rows, and a copied key the producer
+    /// created stays its own. The refused latch above is never reset. Not persisted.
+    package var claudeLiveTranscriptOwnedKeys: [UUID: Set<String>] = [:]
 
     /// Whether `rowID` is a background row delivered from `sourceID`'s stream.
     package func isBackgroundRow(_ rowID: UUID, from sourceID: UUID?) -> Bool {
@@ -1389,6 +1619,10 @@ package final class AgentTabSession: ObservableObject {
     package var assistantDeltaFlushGeneration: UInt64 = 0
     var providerTerminalDrainGeneration: UInt64 = 0
     package var terminalCommitInProgress: Bool = false
+    /// Set once by the irreversible lifecycle teardown (two-stage shutdown Stage B or the legacy
+    /// close path) before it cancels the run, so a runner that commits first after its task is
+    /// cancelled still records the teardown cause. Stage A never sets it.
+    package var lifecycleTeardownCause: AgentRunTerminalCause?
     package var lastTerminalCommitRevision: AgentRunTerminalCommitRevision?
     var lastTerminalPublicationResult: AgentRunTerminalPublicationResult?
     /// Commit whose queued follow-up instruction was already consumed (at most one per commit).
@@ -1557,8 +1791,32 @@ package final class AgentTabSession: ObservableObject {
         didSet {
             if isDirty {
                 persistenceMutationGeneration &+= 1
+                onPersistenceMutation?(self)
             }
         }
+    }
+
+    /// Called on every `isDirty = true`, including dirty-only edits that change no source item.
+    /// Source-item mutations notify through `onSourceItemsChanged` first, before their dirty mark.
+    package var onPersistenceMutation: ((AgentTabSession) -> Void)?
+    /// Transcript save maximum wait (R3), transient and never persisted: when the first change
+    /// not yet covered by a successful save happened. Later changes never move it; only a clean
+    /// save receipt of the current projection (or finding nothing left to save) clears it.
+    package var transcriptSaveFirstUnsavedAt: ContinuousClock.Instant?
+    /// The single maximum-wait (or failed-save retry) timer for this owner.
+    package var transcriptSaveMaxWaitTask: Task<Void, Never>?
+    /// Identifies the armed timer; a wakeup whose generation no longer matches is obsolete.
+    package var transcriptSaveMaxWaitGeneration: UInt64 = 0
+    /// Consecutive maximum-wait saves that wrote nothing; spaces retries (at least 1 s apart).
+    package var transcriptSaveMaxWaitRetryCount: Int = 0
+
+    /// Withdraws the maximum-wait obligation and makes any armed timer's wakeup obsolete.
+    package func invalidateTranscriptSaveMaxWait() {
+        transcriptSaveMaxWaitTask?.cancel()
+        transcriptSaveMaxWaitTask = nil
+        transcriptSaveMaxWaitGeneration &+= 1
+        transcriptSaveFirstUnsavedAt = nil
+        transcriptSaveMaxWaitRetryCount = 0
     }
 
     package var sourceItemsRevision: Int = 0
@@ -1647,6 +1905,11 @@ package final class AgentTabSession: ObservableObject {
 
     @discardableResult
     package func beginPersistentBindingTransition() -> UInt64 {
+        // Replacing an existing binding retires the previous owner's maximum wait. A genuine
+        // creator's first binding (inside its first save) keeps its own obligation.
+        if persistentSessionBindingIdentity != nil {
+            invalidateTranscriptSaveMaxWait()
+        }
         bindingTransitionGeneration &+= 1
         bindingTransitionInProgress = true
         authoritativeHydratedBinding = nil
@@ -1732,8 +1995,11 @@ package final class AgentTabSession: ObservableObject {
         return teardown
     }
 
+    /// `inputUserItemID`: the user item this attempt's own input owns (non-Codex runners, from their
+    /// handoff). The terminal barrier attributes the attempt's outcome to that item's execution turn
+    /// instead of the last user item; `nil` keeps the legacy last-user-item attribution.
     @discardableResult
-    func beginRunAttempt(source: String, attemptID: UUID = UUID()) -> AgentRunOwnership {
+    func beginRunAttempt(source: String, attemptID: UUID = UUID(), inputUserItemID: UUID? = nil) -> AgentRunOwnership {
         assert(runAttemptTerminalResources == nil || runAttemptTerminalResources?.isClaimed == true)
         runAttemptGeneration &+= 1
         runAttemptTerminalResources = nil
@@ -1759,12 +2025,22 @@ package final class AgentTabSession: ObservableObject {
             persistentBindingGeneration: persistentSessionBindingIdentity?.generation,
             bindingTransitionGeneration: bindingTransitionGeneration,
             attemptID: attemptID,
-            turnEpoch: turnEpoch
+            turnEpoch: turnEpoch,
+            // The run's provider, captured once at run start (recovery records it on the attempt).
+            providerKindRaw: selectedAgent.rawValue,
+            // Whether this run's launches are registered (Step 9-activation-b), from the same
+            // authority and provider. A run on an authoritative remote host launches nothing here.
+            runtimeRegistrationRaw: remoteHost == nil
+                ? runtimeLaunchAuthority.runStartRegistrationMark(providerKindRaw: selectedAgent.rawValue)
+                : nil
         )
         attentionTextProvenance = AttentionTextProvenance(
             attemptID: ownership.attemptID,
             minimumSourceSequenceIndex: nextSequenceIndex
         )
+        runAttemptInputAttribution = inputUserItemID.map {
+            AgentRunAttemptInputAttribution(attemptID: ownership.attemptID, userItemID: $0)
+        }
         #if DEBUG
             AgentModePerfDiagnostics.increment("run.lifecycle.attempt.started")
             AgentModePerfDiagnostics.increment("run.lifecycle.attempt.started.source.\(source)")
@@ -1784,7 +2060,18 @@ package final class AgentTabSession: ObservableObject {
         return ownership
     }
 
-    func isCurrentRunAttempt(_ ownership: AgentRunOwnership, expectedRunID: UUID? = nil) -> Bool {
+    /// The user item whose turn the current run attempt's terminal outcome belongs to (F1), when its
+    /// runner named one; see `beginRunAttempt(inputUserItemID:)`.
+    package private(set) var runAttemptInputAttribution: AgentRunAttemptInputAttribution?
+
+    /// A later input of the same run attempt crossed its provider boundary (steering): the attempt's
+    /// outcome now belongs to that input's turn. Ignored for any other attempt.
+    func noteRunAttemptInput(attemptID: UUID, userItemID: UUID) {
+        guard activeRunAttemptID == attemptID else { return }
+        runAttemptInputAttribution = AgentRunAttemptInputAttribution(attemptID: attemptID, userItemID: userItemID)
+    }
+
+    package func isCurrentRunAttempt(_ ownership: AgentRunOwnership, expectedRunID: UUID? = nil) -> Bool {
         guard activeRunOwnership == ownership else { return false }
         if let expectedRunID {
             return runID == expectedRunID
@@ -1792,7 +2079,7 @@ package final class AgentTabSession: ObservableObject {
         return true
     }
 
-    func isCurrentRunAttemptForCurrentBinding(
+    package func isCurrentRunAttemptForCurrentBinding(
         _ ownership: AgentRunOwnership,
         expectedRunID: UUID? = nil
     ) -> Bool {
@@ -2442,6 +2729,8 @@ package final class AgentTabSession: ObservableObject {
         var updatedItems = previousItems
         body(&updatedItems)
         guard updatedItems != previousItems else { return false }
+        preserveClaudeAssociatedToolPayloads(previous: previousItems, in: &updatedItems)
+        guard updatedItems != previousItems else { return false }
         commitSourceItems(
             updatedItems,
             dispatch: .notify(
@@ -2582,6 +2871,9 @@ package final class AgentTabSession: ObservableObject {
         case retentionCompaction
         case codexCommandStatusReconciliation
         case routeActivation
+        /// O11: Send saved placed the same unsent saved input at the execution end (paired with
+        /// its edited canonical transcript).
+        case savedInputRelocation
         case clearedChat
         case stressHarnessReset
         case testOverride
@@ -2602,6 +2894,46 @@ package final class AgentTabSession: ObservableObject {
             }
         }
         return true
+    }
+
+    /// Step 4d5 invariant backstop (not a display policy): a tool row associated to Claude provider
+    /// history (imported or live canonical, whatever its proof) keeps its projected semantic payload
+    /// (kind, text, tool name, invocation ID, arguments, output, error status and streaming state)
+    /// through any incremental replacement or batch mutation; other presentation metadata may change.
+    /// A replacement by a different item never displaces it. Call sites that must show different
+    /// output append it as a separate unidentified row before reaching here.
+    func preservingClaudeAssociatedToolPayload(of previous: AgentChatItem, in updated: AgentChatItem) -> AgentChatItem {
+        guard previous.kind == .toolCall || previous.kind == .toolResult,
+              providerHistoryRecovery?.associatesClaudeLocalItem(previous.id) == true
+        else { return updated }
+        return Self.restoringProjectedToolPayload(of: previous, in: updated)
+    }
+
+    private func preserveClaudeAssociatedToolPayloads(previous: [AgentChatItem], in updated: inout [AgentChatItem]) {
+        guard let protectedIDs = providerHistoryRecovery?.claudeLocalItemIDs, !protectedIDs.isEmpty else { return }
+        var protectedByID: [UUID: AgentChatItem] = [:]
+        for item in previous where protectedIDs.contains(item.id) && (item.kind == .toolCall || item.kind == .toolResult) {
+            protectedByID[item.id] = item
+        }
+        guard !protectedByID.isEmpty else { return }
+        for index in updated.indices {
+            guard let original = protectedByID[updated[index].id] else { continue }
+            updated[index] = Self.restoringProjectedToolPayload(of: original, in: updated[index])
+        }
+    }
+
+    private static func restoringProjectedToolPayload(of previous: AgentChatItem, in updated: AgentChatItem) -> AgentChatItem {
+        guard updated.id == previous.id else { return previous }
+        var restored = updated
+        restored.kind = previous.kind
+        restored.text = previous.text
+        restored.toolName = previous.toolName
+        restored.toolInvocationID = previous.toolInvocationID
+        restored.toolArgsJSON = previous.toolArgsJSON
+        restored.toolResultJSON = previous.toolResultJSON
+        restored.toolIsError = previous.toolIsError
+        restored.isStreaming = previous.isStreaming
+        return restored
     }
 
     package func setItemsSilently(_ items: [AgentChatItem], reason: SilentItemReplacementReason) {
@@ -2843,6 +3175,7 @@ package final class AgentTabSession: ObservableObject {
         )
         guard items.indices.contains(index) else { return }
         let previousItem = items[index]
+        let updatedItem = preservingClaudeAssociatedToolPayload(of: previousItem, in: updatedItem)
         guard updatedItem != previousItem else { return }
         if !admitsIncrementalSourceItemID(updatedItem.id, replacing: previousItem.id) {
             var candidateItems = items
@@ -2884,6 +3217,7 @@ package final class AgentTabSession: ObservableObject {
         let previousItem = items[index]
         var updatedItem = previousItem
         mutate(&updatedItem)
+        updatedItem = preservingClaudeAssociatedToolPayload(of: previousItem, in: updatedItem)
         guard updatedItem != previousItem else { return }
         if !admitsIncrementalSourceItemID(updatedItem.id, replacing: previousItem.id) {
             var candidateItems = items
@@ -2945,6 +3279,7 @@ package final class AgentTabSession: ObservableObject {
         let previousItem = items[index]
         var updatedItem = previousItem
         mutate(&updatedItem)
+        updatedItem = preservingClaudeAssociatedToolPayload(of: previousItem, in: updatedItem)
         guard updatedItem != previousItem else { return }
         if !admitsIncrementalSourceItemID(updatedItem.id, replacing: previousItem.id) {
             var candidateItems = items

@@ -2,7 +2,8 @@ import Foundation
 import RepoPromptWorkspace
 
 struct AgentSessionMetadataIndex: Codable, Equatable {
-    static let currentSchemaVersion = 7
+    /// 8: bounded `recoveryHint` (lossless restart Phase 2). Older caches are rebuilt.
+    static let currentSchemaVersion = 8
 
     var schemaVersion: Int
     var generatedAt: Date
@@ -57,6 +58,10 @@ package struct AgentSessionScheduledSendSummary: Codable, Equatable {
     var runAlongsideOtherSessions: Bool
     package var previewText: String
     package var isUnreadable: Bool
+    /// The schedule attempt a confirmation is about, when it has one, so an index-sourced recovery
+    /// card keeps the same occurrence identity before and after the session hydrates (review A F08).
+    /// Optional and additive: entries written before it decode with `nil`.
+    package var attemptID: UUID? = nil
 
     package static func make(from member: AgentScheduledSendMember?) -> AgentSessionScheduledSendSummary? {
         switch member {
@@ -86,7 +91,8 @@ package struct AgentSessionScheduledSendSummary: Codable, Equatable {
                 isNewSessionStart: record.isNewSessionStart,
                 runAlongsideOtherSessions: record.runAlongsideOtherSessions,
                 previewText: String(record.rawText.prefix(previewTextLimit)),
-                isUnreadable: false
+                isUnreadable: false,
+                attemptID: record.attempt?.attemptID
             )
         }
     }
@@ -115,6 +121,173 @@ package struct AgentSessionScheduledSendSummary: Codable, Equatable {
             attempt: nil,
             lastFailureMessage: nil
         )
+    }
+}
+
+/// Schema-8 bounded recovery discovery hint (lossless restart Phase 2). A cache, never an authority:
+/// it shapes discovery work only. Recovery records are always inspected independently of it, and it
+/// never grants or denies dispatch. It carries no prompt, answer, or transcript text and no entity
+/// lists, and it ignores card acknowledgements (dismissed input still exists). "Unsent" counts saved
+/// input still requiring a decision, not proof of non-delivery.
+package struct AgentSessionRecoveryHint: Codable, Equatable {
+    package enum State: String, Codable {
+        /// Some relevant input could not be inspected (missing evidence reads as unknown).
+        case unknown
+        /// Every relevant input was inspected and is clear.
+        case none
+        /// Some authoritative input needs attention.
+        case needsAttention
+    }
+
+    /// The recovery-record facts relevant to discovery, from one record read or commit.
+    package struct RecordFacts: Equatable {
+        /// Intents still requiring a decision (queued, dispatching, delivery unknown, failed).
+        package var unsentCount: Int
+        /// Nonempty durable composer content.
+        package var hasDraft: Bool
+        package var hasQuestions: Bool
+        /// Step 5a: stored `apply_edits` proposals awaiting View/Discard (runtime fact only; the
+        /// persisted hint keeps its schema and folds this into `needsAttention`).
+        package var hasEditProposals: Bool
+        /// Run evidence without terminal evidence.
+        package var hasOpenRun: Bool
+        /// Unreadable or future record data.
+        package var isUnreadable: Bool
+
+        package init(
+            unsentCount: Int,
+            hasDraft: Bool,
+            hasQuestions: Bool,
+            hasEditProposals: Bool = false,
+            hasOpenRun: Bool,
+            isUnreadable: Bool
+        ) {
+            self.unsentCount = unsentCount
+            self.hasDraft = hasDraft
+            self.hasQuestions = hasQuestions
+            self.hasEditProposals = hasEditProposals
+            self.hasOpenRun = hasOpenRun
+            self.isUnreadable = isUnreadable
+        }
+
+        /// No record (or a record holding nothing that needs attention).
+        package static let absent = RecordFacts(unsentCount: 0, hasDraft: false, hasQuestions: false, hasOpenRun: false, isUnreadable: false)
+        package static let unreadable = RecordFacts(unsentCount: 0, hasDraft: false, hasQuestions: false, hasOpenRun: false, isUnreadable: true)
+
+        package static func make(from record: AgentRecoveryRecord) -> RecordFacts {
+            RecordFacts(
+                unsentCount: record.intents.count { intent in
+                    switch intent.deliveryState {
+                    case .queued, .dispatching, .deliveryUnknown, .failed: true
+                    case .providerAccepted, .withdrawn: false
+                    }
+                },
+                hasDraft: record.composer.map { !$0.content.isEmpty } ?? false,
+                hasQuestions: !record.questions.isEmpty,
+                hasEditProposals: !record.editProposals.isEmpty,
+                hasOpenRun: record.runAttempts.contains { $0.terminal == nil },
+                isUnreadable: false
+            )
+        }
+
+        package static func make(from state: AgentRecoveryRecordState) -> RecordFacts {
+            switch state {
+            case .absent: .absent
+            case .preserved: .unreadable
+            case let .supported(record): make(from: record)
+            }
+        }
+
+        package var needsAttention: Bool {
+            unsentCount > 0 || hasDraft || hasQuestions || hasEditProposals || hasOpenRun || isUnreadable
+        }
+    }
+
+    package var state: State
+    /// Latest unresolved interruption reason, when known.
+    package var reason: AgentTranscriptTurnInterruption.Reason?
+    /// Nonnegative; `nil` when unknown.
+    package var unsentCount: Int?
+    package var hasDraft: Bool?
+
+    package init(
+        state: State,
+        reason: AgentTranscriptTurnInterruption.Reason? = nil,
+        unsentCount: Int? = nil,
+        hasDraft: Bool? = nil
+    ) {
+        self.state = state
+        self.reason = reason
+        self.unsentCount = unsentCount.map { max(0, $0) }
+        self.hasDraft = hasDraft
+    }
+
+    package static let unknown = AgentSessionRecoveryHint(state: .unknown)
+
+    /// Combines the three discovery inputs. `needsAttention` when any known input needs attention;
+    /// `none` only when all are known and clear; otherwise `unknown`.
+    /// - `unresolvedInterruption`: from a decoded transcript (`nil` for a stub).
+    /// - `schedule`: the session's scheduled-send summary (always known from the session file).
+    /// - `record`: recovery-record facts (`nil` when not inspected).
+    package static func make(
+        unresolvedInterruption: Bool?,
+        reason: AgentTranscriptTurnInterruption.Reason?,
+        schedule: AgentSessionScheduledSendSummary?,
+        record: RecordFacts?
+    ) -> AgentSessionRecoveryHint {
+        let scheduleNeedsAttention = schedule.map {
+            $0.isUnreadable || $0.stateRaw == AgentScheduledSendPersist.State.needsConfirmation.rawValue
+        } ?? false
+        let state: State = if unresolvedInterruption == true || scheduleNeedsAttention || record?.needsAttention == true {
+            .needsAttention
+        } else if unresolvedInterruption == false, record != nil {
+            .none
+        } else {
+            .unknown
+        }
+        return AgentSessionRecoveryHint(
+            state: state,
+            reason: unresolvedInterruption == true ? reason : nil,
+            unsentCount: record.map(\.unsentCount),
+            hasDraft: record.map(\.hasDraft)
+        )
+    }
+
+    /// The latest unresolved interruption reason of `turns` (most recent observation; stable turn
+    /// identity breaks ties), or `nil` when none is unresolved.
+    package static func latestUnresolvedInterruptionReason(
+        in turns: [AgentTranscriptTurn]
+    ) -> AgentTranscriptTurnInterruption.Reason? {
+        var latest: (observedAt: Date, turnID: String, reason: AgentTranscriptTurnInterruption.Reason)?
+        for turn in turns {
+            guard let interruption = turn.interruption, interruption.resolution == nil else { continue }
+            let candidate = (interruption.observedAt, turn.id.uuidString, interruption.reason)
+            if let current = latest,
+               (current.observedAt, current.turnID) >= (candidate.0, candidate.1)
+            {
+                continue
+            }
+            latest = candidate
+        }
+        return latest?.reason
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case state
+        case reason
+        case unsentCount
+        case hasDraft
+    }
+
+    /// Tolerant: a missing or unrecognized value reads as unknown, never failing the index.
+    package init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        state = (try? container.decodeIfPresent(String.self, forKey: .state)).flatMap(State.init(rawValue:)) ?? .unknown
+        reason = (try? container.decodeIfPresent(String.self, forKey: .reason))
+            .flatMap(AgentTranscriptTurnInterruption.Reason.init(rawValue:))
+        let count = try? container.decodeIfPresent(Int.self, forKey: .unsentCount)
+        unsentCount = count.flatMap { $0 >= 0 ? $0 : nil }
+        hasDraft = try? container.decodeIfPresent(Bool.self, forKey: .hasDraft)
     }
 }
 
@@ -157,6 +330,13 @@ package struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
     var toolCallCount: Int
     package var scheduledSendSummary: AgentSessionScheduledSendSummary?
     package var lastScheduledDispatch: AgentScheduledSendProvenance?
+    /// Whether the saved transcript holds an unresolved interruption (recovery discovery hint).
+    /// `nil` when unknown (a stub-built or older record). Deliberately not part of
+    /// `lacksTranscriptDerivedFields`, which classifies history enrichment.
+    package var hasUnresolvedInterruption: Bool?
+    /// Schema-8 recovery discovery hint; `unknown` when missing. `hasUnresolvedInterruption` stays as
+    /// a legacy compatibility input (the hint's transcript part) and is not a second authority.
+    package var recoveryHint: AgentSessionRecoveryHint
 
     var hasUnreadableScheduledSend: Bool {
         scheduledSendSummary?.isUnreadable == true
@@ -244,7 +424,9 @@ package struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         interActiveIntervalGapSeconds: [Int] = [],
         toolCallCount: Int = 0,
         scheduledSendSummary: AgentSessionScheduledSendSummary? = nil,
-        lastScheduledDispatch: AgentScheduledSendProvenance? = nil
+        lastScheduledDispatch: AgentScheduledSendProvenance? = nil,
+        hasUnresolvedInterruption: Bool? = nil,
+        recoveryHint: AgentSessionRecoveryHint = .unknown
     ) {
         self.id = id
         self.filename = filename
@@ -282,6 +464,8 @@ package struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         self.toolCallCount = toolCallCount
         self.scheduledSendSummary = scheduledSendSummary
         self.lastScheduledDispatch = lastScheduledDispatch
+        self.hasUnresolvedInterruption = hasUnresolvedInterruption
+        self.recoveryHint = recoveryHint
     }
 
     enum CodingKeys: String, CodingKey {
@@ -321,6 +505,8 @@ package struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         case toolCallCount
         case scheduledSendSummary
         case lastScheduledDispatch
+        case hasUnresolvedInterruption
+        case recoveryHint
     }
 
     package init(from decoder: Decoder) throws {
@@ -381,6 +567,8 @@ package struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         toolCallCount = try container.decodeIfPresent(Int.self, forKey: .toolCallCount) ?? 0
         scheduledSendSummary = try container.decodeIfPresent(AgentSessionScheduledSendSummary.self, forKey: .scheduledSendSummary)
         lastScheduledDispatch = try container.decodeIfPresent(AgentScheduledSendProvenance.self, forKey: .lastScheduledDispatch)
+        hasUnresolvedInterruption = try container.decodeIfPresent(Bool.self, forKey: .hasUnresolvedInterruption)
+        recoveryHint = (try? container.decodeIfPresent(AgentSessionRecoveryHint.self, forKey: .recoveryHint)) ?? .unknown
     }
 
     func sidebarEntry(tabID overrideTabID: UUID? = nil, displayName: String? = nil) -> AgentSessionIndexEntry? {
@@ -469,6 +657,8 @@ package struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             && toolCallCount == other.toolCallCount
             && scheduledSendSummary == other.scheduledSendSummary
             && lastScheduledDispatch == other.lastScheduledDispatch
+            && hasUnresolvedInterruption == other.hasUnresolvedInterruption
+            && recoveryHint == other.recoveryHint
     }
 
     static func record(
@@ -476,9 +666,14 @@ package struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         fileURL: URL,
         observedFileSize: Int64?,
         observedFileModificationDate: Date?,
-        lastIndexedAt: Date = Date()
+        lastIndexedAt: Date = Date(),
+        recoveryRecordFacts: AgentSessionRecoveryHint.RecordFacts? = nil
     ) -> AgentSessionMetadataRecord {
         let turns = session.transcript?.turns ?? []
+        let unresolvedInterruption: Bool? = session.transcript.map { transcript in
+            transcript.turns.contains { $0.interruption.map { $0.resolution == nil } ?? false }
+        }
+        let scheduledSendSummary = AgentSessionScheduledSendSummary.make(from: session.scheduledSend)
         let aggregatedKeyPaths = Self.computeKeyPaths(from: turns)
         let activityBounds = Self.computeActivityBounds(from: turns)
         let durationPrimitives = Self.computeDurationPrimitives(from: turns)
@@ -519,8 +714,15 @@ package struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             coveredTurnDurationSeconds: durationPrimitives.coveredSeconds,
             interActiveIntervalGapSeconds: durationPrimitives.gapSeconds,
             toolCallCount: computedToolCallCount,
-            scheduledSendSummary: AgentSessionScheduledSendSummary.make(from: session.scheduledSend),
-            lastScheduledDispatch: session.lastScheduledDispatch
+            scheduledSendSummary: scheduledSendSummary,
+            lastScheduledDispatch: session.lastScheduledDispatch,
+            hasUnresolvedInterruption: unresolvedInterruption,
+            recoveryHint: AgentSessionRecoveryHint.make(
+                unresolvedInterruption: unresolvedInterruption,
+                reason: AgentSessionRecoveryHint.latestUnresolvedInterruptionReason(in: turns),
+                schedule: scheduledSendSummary,
+                record: recoveryRecordFacts
+            )
         )
     }
 

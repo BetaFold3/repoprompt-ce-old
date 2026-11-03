@@ -487,6 +487,8 @@ package enum ToolResultDTOs {
         /// Indicates the response token budget prevented more codemaps from being emitted
         package let tokenBudgetHit: Bool?
         let worktreeScope: WorktreeScopeDTO?
+        /// Root-scoped terminal automatic-codemap conditions; omitted when no root is affected
+        package let automaticCodemapIssues: [AutomaticCodemapIssueDTO]?
 
         package init(
             fileCount: Int,
@@ -497,7 +499,8 @@ package enum ToolResultDTOs {
             omittedTotal: Int? = nil,
             tokenBudgetOmittedCount: Int? = nil,
             tokenBudgetHit: Bool? = nil,
-            worktreeScope: WorktreeScopeDTO? = nil
+            worktreeScope: WorktreeScopeDTO? = nil,
+            automaticCodemapIssues: [AutomaticCodemapIssueDTO]? = nil
         ) {
             self.fileCount = fileCount
             self.content = content
@@ -508,6 +511,7 @@ package enum ToolResultDTOs {
             self.tokenBudgetOmittedCount = tokenBudgetOmittedCount
             self.tokenBudgetHit = tokenBudgetHit
             self.worktreeScope = worktreeScope
+            self.automaticCodemapIssues = automaticCodemapIssues
         }
 
         private enum CodingKeys: String, CodingKey {
@@ -520,6 +524,25 @@ package enum ToolResultDTOs {
             case tokenBudgetOmittedCount = "token_budget_omitted"
             case tokenBudgetHit = "token_budget_hit"
             case worktreeScope = "worktree_scope"
+            case automaticCodemapIssues = "automatic_codemap_issues"
+        }
+    }
+
+    /// One root whose automatic codemaps are terminally unavailable for this response.
+    package struct AutomaticCodemapIssueDTO: Codable, Equatable {
+        package let rootID: String
+        package let reason: String
+        package let message: String
+
+        package init(rootID: String, reason: String, message: String) {
+            self.rootID = rootID
+            self.reason = reason
+            self.message = message
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case rootID = "root_id"
+            case reason, message
         }
     }
 

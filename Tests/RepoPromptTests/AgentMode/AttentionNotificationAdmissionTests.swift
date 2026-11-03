@@ -25,12 +25,12 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
             let fixture = makeFixture()
             var followUps: [String] = []
             var afterStart: AgentModeRunService.Hooks.FollowUpStartObservation?
-            let barrier = makeBarrier(fixture.vm, startFollowUpRun: { _, text, observe in
-                followUps.append(text)
+            let barrier = makeBarrier(fixture.vm, startFollowUpRun: { _, instruction, observe in
+                followUps.append(instruction.text)
                 afterStart = observe
             })
             let root = makeSession(fixture.vm)
-            root.session.pendingInstructions = ["second"]
+            root.session.setUntrackedPendingInstructionsForTesting(["second"])
 
             let first = beginTurn(root.session, user: "first", assistant: "Intermediate answer A")
             let firstCommit = await barrier.commit(completedRequest(root.session, first, supportsFollowUp: true))
@@ -176,7 +176,7 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
             let root = makeSession(fixture.vm)
             // Codex uses the fixture's no-op stub, so even a regressed refusal launches no provider.
             root.session.selectedAgent = .codexExec
-            root.session.pendingInstructions = ["queued follow-up"]
+            root.session.setUntrackedPendingInstructionsForTesting(["queued follow-up"])
             let ownership = beginTurn(root.session, user: "first", assistant: "Answer before the refused follow-up")
             let commit = await fixture.vm.test_terminalCommitBarrier()
                 .commit(completedRequest(root.session, ownership, supportsFollowUp: true))
@@ -259,7 +259,7 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
             let session = fixture.live.session
             let tabID = fixture.live.tabID
 
-            _ = fixture.vm.submitUserTurn(text: "Root turn", tabID: tabID)
+            _ = fixture.vm.submitUserTurn(text: "Root turn", tabID: tabID, codexAttemptID: nil, admitted: nil)
             try await waitUntil("\(name): root prompt held", timeout: .seconds(30)) {
                 fixture.fakeCount("prompt") >= 1 && session.runState == .running
                     && session.acpController != nil && session.activeRunAttemptID != nil
@@ -271,7 +271,7 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
             _ = await ACPActiveSteeringPromptTestHook.$afterPromptReturned.withValue({ @MainActor in
                 await fixture.gate.pass()
             }) {
-                fixture.vm.submitUserTurn(text: "Steering A", tabID: tabID)
+                fixture.vm.submitUserTurn(text: "Steering A", tabID: tabID, codexAttemptID: nil, admitted: nil)
             }
             try await waitUntil("\(name): steering A held", timeout: .seconds(30)) {
                 fixture.fakeCount("cancel") >= 1 && fixture.fakeCount("prompt") >= 2
@@ -281,7 +281,7 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
 
             // B is accepted behind the active flush.
             if schedule != .flushFinishedWithoutSuccessor {
-                _ = fixture.vm.submitUserTurn(text: "Steering B", tabID: tabID)
+                _ = fixture.vm.submitUserTurn(text: "Steering B", tabID: tabID, codexAttemptID: nil, admitted: nil)
                 await Task { @MainActor in }.value
                 XCTAssertEqual(session.pendingACPSteeringInstructions.count, 1, name)
                 XCTAssertNotNil(session.acpSteeringFlushTask, name)
@@ -379,7 +379,7 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
         session.acpController = controller
 
         // B is accepted for live ACP steering while the run is active; A's answer lands after it.
-        _ = fixture.vm.submitUserTurn(text: "steer B", tabID: root.tabID)
+        _ = fixture.vm.submitUserTurn(text: "steer B", tabID: root.tabID, codexAttemptID: nil, admitted: nil)
         XCTAssertEqual(session.pendingACPSteeringInstructions.count, 1)
         session.appendItem(.assistant("ACP answer A", sequenceIndex: session.nextSequenceIndex))
         let reservation = UUID()
@@ -417,7 +417,7 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
         let session = root.session
         // Codex uses the fixture's no-op stub, so even a regressed refusal launches no provider.
         session.selectedAgent = .codexExec
-        session.pendingInstructions = ["queued follow-up"]
+        session.setUntrackedPendingInstructionsForTesting(["queued follow-up"])
         let ownership = beginTurn(session, user: "first", assistant: "Answer during the ACP handoff")
         let observeACPStart = fixture.vm.beginAttentionFollowUpObservation(for: session)
         let commit = await fixture.vm.test_terminalCommitBarrier()
@@ -479,7 +479,7 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
                 attachments: [],
                 taggedFileAttachments: [],
                 draftText: "steer",
-                optimisticUserItemID: nil,
+                identity: .inactiveForTesting(in: session),
                 createdAt: Date()
             )]
             _ = await barrier.commit(completedRequest(session, ownership))
@@ -684,7 +684,7 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
     /// session did not settle idle on that completion.
     func testCompletionChangedWhilePausedBeforeAdmissionIsNeverDelivered() async throws {
         let scenarios: [(name: String, mutate: (AgentTabSession) -> Void)] = [
-            ("follow-up queued", { $0.pendingInstructions.append("late follow-up") }),
+            ("follow-up queued", { $0.appendUntrackedPendingInstructionForTesting("late follow-up") }),
             ("new run attempt", { session in
                 session.runState = .running
                 session.beginRunAttempt(source: "test.attention.newAttempt")
@@ -764,6 +764,7 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
                     expectedRunID: root.session.runID,
                     terminalState: .cancelled,
                     source: "test.attention.cancel",
+                    cause: .userCancel,
                     attachmentDisposition: .deleteFiles,
                     finalizeNonCodexUsage: false,
                     supportsFollowUp: false,
@@ -1172,7 +1173,7 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
         XCTAssertEqual(fixture.admission.activeEventKey, firstKey)
 
         // Turn 2 commits and its queued successor actually starts while turn 1's request still hangs.
-        root.session.pendingInstructions = ["three"]
+        root.session.setUntrackedPendingInstructionsForTesting(["three"])
         let second = beginTurn(root.session, user: "two", assistant: "second")
         let revision = await barrier.commit(completedRequest(root.session, second, supportsFollowUp: true))
         XCTAssertEqual(revision?.successorKind, .relatedFollowUp)
@@ -1279,6 +1280,7 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
                     expectedRunID: root.session.runID,
                     terminalState: .cancelled,
                     source: "test.attention.cancel",
+                    cause: .userCancel,
                     attachmentDisposition: .deleteFiles,
                     finalizeNonCodexUsage: false,
                     supportsFollowUp: false,
@@ -1494,6 +1496,372 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
         let events = await attention.delivery.events
         XCTAssertEqual(events.map(\.key), [key])
         XCTAssertEqual(events.first?.content, .turnCompleted(finalAssistantText: "Scheduled answer"))
+    }
+
+    /// Plan 2026-10-30 Step 1: a paired device's follow-up to an idle root goes through the normal
+    /// send path (here reaching the stub Codex provider) without installing MCP control, so the
+    /// root stays an attention root and that follow-up turn's completion still notifies.
+    func testRemoteDeviceFollowUpOfIdleRootKeepsItsCompletionAlertable() async throws {
+        let codex = LifecycleRecorder()
+        let fixture = makeFixture(codexRecorder: codex)
+        let root = makeSession(fixture.vm)
+        root.session.selectedAgent = .codexExec
+        XCTAssertFalse(root.session.runState.isActive)
+        XCTAssertTrue(fixture.vm.remoteAttentionRootSession(sessionID: root.sessionID) === root.session)
+
+        let delivery = try await fixture.vm.remoteRootDispatchInstruction(
+            sessionID: root.sessionID,
+            text: "Follow up from the phone"
+        )
+
+        XCTAssertEqual(delivery, .startedRun)
+        try await waitUntil("the follow-up to reach the stub provider") { codex.contains("codex:send") }
+        XCTAssertTrue(root.session.runState.isActive)
+        XCTAssertTrue(root.session.items.contains { $0.kind == .user && $0.text == "Follow up from the phone" })
+        XCTAssertNil(root.session.mcpControlContext)
+        XCTAssertFalse(root.session.isMCPOriginated)
+        XCTAssertFalse(fixture.vm.isMCPControlled(tabID: root.tabID))
+        XCTAssertTrue(fixture.vm.isAttentionNotificationRoot(root.session))
+
+        let ownership = try XCTUnwrap(root.session.activeRunOwnership)
+        root.session.appendItem(.assistant("Done from the phone", sequenceIndex: root.session.nextSequenceIndex))
+        _ = await fixture.vm.test_terminalCommitBarrier().commit(completedRequest(root.session, ownership))
+        let key = AttentionNotificationEventKey.turnCompleted(sessionID: root.sessionID, attemptID: ownership.attemptID)
+        try await waitForRecord(fixture.admission, key) { $0 == .delivered(.sent) }
+        let events = await fixture.delivery.events
+        XCTAssertEqual(events.map(\.key), [key])
+        XCTAssertEqual(events.first?.content, .turnCompleted(finalAssistantText: "Done from the phone"))
+    }
+
+    /// The remote-control set is exactly the alerting set: MCP-controlled roots and children are
+    /// refused before anything is sent.
+    func testRemoteDeviceControlRefusesNonAttentionRoots() async throws {
+        let codex = LifecycleRecorder()
+        let fixture = makeFixture(codexRecorder: codex)
+        let parent = makeSession(fixture.vm)
+        let child = makeSession(fixture.vm, parent: parent.sessionID)
+        let controlled = makeSession(fixture.vm, controlled: true, forceControlContext: true)
+        for candidate in [child, controlled] {
+            candidate.session.selectedAgent = .codexExec
+            XCTAssertFalse(fixture.vm.isAttentionNotificationRoot(candidate.session))
+            XCTAssertNil(fixture.vm.remoteAttentionRootSession(sessionID: candidate.sessionID))
+            do {
+                _ = try await fixture.vm.remoteRootDispatchInstruction(sessionID: candidate.sessionID, text: "nope")
+                XCTFail("A non-root must not accept remote control")
+            } catch {
+                XCTAssertTrue(String(describing: error).contains("not available for remote control"), "\(error)")
+            }
+            XCTAssertFalse(candidate.session.items.contains { $0.kind == .user && $0.text == "nope" })
+        }
+        XCTAssertNil(fixture.vm.remoteAttentionRootSession(sessionID: UUID()))
+        XCTAssertFalse(codex.contains("codex:send"))
+    }
+
+    // MARK: - Plan 2026-10-30 Step 1 fixes (reviews A R1/R2, B P2-3/P2-4)
+
+    private struct ComposerState {
+        let draft = "unsent desktop draft"
+        let tag = AgentTaggedFileAttachment(relativePath: "Draft.swift", displayName: "Draft.swift")
+        let image = AgentImageAttachment(source: .url("https://example.com/draft.png"))
+        let workflow = AgentWorkflowDefinition(customID: UUID(), displayName: "Custom", template: "Do $ARGUMENTS carefully")
+    }
+
+    private func fillComposer(_ vm: AgentModeViewModel, _ root: LiveSession) -> ComposerState {
+        let state = ComposerState()
+        vm.storeDraftText(for: root.tabID, state.draft)
+        root.session.pendingTaggedFileAttachments = [state.tag]
+        root.session.pendingImageAttachments = [state.image]
+        root.session.selectedWorkflow = state.workflow
+        vm.setInterviewFirst(true, for: root.session)
+        return state
+    }
+
+    private func assertComposerUntouched(
+        _ vm: AgentModeViewModel,
+        _ root: LiveSession,
+        _ state: ComposerState,
+        _ label: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertEqual(vm.retrieveDraftText(for: root.tabID), state.draft, label, file: file, line: line)
+        XCTAssertEqual(root.session.pendingTaggedFileAttachments, [state.tag], label, file: file, line: line)
+        XCTAssertEqual(root.session.pendingImageAttachments, [state.image], label, file: file, line: line)
+        XCTAssertEqual(root.session.selectedWorkflow, state.workflow, label, file: file, line: line)
+        XCTAssertTrue(root.session.interviewFirst, label, file: file, line: line)
+    }
+
+    /// A paired device's instruction to a running root goes through the real session-targeted send
+    /// path (no test dispatch seam): it is queued as the root's next instruction with only its own
+    /// text, and the desktop composer's draft, attachments, workflow and interview choice are
+    /// neither sent nor cleared.
+    func testRemoteDeviceSteerOfRunningRootQueuesOnlyItsTextAndKeepsTheComposer() async throws {
+        let fixture = makeFixture()
+        let root = makeSession(fixture.vm)
+        // OpenCode without a live ACP controller has no provider steering route: the instruction
+        // takes the shared pending-instruction queue, and no provider is launched.
+        root.session.selectedAgent = .openCode
+        beginTurn(root.session, user: "first", assistant: nil)
+        let state = fillComposer(fixture.vm, root)
+
+        let delivery = try await fixture.vm.remoteRootDispatchInstruction(
+            sessionID: root.sessionID,
+            text: "Also cover the edge case"
+        )
+
+        XCTAssertEqual(delivery, .queuedFollowUp)
+        XCTAssertEqual(root.session.pendingInstructions.map(\.text), ["Also cover the edge case"])
+        let bubble = try XCTUnwrap(root.session.items.last { $0.kind == .user })
+        XCTAssertEqual(bubble.text, "Also cover the edge case")
+        XCTAssertTrue(bubble.attachments.isEmpty)
+        XCTAssertTrue(bubble.taggedFileAttachments.isEmpty)
+        XCTAssertNil(bubble.workflow)
+        assertComposerUntouched(fixture.vm, root, state, "running")
+        XCTAssertTrue(root.session.runState.isActive)
+        XCTAssertNil(root.session.mcpControlContext)
+        XCTAssertTrue(fixture.vm.isAttentionNotificationRoot(root.session))
+    }
+
+    /// The idle follow-up route (a new run) also leaves the composer alone.
+    func testRemoteDeviceFollowUpOfIdleRootKeepsTheComposer() async throws {
+        let codex = LifecycleRecorder()
+        let fixture = makeFixture(codexRecorder: codex)
+        let root = makeSession(fixture.vm)
+        root.session.selectedAgent = .codexExec
+        let state = fillComposer(fixture.vm, root)
+
+        let delivery = try await fixture.vm.remoteRootDispatchInstruction(
+            sessionID: root.sessionID,
+            text: "Follow up from the phone"
+        )
+
+        XCTAssertEqual(delivery, .startedRun)
+        try await waitUntil("the follow-up to reach the stub provider") { codex.contains("codex:send") }
+        let bubble = try XCTUnwrap(root.session.items.last { $0.kind == .user })
+        XCTAssertEqual(bubble.text, "Follow up from the phone")
+        XCTAssertTrue(bubble.attachments.isEmpty)
+        XCTAssertTrue(bubble.taggedFileAttachments.isEmpty)
+        XCTAssertNil(bubble.workflow)
+        assertComposerUntouched(fixture.vm, root, state, "idle")
+    }
+
+    /// Without durable admission the submission never suspends, and the shared submit step still
+    /// applies the caller's final currency check: a stale target sends and clears nothing.
+    func testNonAdmittedSubmissionRefusedAtTheFinalCheckChangesNothing() async {
+        let fixture = makeFixture()
+        let root = makeSession(fixture.vm)
+        root.session.selectedAgent = .openCode
+        beginTurn(root.session, user: "first", assistant: nil)
+        let state = fillComposer(fixture.vm, root)
+        let itemsBefore = root.session.items.map(\.id)
+        XCTAssertFalse(fixture.vm.requiresDurableRecoveryAdmission(for: root.session))
+
+        for origin in [AgentRecoveryIntentOrigin.mcp, .composer] {
+            let result = await fixture.vm.submitUserTurnAdmittingRecoveryInput(
+                text: "stale",
+                tabID: root.tabID,
+                origin: origin,
+                isStillCurrent: { false }
+            )
+            let expectedMessage = origin == .mcp
+                ? AgentModeViewModel.staleInstructionTargetMessage
+                : AgentModeViewModel.staleComposerSubmitTargetMessage
+            XCTAssertEqual(result, .blocked(message: expectedMessage), "\(origin)")
+            XCTAssertEqual(root.session.items.map(\.id), itemsBefore, "\(origin)")
+            XCTAssertTrue(root.session.pendingInstructions.isEmpty, "\(origin)")
+            assertComposerUntouched(fixture.vm, root, state, "\(origin)")
+        }
+    }
+
+    /// The remote-root target authority used by every post-await fence drops a root the moment it
+    /// stops being an attention root (here: MCP took control), so a pending remote send is refused.
+    func testRemoteRootTargetAuthorityDropsARootThatBecameMCPControlled() async throws {
+        let fixture = makeFixture()
+        let root = makeSession(fixture.vm)
+        XCTAssertIdentical(fixture.vm.instructionTargetSession(sessionID: root.sessionID, target: .remoteAttentionRoot), root.session)
+        root.session.mcpControlContext = AgentMCPControlContext(
+            sessionID: root.sessionID,
+            activationID: UUID(),
+            registration: .init(sessionID: root.sessionID, generation: 0),
+            currentEpoch: nil,
+            preparedEpoch: nil,
+            pendingEpochTransition: nil,
+            originatingConnectionID: nil,
+            interactionTransport: .mcp(sessionID: root.sessionID, originatingConnectionID: nil),
+            suppressUserNotifications: true,
+            forceAutoEditEnabled: false,
+            autoEditEnabledBeforeOverride: false,
+            taskLabelKind: .engineer
+        )
+        XCTAssertNil(fixture.vm.instructionTargetSession(sessionID: root.sessionID, target: .remoteAttentionRoot))
+        XCTAssertIdentical(fixture.vm.instructionTargetSession(sessionID: root.sessionID, target: .mcpControlled), root.session)
+        do {
+            _ = try await fixture.vm.remoteRootDispatchInstruction(sessionID: root.sessionID, text: "nope")
+            XCTFail("A root under MCP control is no longer remote-controllable")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("not available for remote control"), "\(error)")
+        }
+    }
+
+    // MARK: - Plan 2026-10-30 Step 1 fixes round 2 (review A R1 narrow cut)
+
+    /// A cold-restored root shape: its live record is bound but not loaded, and the owner-validated
+    /// session index records it as parentless, so its lineage resolves to depth 0.
+    private func makeIndexedUnhydratedRoot(_ vm: AgentModeViewModel) -> LiveSession {
+        let tabID = UUID()
+        let sessionID = UUID()
+        let workspace = WorkspaceModel(
+            name: "Remote Unhydrated Root",
+            repoPaths: [],
+            ephemeralFlag: true,
+            composeTabs: [ComposeTabState(id: tabID, name: "Root", activeAgentSessionID: sessionID)],
+            activeComposeTabID: tabID
+        )
+        let owner = vm.test_receiveWorkspaceSwitchNotification(workspace)
+        let entry = AgentSessionIndexEntry(
+            id: sessionID,
+            tabID: tabID,
+            name: "Root",
+            lastUserMessageAt: Date(timeIntervalSince1970: 100),
+            savedAt: Date(timeIntervalSince1970: 100),
+            lastRunStateRaw: nil,
+            itemCount: 1,
+            agentKindRaw: nil,
+            agentModelRaw: nil,
+            agentReasoningEffortRaw: nil,
+            autoEditEnabled: false,
+            parentSessionID: nil,
+            hasUnknownConversationContent: false,
+            remoteHostID: nil,
+            remoteHostName: nil,
+            isMCPOriginated: false,
+            origin: nil,
+            profile: .standard,
+            worktreeBindingSummaries: [],
+            activeWorktreeMergeSummaries: []
+        )
+        vm.test_installSessionIndexSnapshot([sessionID: entry], owner: owner, latestOwner: owner, activeWorkspace: workspace)
+        let session = vm.session(for: tabID, createIfNeeded: true)!
+        session.testInstallPersistentSessionBinding(sessionID: sessionID)
+        session.hasLoadedPersistedState = false
+        return LiveSession(tabID: tabID, sessionID: sessionID, session: session)
+    }
+
+    /// An unhydrated root keeps its remote identity (so a phone request never falls through to
+    /// ordinary MCP control) but is not dispatch-ready: idle and running sends are refused with a
+    /// clear reason before any bubble, queued instruction, hydration deferral, provider send or
+    /// control installation.
+    func testRemoteSendToAnUnhydratedRootIsRefusedBeforeAnyMutation() async throws {
+        let codex = LifecycleRecorder()
+        let fixture = makeFixture(codexRecorder: codex)
+        let root = makeIndexedUnhydratedRoot(fixture.vm)
+        root.session.selectedAgent = .codexExec
+        XCTAssertIdentical(fixture.vm.remoteAttentionRootSession(sessionID: root.sessionID), root.session)
+        XCTAssertEqual(
+            fixture.vm.remoteRootDispatchRefusal(session: root.session, text: "Follow up"),
+            AgentModeViewModel.remoteRootNotLoadedMessage
+        )
+        let itemsBefore = root.session.items.map(\.id)
+
+        for running in [false, true] {
+            if running {
+                beginTurn(root.session, user: nil, assistant: nil)
+            }
+            do {
+                _ = try await fixture.vm.remoteRootDispatchInstruction(
+                    sessionID: root.sessionID,
+                    text: "Follow up from the phone"
+                )
+                XCTFail("An unhydrated root must refuse a remote send (running: \(running))")
+            } catch {
+                XCTAssertTrue(
+                    String(describing: error).contains(AgentModeViewModel.remoteRootNotLoadedMessage),
+                    "running: \(running): \(error)"
+                )
+            }
+            XCTAssertEqual(root.session.items.map(\.id), itemsBefore, "running: \(running)")
+            XCTAssertTrue(root.session.pendingInstructions.isEmpty, "running: \(running)")
+            XCTAssertFalse(root.session.isMCPInstructionDispatchInProgress, "running: \(running)")
+            XCTAssertNil(root.session.mcpControlContext, "running: \(running)")
+            XCTAssertFalse(fixture.vm.isMCPControlled(tabID: root.tabID), "running: \(running)")
+            XCTAssertTrue(fixture.vm.isAttentionNotificationRoot(root.session), "running: \(running)")
+        }
+        XCTAssertFalse(codex.contains("codex:send"))
+    }
+
+    /// Native control-plane commands (`/compact`, `/goal`) are refused for a remote root, idle or
+    /// running, before any slash-control progress row, optimistic goal bubble, provider send or
+    /// control installation. The same text is ordinary text for a provider without native commands.
+    func testRemoteNativeControlPlaneCommandIsRefusedBeforeAnyProjection() async throws {
+        let codex = LifecycleRecorder()
+        let fixture = makeFixture(codexRecorder: codex)
+        let root = makeSession(fixture.vm)
+        root.session.selectedAgent = .codexExec
+        let itemsBefore = root.session.items.map(\.id)
+
+        for running in [false, true] {
+            if running {
+                beginTurn(root.session, user: nil, assistant: nil)
+            }
+            for text in ["/compact", "/goal ship the fix"] {
+                do {
+                    _ = try await fixture.vm.remoteRootDispatchInstruction(sessionID: root.sessionID, text: text)
+                    XCTFail("\(text) must be refused for a remote root (running: \(running))")
+                } catch {
+                    XCTAssertTrue(
+                        String(describing: error).contains(AgentModeViewModel.remoteRootControlCommandMessage),
+                        "\(text) running: \(running): \(error)"
+                    )
+                }
+                XCTAssertEqual(root.session.items.map(\.id), itemsBefore, "\(text) running: \(running)")
+                XCTAssertTrue(root.session.pendingInstructions.isEmpty, "\(text) running: \(running)")
+                XCTAssertNil(root.session.mcpControlContext, "\(text) running: \(running)")
+            }
+        }
+        XCTAssertFalse(codex.contains("codex:send"))
+        XCTAssertTrue(fixture.vm.isAttentionNotificationRoot(root.session))
+
+        let openCodeRoot = makeSession(fixture.vm)
+        openCodeRoot.session.selectedAgent = .openCode
+        XCTAssertNil(fixture.vm.remoteRootDispatchRefusal(session: openCodeRoot.session, text: "/compact"))
+    }
+
+    /// The final submission predicate re-evaluates readiness, re-parsing the text, at the boundary:
+    /// a provider switch that turns the text into a control-plane command, or a root that is no
+    /// longer loaded, is refused there. The ordinary MCP target keeps its identity-only predicate.
+    func testRemoteFinalSubmitPredicateRechecksReadinessAndReparsesTheText() {
+        let fixture = makeFixture()
+        let root = makeIndexedUnhydratedRoot(fixture.vm)
+        root.session.hasLoadedPersistedState = true
+        root.session.selectedAgent = .openCode
+        func ready(_ text: String) -> Bool {
+            fixture.vm.sessionInstructionTargetIsReady(
+                session: root.session,
+                sessionID: root.sessionID,
+                target: .remoteAttentionRoot,
+                text: text
+            )
+        }
+
+        XCTAssertTrue(ready("/compact"), "Not a native command for this provider")
+        root.session.selectedAgent = .codexExec
+        XCTAssertFalse(ready("/compact"), "Re-parsed at the boundary: now a Codex control-plane command")
+        XCTAssertTrue(ready("plain follow-up"))
+        root.session.hasLoadedPersistedState = false
+        XCTAssertIdentical(fixture.vm.remoteAttentionRootSession(sessionID: root.sessionID), root.session)
+        XCTAssertFalse(ready("plain follow-up"), "No longer loaded at the boundary")
+
+        let controlled = makeSession(fixture.vm, controlled: true, forceControlContext: true, hydrated: false)
+        controlled.session.selectedAgent = .codexExec
+        XCTAssertTrue(
+            fixture.vm.sessionInstructionTargetIsReady(
+                session: controlled.session,
+                sessionID: controlled.sessionID,
+                target: .mcpControlled,
+                text: "/compact"
+            ),
+            "Ordinary MCP semantics are unchanged"
+        )
     }
 
     /// A remote child materialized by the production projection records its local parent, so its
@@ -1715,7 +2083,7 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
             gate.release()
             let session = live.session
             if session.runState.isActive {
-                await Self.boundedTeardownStep("cancelAgentRun") { await vm.cancelAgentRun(tabID: live.tabID) }
+                await Self.boundedTeardownStep("cancelAgentRun") { await vm.cancelAgentRun(tabID: live.tabID, cause: .userCancel) }
             }
             if let agentTask = session.agentTask {
                 await Self.boundedTeardownStep("agentTask") { await agentTask.value }
@@ -1858,6 +2226,7 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
             expectedRunID: session.runID,
             terminalState: state,
             source: "test.attention",
+            cause: .ordinary,
             attachmentDisposition: .deleteFiles,
             finalizeNonCodexUsage: false,
             supportsFollowUp: supportsFollowUp,
@@ -1871,7 +2240,7 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
     /// invokes its observation).
     private func makeBarrier(
         _ vm: AgentModeViewModel,
-        startFollowUpRun: @escaping (UUID, String, AgentModeRunService.Hooks.FollowUpStartObservation?) -> Void = { _, _, _ in }
+        startFollowUpRun: @escaping (UUID, AgentPendingInstruction, AgentModeRunService.Hooks.FollowUpStartObservation?) -> Void = { _, _, _ in }
     ) -> AgentRunTerminalCommitBarrier {
         AgentRunTerminalCommitBarrier(hooks: AgentModeRunService.Hooks(
             estimateRuntimeTokens: { $0.count },
@@ -1905,10 +2274,11 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
             publishTerminalCommit: { _, _, _ in .accepted(successorEpoch: nil) },
             startFollowUpRun: startFollowUpRun,
             restoreDraftText: { _, _, _, _ in },
-            augmentUserMessageForProviderSend: { text, _, _, _ in text },
+            augmentUserMessageForProviderSend: { text, _, _, _, _ in AgentStagedProviderText(text: text) },
             stageResumeRecoveryHandoffIfNeeded: { _ in },
-            prependPendingHandoffIfNeeded: { text, _ in text },
-            recordPendingHandoffSendOutcome: { _, _ in },
+            prependPendingHandoffIfNeeded: { text, _ in AgentStagedProviderText(text: text) },
+            stagePendingHandoffForDurableDispatch: { _, _ in .none },
+            recordPendingHandoffSendOutcome: { _, _, _ in },
             signalMCPInstructionDelivered: { _ in },
             captureAttentionTurnCompletion: { [weak vm] session, revision in
                 vm?.captureAttentionTurnCompletion(for: session, revision: revision)

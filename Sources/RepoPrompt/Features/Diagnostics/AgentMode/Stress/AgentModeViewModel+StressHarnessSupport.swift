@@ -420,6 +420,7 @@
                         pendingHandoffPayload: session.pendingHandoffPayload,
                         pendingHandoffCreatedAt: session.pendingHandoffCreatedAt,
                         pendingHandoffSourceItemID: session.pendingHandoffSourceItemID,
+                        pendingHandoffPayloadID: session.pendingHandoffPayloadID,
                         pendingHandoffDefersProviderLockUntilSend: session.pendingHandoffDefersProviderLockUntilSend
                     )
                 } catch {

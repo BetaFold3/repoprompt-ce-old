@@ -51,19 +51,34 @@ package enum ProcessLauncherError: Error {
 }
 
 package enum ProcessLauncher {
+    /// Environment marker naming the runtime that owns a spawned process family. The name
+    /// deliberately avoids `KEY`, `TOKEN` and `SECRET`, which tool environment policies strip.
+    package static let runtimeMarkerEnvironmentKey = "RPCE_RUNTIME_ID"
+
+    /// When `runtimeID` is non-nil, the child environment carries `RPCE_RUNTIME_ID` set to its
+    /// canonical string, replacing any supplied value. When nil, `environment` is passed unchanged.
     package static func spawn(
         command: String,
         arguments: [String],
         environment: [String: String],
-        workingDirectory: String?
+        workingDirectory: String?,
+        runtimeID: UUID? = nil
     ) throws -> SpawnedProcess {
         try spawn(
             command: command,
             arguments: arguments,
             environment: environment,
             workingDirectory: workingDirectory,
+            runtimeID: runtimeID,
             initializationFailure: nil
         )
+    }
+
+    static func launchEnvironment(_ environment: [String: String], runtimeID: UUID?) -> [String: String] {
+        guard let runtimeID else { return environment }
+        var composed = environment
+        composed[runtimeMarkerEnvironmentKey] = runtimeID.uuidString
+        return composed
     }
 
     #if DEBUG
@@ -77,6 +92,7 @@ package enum ProcessLauncher {
             arguments: [String],
             environment: [String: String],
             workingDirectory: String?,
+            runtimeID: UUID? = nil,
             initializationFailure: DebugInitializationFailure
         ) throws -> SpawnedProcess {
             let failure: InitializationFailure = switch initializationFailure {
@@ -88,6 +104,7 @@ package enum ProcessLauncher {
                 arguments: arguments,
                 environment: environment,
                 workingDirectory: workingDirectory,
+                runtimeID: runtimeID,
                 initializationFailure: failure
             )
         }
@@ -103,6 +120,7 @@ package enum ProcessLauncher {
         arguments: [String],
         environment: [String: String],
         workingDirectory: String?,
+        runtimeID: UUID?,
         initializationFailure: InitializationFailure?
     ) throws -> SpawnedProcess {
         var stdinPipe: [Int32] = [-1, -1]
@@ -286,9 +304,10 @@ package enum ProcessLauncher {
             }
         }
 
+        let childEnvironment = launchEnvironment(environment, runtimeID: runtimeID)
         var envp: [UnsafeMutablePointer<CChar>?] = []
-        envp.reserveCapacity(environment.count + 1)
-        for (key, value) in environment {
+        envp.reserveCapacity(childEnvironment.count + 1)
+        for (key, value) in childEnvironment {
             envp.append(strdup("\(key)=\(value)"))
         }
         envp.append(nil)

@@ -296,6 +296,10 @@ extension MCPServerViewModel {
         case runInstall
         case runHandover
         case pendingRunScoped
+        /// The run tab of the connection's actor-side run route, for a routed connection without
+        /// its run-tab binding in this window (it yielded the window's run mapping to the run's
+        /// holder). Unbound and without active UI capture.
+        case actorRunRoute
         case implicitBindingCompatibility
         case explicitHint
     }
@@ -1484,6 +1488,19 @@ extension MCPServerViewModel {
         /// Dispatcher-validated provenance for a one-shot hidden `_windowID`.
         /// This is distinct from effective or persisted connection affinity.
         let explicitWindowRoutingHint: MCPExplicitWindowRoutingHint?
+        /// The dispatcher's server-side invocation UUID of this `tools/call`
+        /// (`ServerNetworkManager.currentToolInvocationID`). Local execution identity only; a new
+        /// request is a new invocation. `nil` outside a dispatched tool call.
+        let toolInvocationID: UUID?
+        /// The run tab of the connection's actor-side run route at capture time
+        /// (`ServerNetworkManager.actorRoutedRunPolicyTab`): a routed connection without its run-tab
+        /// binding resolves it (`resolveTabContext`), never active-tab compatibility.
+        private(set) var actorRoutedRunTab: ServerNetworkManager.RunPolicyTab?
+        /// Paired device of a verified per-device gateway app link (`remote:<device8>`), from the
+        /// connection's `.gateway` principal and bootstrap identity
+        /// (`ServerNetworkManager.gatewayRemoteDeviceID(for:)`). Nil for every other caller; the
+        /// client-asserted `clientName` alone never sets it.
+        let gatewayRemoteDeviceID: String?
 
         init(
             connectionID: UUID?,
@@ -1491,7 +1508,10 @@ extension MCPServerViewModel {
             windowID: Int?,
             runPurpose: MCPRunPurpose? = nil,
             tabContextHint: TabContextHint? = nil,
-            explicitWindowRoutingHint: MCPExplicitWindowRoutingHint? = nil
+            explicitWindowRoutingHint: MCPExplicitWindowRoutingHint? = nil,
+            toolInvocationID: UUID? = nil,
+            actorRoutedRunTab: ServerNetworkManager.RunPolicyTab?,
+            gatewayRemoteDeviceID: String? = nil
         ) {
             self.connectionID = connectionID
             self.clientName = clientName
@@ -1499,6 +1519,15 @@ extension MCPServerViewModel {
             self.runPurpose = runPurpose
             self.tabContextHint = tabContextHint
             self.explicitWindowRoutingHint = explicitWindowRoutingHint
+            self.toolInvocationID = toolInvocationID
+            self.actorRoutedRunTab = actorRoutedRunTab
+            self.gatewayRemoteDeviceID = gatewayRemoteDeviceID
+        }
+
+        func withActorRoutedRunTab(_ runTab: ServerNetworkManager.RunPolicyTab?) -> RequestMetadata {
+            var copy = self
+            copy.actorRoutedRunTab = runTab
+            return copy
         }
     }
 
@@ -1544,19 +1573,28 @@ extension MCPServerViewModel {
                 return requestMetadataOverrideForTesting
             }
         #endif
+        // A read-only companion's request context aliases its run's primary connection; every
+        // other request keeps its own connection.
         let connectionID = await currentRequestContextConnectionID()
-        let runPurpose: MCPRunPurpose? = if let connectionID {
-            await ServerNetworkManager.shared.runPurpose(for: connectionID)
+        // One actor read: the run purpose, the actor-side run tab, and the verified gateway device,
+        // from the same state.
+        let routing = if let connectionID {
+            await ServerNetworkManager.shared.requestRoutingContext(for: connectionID)
         } else {
-            nil
+            ServerNetworkManager.RequestRoutingContext(runPurpose: nil, actorRoutedRunTab: nil)
         }
+        let runPurpose = routing.runPurpose
+        let actorRoutedRunTab = routing.actorRoutedRunTab
         return await RequestMetadata(
             connectionID: connectionID,
             clientName: service.currentRequestClientName(),
             windowID: service.currentRequestWindowID(),
             runPurpose: runPurpose,
             tabContextHint: ServerNetworkManager.currentTabContextHint,
-            explicitWindowRoutingHint: service.currentRequestExplicitWindowRoutingHint()
+            explicitWindowRoutingHint: service.currentRequestExplicitWindowRoutingHint(),
+            toolInvocationID: ServerNetworkManager.currentToolInvocationID,
+            actorRoutedRunTab: actorRoutedRunTab,
+            gatewayRemoteDeviceID: routing.gatewayRemoteDeviceID
         )
     }
 
@@ -1576,6 +1614,7 @@ extension MCPServerViewModel {
             toolName: toolName,
             policy: policy,
             runPurpose: metadata.runPurpose,
+            actorRoutedRunTab: metadata.actorRoutedRunTab,
             startMirroring: startMirroring
         )
     }
@@ -2643,7 +2682,7 @@ extension MCPServerViewModel {
             return false
         }
         switch resolvedContext.source {
-        case .runInstall, .runHandover, .pendingRunScoped:
+        case .runInstall, .runHandover, .pendingRunScoped, .actorRunRoute:
             return true
         case .explicitBinding, .implicitBindingCompatibility, .explicitHint, nil:
             return false
@@ -2667,14 +2706,23 @@ extension MCPServerViewModel {
         metadata: RequestMetadata
     ) async -> UUID? {
         var purpose: MCPRunPurpose
+        var metadata = metadata
         if let connectionID = metadata.connectionID {
-            purpose = await ServerNetworkManager.shared.runPurpose(for: connectionID)
-            if purpose == .agentModeRun || purpose == .unknown {
-                let didRehydrate = await ServerNetworkManager.shared.rehydrateRunTabContextForConnectionIfPossible(connectionID)
-                if didRehydrate {
-                    purpose = await ServerNetworkManager.shared.runPurpose(for: connectionID)
+            var routing = await ServerNetworkManager.shared.requestRoutingContext(for: connectionID)
+            if routing.runPurpose == .agentModeRun || routing.runPurpose == .unknown {
+                // Request-originated: never takes the run's window mapping from a different
+                // holder. A yield still applied the run policy; the resolver then resolves the run
+                // tab from the actor-side run route.
+                let rehydrate = await ServerNetworkManager.shared.rehydrateRunTabContextForConnectionIfPossible(
+                    connectionID,
+                    displacesHolder: false
+                )
+                if rehydrate != .unavailable {
+                    routing = await ServerNetworkManager.shared.requestRoutingContext(for: connectionID)
                 }
             }
+            purpose = routing.runPurpose ?? .unknown
+            metadata = metadata.withActorRoutedRunTab(routing.actorRoutedRunTab)
         } else {
             purpose = .unknown
         }
@@ -2702,18 +2750,36 @@ extension MCPServerViewModel {
     private func reconciledAgentRunLaunchPurpose(
         metadata: RequestMetadata
     ) async throws -> MCPRunPurpose {
+        try await reconciledAgentRunLaunchSource(metadata: metadata).purpose
+    }
+
+    /// The launch purpose (from the run's actor and policy state), and `metadata` carrying the
+    /// connection's actor-side run tab after the request-originated rehydrate, which may have
+    /// yielded the window's run mapping to the run's holder.
+    @MainActor
+    private func reconciledAgentRunLaunchSource(
+        metadata: RequestMetadata
+    ) async throws -> (purpose: MCPRunPurpose, metadata: RequestMetadata) {
         var currentPurpose: MCPRunPurpose = .unknown
         var cachedRunPolicyPurpose: MCPRunPurpose?
+        var metadata = metadata
         if let connectionID = metadata.connectionID {
             let networkManager = ServerNetworkManager.shared
-            currentPurpose = await networkManager.runPurpose(for: connectionID)
+            var routing = await networkManager.requestRoutingContext(for: connectionID)
+            currentPurpose = routing.runPurpose ?? .unknown
             if currentPurpose == .agentModeRun || currentPurpose == .discoverRun || currentPurpose == .unknown {
-                _ = await networkManager.rehydrateRunTabContextForConnectionIfPossible(connectionID)
-                currentPurpose = await networkManager.runPurpose(for: connectionID)
+                // Request-originated: never takes the run's window mapping from a different holder.
+                await networkManager.rehydrateRunTabContextForConnectionIfPossible(
+                    connectionID,
+                    displacesHolder: false
+                )
+                routing = await networkManager.requestRoutingContext(for: connectionID)
+                currentPurpose = routing.runPurpose ?? .unknown
             }
             if let runID = await networkManager.runIDForConnection(connectionID) {
                 cachedRunPolicyPurpose = await networkManager.runPolicyPurpose(for: runID)
             }
+            metadata = metadata.withActorRoutedRunTab(routing.actorRoutedRunTab)
         }
 
         let scopedPurposes = [metadata.runPurpose, currentPurpose, cachedRunPolicyPurpose]
@@ -2727,7 +2793,7 @@ extension MCPServerViewModel {
                 "agent_run.start observed conflicting run purposes while resolving its launch source. Refusing ambiguous routing."
             )
         }
-        return scopedPurposes.first ?? .unknown
+        return (scopedPurposes.first ?? .unknown, metadata)
     }
 
     @MainActor
@@ -2798,7 +2864,9 @@ extension MCPServerViewModel {
         metadata: RequestMetadata,
         targetWindow: WindowState
     ) async throws -> AgentRunOracleReviewLaunchSnapshot {
-        let purpose = try await reconciledAgentRunLaunchPurpose(metadata: metadata)
+        let launchSource = try await reconciledAgentRunLaunchSource(metadata: metadata)
+        let purpose = launchSource.purpose
+        let metadata = launchSource.metadata
         let binding = metadata.connectionID.map(connectionBindingSnapshot(forConnection:))
         let explicitWindowRoutingHint = metadata.explicitWindowRoutingHint
 
@@ -3059,6 +3127,7 @@ extension MCPServerViewModel {
         toolName: String = "unknown",
         policy: TabContextResolutionPolicy,
         runPurpose: MCPRunPurpose? = nil,
+        actorRoutedRunTab: ServerNetworkManager.RunPolicyTab?,
         startMirroring: Bool = true
     ) throws -> TabContextResolution {
         // Prefer network-provided window ID, but if it's missing and we've
@@ -3072,7 +3141,9 @@ extension MCPServerViewModel {
         // 1) Existing bound tab-context snapshot for this connection is authoritative only
         // when it is compatible with any current run hint and the requested policy.
         if let connectionID, let bound = tabContextByConnectionID[connectionID] {
-            let requiredRunID = connectionIDToRunID[connectionID]
+            // The window's run mapping, else the actor-side run route: a routed connection's
+            // binding to another tab (or none of the run's) never outranks its run tab.
+            let requiredRunID = connectionIDToRunID[connectionID] ?? actorRoutedRunTab?.runID
             let boundMatchesRunHint = requiredRunID.map { bound.runID == $0 } ?? true
             let boundAllowedByPolicy = policy != .requireExplicitOrRunScoped || bound.runID != nil || bound.explicitlyBound
             if !boundMatchesRunHint || !boundAllowedByPolicy {
@@ -3152,6 +3223,33 @@ extension MCPServerViewModel {
             return .tabContextSnapshot(context, source: .pendingRunScoped)
         }
 
+        // 4b) The actor-side run route of a connection without its run-tab binding here (a request
+        // that yielded the window's run mapping to a different holder): the run's own tab, unbound
+        // and without active UI capture, never active-tab compatibility. Fails closed when the run
+        // tab is not in this window. Client-agnostic: a fail-closed rule for any routed
+        // connection with a run tab (only Claude native request paths yield the mapping).
+        if let connectionID,
+           let actorRoutedRunTab,
+           connectionIDToRunID[connectionID] == nil || connectionIDToRunID[connectionID] == actorRoutedRunTab.runID
+        {
+            guard actorRoutedRunTab.windowID == windowID else {
+                throw MCPError.invalidParams(
+                    "\(toolName) is routed to an Agent Mode run whose tab is in window \(actorRoutedRunTab.windowID), not window \(windowID). Refusing to resolve another tab context."
+                )
+            }
+            let snapshot = try makeTabContextSnapshot(
+                tabID: actorRoutedRunTab.tabID,
+                workspaceID: actorRoutedRunTab.workspaceID,
+                windowID: actorRoutedRunTab.windowID,
+                runID: actorRoutedRunTab.runID,
+                explicitlyBound: false,
+                captureActiveUIState: false,
+                flushActiveSelection: false
+            )
+            tabContextLog("resolveTabContext using the actor-side run route connectionID=\(connectionID) runID=\(actorRoutedRunTab.runID) tab=\(snapshot.tabID) window=\(snapshot.windowID)")
+            return .tabContextSnapshot(snapshot, source: .actorRunRoute)
+        }
+
         // 5) Named active-tab compatibility fallback for legacy, non-agent callers.
         let hasRunScopedContext = connectionID.flatMap { connectionIDToRunID[$0] } != nil
         switch Self.activeTabCompatibilityFallbackDecision(
@@ -3207,13 +3305,17 @@ extension MCPServerViewModel {
             throw MCPError.invalidParams("No active connection for \(toolName)")
         }
 
+        let routing = await ServerNetworkManager.shared.requestRoutingContext(for: connectionID)
+        let purpose = routing.runPurpose ?? .unknown
+        // The actor-side run tab too: a routed connection without its run-tab binding resolves its
+        // run tab (step 4b), never another context.
         let metadata = await RequestMetadata(
             connectionID: connectionID,
             clientName: service.currentRequestClientName(),
             windowID: service.currentRequestWindowID(),
-            tabContextHint: ServerNetworkManager.currentTabContextHint
+            tabContextHint: ServerNetworkManager.currentTabContextHint,
+            actorRoutedRunTab: routing.actorRoutedRunTab
         )
-        let purpose = await ServerNetworkManager.shared.runPurpose(for: connectionID)
 
         do {
             let resolution = try resolveTabContext(
@@ -3726,6 +3828,32 @@ extension MCPServerViewModel {
         }
     }
 
+    #if DEBUG
+        /// Every window-side run-mapping displacement, recorded synchronously where the window
+        /// replaces a run's holder (before any replacement is scheduled). Bounded.
+        struct DebugRunMappingDisplacement: Equatable {
+            let existing: UUID
+            let replacement: UUID
+            let runID: UUID
+            let path: String
+        }
+
+        @MainActor static var debugRunMappingDisplacements: [DebugRunMappingDisplacement] = []
+
+        @MainActor
+        static func debugRecordRunMappingDisplacement(existing: UUID, by replacement: UUID, runID: UUID, path: String) {
+            debugRunMappingDisplacements.append(DebugRunMappingDisplacement(existing: existing, replacement: replacement, runID: runID, path: path))
+            if debugRunMappingDisplacements.count > 500 {
+                debugRunMappingDisplacements.removeFirst(debugRunMappingDisplacements.count - 500)
+            }
+        }
+
+        @MainActor
+        static func debugRunMappingDisplacementCount(existing: UUID, runID: UUID) -> Int {
+            debugRunMappingDisplacements.count { $0.existing == existing && $0.runID == runID }
+        }
+    #endif
+
     @MainActor
     @discardableResult
     func registerRunIDMapping(
@@ -3765,6 +3893,9 @@ extension MCPServerViewModel {
             }
             // Handle connection replacement - uses soft-disconnect for same-session reconnects
             tabContextLog("registerRunIDMapping handling connection replacement: old=\(existingConnection) new=\(connectionID) runID=\(runID)")
+            #if DEBUG
+                Self.debugRecordRunMappingDisplacement(existing: existingConnection, by: connectionID, runID: runID, path: "register_run_id_mapping")
+            #endif
             Task {
                 await ServerNetworkManager.shared.handleConnectionReplaced(
                     existing: existingConnection,
@@ -3831,6 +3962,11 @@ extension MCPServerViewModel {
             previousWindowID: windowIDByConnection[connectionID]
         )
         installReadFileAutoSelectionHandoverLineage(for: token)
+        #if DEBUG
+            if let displaced = token.displacedConnectionID {
+                Self.debugRecordRunMappingDisplacement(existing: displaced, by: connectionID, runID: runID, path: "pending_policy")
+            }
+        #endif
 
         if let displacedConnectionID = token.displacedConnectionID,
            connectionIDToRunID[displacedConnectionID] == runID

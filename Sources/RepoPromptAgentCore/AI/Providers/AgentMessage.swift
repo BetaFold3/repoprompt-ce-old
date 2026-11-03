@@ -22,9 +22,21 @@ public struct AgentMessage: Sendable, Equatable {
     /// Used by Claude CLI to resume with --resume <session-id> instead of replaying history
     public var resumeSessionID: String?
 
+    /// The managed session (lifecycle and run attempt) this message's provider run serves, or
+    /// explicit sessionless work (Context Builder, chat providers). Fail-closed default: a managed
+    /// launch for a message that never set it is refused under runtime registration (R6).
+    package var runtimeSession: AgentRuntimeSessionScope = .unavailable
+
     public init(systemPrompt: String = "", userMessage: String, resumeSessionID: String? = nil) {
         self.systemPrompt = systemPrompt
         self.userMessage = userMessage
         self.resumeSessionID = resumeSessionID
+    }
+
+    /// The same message bound to `runtimeSession`.
+    package func withRuntimeSession(_ runtimeSession: AgentRuntimeSessionScope) -> AgentMessage {
+        var message = self
+        message.runtimeSession = runtimeSession
+        return message
     }
 }

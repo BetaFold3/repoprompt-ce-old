@@ -93,6 +93,15 @@ package enum CodexAppServerRequestID: Hashable {
     }
 }
 
+/// R6: the immutable identity of one runtime-initiated request: the client instance and transport
+/// generation it arrived on, plus its wire ID. Registered replies are routed by receipt, never by the
+/// wire ID alone, because a replacement transport can issue its own request with the same ID.
+package struct CodexServerRequestReceipt: Hashable {
+    package let clientInstanceID: UUID
+    package let transportGeneration: UInt64
+    package let id: CodexAppServerRequestID
+}
+
 package actor CodexAppServerClient {
     package struct RequestFailure: Equatable {
         let method: String
@@ -171,6 +180,20 @@ package actor CodexAppServerClient {
         let id: CodexAppServerRequestID
         let method: String
         let params: [String: CodexJSONValue]
+        /// R6: the receipt replies must present (`nil` only for fixtures built without a client).
+        let receipt: CodexServerRequestReceipt?
+
+        init(
+            id: CodexAppServerRequestID,
+            method: String,
+            params: [String: CodexJSONValue],
+            receipt: CodexServerRequestReceipt? = nil
+        ) {
+            self.id = id
+            self.method = method
+            self.params = params
+            self.receipt = receipt
+        }
     }
 
     struct Config {
@@ -339,6 +362,8 @@ package actor CodexAppServerClient {
     private struct TerminatingTransport {
         let process: SpawnedProcess?
         let expectedAgentPIDToClear: RegisteredExpectedAgentPID?
+        /// The exact launch owning `process` (captured; never the client's current launch).
+        var runtimeLaunch: AgentRuntimeLaunch?
     }
 
     /// An oversized inbound frame detected while feeding stdout. Recorded from inside
@@ -445,6 +470,35 @@ package actor CodexAppServerClient {
 
     private var config = Config()
     private var process: SpawnedProcess?
+    /// Runtime ownership of `process` (spec R6); `nil` while Phase 3 registration is off. The client
+    /// owns the runtime; thread owners contribute conversation associations.
+    private var runtimeLaunch: AgentRuntimeLaunch?
+    /// Transport generation whose birth identity is committed (writes are refused otherwise).
+    private var runtimeCommittedGeneration: UInt64?
+    private let launchAuthority: AgentRuntimeLaunchAuthority
+    /// R6: the session scope of starts and requests that carry none of their own (fixed at
+    /// construction: `.sessionless` for non-agent clients; `.unavailable`, which fails closed under
+    /// registration, otherwise). The client never holds a mutable "current session": thread owners
+    /// pass the immutable scope their owner operation captured with each start and request.
+    private let defaultRuntimeSession: AgentRuntimeSessionScope
+    /// R6: distinguishes this client's request receipts from every other client's (transport
+    /// generations restart at each client).
+    private let clientInstanceID = UUID()
+    /// Whether this client's launches are registered (fixed at construction): cleanup is then
+    /// retained and joined before a successor reserves.
+    package nonisolated let isRuntimeRegistrationActive: Bool
+    /// R6: retained cleanup of registered terminated transports (reap report and post-reap
+    /// discovery), joined by `stop()` and before the next launch reserves.
+    private var pendingTransportCleanups: [UUID: Task<Void, Never>] = [:]
+    #if DEBUG
+        /// Test-only suspension at R6 fence checkpoints (`ownerCaptured` right after a request
+        /// captures its transport, `associated` after its association await), so fixtures can replace
+        /// the transport inside a request's awaits. Never set outside tests.
+        private var debugRuntimeFenceCheckpoint: (@Sendable (String) async -> Void)?
+        /// Test-only replacement of process start and initialization (a fixture installs its test
+        /// transport and registered launch, advancing the generation). Never set outside tests.
+        private var debugStartupOverride: (@Sendable (CodexAppServerClient) async throws -> Void)?
+    #endif
     private var stdoutChunkChannel: FileHandleChunkChannel?
     private var stderrChunkChannel: FileHandleChunkChannel?
     private var stdoutConsumerTask: Task<Void, Never>?
@@ -455,6 +509,9 @@ package actor CodexAppServerClient {
     private var nextRequestID: Int = 1
     private var notificationContinuations: [UUID: AsyncStream<Notification>.Continuation] = [:]
     private var serverRequestContinuations: [UUID: AsyncStream<ServerRequest>.Continuation] = [:]
+    /// The transport each pending runtime-initiated request arrived on, keyed by its immutable
+    /// receipt (reply routing, R6; registered transports only).
+    private var inboundServerRequestOwners: [CodexServerRequestReceipt: RuntimeWriteOwner] = [:]
     private var isInitialized = false
     /// Inbound frame ceiling for this client; `Config.maxInboundFrameBytes` outside DEBUG test overrides.
     private var inboundFrameLimitBytes = Config.maxInboundFrameBytes
@@ -491,8 +548,13 @@ package actor CodexAppServerClient {
         livenessProbe: @escaping @Sendable (SpawnedProcess) -> Bool = { process in
             CodexAppServerClient.defaultProcessAppearsAlive(process)
         },
-        expectedAgentPIDRegistrar: ExpectedAgentPIDRegistrar? = nil
+        expectedAgentPIDRegistrar: ExpectedAgentPIDRegistrar? = nil,
+        launchAuthority: AgentRuntimeLaunchAuthority = .production,
+        defaultRuntimeSession: AgentRuntimeSessionScope = .unavailable
     ) {
+        self.launchAuthority = launchAuthority
+        isRuntimeRegistrationActive = launchAuthority.isRegistrationActive(family: .codexAppServer, provider: .codex)
+        self.defaultRuntimeSession = defaultRuntimeSession
         self.writeFrameHandler = writeFrameHandler
         self.livenessProbe = livenessProbe
         self.expectedAgentPIDRegistrar = expectedAgentPIDRegistrar ?? .mcpHost(mcpHost)
@@ -616,7 +678,14 @@ package actor CodexAppServerClient {
         }
     }
 
+    /// Starts with the client's fixed default runtime session scope.
     package func startIfNeeded() async throws {
+        try await startIfNeeded(runtimeSession: nil)
+    }
+
+    /// `runtimeSession`: the session scope the starting operation's owner captured (recorded by the
+    /// launch reservation); `nil` uses the client's fixed default scope.
+    package func startIfNeeded(runtimeSession: AgentRuntimeSessionScope?) async throws {
         if let existingStartupTask = startupTask?.task {
             return try await existingStartupTask.value
         }
@@ -637,7 +706,7 @@ package actor CodexAppServerClient {
         }
         let startupID = UUID()
         let task = Task<Void, Error> {
-            try await self.performStartupIfNeeded()
+            try await self.performStartupIfNeeded(runtimeSession: runtimeSession)
         }
         startupTask = (id: startupID, task: task)
         do {
@@ -657,6 +726,20 @@ package actor CodexAppServerClient {
         startupTask?.task.cancel()
         startupTask = nil
         await terminateTransport(flushStdout: true, reason: .explicitStop)
+        // R6: an earlier invalidation's registered cleanup (reap report and post-reap discovery)
+        // also finishes before stop returns, so the caller's successor never races it.
+        await joinPendingTransportCleanups()
+    }
+
+    private func joinPendingTransportCleanups() async {
+        while let (id, cleanup) = pendingTransportCleanups.first {
+            await cleanup.value
+            pendingTransportCleanups[id] = nil
+        }
+    }
+
+    private func finishPendingTransportCleanup(_ id: UUID) {
+        pendingTransportCleanups[id] = nil
     }
 
     // MARK: - Authoritative transport termination
@@ -749,6 +832,7 @@ package actor CodexAppServerClient {
 
         let serverReqContinuations = serverRequestContinuations
         serverRequestContinuations.removeAll()
+        inboundServerRequestOwners.removeAll()
         for continuation in serverReqContinuations.values {
             continuation.finish()
         }
@@ -759,7 +843,10 @@ package actor CodexAppServerClient {
         // correctly fail/bail out.
         let terminatingProcess = process
         let expectedAgentPIDToClear = takeRegisteredExpectedAgentPIDForDeferredClear()
+        let terminatingLaunch = runtimeLaunch
         process = nil
+        runtimeLaunch = nil
+        runtimeCommittedGeneration = nil
         isInitialized = false
 
         // 6. Reset framer state for potential future restart.
@@ -769,14 +856,25 @@ package actor CodexAppServerClient {
 
         return TerminatingTransport(
             process: terminatingProcess,
-            expectedAgentPIDToClear: expectedAgentPIDToClear
+            expectedAgentPIDToClear: expectedAgentPIDToClear,
+            runtimeLaunch: terminatingLaunch
         )
     }
 
     private func scheduleTransportCleanup(_ terminatingTransport: TerminatingTransport?) {
         guard let terminatingTransport else { return }
-        Task {
+        guard terminatingTransport.runtimeLaunch != nil else {
+            Task {
+                await self.finishTransportTermination(terminatingTransport)
+            }
+            return
+        }
+        // R6: a registered transport's cleanup is retained so stop() and the next reservation
+        // join its reap report instead of racing it.
+        let id = UUID()
+        pendingTransportCleanups[id] = Task {
             await self.finishTransportTermination(terminatingTransport)
+            await self.finishPendingTransportCleanup(id)
         }
     }
 
@@ -823,13 +921,17 @@ package actor CodexAppServerClient {
         }
         guard let process else { return }
         self.process = nil
+        let launch = runtimeLaunch
+        runtimeLaunch = nil
+        runtimeCommittedGeneration = nil
         process.stdout.readabilityHandler = nil
         process.stderr.readabilityHandler = nil
         process.stdin?.closeFile()
         let pid = process.pid
         let processGroupID = process.processGroupID
         Task.detached {
-            _ = await ProcessTermination.terminateAndReap(pid: pid, processGroupID: processGroupID)
+            let reaped = await ProcessTermination.terminateAndReapReportingRoot(pid: pid, processGroupID: processGroupID)
+            await launch?.rootReaped(pid: pid, confirmed: reaped.rootReaped)
         }
     }
 
@@ -847,11 +949,87 @@ package actor CodexAppServerClient {
         process.stderr.readabilityHandler = nil
         process.stdin?.closeFile()
         let pid = process.pid
-        _ = await ProcessTermination.terminateAndReap(
+        let reaped = await ProcessTermination.terminateAndReapReportingRoot(
             pid: pid,
             processGroupID: process.processGroupID,
             logger: config.enableDebugLogging ? { print("[CodexAppServer] \($0)") } : { _ in }
         )
+        await terminatingTransport.runtimeLaunch?.rootReaped(pid: pid, confirmed: reaped.rootReaped)
+    }
+
+    /// The exact transport a request was issued on, captured before its first suspension: every
+    /// fence step and the final synchronous write require the client to still be on this
+    /// generation with this launch, so a replacement started meanwhile receives zero bytes.
+    private struct RuntimeWriteOwner {
+        let generation: UInt64
+        let launch: AgentRuntimeLaunch?
+    }
+
+    private func isCurrent(_ owner: RuntimeWriteOwner) -> Bool {
+        process != nil && transportGeneration == owner.generation && runtimeLaunch === owner.launch
+    }
+
+    /// R6 operation association on the captured transport, before any thread mutation or turn
+    /// write (resumed threads: before `thread/resume`): the owner-captured session and run attempt,
+    /// the thread and any permission configuration the request asks for. A conflicting writer or a
+    /// missing Agent Mode session context throws.
+    private func associateRuntimeConversation(
+        _ threadID: String,
+        session: AgentRuntimeSessionScope,
+        permission: AgentRuntimePermissionSnapshot?,
+        worktreePath: String?,
+        launch: AgentRuntimeLaunch,
+        owner: RuntimeWriteOwner
+    ) async throws {
+        let trimmed = threadID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        // The operation's own worktree (`cwd`), never the transport's launch directory or whichever
+        // thread is current; the launch directory applies only when the operation names none.
+        try await launch.associate(
+            session: session,
+            conversationID: trimmed,
+            worktreePath: worktreePath,
+            permission: permission
+        )
+        #if DEBUG
+            if let checkpoint = debugRuntimeFenceCheckpoint { await checkpoint("associated") }
+        #endif
+        guard isCurrent(owner) else { throw ClientError.processNotRunning }
+    }
+
+    /// Lossless-restart Phase 4 recovery observation: associates the observed `threadID` with this
+    /// client's current registered transport for the owner's session and worktree before its
+    /// observational reads (registry attribution only; nothing is written to the transport). The
+    /// transport must still be `expectedGeneration` with a registered launch; an unregistered,
+    /// stopped or replaced transport throws, and a conflicting writer is refused by the registry.
+    package func associateObservedConversation(
+        _ threadID: String,
+        runtimeSession: AgentRuntimeSessionScope?,
+        worktreePath: String?,
+        expectedGeneration: UInt64
+    ) async throws {
+        guard process != nil, transportGeneration == expectedGeneration, let launch = runtimeLaunch else {
+            throw ClientError.processNotRunning
+        }
+        try await associateRuntimeConversation(
+            threadID,
+            session: runtimeSession ?? defaultRuntimeSession,
+            permission: nil,
+            worktreePath: worktreePath,
+            launch: launch,
+            owner: RuntimeWriteOwner(generation: expectedGeneration, launch: launch)
+        )
+    }
+
+    /// R6 write fence on the captured transport: its launch is still the committed live owner and
+    /// serves `threadID`.
+    private func authorizeRuntimeWrite(
+        threadID: String?,
+        launch: AgentRuntimeLaunch,
+        owner: RuntimeWriteOwner
+    ) async throws {
+        try await launch.authorizeWrite(conversationID: threadID)
+        guard isCurrent(owner) else { throw ClientError.processNotRunning }
     }
 
     private static func defaultProcessAppearsAlive(_ process: SpawnedProcess) -> Bool {
@@ -879,11 +1057,24 @@ package actor CodexAppServerClient {
     }
 
     package func request(method: String, params: [String: Any]?, timeout: TimeInterval? = nil) async throws -> [String: Any] {
+        try await request(method: method, params: params, timeout: timeout, useDefaultTimeout: true)
+    }
+
+    /// `runtimeSession`: the session scope the requesting operation's owner captured, used for this
+    /// request's association (a thread owner passes its own; `nil` uses the client's fixed default
+    /// scope).
+    package func request(
+        method: String,
+        params: [String: Any]?,
+        timeout: TimeInterval?,
+        runtimeSession: AgentRuntimeSessionScope?
+    ) async throws -> [String: Any] {
         try await request(
             method: method,
             params: params,
             timeout: timeout,
-            useDefaultTimeout: true
+            useDefaultTimeout: true,
+            runtimeSession: runtimeSession
         )
     }
 
@@ -891,10 +1082,137 @@ package actor CodexAppServerClient {
         method: String,
         params: [String: Any]?,
         timeout: TimeInterval?,
-        useDefaultTimeout: Bool
+        useDefaultTimeout: Bool,
+        runtimeSession: AgentRuntimeSessionScope? = nil
     ) async throws -> [String: Any] {
         try Task.checkCancellation()
         guard process != nil else { throw ClientError.processNotRunning }
+        // R6: capture the exact transport (generation and launch) before the first suspension.
+        // Each request carries its own owner-captured session scope and the permission its own
+        // params ask for; nothing is read from a session or shared across requests.
+        let owner = RuntimeWriteOwner(generation: transportGeneration, launch: runtimeLaunch)
+        let session = runtimeSession ?? defaultRuntimeSession
+        let permission = Self.runtimePermission(fromParams: params)
+        // R6: this operation's own worktree, captured with its owner before any await.
+        let worktreePath = Self.runtimeWorktreePath(fromParams: params)
+        #if DEBUG
+            if let checkpoint = debugRuntimeFenceCheckpoint { await checkpoint("ownerCaptured") }
+        #endif
+        if let launch = owner.launch {
+            try await fenceRuntimeRequest(
+                method: method,
+                params: params,
+                session: session,
+                permission: permission,
+                worktreePath: worktreePath,
+                launch: launch,
+                owner: owner
+            )
+        }
+        let result = try await sendRequest(
+            method: method,
+            params: params,
+            timeout: timeout,
+            useDefaultTimeout: useDefaultTimeout,
+            owner: owner
+        )
+        if let launch = owner.launch, Self.runtimeThreadCreatingMethods.contains(method),
+           let thread = result["thread"] as? [String: Any],
+           let threadID = (thread["id"] ?? thread["threadId"]) as? String
+        {
+            // R6: a fresh thread is associated with the operation that created it (its session,
+            // attempt and requested permission) before the caller can mutate it or start a turn.
+            try await associateRuntimeConversation(
+                threadID,
+                session: session,
+                permission: permission,
+                worktreePath: worktreePath,
+                launch: launch,
+                owner: owner
+            )
+        }
+        return result
+    }
+
+    /// The worktree an operation names (`cwd`), or `nil` when it names none.
+    static func runtimeWorktreePath(fromParams params: [String: Any]?) -> String? {
+        guard let cwd = (params?["cwd"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !cwd.isEmpty else {
+            return nil
+        }
+        return cwd
+    }
+
+    /// The permission configuration a request asks for (`approvalPolicy`, `sandbox` or
+    /// `sandboxPolicy.type`), or `nil` when it asks for none.
+    static func runtimePermission(fromParams params: [String: Any]?) -> AgentRuntimePermissionSnapshot? {
+        guard let params else { return nil }
+        let approvalPolicy = params["approvalPolicy"] as? String
+        let sandbox = params["sandbox"] as? String
+            ?? (params["sandboxPolicy"] as? [String: Any])?["type"] as? String
+        guard approvalPolicy != nil || sandbox != nil else { return nil }
+        return .codex(approvalPolicy: approvalPolicy, sandbox: sandbox)
+    }
+
+    /// Thread-scoped reads: they name a thread but never write to it, so they authorize the
+    /// transport without creating or requiring an association. Every other request that names a
+    /// thread is treated as a write (deny by default).
+    private static let runtimeThreadReadMethods: Set<String> = [
+        "thread/read", "thread/turns/list", "thread/goal/get", "thread/list", "thread/loaded/list"
+    ]
+    /// Requests whose response creates a thread served by this runtime.
+    private static let runtimeThreadCreatingMethods: Set<String> = ["thread/start", "thread/fork"]
+
+    /// Turn writes that create no ownership: they only pass the write fence on a thread an owner
+    /// operation already associated, so a late callback is never attributed to another run.
+    private static let runtimeAuthorizeOnlyMethods: Set<String> = ["turn/interrupt"]
+
+    /// R6 request fence on the captured transport while registration is active. Every request is
+    /// authorized against its captured launch (models, auth, control and reads included):
+    /// - thread creation first validates the owner's session context (before the write; the
+    ///   returned thread is associated before it is returned);
+    /// - `thread/resume` and every other request naming a thread (deny by default) associate the
+    ///   thread for the owner's session, worktree and requested permission, then authorize it;
+    /// - interrupts only authorize on an already-associated thread; thread reads and requests that
+    ///   name no thread authorize the transport only.
+    private func fenceRuntimeRequest(
+        method: String,
+        params: [String: Any]?,
+        session: AgentRuntimeSessionScope,
+        permission: AgentRuntimePermissionSnapshot?,
+        worktreePath: String?,
+        launch: AgentRuntimeLaunch,
+        owner: RuntimeWriteOwner
+    ) async throws {
+        let threadID = (params?["threadId"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if Self.runtimeThreadCreatingMethods.contains(method) {
+            if case .unavailable = session { throw AgentProcessRegistryError.sessionContextUnavailable }
+            try await authorizeRuntimeWrite(threadID: nil, launch: launch, owner: owner)
+            return
+        }
+        guard let threadID, !threadID.isEmpty, !Self.runtimeThreadReadMethods.contains(method) else {
+            try await authorizeRuntimeWrite(threadID: nil, launch: launch, owner: owner)
+            return
+        }
+        if !Self.runtimeAuthorizeOnlyMethods.contains(method) {
+            try await associateRuntimeConversation(
+                threadID,
+                session: session,
+                permission: permission,
+                worktreePath: worktreePath,
+                launch: launch,
+                owner: owner
+            )
+        }
+        try await authorizeRuntimeWrite(threadID: threadID, launch: launch, owner: owner)
+    }
+
+    private func sendRequest(
+        method: String,
+        params: [String: Any]?,
+        timeout: TimeInterval?,
+        useDefaultTimeout: Bool,
+        owner: RuntimeWriteOwner
+    ) async throws -> [String: Any] {
         let requestID = makeRequestID()
         let generation = transportGeneration
         let deadline = timeout ?? (useDefaultTimeout ? config.requestTimeout : nil)
@@ -922,7 +1240,7 @@ package actor CodexAppServerClient {
                     return
                 }
                 do {
-                    try sendJSONLine(payload, method: method)
+                    try sendJSONLine(payload, method: method, owner: owner)
                 } catch {
                     failPendingRequestIfPresent(id: requestID, error: error)
                 }
@@ -933,8 +1251,48 @@ package actor CodexAppServerClient {
         }
     }
 
+    /// A reply to a runtime-initiated request goes only to the transport that issued it, identified
+    /// by the request's immutable receipt (R6: a registered transport never receives a reply meant
+    /// for a replaced one, even when it issued a request with the same wire ID). The issuing launch
+    /// must still authorize the write after the registry await; replies create no ownership.
+    private func serverRequestReplyOwner(for receipt: CodexServerRequestReceipt) async throws -> RuntimeWriteOwner? {
+        guard receipt.clientInstanceID == clientInstanceID else { throw ClientError.processNotRunning }
+        let issued = inboundServerRequestOwners.removeValue(forKey: receipt)
+        guard runtimeLaunch != nil || issued != nil else { return nil }
+        guard let issued, receipt.transportGeneration == issued.generation, isCurrent(issued),
+              let launch = issued.launch
+        else { throw ClientError.processNotRunning }
+        try await authorizeRuntimeWrite(threadID: nil, launch: launch, owner: issued)
+        return issued
+    }
+
+    /// The reply for the request identified by `receipt`.
+    func respondToServerRequest(receipt: CodexServerRequestReceipt, result: [String: Any]) async throws {
+        guard process != nil else { throw ClientError.processNotRunning }
+        let owner = try await serverRequestReplyOwner(for: receipt)
+        let payload: [String: Any] = [
+            "id": receipt.id.jsonValue,
+            "result": result
+        ]
+        try sendJSONLine(payload, method: nil, owner: owner)
+    }
+
+    func respondToServerRequestError(
+        receipt: CodexServerRequestReceipt,
+        code: Int = -32601,
+        message: String,
+        data: [String: Any]? = nil
+    ) async throws {
+        guard process != nil else { throw ClientError.processNotRunning }
+        let owner = try await serverRequestReplyOwner(for: receipt)
+        try sendJSONLine(Self.errorReplyPayload(id: receipt.id, code: code, message: message, data: data), method: nil, owner: owner)
+    }
+
+    /// Legacy reply by wire ID alone (no receipt). Refused while the transport is registered: a
+    /// wire ID cannot tell a replaced transport's request from the replacement's.
     func respondToServerRequest(id: CodexAppServerRequestID, result: [String: Any]) throws {
         guard process != nil else { throw ClientError.processNotRunning }
+        guard runtimeLaunch == nil else { throw ClientError.processNotRunning }
         let payload: [String: Any] = [
             "id": id.jsonValue,
             "result": result
@@ -942,6 +1300,7 @@ package actor CodexAppServerClient {
         try sendJSONLine(payload, method: nil)
     }
 
+    /// Legacy error reply by wire ID alone; refused while the transport is registered.
     func respondToServerRequestError(
         id: CodexAppServerRequestID,
         code: Int = -32601,
@@ -949,6 +1308,16 @@ package actor CodexAppServerClient {
         data: [String: Any]? = nil
     ) throws {
         guard process != nil else { throw ClientError.processNotRunning }
+        guard runtimeLaunch == nil else { throw ClientError.processNotRunning }
+        try sendJSONLine(Self.errorReplyPayload(id: id, code: code, message: message, data: data), method: nil)
+    }
+
+    private static func errorReplyPayload(
+        id: CodexAppServerRequestID,
+        code: Int,
+        message: String,
+        data: [String: Any]?
+    ) -> [String: Any] {
         var errorObject: [String: Any] = [
             "code": code,
             "message": message
@@ -956,22 +1325,27 @@ package actor CodexAppServerClient {
         if let data {
             errorObject["data"] = data
         }
-        let payload: [String: Any] = [
+        return [
             "id": id.jsonValue,
             "error": errorObject
         ]
-        try sendJSONLine(payload, method: nil)
     }
 
-    func notify(method: String, params: [String: Any]?) throws {
+    /// A notification on the current transport; a registered transport authorizes it against its
+    /// captured launch first (no ownership is created).
+    func notify(method: String, params: [String: Any]?) async throws {
         guard process != nil else { throw ClientError.processNotRunning }
+        let owner = RuntimeWriteOwner(generation: transportGeneration, launch: runtimeLaunch)
+        if let launch = owner.launch {
+            try await authorizeRuntimeWrite(threadID: nil, launch: launch, owner: owner)
+        }
         var payload: [String: Any] = [
             "method": method
         ]
         if let params {
             payload["params"] = params
         }
-        try sendJSONLine(payload, method: method)
+        try sendJSONLine(payload, method: method, owner: owner.launch == nil ? nil : owner)
     }
 
     /// Returns all models exposed by Codex app-server `model/list`, following pagination.
@@ -1086,25 +1460,32 @@ package actor CodexAppServerClient {
                 "capabilities": capabilities
             ]
         )
-        try notify(method: "initialized", params: nil)
+        try await notify(method: "initialized", params: nil)
         isInitialized = true
     }
 
-    private func performStartupIfNeeded() async throws {
+    private func performStartupIfNeeded(runtimeSession: AgentRuntimeSessionScope?) async throws {
+        #if DEBUG
+            if let debugStartupOverride {
+                try await debugStartupOverride(self)
+                return
+            }
+        #endif
         if process == nil {
-            try await startProcess()
+            try await startProcess(runtimeSession: runtimeSession)
         }
         try await initializeIfNeeded()
     }
 
-    private func startProcess() async throws {
+    private func startProcess(runtimeSession: AgentRuntimeSessionScope?) async throws {
         let environmentResult = await ProcessEnvironmentBuilder.build(
             ProcessEnvironmentRequest(
                 purpose: .codexAppServer,
                 enableDebugLogging: config.enableDebugLogging
             )
         )
-        let environment = environmentResult.environment
+        // Managed launch boundary: an inherited runtime marker never reaches the child.
+        let environment = AgentRuntimeLaunchAuthority.strippingInheritedMarker(environmentResult.environment)
         let resolution = CodexProviderHelpers.resolveCodexExecutable(
             commandName: config.commandName,
             environment: environment,
@@ -1122,18 +1503,57 @@ package actor CodexAppServerClient {
             featurePolicy: config.processFeaturePolicy
         )
         let args = processOverrides + ["app-server"]
-        let spawned = try ProcessLauncher.spawn(
-            command: resolution.resolvedCommand,
-            arguments: args,
-            environment: environment,
-            workingDirectory: config.workingDirectory
-        )
+        // R6: every transport start (models, auth, control, sessionless and thread work) reserves
+        // its runtime immediately before the spawn; a refusal spawns nothing.
+        // The process requests no permission configuration itself; threads request theirs.
+        let launch: AgentRuntimeLaunch? = if isRuntimeRegistrationActive {
+            launchAuthority.makeLaunch(AgentRuntimeLaunchContext(
+                family: .codexAppServer,
+                provider: .codex,
+                session: runtimeSession ?? defaultRuntimeSession,
+                worktreePath: config.workingDirectory,
+                permission: .unavailable
+            ))
+        } else {
+            nil
+        }
+        if launch != nil {
+            // R6: an earlier registered transport's cleanup (reap report and post-reap discovery)
+            // finishes before this launch reserves; revalidated after the await.
+            await joinPendingTransportCleanups()
+            try Task.checkCancellation()
+            guard process == nil else { return }
+        }
+        let runtimeID = try await launch?.prepareSpawn()
+        guard process == nil else {
+            await launch?.spawnFailed()
+            return
+        }
+        if launch != nil, Task.isCancelled {
+            await launch?.spawnFailed()
+            throw CancellationError()
+        }
+        let spawned: SpawnedProcess
+        do {
+            spawned = try ProcessLauncher.spawn(
+                command: resolution.resolvedCommand,
+                arguments: args,
+                environment: environment,
+                workingDirectory: config.workingDirectory,
+                runtimeID: runtimeID
+            )
+        } catch {
+            await launch?.spawnFailed()
+            throw error
+        }
         stdoutFramer = makeStdoutFramer()
         pendingInboundFrameViolation = nil
         didTerminateTransport = false
         transportGeneration &+= 1
         decodeRecoveryAttemptsByGeneration[transportGeneration] = 0
         process = spawned
+        runtimeLaunch = launch
+        runtimeCommittedGeneration = launch == nil ? transportGeneration : nil
         do {
             try startStdoutReader(spawned.stdout)
             try startStderrReader(spawned.stderr)
@@ -1146,6 +1566,26 @@ package actor CodexAppServerClient {
             )
             await finishTransportTermination(terminatingTransport)
             throw clientError
+        }
+        if let launch {
+            // R6: commit the birth identity before `initialize` (the first write).
+            let generation = transportGeneration
+            do {
+                try await launch.commitSpawn(pid: spawned.pid, processGroupID: spawned.processGroupID)
+            } catch {
+                let terminatingTransport = invalidateTransport(
+                    flushStdout: false,
+                    expectedGeneration: generation,
+                    requestFailure: .processNotRunning,
+                    reason: .explicitStop
+                )
+                await finishTransportTermination(terminatingTransport)
+                throw error
+            }
+            guard generation == transportGeneration, process?.pid == spawned.pid, runtimeLaunch === launch else {
+                throw ClientError.processNotRunning
+            }
+            runtimeCommittedGeneration = generation
         }
         await registerExpectedAgentPIDIfNeeded(for: spawned.pid)
         guard process?.pid == spawned.pid, !didTerminateTransport else {
@@ -1628,7 +2068,11 @@ package actor CodexAppServerClient {
     }
 
     private func broadcastServerRequest(id: CodexAppServerRequestID, method: String, params: [String: CodexJSONValue]) {
-        let request = ServerRequest(id: id, method: method, params: params)
+        let receipt = CodexServerRequestReceipt(clientInstanceID: clientInstanceID, transportGeneration: transportGeneration, id: id)
+        if runtimeLaunch != nil {
+            inboundServerRequestOwners[receipt] = RuntimeWriteOwner(generation: transportGeneration, launch: runtimeLaunch)
+        }
+        let request = ServerRequest(id: id, method: method, params: params, receipt: receipt)
         for continuation in serverRequestContinuations.values {
             continuation.yield(request)
         }
@@ -1651,8 +2095,17 @@ package actor CodexAppServerClient {
     ///
     /// Related:
     /// - ClaudeNativeProcessSessionController.sendLine (reference atomic write pattern)
-    private func sendJSONLine(_ payload: [String: Any], method: String?) throws {
+    private func sendJSONLine(_ payload: [String: Any], method: String?, owner: RuntimeWriteOwner? = nil) throws {
         guard let process else { throw ClientError.processNotRunning }
+        // R6 final synchronous check: an owned write goes only to the exact transport (generation
+        // and launch) its operation captured before its first suspension.
+        if let owner, !isCurrent(owner) {
+            throw ClientError.processNotRunning
+        }
+        // R6: a registered transport writes only after its birth identity is committed.
+        if runtimeLaunch != nil, runtimeCommittedGeneration != transportGeneration {
+            throw ClientError.processNotRunning
+        }
         let data = try JSONSerialization.data(withJSONObject: payload, options: [])
         if config.enableDebugLogging {
             if let line = String(data: data, encoding: .utf8) {
@@ -1905,6 +2358,21 @@ package actor CodexAppServerClient {
             pendingInboundFrameViolation = nil
             transportGeneration &+= 1
             decodeRecoveryAttemptsByGeneration[transportGeneration] = 0
+        }
+
+        /// Attaches a fixture runtime launch to the current test transport, committed (birth identity
+        /// registered for this generation) or not, so request fences run without a real spawn.
+        func debugInstallTestRuntimeLaunch(_ launch: AgentRuntimeLaunch, committed: Bool) {
+            runtimeLaunch = launch
+            runtimeCommittedGeneration = committed ? transportGeneration : nil
+        }
+
+        func debugSetRuntimeFenceCheckpoint(_ checkpoint: (@Sendable (String) async -> Void)?) {
+            debugRuntimeFenceCheckpoint = checkpoint
+        }
+
+        func debugSetStartupOverride(_ override: (@Sendable (CodexAppServerClient) async throws -> Void)?) {
+            debugStartupOverride = override
         }
 
     #endif

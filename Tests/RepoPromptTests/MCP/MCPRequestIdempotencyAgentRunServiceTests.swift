@@ -29,7 +29,8 @@ final class MCPRequestIdempotencyAgentRunServiceTests: XCTestCase {
                 MCPServerViewModel.RequestMetadata(
                     connectionID: nil,
                     clientName: "idempotency-service-tests",
-                    windowID: nil
+                    windowID: nil,
+                    actorRoutedRunTab: nil
                 )
             },
             requireTargetWindow: {
@@ -331,7 +332,8 @@ final class MCPRequestIdempotencyAgentRunServiceTests: XCTestCase {
                 MCPServerViewModel.RequestMetadata(
                     connectionID: nil,
                     clientName: "idempotency-service-tests",
-                    windowID: window.windowID
+                    windowID: window.windowID,
+                    actorRoutedRunTab: nil
                 )
             },
             requireTargetWindow: { window },

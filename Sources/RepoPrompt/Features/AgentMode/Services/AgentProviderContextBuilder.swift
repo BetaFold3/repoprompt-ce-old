@@ -19,7 +19,10 @@ enum AgentProviderContextBuilder {
             profile: .uiAssisted
         )
         do {
-            return try await WorkspaceCodemapPresentationCoordinator(store: store).withPresentation(
+            return try await WorkspaceCodemapPresentationCoordinator(
+                store: store,
+                policy: .optionalEnrichment(for: presentationPlan.intent)
+            ).withPresentation(
                 for: presentationPlan.intent,
                 rootScope: lookupContext.rootScope,
                 logicalRootDisplayNamesByRootID: lookupContext.logicalRootDisplayNamesByRootID(
@@ -116,7 +119,10 @@ enum AgentProviderContextBuilder {
             profile: .uiAssisted
         )
         do {
-            return try await WorkspaceCodemapPresentationCoordinator(store: store).withPresentation(
+            return try await WorkspaceCodemapPresentationCoordinator(
+                store: store,
+                policy: .optionalEnrichment(for: presentationPlan.intent)
+            ).withPresentation(
                 for: presentationPlan.intent,
                 rootScope: lookupContext.rootScope,
                 logicalRootDisplayNamesByRootID: lookupContext.logicalRootDisplayNamesByRootID(

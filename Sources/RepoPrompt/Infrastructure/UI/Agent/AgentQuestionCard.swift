@@ -338,18 +338,41 @@ struct AgentRequestUserInputCard: View {
     let request: AgentRequestUserInputRequest
     let onSubmit: (AgentRequestUserInputResponse) -> Void
     let onStop: () -> Void
+    /// Session-owned draft sink (the session, not this view, owns partial answers so shutdown
+    /// preparation sees them; secret drafts stay memory-only).
+    let onDraftChange: (_ questionID: String, _ draft: AgentRequestUserInputQuestionDraft) -> Void
+    /// Shutdown preparation froze this session: answers cannot be edited or submitted meanwhile.
+    let isFrozen: Bool
+    /// The session-owned drafts of `request` (seed for this card's editing state).
+    let initialDrafts: [String: AgentRequestUserInputQuestionDraft]
 
     @State private var draftsByQuestionID: [String: AgentRequestUserInputQuestionDraft]
 
     init(
         request: AgentRequestUserInputRequest,
+        initialDrafts: [String: AgentRequestUserInputQuestionDraft] = [:],
+        isFrozen: Bool = false,
         onSubmit: @escaping (AgentRequestUserInputResponse) -> Void,
-        onStop: @escaping () -> Void
+        onStop: @escaping () -> Void,
+        onDraftChange: @escaping (_ questionID: String, _ draft: AgentRequestUserInputQuestionDraft) -> Void = { _, _ in }
     ) {
         self.request = request
         self.onSubmit = onSubmit
         self.onStop = onStop
-        _draftsByQuestionID = State(initialValue: Self.makeDrafts(for: request))
+        self.onDraftChange = onDraftChange
+        self.isFrozen = isFrozen
+        self.initialDrafts = initialDrafts
+        _draftsByQuestionID = State(initialValue: Self.seededDrafts(for: request, initialDrafts: initialDrafts))
+    }
+
+    /// Editing state for `request`: its defaults overlaid with the session-owned partial answers.
+    /// Used on creation and whenever the card switches requests, so a reused card never shows (and
+    /// then reports) empty defaults over a retained partial answer.
+    static func seededDrafts(
+        for request: AgentRequestUserInputRequest,
+        initialDrafts: [String: AgentRequestUserInputQuestionDraft]
+    ) -> [String: AgentRequestUserInputQuestionDraft] {
+        makeDrafts(for: request).merging(initialDrafts) { _, kept in kept }
     }
 
     var body: some View {
@@ -358,6 +381,7 @@ struct AgentRequestUserInputCard: View {
 
             ForEach(request.questions, id: \.id) { question in
                 questionSection(question)
+                    .disabled(isFrozen)
             }
 
             actionButtons
@@ -370,7 +394,7 @@ struct AgentRequestUserInputCard: View {
                 .stroke(Color.blue.opacity(0.3), lineWidth: 1)
         )
         .onChange(of: request.id) { _, _ in
-            draftsByQuestionID = Self.makeDrafts(for: request)
+            draftsByQuestionID = Self.seededDrafts(for: request, initialDrafts: initialDrafts)
         }
     }
 
@@ -490,6 +514,7 @@ struct AgentRequestUserInputCard: View {
                 Label("Submit Answers", systemImage: "checkmark.circle.fill")
             }
             .buttonStyle(.borderedProminent)
+            .disabled(isFrozen)
         }
     }
 
@@ -505,6 +530,7 @@ struct AgentRequestUserInputCard: View {
         var draft = draftsByQuestionID[question.id] ?? .init()
         draft.selectedOptionIndex = draft.selectedOptionIndex == index ? nil : index
         draftsByQuestionID[question.id] = draft
+        onDraftChange(question.id, draft)
     }
 
     private func noteBinding(for question: AgentRequestUserInputQuestion) -> Binding<String> {
@@ -516,6 +542,7 @@ struct AgentRequestUserInputCard: View {
                 var draft = draftsByQuestionID[question.id] ?? .init()
                 draft.note = newValue
                 draftsByQuestionID[question.id] = draft
+                onDraftChange(question.id, draft)
             }
         )
     }

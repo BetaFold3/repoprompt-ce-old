@@ -73,9 +73,9 @@ final class AgentStaleResetOwnershipTests: XCTestCase {
         XCTAssertTrue(owner.session.isDirty)
 
         // Backend admission is closed and the view is retained; nothing is written.
-        let submit = owner.viewModel.submitUserTurn(text: "blocked", tabID: owner.tabID)
+        let submit = owner.viewModel.submitUserTurn(text: "blocked", tabID: owner.tabID, codexAttemptID: nil, admitted: nil)
         XCTAssertEqual(submit, .blocked(message: AgentModeViewModel.staleResetRecoveryBlockedMessage))
-        let start = await owner.viewModel.startAgentRun(tabID: owner.tabID, initialMessage: "blocked")
+        let start = await owner.viewModel.startAgentRun(tabID: owner.tabID, initialMessage: "blocked", inputConstituents: nil)
         guard case let .failed(startMessage)? = start else {
             return XCTFail("Run start must be refused, got \(String(describing: start))")
         }
@@ -1237,12 +1237,13 @@ final class AgentStaleResetOwnershipTests: XCTestCase {
         try FileManager.default.createDirectory(at: otherStorage, withIntermediateDirectories: true)
         let otherWorkspace = WorkspaceModel(name: "Other", repoPaths: [otherStorage.path], customStoragePath: otherStorage)
         let foreignSessionID = sessionID
-        _ = try await owner.viewModel.test_dataService.saveAgentSession(
+        let foreignFileURL = try await owner.viewModel.test_dataService.saveAgentSession(
             AgentSession(id: foreignSessionID, workspaceID: otherWorkspace.id, composeTabID: owner.tabID, name: "Foreign"),
             for: otherWorkspace,
             preparation: .alreadyCanonicalTranscript,
             trustedCanonicalItemCount: 0
         )
+        let foreignBytes = try Data(contentsOf: foreignFileURL)
 
         // The active workspace changes after the verdict, while the destructive phase is held.
         let foreignSortDate = Date(timeIntervalSinceReferenceDate: 4416)
@@ -1285,8 +1286,14 @@ final class AgentStaleResetOwnershipTests: XCTestCase {
         owner.viewModel.test_composeTabRemovalPhaseTwoHook = nil
 
         XCTAssertNil(owner.viewModel.sessions[owner.tabID], "Logical Agent removal committed before cleanup suspended")
+        XCTAssertEqual(
+            try? Data(contentsOf: foreignFileURL),
+            foreignBytes,
+            "Captured cleanup never targets the newly active workspace"
+        )
+        // The committed deletion's UUID-wide tombstone logically retires the same ID everywhere.
         let foreign = try await owner.viewModel.test_dataService.loadAgentSession(id: foreignSessionID, for: otherWorkspace)
-        XCTAssertNotNil(foreign, "Captured cleanup never targets the newly active workspace")
+        XCTAssertNil(foreign)
         XCTAssertEqual(owner.viewModel.ownerValidatedSessionIndex[foreignSessionID], foreignIndexEntry)
         XCTAssertEqual(owner.viewModel.ownerValidatedSessionListSortDates[owner.tabID], foreignSortDate)
         owner.viewModel.test_establishPersistenceWorkspace(owner.workspace)
@@ -1938,7 +1945,9 @@ final class AgentStaleResetOwnershipTests: XCTestCase {
         XCTAssertTrue(ownerSaved)
         let sessionID = try XCTUnwrap(owner.session.activeAgentSessionID)
         let persisted = try await owner.persistedSession()
-        XCTAssertEqual(persisted.lastRunState, AgentSessionRunState.idle.rawValue, "A persisted active run loads as idle")
+        // F-7: this same-launch read is a storage mutation, so the live owner's active run is kept as
+        // saved; only the cold hydration below maps it to idle.
+        XCTAssertEqual(persisted.lastRunState, AgentSessionRunState.running.rawValue, "A same-launch read keeps the saved active run")
         let fileURL = try XCTUnwrap(persisted.fileURL)
 
         // Another owner stays active in the peer window; the bound tab hydrates in the background.
@@ -1993,6 +2002,286 @@ final class AgentStaleResetOwnershipTests: XCTestCase {
         XCTAssertEqual(reloaded?.lastRunState, AgentSessionRunState.idle.rawValue)
         try assertCancelled(reloaded?.transcript, "reloaded")
         return metricLines
+    }
+
+    // MARK: - Full-save write diagnostics (lossless-restart Phase 0)
+
+    /// `save.session.written` counts each successful full-session replacement exactly once, after the
+    /// atomic writer returns; a clean (skipped) save and a writer failure count nothing, and a retry
+    /// after the failure counts once.
+    func testFullSessionWrittenDiagnosticCountsOnlyCommittedWrites() async throws {
+        let previousOverride = AgentModePerfDiagnostics.debugProcessOverrideEnabled
+        AgentModePerfDiagnostics.setDebugProcessOverrideEnabled(true)
+        defer { AgentModePerfDiagnostics.setDebugProcessOverrideEnabled(previousOverride) }
+
+        let owner = try await makeHarness(windowID: 4421)
+        let baseline = Self.diagnosticsTabCounter("save.session.written", tabID: owner.tabID)
+        owner.session.appendItem(.user("Counted prompt"))
+        owner.session.appendItem(.assistant("Counted answer"))
+        let saved = await owner.viewModel.flushSave(for: owner.tabID)
+        XCTAssertTrue(saved)
+        XCTAssertEqual(Self.diagnosticsTabCounter("save.session.written", tabID: owner.tabID), baseline + 1)
+        let fields = try XCTUnwrap(Self.fullSessionWrittenEventFields(tabID: owner.tabID).last)
+        XCTAssertEqual(fields["transcriptReset"], "false")
+        XCTAssertGreaterThan(Int(fields["bytes"] ?? "") ?? 0, 0, "\(fields)")
+        for key in ["duration", "prepare", "encode", "writerAwait"] {
+            XCTAssertEqual(fields[key]?.hasSuffix("ms"), true, "\(key): \(fields)")
+        }
+
+        let skipped = await owner.viewModel.flushSaveDetailed(for: owner.tabID)
+        XCTAssertEqual(skipped, .notWritten, "A clean session is skipped before the data service")
+        XCTAssertEqual(Self.diagnosticsTabCounter("save.session.written", tabID: owner.tabID), baseline + 1)
+
+        // A writer failure (read-only sessions folder) throws from the atomic writer: not counted.
+        let persistedForPath = try await owner.persistedSession()
+        let fileURL = try XCTUnwrap(persistedForPath.fileURL)
+        let folderPath = fileURL.deletingLastPathComponent().path
+        let originalPermissions = try XCTUnwrap(
+            FileManager.default.attributesOfItem(atPath: folderPath)[.posixPermissions] as? NSNumber
+        )
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: folderPath)
+        var permissionsRestored = false
+        defer {
+            if !permissionsRestored {
+                try? FileManager.default.setAttributes([.posixPermissions: originalPermissions], ofItemAtPath: folderPath)
+            }
+        }
+        owner.session.appendItem(.user("Write fails"))
+        let failed = await owner.viewModel.flushSaveDetailed(for: owner.tabID)
+        XCTAssertEqual(failed, .notWritten)
+        XCTAssertTrue(owner.session.isDirty)
+        XCTAssertEqual(Self.diagnosticsTabCounter("save.session.written", tabID: owner.tabID), baseline + 1)
+
+        try FileManager.default.setAttributes([.posixPermissions: originalPermissions], ofItemAtPath: folderPath)
+        permissionsRestored = true
+        let retried = await owner.viewModel.flushSave(for: owner.tabID)
+        XCTAssertTrue(retried)
+        XCTAssertEqual(Self.diagnosticsTabCounter("save.session.written", tabID: owner.tabID), baseline + 2)
+    }
+
+    /// A committed peer reset counts once (marked `transcriptReset=true`); the owner's stale save,
+    /// rejected by the reset-generation fence before encoding, counts nothing.
+    func testFullSessionWrittenDiagnosticSkipsStaleResetRejection() async throws {
+        let previousOverride = AgentModePerfDiagnostics.debugProcessOverrideEnabled
+        AgentModePerfDiagnostics.setDebugProcessOverrideEnabled(true)
+        defer { AgentModePerfDiagnostics.setDebugProcessOverrideEnabled(previousOverride) }
+
+        let owner = try await makeHarness(windowID: 4422)
+        owner.session.appendItem(.user("Pre-reset prompt"))
+        owner.session.appendItem(.assistant("Pre-reset answer"))
+        let ownerSaved = await owner.viewModel.flushSave(for: owner.tabID)
+        XCTAssertTrue(ownerSaved)
+        let sessionID = try XCTUnwrap(owner.session.activeAgentSessionID)
+
+        let peer = try await makeHarness(windowID: 4423, workspace: owner.workspace, storageURL: owner.storageURL)
+        XCTAssertNotNil(peer.viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: peer.session))
+        _ = await peer.viewModel.test_hydrateBoundSession(tabID: peer.tabID)
+        let peerBaseline = Self.diagnosticsTabCounter("save.session.written", tabID: peer.tabID)
+        peer.viewModel.clearChat(tabID: peer.tabID)
+        let resetSaved = await peer.viewModel.flushSave(for: peer.tabID)
+        XCTAssertTrue(resetSaved)
+        XCTAssertEqual(Self.diagnosticsTabCounter("save.session.written", tabID: peer.tabID), peerBaseline + 1)
+        XCTAssertEqual(Self.fullSessionWrittenEventFields(tabID: peer.tabID).last?["transcriptReset"], "true")
+
+        let ownerBaseline = Self.diagnosticsTabCounter("save.session.written", tabID: owner.tabID)
+        owner.session.appendItem(.user("Sent after the peer reset"))
+        let rejected = await owner.viewModel.flushSaveDetailed(for: owner.tabID)
+        XCTAssertEqual(rejected, .notWritten)
+        XCTAssertNotNil(owner.session.staleResetRecovery)
+        XCTAssertEqual(Self.diagnosticsTabCounter("save.session.written", tabID: owner.tabID), ownerBaseline)
+    }
+
+    /// Phase 0 advisory fixture evidence, opt-in (about 14 s wall clock): a text-only stream delivers deltas every
+    /// 100 ms for 12 s through the real 250 ms delta buffer, whose flushes mutate source items and
+    /// re-arm the 1 s save debounce. Prints the observed save timeline (counter samples every ~100 ms;
+    /// final-text observation polls every 10 ms). It asserts only that the final text eventually
+    /// reaches the saved file; it never asserts that starvation occurs.
+    func testRestartPhase0LongTextOnlyStreamSaveTimelineReport() async throws {
+        try XCTSkipUnless(Self.restartSaveMetricsOptedIn, Self.restartSaveMetricsSkipMessage)
+        let previousOverride = AgentModePerfDiagnostics.debugProcessOverrideEnabled
+        AgentModePerfDiagnostics.setDebugProcessOverrideEnabled(true)
+        defer { AgentModePerfDiagnostics.setDebugProcessOverrideEnabled(previousOverride) }
+
+        let owner = try await makeHarness(windowID: 4424)
+        owner.session.appendItem(.user("Stream a long answer"))
+        let primed = await owner.viewModel.flushSave(for: owner.tabID)
+        XCTAssertTrue(primed)
+        let persistedForPath = try await owner.persistedSession()
+        let fileURL = try XCTUnwrap(persistedForPath.fileURL)
+
+        func counter(_ key: String) -> Int {
+            Self.diagnosticsTabCounter(key, tabID: owner.tabID)
+        }
+        let writtenBaseline = counter("save.session.written")
+        let invokedBaseline = counter("save.session.invoked")
+        let scheduleBaseline = counter("save.schedule")
+        let replacedBaseline = counter("save.schedule.replaced")
+
+        let streamSeconds: TimeInterval = 12
+        let streamStart = Date()
+        var chunkCount = 0
+        var writeOffsetsDuringStream: [TimeInterval] = []
+        var lastObservedWritten = writtenBaseline
+        while Date().timeIntervalSince(streamStart) < streamSeconds {
+            owner.viewModel.enqueueAssistantDelta("chunk-\(chunkCount) ", session: owner.session)
+            chunkCount += 1
+            try await Task.sleep(nanoseconds: 100_000_000)
+            let written = counter("save.session.written")
+            if written > lastObservedWritten {
+                writeOffsetsDuringStream.append(Date().timeIntervalSince(streamStart))
+                lastObservedWritten = written
+            }
+        }
+        let streamEnd = Date()
+        let finalToken = "chunk-\(chunkCount - 1) "
+        let schedulesDuringStream = counter("save.schedule") - scheduleBaseline
+        let replacedDuringStream = counter("save.schedule.replaced") - replacedBaseline
+        let invokedDuringStream = counter("save.session.invoked") - invokedBaseline
+        // A write between the last in-loop sample and here is not attributed to a stream offset.
+        let writtenAfterLastSample = counter("save.session.written") - lastObservedWritten
+
+        // Final-text persistence is the condition (satisfied immediately if a write already landed);
+        // no save is forced, so the experiment is unchanged.
+        try await waitUntil("final streamed text in the atomically replaced session file", timeout: 5) {
+            (try? String(contentsOf: fileURL, encoding: .utf8))?.contains(finalToken) == true
+        }
+        let finalTextObservedAfterStreamEnd = Date().timeIntervalSince(streamEnd)
+        let writtenThroughFinalText = counter("save.session.written") - writtenBaseline
+        let savedText = try String(contentsOf: fileURL, encoding: .utf8)
+        XCTAssertTrue(owner.session.items.last?.text.hasSuffix(finalToken) == true)
+
+        let boundaries = [0] + writeOffsetsDuringStream + [streamEnd.timeIntervalSince(streamStart)]
+        let longestUnsaved = zip(boundaries, boundaries.dropFirst()).map { $1 - $0 }.max() ?? 0
+        print(
+            "[RestartPhase0] stream seconds=\(Self.format(streamSeconds)) chunks=\(chunkCount) deltaIntervalMS=100"
+                + " saveSchedule=\(schedulesDuringStream) saveScheduleReplaced=\(replacedDuringStream)"
+                + " saveInvoked=\(invokedDuringStream) writtenDuringStream=\(writeOffsetsDuringStream.count)"
+                + " writeOffsetsS=\(writeOffsetsDuringStream.map { Self.format($0) })"
+                + " longestUnsavedWindowS=\(Self.format(longestUnsaved))"
+                + " writtenAfterLastSample=\(writtenAfterLastSample) writtenThroughFinalText=\(writtenThroughFinalText)"
+                + " finalTextOnDiskObservedAfterStreamEndS=\(Self.format(finalTextObservedAfterStreamEnd))"
+                + " finalBytes=\(savedText.utf8.count)"
+        )
+    }
+
+    /// Phase 0 evidence, opt-in: full-save cost for one deterministic reference-size session through the real VM
+    /// save, storage preparation, codec, and atomic writer (temporary storage only). Prints each
+    /// repetition; no thresholds. `prepare`/`encode`/`writerAwait` run on the data-service actor, not
+    /// the main actor; `measuredPhases` is their sum and excludes other data-service work (persistence
+    /// gate wait, schedule-authority load, metadata-index upsert). `vmTotal` is the VM `save.session.complete` elapsed time from save entry: it
+    /// includes suspension across the data-service await and index work, so it is not isolated
+    /// main-actor cost.
+    func testRestartPhase0LargeSessionSaveCostReport() async throws {
+        try XCTSkipUnless(Self.restartSaveMetricsOptedIn, Self.restartSaveMetricsSkipMessage)
+        let previousOverride = AgentModePerfDiagnostics.debugProcessOverrideEnabled
+        AgentModePerfDiagnostics.setDebugProcessOverrideEnabled(true)
+        defer { AgentModePerfDiagnostics.setDebugProcessOverrideEnabled(previousOverride) }
+
+        let repetitions = 5
+        // The spec's reference running-session size (about 1,500 source items).
+        let targetItemCount = 1500
+        let owner = try await makeHarness(windowID: 4425)
+        // One source mutation installs the whole deterministic fixture (per-item appends would
+        // measure fixture construction, not saves).
+        var items: [AgentChatItem] = []
+        var turn = 0
+        while items.count + 4 <= targetItemCount {
+            let invocationID = UUID()
+            let base = items.count
+            items.append(.user(
+                "Turn \(turn) request. " + String(repeating: "Please inspect the module. ", count: 8),
+                sequenceIndex: base
+            ))
+            items.append(.toolCall(
+                name: "bash",
+                invocationID: invocationID,
+                argsJSON: #"{"command":"rg -n \"pattern\" Sources --max-count 40"}"#,
+                sequenceIndex: base + 1
+            ))
+            items.append(.toolResult(
+                name: "bash",
+                invocationID: invocationID,
+                resultJSON: #"{"output":""# + String(repeating: "Sources/File\(turn).swift:12: let value = compute() ", count: 30) + #""}"#,
+                isError: false,
+                sequenceIndex: base + 2
+            ))
+            items.append(.assistant(
+                "Turn \(turn) reply. " + String(repeating: "The change keeps behavior identical. ", count: 20),
+                sequenceIndex: base + 3
+            ))
+            turn += 1
+        }
+        let installStart = Date()
+        owner.session.replaceItems(items)
+        owner.session.nextSequenceIndex = items.count
+        let installSeconds = Date().timeIntervalSince(installStart)
+        let firstSaveStart = Date()
+        let firstSaved = await owner.viewModel.flushSave(for: owner.tabID)
+        let firstSaveSeconds = Date().timeIntervalSince(firstSaveStart)
+        XCTAssertTrue(firstSaved)
+        let firstWritten = Self.fullSessionWrittenEventFields(tabID: owner.tabID).last
+        print(
+            "[RestartPhase0] largeSessionFixture sourceItems=\(items.count) installS=\(Self.format(installSeconds, digits: 3))"
+                + " firstSaveWallS=\(Self.format(firstSaveSeconds, digits: 3))"
+                + " firstPersistedItemCount=\(firstWritten?["itemCount"] ?? "?") firstBytes=\(firstWritten?["bytes"] ?? "?")"
+                + " firstMeasuredPhases=\(firstWritten?["duration"] ?? "?")"
+        )
+        for repetition in 0 ..< repetitions {
+            owner.session.appendItem(.assistant("Repetition \(repetition) marker"))
+            let wallStart = Date()
+            let saved = await owner.viewModel.flushSave(for: owner.tabID)
+            let wall = Date().timeIntervalSince(wallStart) * 1000
+            XCTAssertTrue(saved)
+            let written = try XCTUnwrap(Self.fullSessionWrittenEventFields(tabID: owner.tabID).last)
+            let complete = Self.metricEventFields(named: "save.session.complete", tabID: owner.tabID).last
+            print(
+                "[RestartPhase0] largeSession sourceItems=\(items.count) persistedItemCount=\(written["itemCount"] ?? "?")"
+                    + " turns=\(written["turnCount"] ?? "?") liveWorkingItems=\(owner.session.items.count) repetition=\(repetition)"
+                    + " bytes=\(written["bytes"] ?? "?") prepare=\(written["prepare"] ?? "?")"
+                    + " encode=\(written["encode"] ?? "?") writerAwait=\(written["writerAwait"] ?? "?")"
+                    + " measuredPhases=\(written["duration"] ?? "?")"
+                    + " vmTotal=\(complete?["duration"] ?? "?") flushWall=\(Self.format(wall / 1000, digits: 4))s"
+            )
+        }
+    }
+
+    /// Reuses the existing conductor-forwarded scale gate; no new opt-in mechanism.
+    private static var restartSaveMetricsOptedIn: Bool {
+        ProcessInfo.processInfo.environment["RPCE_RUN_SCALE_TESTS"] == "1"
+    }
+
+    private static let restartSaveMetricsSkipMessage =
+        "Lossless-restart Phase 0 save reports are opt-in advisory fixture evidence. Set RPCE_RUN_SCALE_TESTS=1."
+
+    private static func diagnosticsTabCounter(_ key: String, tabID: UUID) -> Int {
+        let counters = AgentModePerfDiagnostics.debugStateSnapshot(lineLimit: 1)["counters"] as? [String: Int] ?? [:]
+        return counters["\(key).tab.\(tabID.uuidString)"] ?? 0
+    }
+
+    private static func fullSessionWrittenEventFields(tabID: UUID) -> [[String: String]] {
+        metricEventFields(named: "save.session.written", tabID: tabID)
+    }
+
+    private static func metricEventFields(named name: String, tabID: UUID) -> [[String: String]] {
+        let tabTag = "tabID=\(AgentModePerfDiagnostics.shortID(tabID))"
+        return AgentModePerfDiagnostics.recentMetricLinesSnapshot(limit: 1000)
+            .filter { $0.contains(" \(name) ") && $0.contains(tabTag) }
+            .map { line in
+                let pairs = line.split(separator: " ").compactMap { token -> (String, String)? in
+                    let parts = token.split(separator: "=", maxSplits: 1)
+                    guard parts.count == 2 else { return nil }
+                    return (String(parts[0]), String(parts[1]))
+                }
+                return Dictionary(pairs, uniquingKeysWith: { _, new in new })
+            }
+    }
+
+    private static func format(_ seconds: TimeInterval) -> String {
+        format(seconds, digits: 2)
+    }
+
+    private static func format(_ seconds: TimeInterval, digits: Int) -> String {
+        String(format: "%.\(digits)f", seconds)
     }
 
     // MARK: - Harness
@@ -2059,6 +2348,70 @@ final class AgentStaleResetOwnershipTests: XCTestCase {
             targetSessionID: targetSessionID,
             fillerTabIDs: fillers.map(\.id)
         )
+    }
+
+    func testDeletedSessionCleanupNeverRemovesAReplacementInstalledDuringItsTeardown() async throws {
+        let fixture = try await makePromptManagedFixture(windowID: 4391)
+        let viewModel = fixture.viewModel
+        let workspaceManager = fixture.workspaceManager
+        let workspaceID = fixture.workspace.id
+        let tabID = fixture.primaryTabID
+
+        // Crash-window state: the session is durably deleted, the tab is still bound to it.
+        let deletedID = UUID()
+        _ = try await viewModel.test_dataService.saveAgentSession(
+            AgentSession(id: deletedID, workspaceID: workspaceID, name: "Deleted elsewhere"),
+            for: fixture.workspace,
+            preparation: .alreadyCanonicalTranscript,
+            trustedCanonicalItemCount: 0
+        )
+        try await viewModel.test_dataService.deleteAgentSession(id: deletedID, for: fixture.workspace)
+        let old = try await viewModel.ensureSessionReady(tabID: tabID)
+        XCTAssertNotNil(viewModel.test_installPersistentSessionBinding(sessionID: deletedID, on: old, updateWorkspaceMetadata: true))
+        XCTAssertEqual(workspaceManager.activeAgentSessionID(forTabID: tabID, inWorkspaceID: workspaceID), deletedID)
+
+        // Held at the awaited-teardown boundary: a replacement owner with a fresh UUID and dirty
+        // content is installed on the same tab, then the old cleanup resumes.
+        let box = ReplacementOwnerBox()
+        viewModel.test_deletedSessionTeardownHook = { [box] held in
+            guard box.replacement == nil else { return }
+            box.heldOwnerWasOld = held === old
+            box.ownerDetachedBeforeTeardown = viewModel.sessions[tabID] == nil
+            box.durableBindingCleared = workspaceManager.activeAgentSessionID(forTabID: tabID, inWorkspaceID: workspaceID) == nil
+            guard let fresh = try? await viewModel.ensureSessionReady(tabID: tabID) else { return }
+            box.replacement = fresh
+            box.replacementID = viewModel.ensureSessionBoundToTab(fresh)
+            fresh.appendItem(.user("replacement content"))
+            fresh.isDirty = true
+        }
+        await viewModel.finalizeDeletedAgentSessionReferences(
+            sessionID: deletedID,
+            workspaceID: workspaceID,
+            reason: "restored_deleted_binding"
+        )
+        viewModel.test_deletedSessionTeardownHook = nil
+
+        XCTAssertTrue(box.heldOwnerWasOld, "Only the captured owner is torn down")
+        XCTAssertTrue(box.ownerDetachedBeforeTeardown, "The old owner leaves the tab before any awaited teardown")
+        XCTAssertTrue(box.durableBindingCleared, "The durable workspace binding to the deleted UUID is cleared")
+        let replacement = try XCTUnwrap(box.replacement)
+        let replacementID = try XCTUnwrap(box.replacementID)
+        XCTAssertFalse(replacement === old)
+        XCTAssertNotEqual(replacementID, deletedID)
+        XCTAssertTrue(viewModel.sessions[tabID] === replacement, "The replacement owner remains installed")
+        XCTAssertEqual(replacement.activeAgentSessionID, replacementID)
+        XCTAssertEqual(
+            workspaceManager.activeAgentSessionID(forTabID: tabID, inWorkspaceID: workspaceID),
+            replacementID,
+            "The old cleanup never clears the replacement's durable binding"
+        )
+        XCTAssertTrue(replacement.items.contains { $0.text == "replacement content" })
+        let saved = await viewModel.flushSave(for: tabID)
+        XCTAssertTrue(saved, "The replacement saves cleanly")
+        let persisted = try await viewModel.test_dataService.loadAgentSession(id: replacementID, for: fixture.workspace)
+        XCTAssertTrue(try XCTUnwrap(persisted).toLiveItems().contains { $0.text == "replacement content" })
+        let deleted = try await viewModel.test_dataService.loadAgentSession(id: deletedID, for: fixture.workspace)
+        XCTAssertNil(deleted, "The deleted session stays deleted")
     }
 
     private struct PromptManagedFixture {
@@ -2303,6 +2656,15 @@ private final class StaleResetGate {
 private final class CreationResultBox {
     var finished = false
     var tabID: UUID?
+}
+
+@MainActor
+private final class ReplacementOwnerBox {
+    var replacement: AgentTabSession?
+    var replacementID: UUID?
+    var heldOwnerWasOld = false
+    var ownerDetachedBeforeTeardown = false
+    var durableBindingCleared = false
 }
 
 @MainActor

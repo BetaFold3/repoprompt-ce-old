@@ -847,6 +847,58 @@ final class GatewayRuntimeBindingTests: XCTestCase {
         XCTAssertEqual(polledSessionIDs, Set([sessionID, otherSessionID]))
     }
 
+    /// S3-A-09: when a subscribe's correlated response is WITHHELD (e.g. the connection locked or its
+    /// binding changed at settlement), the handler calls `discardQueuedResponse` instead of
+    /// `didQueueResponse`. The discard must drop EXACTLY that request's deferred validation — so its
+    /// catch-up poll never runs and no `session_update` is emitted — without cancelling an unrelated
+    /// subscription that shares the same request id on a different connection.
+    func testWithheldSubscriptionDiscardsOnlyItsOwnDeferredValidation() async throws {
+        let withheldSessionID = sessionID
+        let survivingSessionID = "22222222-2222-2222-2222-222222222222"
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(
+                json: GatewayTestHelpers.snapshot(sessionID: survivingSessionID, status: "running")
+            ))
+        ])
+        let runtime = try await makeRuntime(connection: connection, bindingState: .bound)
+        let withheldSink = RecordingFrameSink()
+        let survivingSink = RecordingFrameSink()
+        let withheldSinkID = UUID()
+        let survivingSinkID = UUID()
+        // Same request id ("dup") on two different connections — distinct FIFO validation keys.
+        let withheldRequest = RemoteClientFrame(type: "subscribe", requestID: "dup", sessionID: withheldSessionID)
+        let survivingRequest = RemoteClientFrame(type: "subscribe", requestID: "dup", sessionID: survivingSessionID)
+
+        let withheldMaybe = await runtime.handle(withheldRequest, deviceID: "device", sinkID: withheldSinkID, sink: withheldSink)
+        _ = try XCTUnwrap(withheldMaybe)
+        let survivingMaybe = await runtime.handle(survivingRequest, deviceID: "device", sinkID: survivingSinkID, sink: survivingSink)
+        let survivingHandled = try XCTUnwrap(survivingMaybe)
+
+        // The withheld connection's response is never delivered; its deferred validation is discarded.
+        await runtime.discardQueuedResponse(for: withheldRequest, deviceID: "device", sinkID: withheldSinkID)
+        // The unrelated duplicate-id subscription is delivered and its deferred validation activates.
+        await survivingSink.send(survivingHandled)
+        await runtime.didQueueResponse(for: survivingRequest, response: survivingHandled, deviceID: "device", sinkID: survivingSinkID)
+
+        for _ in 0 ..< 50 {
+            let frames = await survivingSink.frames
+            if frames.contains(where: { $0.type == "session_update" }) { break }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+
+        // The surviving duplicate-requestID subscription's deferred validation was NOT discarded by
+        // the withheld one's discard (the FIFO validation key includes sinkID + sessionIDs, so a shared
+        // client requestID does not collide). It therefore activates: it emits a correlated
+        // session_update and runs its catch-up poll against its own session.
+        let survivingFrames = await survivingSink.frames
+        XCTAssertTrue(survivingFrames.contains { $0.type == "session_update" }, "The surviving duplicate-id subscription still validates and emits.")
+        let polledSessions = await Set(connection.calls.compactMap { $0.arguments["session_id"]?.stringValue })
+        XCTAssertTrue(polledSessions.contains(survivingSessionID), "The surviving subscription polls its own session during catch-up validation.")
+        // The withheld subscription's deferred validation entry was popped by its own discard (keyed by
+        // sinkID + requestID + sessionIDs), so it was never handed to `validateSubscription`: the discard
+        // controls the deferred VALIDATION, not the already-registered observation intent.
+    }
+
     func testSubscribeOnUnboundConnectionReturnsBindingRequiredWithWindows() async throws {
         let connection = RecordingAppLinkConnection(responses: [
             .result(windowListResponse())
@@ -1205,6 +1257,70 @@ final class GatewayRuntimeBindingTests: XCTestCase {
         XCTAssertEqual(windows.count, 2)
         let calls = await connection.calls
         XCTAssertEqual(calls.map(\.name), ["bind_context"])
+    }
+
+    /// Compatibility: after the last Mac window closes, a workspace-scoped list keeps its existing
+    /// lookup-unavailable mapping (`app_tool_error`, never `workspace_not_open`), so the desktop remote
+    /// sidebar does not newly auto-open a workspace on a windowless host. The browser-only
+    /// `list_workspaces` read reports the same empty inventory honestly as `windows: []`.
+    func testWorkspaceScopedListSessionsAfterLastWindowClosedKeepsLegacyErrorWhileDiscoveryIsEmpty() async throws {
+        let workspaceB = "55555555-5555-5555-5555-555555555555"
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(windowListResponse()),
+            .result(workspaceSessionListResponse(
+                [(sessionID, "Workspace B Session", "2026-07-12T01:00:00.000Z")],
+                workspaceID: workspaceB,
+                workspaceName: "Workspace B"
+            )),
+            .result(GatewayTestHelpers.toolResult(json: .object(["windows": .array([])]))),
+            .result(GatewayTestHelpers.toolResult(json: .object(["windows": .array([])]))),
+            .result(GatewayTestHelpers.toolResult(json: .object(["unexpected": .string("shape")]))),
+            .failure("raw transport detail")
+        ])
+        let runtime = try await makeRuntime(connection: connection, bindingState: .bound)
+
+        func list(_ requestID: String) async -> RemoteServerFrame? {
+            await runtime.handle(
+                RemoteClientFrame(
+                    type: "list_sessions",
+                    requestID: requestID,
+                    payload: .object(["workspace_id": .string(workspaceB), "limit": .int(50)])
+                ),
+                deviceID: "device",
+                sinkID: UUID(),
+                sink: RecordingFrameSink()
+            )
+        }
+
+        let before = await list("last-window-before")
+        XCTAssertEqual(before?.type, "command_result")
+
+        let closed = await list("last-window-closed")
+        XCTAssertEqual(closed?.type, "command_error")
+        XCTAssertEqual(
+            closed?.payload?.objectValue?["code"],
+            .string("app_tool_error"),
+            "Legacy mapping kept: not workspace_not_open, which would trigger desktop auto-open"
+        )
+
+        let discovered = await runtime.handle(
+            RemoteClientFrame(type: "list_workspaces", requestID: "last-window-discover"),
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+        XCTAssertEqual(discovered?.type, "command_result")
+        XCTAssertEqual(discovered?.payload, .object(["windows": .array([])]), "A fresh read, never the earlier windows")
+
+        for requestID in ["lookup-decode", "lookup-transport"] {
+            let failed = await list(requestID)
+            XCTAssertEqual(failed?.payload?.objectValue?["code"], .string("app_tool_error"), requestID)
+        }
+        let calls = await connection.calls
+        XCTAssertEqual(
+            calls.map(\.name),
+            ["bind_context", "agent_manage", "bind_context", "bind_context", "bind_context", "bind_context"]
+        )
     }
 
     func testWorkspaceScopedListSessionsNormalizesWorkspaceMismatchWithWindows() async throws {
@@ -1873,6 +1989,34 @@ final class GatewayRuntimeBindingTests: XCTestCase {
         XCTAssertEqual(response?.payload?.objectValue?["code"]?.stringValue, "in_doubt")
         let steerCalls = await connection.calls.filter { $0.name == "agent_run" && $0.arguments["op"] == .string("steer") }
         XCTAssertEqual(steerCalls.count, 1)
+    }
+
+    /// An uncertain tool failure (indistinguishable provenance) must be IN DOUBT exactly like a lost
+    /// link — never a definite failure and never a safe-retry signal — and the action that executed
+    /// before the throw is not retried. `.failure` surfaces a non-MCP throw that `AppLinkSession`
+    /// normalizes to `.uncertainToolFailure(.unclassified)`, which shares the ledger mapping line with
+    /// `.authoritativeToolFailure`. (Step 3 Oracle plan §3.)
+    func testUncertainToolFailureDoesNotRetryAndReturnsInDoubt() async throws {
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(windowListResponse()),
+            .result(sessionListResponse([sessionID])),
+            .result(sessionListResponse([])),
+            .failure("indistinguishable SDK failure")
+        ])
+        let runtime = try await makeRuntime(connection: connection, bindingState: .bindingRequired("bind first"))
+        let sink = RecordingFrameSink()
+
+        let response = await runtime.handle(
+            RemoteClientFrame(type: "steer", requestID: "r1", sessionID: sessionID, payload: .object(["message": .string("next")])),
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: sink
+        )
+
+        XCTAssertEqual(response?.type, "command_error")
+        XCTAssertEqual(response?.payload?.objectValue?["code"]?.stringValue, "in_doubt")
+        let steerCalls = await connection.calls.filter { $0.name == "agent_run" && $0.arguments["op"] == .string("steer") }
+        XCTAssertEqual(steerCalls.count, 1, "The in-doubt action must not be retried.")
     }
 
     func testBoundStartWithUniqueWorkspaceNameAutoRoutesAndAuditsMatchCount() async throws {
@@ -2842,6 +2986,113 @@ final class GatewayRuntimeBindingTests: XCTestCase {
         }
         await manager.shutdown()
         XCTAssertFalse(expiredFrames.isEmpty)
+    }
+
+    // MARK: list_workspaces (browser workspace chooser discovery)
+
+    private func listWorkspaces(
+        _ runtime: RemoteGatewayRuntime,
+        requestID: String,
+        payload: JSONValue? = .object([:])
+    ) async -> RemoteServerFrame? {
+        await runtime.handle(
+            RemoteClientFrame(type: "list_workspaces", requestID: requestID, payload: payload),
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+    }
+
+    func testListWorkspacesReturnsFreshProjectedWindowsAndNeverFallsBackToCachedDetails() async throws {
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(windowListResponse()),
+            .failure("raw app failure /Users/owner/secret-path token=abc")
+        ])
+        let runtime = try await makeRuntime(connection: connection, bindingState: .bound)
+
+        let first = await listWorkspaces(runtime, requestID: "lw-1")
+        XCTAssertEqual(first?.type, "command_result")
+        XCTAssertEqual(first?.requestID, "lw-1")
+        let windows = try XCTUnwrap(first?.payload?.objectValue?["windows"]?.arrayValue)
+        XCTAssertEqual(windows, [
+            .object([
+                "window_id": .int(1),
+                "workspace_id": .string("44444444-4444-4444-4444-444444444444"),
+                "workspace_name": .string("Workspace A")
+            ]),
+            .object([
+                "window_id": .int(2),
+                "workspace_id": .string("55555555-5555-5555-5555-555555555555"),
+                "workspace_name": .string("Workspace B")
+            ])
+        ])
+        XCTAssertEqual(first?.payload?.objectValue?.keys.sorted(), ["windows"])
+
+        // A second read is fresh: the cached details from the first read are never substituted.
+        let second = await listWorkspaces(runtime, requestID: "lw-2")
+        XCTAssertEqual(second?.type, "command_error")
+        XCTAssertEqual(second?.payload?.objectValue?["code"], .string("workspace_discovery_unavailable"))
+        XCTAssertEqual(second?.payload?.objectValue?["message"], .string("Open workspaces are unavailable. Retry."))
+        XCTAssertNil(second?.payload?.objectValue?["details"])
+
+        let calls = await connection.calls
+        XCTAssertEqual(calls.map(\.name), ["bind_context", "bind_context"])
+        for call in calls {
+            XCTAssertEqual(call.arguments, ["op": .string("list"), "_rawJSON": .bool(true)])
+            XCTAssertEqual(call.timeout, 10)
+        }
+    }
+
+    func testListWorkspacesRejectsAnyArgumentsBeforeAppLookup() async throws {
+        let connection = RecordingAppLinkConnection(responses: [.result(windowListResponse())])
+        let runtime = try await makeRuntime(connection: connection, bindingState: .bound)
+
+        let rejectedPayloads: [JSONValue] = [
+            .object(["workspace_id": .string("44444444-4444-4444-4444-444444444444")]),
+            .object(["_windowID": .int(2)]),
+            .string("list"),
+            .array([])
+        ]
+        for (index, payload) in rejectedPayloads.enumerated() {
+            let response = await listWorkspaces(runtime, requestID: "lw-bad-\(index)", payload: payload)
+            XCTAssertEqual(response?.type, "command_error")
+            XCTAssertEqual(response?.payload?.objectValue?["code"], .string("invalid_payload"))
+            XCTAssertNil(response?.payload?.objectValue?["details"])
+        }
+        let calls = await connection.calls
+        XCTAssertTrue(calls.isEmpty)
+
+        let missingPayload = await listWorkspaces(runtime, requestID: "lw-nil", payload: nil)
+        XCTAssertEqual(missingPayload?.type, "command_result")
+    }
+
+    func testListWorkspacesFailuresAreFixedAndSanitizedAndEmptyInventoryIsHonest() async throws {
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(
+                json: .object(["error": .string("raw tool error /Users/owner/private")]),
+                isError: true
+            )),
+            .result(GatewayTestHelpers.toolResult(json: .object(["unexpected": .string("shape")]))),
+            .failure("raw transport detail"),
+            .result(GatewayTestHelpers.toolResult(json: .object(["windows": .array([])])))
+        ])
+        let runtime = try await makeRuntime(connection: connection, bindingState: .bindingRequired("bind first"))
+
+        for index in 0 ..< 3 {
+            let response = await listWorkspaces(runtime, requestID: "lw-fail-\(index)")
+            XCTAssertEqual(response?.type, "command_error")
+            XCTAssertEqual(
+                response?.payload,
+                .object([
+                    "code": .string("workspace_discovery_unavailable"),
+                    "message": .string("Open workspaces are unavailable. Retry.")
+                ])
+            )
+        }
+
+        let empty = await listWorkspaces(runtime, requestID: "lw-empty")
+        XCTAssertEqual(empty?.type, "command_result")
+        XCTAssertEqual(empty?.payload, .object(["windows": .array([])]))
     }
 
     private func waitForSessionUpdateCount(

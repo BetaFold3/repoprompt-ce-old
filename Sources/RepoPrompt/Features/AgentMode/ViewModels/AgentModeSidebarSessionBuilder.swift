@@ -410,15 +410,10 @@ struct AgentModeSidebarSessionBuilder {
                 in: liveSession.worktreeMergeOperations
             )
         }
-        guard let summaries = entry?.activeWorktreeMergeSummaries,
-              let primary = summaries.sorted(by: { $0.updatedAt > $1.updatedAt }).first,
-              primary.status == .conflicted
-              || primary.status == .awaitingCommit
-              || primary.status == .awaitingApproval
-        else {
+        guard let summaries = entry?.activeWorktreeMergeSummaries else {
             return nil
         }
-        return AgentWorktreeMergeAttention(summary: primary)
+        return AgentWorktreeMergeBlockerSelector.sidebarAttention(inSummaries: summaries)
     }
 
     /// Resolves the representative worktree indicator for a session row.

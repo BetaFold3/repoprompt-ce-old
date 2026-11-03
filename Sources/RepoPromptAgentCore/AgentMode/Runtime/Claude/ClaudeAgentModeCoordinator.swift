@@ -143,6 +143,10 @@ package final class ClaudeAgentModeCoordinator {
     private let steeringInterruptSafePointTimeoutSeconds: TimeInterval
     private let globalCodeMapsDisabled: @MainActor () -> Bool
     private var interruptedTurnSettlementTimeoutSeconds: TimeInterval = 5.0
+    /// Step 12: how long a steer holds its own write after an acknowledged interrupt of a turn with
+    /// no visible output, so the CLI's result for that turn arrives while it is still the
+    /// controller's only outstanding turn. Capped at the interrupt's 1.5 s control timeout.
+    private var unstartedInterruptResultWaitSeconds: TimeInterval = 1.5
 
     /// Per-tab tool tracking handler for Claude sessions.
     /// Each tab gets its own handler instance to isolate correlation state across concurrent sessions.
@@ -151,10 +155,77 @@ package final class ClaudeAgentModeCoordinator {
     private var controllerEffortEvidenceByTabID: [UUID: ControllerEffortEvidence] = [:]
     private var preparationByTabID: [UUID: JoinablePreparation] = [:]
     private var dispatchReservationByTabID: [UUID: DispatchReservation] = [:]
+    /// Written user messages awaiting the provider's affirmative evidence (their own turn's
+    /// `turnCompleted(.completed)` from the controller that wrote them), keyed by the controller
+    /// turn ID returned by the write. An entry outlives its run attempt (a late completion still
+    /// refines that same delivery attempt) but never the writing controller's event delivery: it
+    /// ends at the turn's own completion, when no router can deliver that controller's events
+    /// any more, when the controller is gone, or at `stop()`.
+    private var dispatchHandoffsByTurnID: [UUID: WrittenDispatchHandoff] = [:]
+
+    private struct WrittenDispatchHandoff {
+        let tabID: UUID
+        let runAttemptID: UUID?
+        let handoff: AgentProviderHandoff
+        /// The controller that performed the write. Weak: evidence never keeps a process alive,
+        /// and a deallocated controller can emit nothing more for this turn.
+        weak var controller: AnyObject?
+        /// O49 marks, placed only on the turn the CLI had begun: the controller attributed model
+        /// output, reasoning, or a tool call to this very turn (`startedTurnID`). Never a queued or
+        /// older retained turn.
+        ///
+        /// RepoPrompt's own Stop, window close, or quit, placed before the run detaches. Final: no
+        /// interrupt outcome withdraws it. The message settles as accepted at its cancelled/failed
+        /// end or at run end, without waiting for the CLI's result.
+        var teardownRequestedByRepoPrompt = false
+        /// A steer or cleanup interrupt of this turn awaits `interruptTurn`'s outcome. Provisional:
+        /// it proves nothing until the interrupt is acknowledged.
+        var interruptPending = false
+        /// A cancelled/failed completion that arrived while `interruptPending`; decided once the
+        /// interrupt outcome is known.
+        var completionDuringInterrupt: NativeAgentRuntimeTurnStatus?
+        /// Step 12: RepoPrompt's own interrupt (steer or cleanup) of this turn before the CLI was
+        /// credited with starting it, placed only while it was the writing controller's sole
+        /// unresolved written turn. Accepts only with both an acknowledged interrupt and the CLI's
+        /// own exclusive `.cancelled` result for this turn, in either order.
+        var unstartedInterrupt: UnstartedInterrupt?
+    }
+
+    /// Which mark `noteRepoPromptInterruptRequested` placed, so the interrupt's outcome resolves
+    /// exactly that mark.
+    private enum RepoPromptInterruptMark {
+        /// O49 `interruptPending` on the started turn.
+        case started(UUID)
+        /// Step 12 `unstartedInterrupt` on the sole unresolved written turn.
+        case unstarted(UUID)
+    }
+
+    /// Step 12: the two halves of gated acceptance for an interrupt before first visible output.
+    private struct UnstartedInterrupt {
+        /// `interruptTurn` returned `.acknowledged`.
+        var acknowledged = false
+        /// The CLI's exclusive `.cancelled` result arrived before the acknowledgement.
+        var providerCancelledResultHeld = false
+    }
+
     private var controllerRetirementGenerationByTabID: [UUID: UUID] = [:]
+    /// Tabs whose unhealthy launch was retired for RepoPrompt MCP recovery: the successor must
+    /// resume this conversation and prove RepoPrompt MCP connected before any turn is submitted.
+    /// Kept until that evidence arrives, so every later preparation re-proves it. Each arming has
+    /// a fresh generation, so a confirmation that resumes after a suspension can tell whether the
+    /// recovery it was confirming is still the tab's current one.
+    private struct PendingRepoPromptMCPRecovery {
+        let conversationID: String
+        let generation: UUID
+    }
+
+    private var pendingRepoPromptMCPRecoveryByTabID: [UUID: PendingRepoPromptMCPRecovery] = [:]
+    static let repoPromptMCPRecoveryEvidenceTimeoutSeconds: TimeInterval = 20
     private var fallbackReplacementClaimByTabID: [UUID: FallbackReplacementClaim] = [:]
     private var privateFallbackControllerByTabID: [UUID: TrackedPrivateFallbackController] = [:]
     #if DEBUG
+        /// How many readiness calls joined an in-flight preparation instead of starting one.
+        private(set) var testPreparationJoinCount = 0
         private var testStopToolTrackingGate: (() async -> Void)?
         private var testBeforePromptCacheRetentionSync: ((AgentTabSession) -> Void)?
         private var testResumeRecoveryHandoffBeforeCommitGate: (@MainActor () async -> Void)?
@@ -262,6 +333,10 @@ package final class ClaudeAgentModeCoordinator {
         preparationByTabID.values.forEach { $0.task.cancel() }
         preparationByTabID.removeAll()
         dispatchReservationByTabID.removeAll()
+        // No controller event is processed after stop: written messages stay delivery-unknown.
+        let writtenHandoffs = Array(dispatchHandoffsByTurnID.values)
+        dispatchHandoffsByTurnID.removeAll()
+        writtenHandoffs.forEach(Self.settleWithoutCompletion)
         controllerEffortEvidenceByTabID.removeAll()
         if let viewModel {
             for session in viewModel.sessions.values {
@@ -270,6 +345,7 @@ package final class ClaudeAgentModeCoordinator {
         }
         controllerLaunchSettingsByTabID.removeAll()
         controllerRetirementGenerationByTabID.removeAll()
+        pendingRepoPromptMCPRecoveryByTabID.removeAll()
         fallbackReplacementClaimByTabID.removeAll()
         let privateFallbackControllers = privateFallbackControllerByTabID.values.map(\.controller)
         privateFallbackControllerByTabID.removeAll()
@@ -324,6 +400,14 @@ package final class ClaudeAgentModeCoordinator {
         // handles the case where the stream was finished by handleStdoutEOF or another path
         // that called finishEventsStreamIfNeeded.
         return await (controller, controller.eventsSubscription())
+    }
+
+    /// The PID of the session's current, healthy Claude launch's spawned process, bound to its
+    /// RepoPrompt MCP launch token, or `nil`. It may not be registered for RepoPrompt MCP routing
+    /// yet (the host's proof then fails and the turn waits).
+    func repoPromptMCPLaunchAgentPID(for session: AgentTabSession) async -> pid_t? {
+        guard let controller = session.claudeController else { return nil }
+        return await controller.repoPromptMCPLaunchAgentPID
     }
 
     func hasTurnInFlight(for session: AgentTabSession) async -> Bool {
@@ -428,6 +512,9 @@ package final class ClaudeAgentModeCoordinator {
     ) async -> Bool {
         while true {
             if let existing = preparationByTabID[session.tabID] {
+                #if DEBUG
+                    testPreparationJoinCount += 1
+                #endif
                 await existing.task.value
                 let wasCancelled = existing.task.isCancelled
                 if preparationByTabID[session.tabID]?.id == existing.id {
@@ -529,10 +616,18 @@ package final class ClaudeAgentModeCoordinator {
         let autoPermissionValidationKeyChanged =
             currentLaunchSettings?.autoPermissionValidationKey != autoPermissionValidationKey
         let repoPromptToolsModeChanged = currentLaunchSettings?.repoPromptToolsMode != effectiveRepoPromptToolsMode
+        // A launch whose RepoPrompt MCP connection was lost is restarted here, at a turn boundary,
+        // resuming its conversation; it is never silently reused.
+        var repoPromptMCPRecoveryRequired = false
+        if let existingController = session.claudeController {
+            let health = await existingController.currentRepoPromptMCPHealth
+            guard !Task.isCancelled, sessionOwnsClaudeController(existingController, for: session) else { return }
+            repoPromptMCPRecoveryRequired = health.isUnhealthy
+        }
         if let existingController = session.claudeController,
            runtimeVariantChanged || permissionModeChanged || bashToolChanged || mcpStrictModeChanged
            || sessionProfileChanged || toolSearchChanged || autoPermissionValidationKeyChanged
-           || repoPromptToolsModeChanged
+           || repoPromptToolsModeChanged || repoPromptMCPRecoveryRequired
         {
             let hasTurnInFlight = await existingController.hasTurnInFlight
             guard !Task.isCancelled,
@@ -548,6 +643,14 @@ package final class ClaudeAgentModeCoordinator {
                     )
                 }
                 return
+            }
+            if repoPromptMCPRecoveryRequired, !runtimeVariantChanged {
+                guard await armRepoPromptMCPRecovery(for: session, controller: existingController),
+                      !Task.isCancelled
+                else {
+                    clearStaleRepoPromptMCPRecoveryStatus(for: session)
+                    return
+                }
             }
             await recycleClaudeControllerForLaunchSettingsChange(
                 session: session,
@@ -646,6 +749,7 @@ package final class ClaudeAgentModeCoordinator {
               session.runState.isActive,
               sessionOwnsClaudeController(controller, for: session)
         else {
+            clearStaleRepoPromptMCPRecoveryStatus(for: session)
             return
         }
         do {
@@ -680,6 +784,14 @@ package final class ClaudeAgentModeCoordinator {
             updateProviderSessionIDIfNeeded(sessionRef.sessionID, for: session)
             guard let installedController = session.claudeController else {
                 return
+            }
+            if pendingRepoPromptMCPRecoveryByTabID[session.tabID] != nil {
+                guard await confirmRepoPromptMCPRecovery(
+                    for: session,
+                    controller: installedController,
+                    runID: runID,
+                    runAttemptID: runAttemptID
+                ) else { return }
             }
             let controllerIdentifier = ObjectIdentifier(installedController as AnyObject)
             if let installedLaunchSettings = controllerLaunchSettingsByTabID[session.tabID],
@@ -813,6 +925,163 @@ package final class ClaudeAgentModeCoordinator {
                 for: session
             )
             finalizeSession(session, state: .failed, save: true)
+        }
+    }
+
+    // MARK: - RepoPrompt MCP health recovery
+
+    /// Arms recovery of a launch whose RepoPrompt MCP connection was lost, just before the caller
+    /// retires it: the successor resumes exactly this conversation (the implicit fresh fallback is
+    /// suppressed for it) and must prove RepoPrompt MCP connected before a turn is submitted.
+    /// Without a conversation to resume nothing restarts and the dispatch fails visibly.
+    private func armRepoPromptMCPRecovery(
+        for session: AgentTabSession,
+        controller: any NativeAgentRuntimeControlling,
+        stoppedRunningTurn: Bool = false
+    ) async -> Bool {
+        let sessionRef = await controller.currentSessionRef()
+        guard sessionOwnsClaudeController(controller, for: session) else { return false }
+        let conversationID = [sessionRef.sessionID, session.providerSessionID]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty }
+        guard let conversationID else {
+            failRepoPromptMCPRecovery(
+                for: session,
+                message: "RepoPrompt MCP disconnected from Claude and there is no conversation to resume, so nothing was sent. Start a new conversation to continue."
+            )
+            return false
+        }
+        updateProviderSessionIDIfNeeded(conversationID, for: session)
+        session.recoveryResumeFallbackSuppressedConversationID = conversationID
+        pendingRepoPromptMCPRecoveryByTabID[session.tabID] = PendingRepoPromptMCPRecovery(
+            conversationID: conversationID,
+            generation: UUID()
+        )
+        if stoppedRunningTurn, session.runState.isActive {
+            session.appendItem(.system(
+                Self.repoPromptMCPStoppedRunningTurnNotice,
+                sequenceIndex: session.nextSequenceIndex
+            ))
+        }
+        setRepoPromptMCPRecoveryStatus(
+            stoppedRunningTurn
+                ? Self.repoPromptMCPStoppedTurnStatus
+                : Self.repoPromptMCPRestartingStatus,
+            for: session
+        )
+        Self.logger.notice(
+            "Claude RepoPrompt MCP recovery armed tab=\(session.tabID.uuidString, privacy: .public) stoppedRunningTurn=\(stoppedRunningTurn, privacy: .public)"
+        )
+        return true
+    }
+
+    static let repoPromptMCPRestartingStatus = "Restarting Claude to reconnect RepoPrompt MCP…"
+    static let repoPromptMCPStoppedTurnStatus = "Stopped the running turn to reconnect RepoPrompt tools…"
+    static let repoPromptMCPWaitingStatus = "Waiting for RepoPrompt MCP to reconnect…"
+    static let repoPromptMCPStoppedRunningTurnNotice = "RepoPrompt tools disconnected during the running turn, so it was stopped to reconnect them. Claude is restarting and resuming this conversation; your new message is sent once RepoPrompt MCP reconnects."
+
+    /// Recovery status is shown only while a dispatch is active: an idle tab never shows it.
+    private func setRepoPromptMCPRecoveryStatus(_ text: String, for session: AgentTabSession) {
+        guard session.runState.isActive else { return }
+        session.setRunningStatus(text, source: .transport)
+        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+    }
+
+    /// Clears a recovery status left behind once no dispatch is active any more. Another
+    /// attempt's status (or any non-recovery status) is never touched.
+    private func clearStaleRepoPromptMCPRecoveryStatus(for session: AgentTabSession) {
+        guard !session.runState.isActive,
+              session.runningStatusSource == .transport,
+              let text = session.runningStatusText,
+              [
+                  Self.repoPromptMCPRestartingStatus,
+                  Self.repoPromptMCPStoppedTurnStatus,
+                  Self.repoPromptMCPWaitingStatus
+              ].contains(text)
+        else { return }
+        session.setRunningStatus(nil, source: nil)
+        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+    }
+
+    /// Waits for the recovered launch's fresh RepoPrompt MCP connected evidence. On failure the
+    /// launch is retired (recovery stays pending for the next attempt), the failure is shown, and
+    /// nothing is submitted. A wait or retirement that was superseded (another run or attempt,
+    /// another recovery generation) or cancelled changes nothing.
+    private func confirmRepoPromptMCPRecovery(
+        for session: AgentTabSession,
+        controller: any NativeAgentRuntimeControlling,
+        runID: UUID,
+        runAttemptID: UUID?
+    ) async -> Bool {
+        guard let generation = pendingRepoPromptMCPRecoveryByTabID[session.tabID]?.generation else {
+            return true
+        }
+        func stillCurrent() -> Bool {
+            !Task.isCancelled
+                && session.runID == runID
+                && session.activeRunAttemptID == runAttemptID
+                && session.runState.isActive
+                && pendingRepoPromptMCPRecoveryByTabID[session.tabID]?.generation == generation
+        }
+        setRepoPromptMCPRecoveryStatus(Self.repoPromptMCPWaitingStatus, for: session)
+        let outcome = await controller.awaitRepoPromptMCPConnectedEvidence(
+            timeoutSeconds: Self.repoPromptMCPRecoveryEvidenceTimeoutSeconds,
+            pollIntervalSeconds: 0.25
+        )
+        guard stillCurrent(), sessionOwnsClaudeController(controller, for: session) else {
+            clearStaleRepoPromptMCPRecoveryStatus(for: session)
+            return false
+        }
+        switch outcome {
+        case .connected:
+            pendingRepoPromptMCPRecoveryByTabID.removeValue(forKey: session.tabID)
+            session.setRunningStatus("Thinking…", source: .transport)
+            viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+            Self.logger.notice(
+                "Claude RepoPrompt MCP recovery confirmed tab=\(session.tabID.uuidString, privacy: .public)"
+            )
+            return true
+        case let .notConnected(reason):
+            if let detached = detachClaudeController(controller, from: session, removeToolTracking: true) {
+                _ = await retireClaudeController(detached, for: session, captureProviderSessionID: true)
+            }
+            // Retirement suspends: a superseding run, attempt or recovery owns the session now.
+            guard stillCurrent() else {
+                Self.logger.notice(
+                    "Claude RepoPrompt MCP recovery failure superseded during retirement tab=\(session.tabID.uuidString, privacy: .public)"
+                )
+                clearStaleRepoPromptMCPRecoveryStatus(for: session)
+                return false
+            }
+            failRepoPromptMCPRecovery(
+                for: session,
+                message: "RepoPrompt MCP did not reconnect after Claude restarted (\(reason)). Nothing was sent; send your message again to retry."
+            )
+            return false
+        }
+    }
+
+    /// Fails the active user dispatch visibly. Without one (no dispatch is active), nothing is
+    /// finalized and no recovery status is left on the idle tab: the pending recovery stays, and
+    /// the next dispatch retries it.
+    private func failRepoPromptMCPRecovery(for session: AgentTabSession, message: String) {
+        Self.logger.error(
+            "Claude RepoPrompt MCP recovery failed tab=\(session.tabID.uuidString, privacy: .public) active=\(session.runState.isActive, privacy: .public): \(message, privacy: .public)"
+        )
+        guard session.runState.isActive else {
+            clearStaleRepoPromptMCPRecoveryStatus(for: session)
+            return
+        }
+        session.appendItem(.error(message, sequenceIndex: session.nextSequenceIndex))
+        finalizeSession(session, state: .failed, save: true)
+    }
+
+    /// Drops a pending recovery when the tab's conversation ends (reset or provider identity
+    /// change): it applied only to that conversation.
+    private func clearRepoPromptMCPRecovery(for session: AgentTabSession) {
+        guard let pending = pendingRepoPromptMCPRecoveryByTabID.removeValue(forKey: session.tabID) else { return }
+        if session.recoveryResumeFallbackSuppressedConversationID == pending.conversationID {
+            session.recoveryResumeFallbackSuppressedConversationID = nil
         }
     }
 
@@ -1106,6 +1375,10 @@ package final class ClaudeAgentModeCoordinator {
             toolHandlerByTabID[session.tabID]?.currentTrackedRunID
         }
 
+        func test_setUnstartedInterruptResultWaitSeconds(_ seconds: TimeInterval) {
+            unstartedInterruptResultWaitSeconds = seconds
+        }
+
         func test_setInterruptedTurnSettlementTimeoutSeconds(_ seconds: TimeInterval) {
             interruptedTurnSettlementTimeoutSeconds = seconds
         }
@@ -1128,6 +1401,12 @@ package final class ClaudeAgentModeCoordinator {
             for session: AgentTabSession
         ) -> Bool {
             fallbackReplacementClaimByTabID[session.tabID] != nil
+        }
+
+        func test_pendingRepoPromptMCPRecoveryConversationID(
+            for session: AgentTabSession
+        ) -> String? {
+            pendingRepoPromptMCPRecoveryByTabID[session.tabID]?.conversationID
         }
 
         func test_hasTrackedPrivateFallbackController(
@@ -1218,14 +1497,44 @@ package final class ClaudeAgentModeCoordinator {
     ) async throws -> NativeAgentRuntimeSessionRef {
         let existingSessionID = session.providerSessionID
         let runAttemptID = session.activeRunAttemptID
+        // R6 owner capture: this start (launch reservation, startup permission mode) and its fresh
+        // fallback carry the scope of the run attempt captured here, never one read later.
+        let runtimeOwner = session.runtimeSessionScope(processRunID: runID)
         let systemPromptOverride = agentModeSystemPromptOverride(for: session)
+        if let pendingConversationID = pendingRepoPromptMCPRecoveryByTabID[session.tabID]?.conversationID {
+            if pendingConversationID == existingSessionID {
+                // Every start of a pending RepoPrompt MCP recovery resumes exactly that
+                // conversation; an unavailable resume asks the user rather than starting fresh.
+                session.recoveryResumeFallbackSuppressedConversationID = pendingConversationID
+            } else {
+                // The tab moved to another (or no) conversation: that recovery no longer applies.
+                clearRepoPromptMCPRecovery(for: session)
+            }
+        }
+        if controller.joinsRetirementBeforeSuccessor {
+            // R6: a retired registered runtime of this tab (any provider, for example a Codex
+            // controller retired by a provider switch) finishes its cleanup before this start
+            // reserves; the start then proceeds only while it is still current.
+            await session.joinRuntimeRetirements()
+            guard !Task.isCancelled,
+                  session.runID == runID,
+                  session.activeRunAttemptID == runAttemptID,
+                  session.runState.isActive,
+                  sessionOwnsClaudeController(controller, for: session)
+            else {
+                await shutdownClaudeControllerIfUnowned(controller, by: session)
+                throw ControllerLifecycleError.superseded
+            }
+        }
         do {
-            let sessionRef = try await controller.startOrResume(
-                existingSessionID: existingSessionID,
-                model: model,
-                effortLevel: effortLevel,
-                systemPromptOverride: systemPromptOverride
-            )
+            let sessionRef = try await AgentRuntimeOperationOwner.$session.withValue(runtimeOwner) {
+                try await controller.startOrResume(
+                    existingSessionID: existingSessionID,
+                    model: model,
+                    effortLevel: effortLevel,
+                    systemPromptOverride: systemPromptOverride
+                )
+            }
             recordStartupEffortEvidence(
                 from: sessionRef,
                 controller: controller,
@@ -1240,6 +1549,11 @@ package final class ClaudeAgentModeCoordinator {
                 await shutdownClaudeControllerIfUnowned(controller, by: session)
                 throw ControllerLifecycleError.superseded
             }
+            if let existingSessionID, session.recoveryResumeFallbackSuppressedConversationID == existingSessionID {
+                // Phase 4: the recovery dispatch resumed its conversation; the suppression ends.
+                session.recoveryResumeFallbackSuppressedConversationID = nil
+                session.recoveryResumeUnavailableConversationID = nil
+            }
             return sessionRef
         } catch ControllerLifecycleError.superseded {
             throw ControllerLifecycleError.superseded
@@ -1252,8 +1566,20 @@ package final class ClaudeAgentModeCoordinator {
                 await shutdownClaudeControllerIfUnowned(controller, by: session)
                 throw ControllerLifecycleError.superseded
             }
-            guard Self.shouldRetryFreshStartWithoutResume(after: error, existingSessionID: existingSessionID) else {
+            switch Self.resumeFailureDisposition(
+                after: error,
+                existingSessionID: existingSessionID,
+                suppressedConversationID: session.recoveryResumeFallbackSuppressedConversationID
+            ) {
+            case .rethrow:
                 throw error
+            case let .requireExplicitChoice(conversationID):
+                // Phase 4: a recovery dispatch never falls back to an implicit fresh conversation.
+                // The startup failed before any input write; the user chooses explicitly.
+                session.recoveryResumeUnavailableConversationID = conversationID
+                throw AgentRecoveryResumeFallbackRequired(conversationID: conversationID)
+            case .retryFresh:
+                break
             }
 
             let replacementClaim = beginFallbackReplacementClaim(
@@ -1335,15 +1661,16 @@ package final class ClaudeAgentModeCoordinator {
                 ),
                 for: session
             )
-
             let sessionRef: NativeAgentRuntimeSessionRef
             do {
-                sessionRef = try await freshController.startOrResume(
-                    existingSessionID: nil,
-                    model: model,
-                    effortLevel: effortLevel,
-                    systemPromptOverride: systemPromptOverride
-                )
+                sessionRef = try await AgentRuntimeOperationOwner.$session.withValue(runtimeOwner) {
+                    try await freshController.startOrResume(
+                        existingSessionID: nil,
+                        model: model,
+                        effortLevel: effortLevel,
+                        systemPromptOverride: systemPromptOverride
+                    )
+                }
             } catch {
                 guard sessionOwnsDetachedFallbackReplacementClaim(replacementClaim, for: session),
                       let failedPrivateController = removeTrackedPrivateFallbackController(
@@ -1451,12 +1778,38 @@ package final class ClaudeAgentModeCoordinator {
         return description.isEmpty ? String(describing: error) : description
     }
 
+    enum ResumeFailureDisposition: Equatable {
+        case rethrow
+        case retryFresh
+        /// Phase 4 recovery dispatch: the implicit fresh fallback is suppressed for this conversation.
+        case requireExplicitChoice(conversationID: String)
+    }
+
+    /// What a failed start/resume does next. The implicit fresh retry applies only when the failure
+    /// qualifies (`shouldRetryFreshStartWithoutResume`) and no recovery dispatch suppressed it for
+    /// exactly this conversation.
+    static func resumeFailureDisposition(
+        after error: Error,
+        existingSessionID: String?,
+        suppressedConversationID: String?
+    ) -> ResumeFailureDisposition {
+        guard shouldRetryFreshStartWithoutResume(after: error, existingSessionID: existingSessionID) else {
+            return .rethrow
+        }
+        if let existingSessionID, suppressedConversationID == existingSessionID {
+            return .requireExplicitChoice(conversationID: existingSessionID)
+        }
+        return .retryFresh
+    }
+
     private static func shouldRetryFreshStartWithoutResume(
         after error: Error,
         existingSessionID: String?
     ) -> Bool {
         if error is ClaudeNativeProcessSessionController.PermissionStageError
             || error is ClaudeAgentToolPreferences.AutoPermissionModeBlockedError
+            // R6: a registry refusal never falls back to another (fresh) launch.
+            || error is AgentProcessRegistryError
         {
             return false
         }
@@ -1478,7 +1831,8 @@ package final class ClaudeAgentModeCoordinator {
              .invalidControlResponse,
              .controlRequestTimedOut:
             return true
-        case .liveModelSwitchRequiresRestart:
+        case .liveModelSwitchRequiresRestart,
+             .repoPromptMCPRecoveryRequired:
             return false
         }
     }
@@ -1610,13 +1964,325 @@ package final class ClaudeAgentModeCoordinator {
         )
     }
 
+    /// Records the provider's terminal evidence for a written user message. Only the turn's own
+    /// `.completed` result is affirmative acceptance; cancelled/failed results (including ones the
+    /// controller synthesizes on process exit) leave delivery unknown, unless RepoPrompt's own Stop
+    /// or quit ended that turn after it started (O49, `teardownRequestedByRepoPrompt`). While a
+    /// steer interrupt of the turn is pending, the decision waits for its outcome. Called before
+    /// any other handling of the completion.
+    ///
+    /// Step 12: a turn RepoPrompt interrupted before the CLI was credited with starting it
+    /// (`unstartedInterrupt`) is accepted only on the CLI's exclusive interrupted-turn `.cancelled`
+    /// result (`origin.isExclusiveInterruptedResult`) together with an acknowledged interrupt, in
+    /// either order.
+    ///
+    /// The completion must come from the controller that wrote the turn (`isEmittedBy` is asked
+    /// about that controller), so it applies only to that same captured turn and delivery
+    /// attempt, never to a successor. It is honored even after the turn's run attempt finalized
+    /// and recorded uncertainty: a late `.completed` refines `deliveryUnknown` to accepted.
+    func noteClaudeTurnCompleted(
+        turnID: UUID,
+        status: NativeAgentRuntimeTurnStatus,
+        origin: NativeAgentRuntimeTurnCompletionOrigin = .controllerSynthesized,
+        isEmittedBy: (AnyObject) -> Bool
+    ) {
+        guard let written = dispatchHandoffsByTurnID[turnID] else { return }
+        guard let writer = written.controller else {
+            // The writing controller is gone; nothing more can arrive for this turn.
+            dispatchHandoffsByTurnID.removeValue(forKey: turnID)
+            Self.settleWithoutCompletion(written)
+            return
+        }
+        guard isEmittedBy(writer) else { return }
+        switch status {
+        case .completed:
+            dispatchHandoffsByTurnID.removeValue(forKey: turnID)
+            written.handoff.noteAccepted()
+        case .cancelled where written.teardownRequestedByRepoPrompt, .failed where written.teardownRequestedByRepoPrompt:
+            // O49: RepoPrompt's own Stop or quit ended a turn the CLI had already begun (output
+            // was attributed to it), so the message was received. The basis is that start
+            // evidence, not the cancel: a `.failed` from a process exit during the stop is the
+            // same received message.
+            dispatchHandoffsByTurnID.removeValue(forKey: turnID)
+            written.handoff.noteAccepted()
+        case .cancelled where written.interruptPending, .failed where written.interruptPending:
+            // O49: the steer's mark is provisional; the interrupt outcome decides.
+            dispatchHandoffsByTurnID[turnID]?.completionDuringInterrupt = status
+        case .cancelled where written.unstartedInterrupt != nil && origin.isExclusiveInterruptedResult:
+            // Step 12: the CLI's own interrupted-turn result for exactly this turn. With the
+            // interrupt acknowledged it proves receipt; before the acknowledgement it waits for it.
+            if written.unstartedInterrupt?.acknowledged == true {
+                dispatchHandoffsByTurnID.removeValue(forKey: turnID)
+                written.handoff.noteAccepted()
+            } else {
+                dispatchHandoffsByTurnID[turnID]?.unstartedInterrupt?.providerCancelledResultHeld = true
+            }
+        case .cancelled, .failed:
+            // Includes Step 12's non-qualifying ends: a synthesized or shared-FIFO completion, a
+            // result that does not itself report an interruption or names another message, or
+            // `.failed`, never proves receipt of a turn that showed no output.
+            dispatchHandoffsByTurnID.removeValue(forKey: turnID)
+            written.handoff.noteDeliveryUnknown()
+        }
+    }
+
+    /// O49: the written turn `controller` reports as started, when that same controller wrote it.
+    /// Queued turns and older retained handoffs are never the started turn.
+    private func startedWrittenTurnID(of controller: any NativeAgentRuntimeControlling) -> UUID? {
+        guard let turnID = controller.startedTurnID,
+              let written = dispatchHandoffsByTurnID[turnID],
+              written.controller === (controller as AnyObject)
+        else { return nil }
+        return turnID
+    }
+
+    /// Step 12: the one written turn of `controller` with no completion yet, when there is exactly
+    /// one. More than one means the CLI's next result cannot be tied to a specific turn (FIFO
+    /// attribution; a skipped message would take another turn's result).
+    private func soleUnresolvedWrittenTurnID(of controller: any NativeAgentRuntimeControlling) -> UUID? {
+        let unresolved = dispatchHandoffsByTurnID.filter { _, written in
+            written.controller === (controller as AnyObject)
+                && written.completionDuringInterrupt == nil
+                && written.unstartedInterrupt?.providerCancelledResultHeld != true
+        }
+        guard unresolved.count == 1 else { return nil }
+        return unresolved.first?.key
+    }
+
+    /// O49: RepoPrompt is about to interrupt `controller`'s started turn (steer or cleanup). The
+    /// mark is provisional until `resolveRepoPromptInterrupt` learns the outcome. Call before
+    /// `interruptTurn`, so a result that races the acknowledgement waits for it. Returns the mark
+    /// this call placed (nil when nothing was marked or another interrupt is already pending).
+    ///
+    /// Step 12: with no started turn, the controller's sole unresolved written turn gets the gated
+    /// `unstartedInterrupt` mark instead. Steer interrupts before writing its own message, so that
+    /// message is never counted here.
+    ///
+    /// A started turn that still carries an acknowledged unstarted mark gets no O49 mark: after an
+    /// acknowledged interrupt and no result of its own, the output now credited to it (FIFO head)
+    /// is almost certainly a later message's, so it stays under the Step 12 gate. A started turn
+    /// with an unacknowledged unstarted mark drops it and the started path (O49) decides it.
+    private func noteRepoPromptInterruptRequested(
+        controller: any NativeAgentRuntimeControlling
+    ) -> RepoPromptInterruptMark? {
+        if let turnID = startedWrittenTurnID(of: controller) {
+            guard dispatchHandoffsByTurnID[turnID]?.interruptPending == false,
+                  !Self.hasAcknowledgedUnstartedInterrupt(dispatchHandoffsByTurnID[turnID])
+            else { return nil }
+            dispatchHandoffsByTurnID[turnID]?.interruptPending = true
+            dispatchHandoffsByTurnID[turnID]?.unstartedInterrupt = nil
+            return .started(turnID)
+        }
+        guard let turnID = soleUnresolvedWrittenTurnID(of: controller),
+              let written = dispatchHandoffsByTurnID[turnID],
+              !written.interruptPending,
+              written.unstartedInterrupt == nil
+        else { return nil }
+        dispatchHandoffsByTurnID[turnID]?.unstartedInterrupt = UnstartedInterrupt()
+        return .unstarted(turnID)
+    }
+
+    /// O49: the interrupt that marked `turnID` returned. Acknowledged: the started message was
+    /// received and settles accepted. Otherwise the provisional mark is withdrawn, and a
+    /// completion that arrived meanwhile gets its normal outcome. A teardown mark is never
+    /// withdrawn here.
+    private func resolveRepoPromptInterrupt(
+        _ mark: RepoPromptInterruptMark?,
+        outcome: NativeAgentRuntimeInterruptOutcome
+    ) {
+        let turnID: UUID
+        switch mark {
+        case nil:
+            return
+        case let .unstarted(markedTurnID):
+            guard let written = dispatchHandoffsByTurnID[markedTurnID],
+                  let unstarted = written.unstartedInterrupt
+            else { return }
+            resolveUnstartedInterrupt(markedTurnID, written: written, unstarted: unstarted, outcome: outcome)
+            return
+        case let .started(markedTurnID):
+            turnID = markedTurnID
+        }
+        guard let written = dispatchHandoffsByTurnID[turnID] else { return }
+        if outcome == .acknowledged {
+            dispatchHandoffsByTurnID.removeValue(forKey: turnID)
+            written.handoff.noteAccepted()
+            return
+        }
+        guard written.completionDuringInterrupt != nil else {
+            dispatchHandoffsByTurnID[turnID]?.interruptPending = false
+            return
+        }
+        dispatchHandoffsByTurnID.removeValue(forKey: turnID)
+        if written.teardownRequestedByRepoPrompt {
+            written.handoff.noteAccepted()
+        } else {
+            written.handoff.noteDeliveryUnknown()
+        }
+    }
+
+    /// Step 12: the gated half of `resolveRepoPromptInterrupt`. Acknowledged: accepts when the
+    /// CLI's exclusive cancelled result is already held, otherwise waits for it (run end without it
+    /// leaves the message uncertain). Not acknowledged (timed out, failed, no turn in flight): the
+    /// mark is withdrawn and a held result proves nothing.
+    private func resolveUnstartedInterrupt(
+        _ turnID: UUID,
+        written: WrittenDispatchHandoff,
+        unstarted: UnstartedInterrupt,
+        outcome: NativeAgentRuntimeInterruptOutcome
+    ) {
+        guard outcome == .acknowledged else {
+            guard unstarted.providerCancelledResultHeld else {
+                dispatchHandoffsByTurnID[turnID]?.unstartedInterrupt = nil
+                return
+            }
+            dispatchHandoffsByTurnID.removeValue(forKey: turnID)
+            written.handoff.noteDeliveryUnknown()
+            return
+        }
+        guard unstarted.providerCancelledResultHeld else {
+            dispatchHandoffsByTurnID[turnID]?.unstartedInterrupt?.acknowledged = true
+            return
+        }
+        dispatchHandoffsByTurnID.removeValue(forKey: turnID)
+        written.handoff.noteAccepted()
+    }
+
+    /// O49 (Stop and quit): RepoPrompt is about to stop this session's run. Called synchronously
+    /// before the run detaches its controller, so the started turn is marked before run end
+    /// settles its written messages; the CLI's result is not awaited.
+    package func noteRepoPromptTeardownRequested(_ session: AgentTabSession) {
+        guard session.selectedAgent.usesClaudeNativeRuntime,
+              let controller = session.claudeController,
+              let turnID = startedWrittenTurnID(of: controller),
+              // Step 12: a suspect started credit (see `noteRepoPromptInterruptRequested`).
+              !Self.hasAcknowledgedUnstartedInterrupt(dispatchHandoffsByTurnID[turnID])
+        else { return }
+        dispatchHandoffsByTurnID[turnID]?.teardownRequestedByRepoPrompt = true
+    }
+
+    /// Step 12: `written` carries an unstarted interrupt the CLI acknowledged and no result of its
+    /// own has decided it. Such a turn is never promoted to O49 acceptance by a later started credit.
+    private static func hasAcknowledgedUnstartedInterrupt(_ written: WrittenDispatchHandoff?) -> Bool {
+        written?.unstartedInterrupt?.acknowledged == true
+    }
+
+    /// O49: how a written message without its turn's completion ends tracking. Only a teardown
+    /// mark accepts; a pending interrupt's provisional mark does not.
+    private static func settleWithoutCompletion(_ written: WrittenDispatchHandoff) {
+        if written.teardownRequestedByRepoPrompt {
+            written.handoff.noteAccepted()
+        } else {
+            written.handoff.settleIfUnresolved()
+        }
+    }
+
+    /// A run attempt ended: written messages of that attempt without their turn's completion
+    /// become delivery-unknown (never retryable drafts). They stay associated with their turn so
+    /// a late completion from the same controller can still prove acceptance.
+    func settleWrittenDispatchHandoffs(tabID: UUID, runAttemptID: UUID) {
+        for written in dispatchHandoffsByTurnID.values
+            where written.tabID == tabID && written.runAttemptID == runAttemptID
+        {
+            Self.settleWithoutCompletion(written)
+        }
+    }
+
+    /// An event router of `tabID` finished: no further events can be delivered from controllers
+    /// for which `isStillDeliverable` is false. Their written messages end tracking as
+    /// delivery-unknown; entries of deallocated controllers end too.
+    func releaseWrittenDispatchHandoffs(
+        tabID: UUID,
+        isStillDeliverable: (AnyObject) -> Bool
+    ) {
+        let released = dispatchHandoffsByTurnID.filter { _, written in
+            guard written.tabID == tabID else { return false }
+            guard let writer = written.controller else { return true }
+            return !isStillDeliverable(writer)
+        }
+        for (turnID, written) in released {
+            dispatchHandoffsByTurnID.removeValue(forKey: turnID)
+            Self.settleWithoutCompletion(written)
+        }
+    }
+
+    #if DEBUG
+        var test_writtenDispatchHandoffCount: Int {
+            dispatchHandoffsByTurnID.count
+        }
+
+        /// Whether a cancelled/failed completion of `turnID` is held for a pending interrupt.
+        func test_holdsCompletionDuringInterrupt(turnID: UUID) -> Bool {
+            dispatchHandoffsByTurnID[turnID]?.completionDuringInterrupt != nil
+                || dispatchHandoffsByTurnID[turnID]?.unstartedInterrupt?.providerCancelledResultHeld == true
+        }
+
+        /// Step 12: whether `turnID` carries the gated unstarted-interrupt mark.
+        func test_hasUnstartedInterruptMark(turnID: UUID) -> Bool {
+            dispatchHandoffsByTurnID[turnID]?.unstartedInterrupt != nil
+        }
+
+        /// Whether `turnID`'s written message is still tracked (no final evidence decided yet).
+        func test_tracksWrittenDispatchHandoff(turnID: UUID) -> Bool {
+            dispatchHandoffsByTurnID[turnID] != nil
+        }
+
+        /// Records `handoff` as written by `controller` under `turnID`, exactly as a successful
+        /// `sendClaudeNativeMessage` write does, for routes whose harness cannot prepare a session.
+        func test_recordWrittenDispatchHandoff(
+            turnID: UUID,
+            session: AgentTabSession,
+            handoff: AgentProviderHandoff,
+            controller: any NativeAgentRuntimeControlling
+        ) {
+            dispatchHandoffsByTurnID[turnID] = WrittenDispatchHandoff(
+                tabID: session.tabID,
+                runAttemptID: session.activeRunAttemptID,
+                handoff: handoff,
+                controller: controller as AnyObject
+            )
+        }
+    #endif
+
+    static let dispatchBaselineRefusedText =
+        "Claude native send stopped before anything was sent: this message's pre-send history position couldn't be saved."
+
+    /// Errors the Claude controller throws before writing the user message (see
+    /// `ClaudeNativeProcessSessionController.sendUserMessage`). Any other error is ambiguous.
+    private static func sendErrorProvesNoWrite(_ error: Error) -> Bool {
+        guard let controllerError = error as? NativeAgentRuntimeControllerError else { return false }
+        switch controllerError {
+        case .processNotRunning, .initializationFailed, .repoPromptMCPRecoveryRequired:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// The central Claude native send seam. `handoff` carries the input's committed dispatch
+    /// evidence: every return before the controller write reports no handoff; a write that the
+    /// controller proves never happened reports no handoff; any other write outcome stays
+    /// uncertain until the turn's own completion (`noteClaudeTurnCompleted`). A successful write
+    /// is not acceptance.
     @discardableResult
     func sendClaudeNativeMessage(
         session: AgentTabSession,
         text: String,
-        attachments _: [AgentImageAttachment]
+        attachments _: [AgentImageAttachment],
+        handoff: AgentProviderHandoff
     ) async -> Bool {
+        defer {
+            if !handoff.handoffStarted {
+                handoff.noteNoHandoff()
+            }
+        }
         guard dispatchReservationByTabID[session.tabID] == nil else {
+            return false
+        }
+        // The handoff was recorded against an exact run attempt; never send it under another.
+        if let expectedRunAttemptID = handoff.runAttemptID,
+           session.activeRunAttemptID != expectedRunAttemptID
+        {
             return false
         }
         let dispatchRunID = session.runID ?? UUID()
@@ -1642,6 +2308,18 @@ package final class ClaudeAgentModeCoordinator {
         viewModel?.setAgentRunActive(session.tabID, isActive: true)
         viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
 
+        // Durable run-start input (adopted plan §5): provider text whose pending-handoff prefix
+        // (e.g. a resume-recovery handoff staged by the session preparation below) was attached to
+        // the still-queued carrier before its dispatch commit. Set once, at that commit.
+        var committedDurableText: String?
+        func blockDurableSend(_ failure: AgentProviderHandoff.CommitFailure) -> Bool {
+            handoff.blockBeforeHandoff(failure)
+            session.appendItem(.error(failure.userText, sequenceIndex: session.nextSequenceIndex))
+            return false
+        }
+
+        // One automatic RepoPrompt MCP recovery restart per dispatch, never a loop.
+        var repoPromptMCPRecoveryAttempted = false
         for _ in 0 ..< 3 {
             let preparationReady = await ensureClaudeNativeSessionReadiness(session: session)
             guard preparationReady,
@@ -1711,6 +2389,80 @@ package final class ClaudeAgentModeCoordinator {
             guard hasActiveSession else {
                 finalizeSession(session, state: .failed)
                 return false
+            }
+
+            // Preparation restarts an unhealthy idle launch; one still unhealthy here had a turn in
+            // flight (or lost its connection again). This dispatch ends that turn, exactly as a
+            // launch-settings recycle does, and restarts once, resuming the conversation.
+            let repoPromptMCPHealth = await controller.currentRepoPromptMCPHealth
+            guard dispatchReservationIsCurrent(dispatchReservation, for: session) else {
+                return false
+            }
+            guard sessionOwnsClaudeController(controller, for: session) else {
+                continue
+            }
+            if repoPromptMCPHealth.isUnhealthy {
+                guard !repoPromptMCPRecoveryAttempted else {
+                    failRepoPromptMCPRecovery(
+                        for: session,
+                        message: "RepoPrompt MCP disconnected from Claude again right after a restart. Nothing was sent; send your message again to retry."
+                    )
+                    return false
+                }
+                let stoppingRunningTurn = await controller.hasTurnInFlight
+                guard dispatchReservationIsCurrent(dispatchReservation, for: session) else {
+                    return false
+                }
+                guard sessionOwnsClaudeController(controller, for: session) else {
+                    continue
+                }
+                let interrupted = await interruptClaudeTurnIfNeeded(
+                    session: session,
+                    controller: controller,
+                    handler: handler,
+                    dispatchReservation: dispatchReservation
+                )
+                guard dispatchReservationIsCurrent(dispatchReservation, for: session) else {
+                    return false
+                }
+                guard interrupted else {
+                    if !sessionOwnsClaudeController(controller, for: session) {
+                        continue
+                    }
+                    return false
+                }
+                guard sessionOwnsClaudeController(controller, for: session) else {
+                    continue
+                }
+                // Consumed only once this dispatch owns the ended turn: a controller replaced
+                // while interrupting is re-examined as a fresh launch, not as a failed restart.
+                repoPromptMCPRecoveryAttempted = true
+                guard await armRepoPromptMCPRecovery(
+                    for: session,
+                    controller: controller,
+                    stoppedRunningTurn: stoppingRunningTurn
+                ) else {
+                    return false
+                }
+                guard dispatchReservationIsCurrent(dispatchReservation, for: session) else {
+                    return false
+                }
+                await recycleClaudeControllerForLaunchSettingsChange(
+                    session: session,
+                    existingController: controller,
+                    runtimeVariantChanged: false
+                )
+                guard dispatchReservationIsCurrent(dispatchReservation, for: session) else {
+                    return false
+                }
+                if let runID = session.runID {
+                    await ensureClaudeToolTrackingIfNeeded(for: session, runID: runID)
+                    guard dispatchReservationIsCurrent(dispatchReservation, for: session) else {
+                        return false
+                    }
+                    handler = toolHandler(for: session)
+                }
+                continue
             }
 
             let interrupted = await interruptClaudeTurnIfNeeded(
@@ -1810,6 +2562,40 @@ package final class ClaudeAgentModeCoordinator {
                 }
             }
 
+            // Deferred durable dispatch commit, after every preparation above that can create the
+            // pending-handoff prefix: stage it, attach its exact snapshot to the queued carrier,
+            // then commit. If that cannot be completed the send is blocked with its input saved —
+            // never sent without its handoff.
+            // Untracked input commits too (nothing is written for it) and keeps legacy staging at the
+            // write below.
+            if !handoff.isCommitted {
+                var durableText = text
+                if handoff.isDurable {
+                    // Without a host nothing can stage a prefix (`.none`); the late-payload check
+                    // below still guards the write.
+                    switch await viewModel?.stagePendingHandoffForDurableDispatch(text, session: session) ?? .none {
+                    case .none:
+                        break
+                    case let .staged(staged, snapshot):
+                        durableText = staged.text
+                        handoff.carryStagedInput(AgentCarriedStagedInput(pendingHandoffStage: staged.pendingHandoffStage))
+                        handoff.notePendingHandoff(snapshot)
+                    case .failed:
+                        return blockDurableSend(.pendingHandoffNotSaved)
+                    }
+                }
+                if case let .failure(failure) = await handoff.commitDispatch(session: session) {
+                    return blockDurableSend(failure)
+                }
+                committedDurableText = durableText
+                guard dispatchReservationIsCurrent(dispatchReservation, for: session) else {
+                    return false
+                }
+                guard sessionOwnsClaudeController(controller, for: session) else {
+                    continue
+                }
+            }
+
             // This is the final launch-settings validation before dispatch. There is
             // intentionally no suspension between this check and sendUserMessage, so a
             // Safe Managed tightening cannot enqueue a turn on the stale controller.
@@ -1837,19 +2623,89 @@ package final class ClaudeAgentModeCoordinator {
             else {
                 return false
             }
+            let baselineRefusal = ClaudeDispatchBaselineRefusal()
             do {
-                let outboundText: String = if let viewModel {
-                    viewModel.prependPendingHandoffIfNeeded(text, session: session)
+                let outboundText: String
+                if handoff.isDurable {
+                    // Durable input carries exactly the prefix its intent records. A handoff payload
+                    // that preparation created after this input's commit (late bootstrap, e.g. a
+                    // controller recycled after the commit) would send it without the history it
+                    // needs: blocked, with its input saved.
+                    guard !handoff.pendingHandoffCreatedAfterCommit(in: session) else {
+                        return blockDurableSend(.pendingHandoffAfterCommit)
+                    }
+                    outboundText = committedDurableText ?? text
+                } else if let viewModel {
+                    // Untracked input: a recovery handoff staged during session preparation rides
+                    // on this write; this handoff then settles exactly that stage.
+                    let staged = viewModel.stagePendingHandoffIfNeeded(text, session: session)
+                    outboundText = staged.text
+                    handoff.carryStagedInput(AgentCarriedStagedInput(pendingHandoffStage: staged.pendingHandoffStage))
                 } else {
-                    text
+                    outboundText = text
                 }
                 let instructions = agentModeInstructionInjection(for: session)
                 let providerBoundText = providerBoundUserMessage(outboundText, instructions: instructions)
-                let turnID = try await controller.sendUserMessage(providerBoundText)
+                guard handoff.enterProviderBoundary(in: session) else { return false }
+                // R6 owner capture: the dispatch reservation (verified current above) owns this
+                // user turn; its scope is captured now and never re-read at write time.
+                let runtimeOwner = session.runtimeSessionScope
+                // R6: a managed transport re-verifies this dispatch still owns the turn after its
+                // registry awaits, immediately before the bytes.
+                // Phase 4: inside that same pre-byte admission, the dispatch's history baseline is
+                // captured and committed first (gated OFF in production: no read, no write). A
+                // baseline that cannot be persisted refuses the write: zero bytes, proven not written.
+                let baselineIdentity = handoff.dispatchBaselineIdentity
+                // Outbound identity: the transport reports whether its launch is eligible; the claim
+                // (dispatch UUID + digest of exactly `providerBoundText`) is fixed before any await,
+                // and the UUID reaches the wire only when this admission newly committed it.
+                let writeAdmission: @Sendable (Bool) async -> AgentRuntimeWriteAdmission = { @MainActor [weak self, weak session] identityEligible in
+                    guard let self, let session,
+                          dispatchReservationIsCurrent(dispatchReservation, for: session),
+                          sessionOwnsClaudeController(controller, for: session)
+                    else { return .denied }
+                    var admission = AgentRuntimeWriteAdmission.admittedWithoutIdentity
+                    if let viewModel {
+                        let claim = identityEligible ? baselineIdentity.map {
+                            AgentSessionProviderHistoryRecovery.DispatchBaseline.OutboundUserMessage(
+                                uuid: $0.dispatchID,
+                                providerBoundText: providerBoundText
+                            )
+                        } : nil
+                        admission = await viewModel.admitClaudeDispatchBaseline(
+                            baselineIdentity,
+                            outboundUserMessage: claim,
+                            session: session
+                        )
+                        if admission == .denied {
+                            baselineRefusal.refused = true
+                            return .denied
+                        }
+                    }
+                    // Revalidated after the baseline's awaits.
+                    guard dispatchReservationIsCurrent(dispatchReservation, for: session),
+                          sessionOwnsClaudeController(controller, for: session)
+                    else { return .denied }
+                    return admission
+                }
+                let turnID = try await AgentRuntimeOperationOwner.$session.withValue(runtimeOwner) {
+                    try await AgentRuntimeOperationOwner.$writeAdmission.withValue(writeAdmission) {
+                        try await controller.sendUserMessage(providerBoundText)
+                    }
+                }
+                // Written: track until the turn's own completion proves acceptance.
+                dispatchHandoffsByTurnID[turnID] = WrittenDispatchHandoff(
+                    tabID: session.tabID,
+                    runAttemptID: dispatchReservation.runAttemptID,
+                    handoff: handoff,
+                    controller: controller as AnyObject
+                )
                 guard dispatchReservationIsCurrent(dispatchReservation, for: session) else {
+                    handoff.noteDeliveryUnknown()
                     return false
                 }
                 guard sessionOwnsClaudeController(controller, for: session) else {
+                    handoff.noteDeliveryUnknown()
                     await shutdownClaudeControllerIfUnowned(controller, by: session)
                     return false
                 }
@@ -1859,6 +2715,13 @@ package final class ClaudeAgentModeCoordinator {
                 // through the session-owned seam; nothing is registered from here.
                 return true
             } catch {
+                if !handoff.handoffStarted {
+                    handoff.noteNoHandoff(message: error.localizedDescription)
+                } else if Self.sendErrorProvesNoWrite(error) {
+                    handoff.noteProvenNotWritten(message: error.localizedDescription)
+                } else {
+                    handoff.noteDeliveryUnknown()
+                }
                 guard dispatchReservationIsCurrent(dispatchReservation, for: session) else {
                     return false
                 }
@@ -1867,7 +2730,9 @@ package final class ClaudeAgentModeCoordinator {
                     return false
                 }
                 let errorItem = AgentChatItem.error(
-                    "Claude native send failed: \(error.localizedDescription)",
+                    baselineRefusal.refused
+                        ? Self.dispatchBaselineRefusedText
+                        : "Claude native send failed: \(error.localizedDescription)",
                     sequenceIndex: session.nextSequenceIndex
                 )
                 session.appendItem(errorItem)
@@ -1928,6 +2793,37 @@ package final class ClaudeAgentModeCoordinator {
         }
     }
 
+    /// Step 12 (P1-B): after an acknowledged interrupt of a turn with no visible output, holds the
+    /// steer's own write until the controller has processed that turn's result. The controller fixes
+    /// a result's exclusivity when it processes it, so writing the steer first would make the
+    /// interrupted turn's result shared and never acceptable. Ends when the turn's evidence is
+    /// decided, the controller has no turn in flight (its result was processed), the reservation or
+    /// controller ownership is lost, or after `unstartedInterruptResultWaitSeconds`. A timeout is not
+    /// a failure: the steer is written and the interrupted turn stays uncertain. Steers that target a
+    /// started turn, or whose interrupt was not acknowledged, never wait here.
+    private func awaitUnstartedInterruptedTurnResult(
+        turnID: UUID,
+        session: AgentTabSession,
+        controller: any NativeAgentRuntimeControlling,
+        dispatchReservation: DispatchReservation
+    ) async {
+        let deadline = ContinuousClock.now.advanced(
+            by: .milliseconds(Int64(min(unstartedInterruptResultWaitSeconds, 1.5) * 1000))
+        )
+        while ContinuousClock.now < deadline {
+            guard dispatchHandoffsByTurnID[turnID]?.unstartedInterrupt?.acknowledged == true,
+                  dispatchReservationIsCurrent(dispatchReservation, for: session),
+                  sessionOwnsClaudeController(controller, for: session)
+            else { return }
+            guard await controller.hasTurnInFlight else { return }
+            do {
+                try await Task.sleep(nanoseconds: 25_000_000)
+            } catch {
+                return
+            }
+        }
+    }
+
     private func interruptClaudeTurnIfNeeded(
         session: AgentTabSession,
         controller: any NativeAgentRuntimeControlling,
@@ -1962,7 +2858,17 @@ package final class ClaudeAgentModeCoordinator {
             return false
         }
 
+        let mark = noteRepoPromptInterruptRequested(controller: controller)
         let interruptOutcome = await controller.interruptTurn(reason: "interrupt")
+        resolveRepoPromptInterrupt(mark, outcome: interruptOutcome)
+        if interruptOutcome == .acknowledged, case let .unstarted(turnID)? = mark {
+            await awaitUnstartedInterruptedTurnResult(
+                turnID: turnID,
+                session: session,
+                controller: controller,
+                dispatchReservation: dispatchReservation
+            )
+        }
         guard dispatchReservationIsCurrent(dispatchReservation, for: session),
               sessionOwnsClaudeController(controller, for: session)
         else {
@@ -2029,6 +2935,7 @@ package final class ClaudeAgentModeCoordinator {
     ) -> DetachedClaudeController? {
         let detached = prepareClaudeCancelSync(session)
         invalidatePendingClaudeResumeTransfer(for: session)
+        clearRepoPromptMCPRecovery(for: session)
         session.providerSessionID = nil
         return detached
     }
@@ -2044,7 +2951,14 @@ package final class ClaudeAgentModeCoordinator {
             return
         }
         let detached = prepareClaudeProviderIdentityResetSync(session)
-        Task { await cancelClaudeRun(session, oldController: detached) }
+        if let detached, detached.controller.joinsRetirementBeforeSuccessor {
+            // R6: retained so a registered successor of any provider on this tab joins it.
+            session.retainRuntimeRetirement { [self] in
+                await cancelClaudeRun(session, oldController: detached)
+            }
+        } else {
+            Task { await cancelClaudeRun(session, oldController: detached) }
+        }
     }
 
     package func handleProviderIdentityTransition(
@@ -2064,6 +2978,7 @@ package final class ClaudeAgentModeCoordinator {
     package func prepareForConversationResetSync(_ session: AgentTabSession) {
         let detached = prepareClaudeCancelSync(session)
         invalidatePendingClaudeResumeTransfer(for: session)
+        clearRepoPromptMCPRecovery(for: session)
         Task { await cancelClaudeRun(session, oldController: detached) }
     }
 
@@ -2142,7 +3057,9 @@ package final class ClaudeAgentModeCoordinator {
         oldController: DetachedClaudeController
     ) async -> NativeAgentRuntimeSessionRef {
         let controller = oldController.controller
+        let mark = noteRepoPromptInterruptRequested(controller: controller)
         let interruptOutcome = await controller.interruptTurn(reason: "interrupt")
+        resolveRepoPromptInterrupt(mark, outcome: interruptOutcome)
         await stopToolTracking(oldController, for: session)
         if interruptOutcome == .acknowledged {
             // Give Claude ~200 ms to persist any in-flight state before we

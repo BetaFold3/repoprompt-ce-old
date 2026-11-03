@@ -144,7 +144,10 @@ actor PromptContextAccountingService {
             profile: request.pathLocateProfile
         )
         let rootDisplayNames = await lookupContext.logicalRootDisplayNamesByRootID(store: store)
-        return try await WorkspaceCodemapPresentationCoordinator(store: store).withPresentation(
+        return try await WorkspaceCodemapPresentationCoordinator(
+            store: store,
+            policy: .optionalEnrichment(for: plan.intent)
+        ).withPresentation(
             for: plan.intent,
             rootScope: request.rootScope,
             logicalRootDisplayNamesByRootID: rootDisplayNames
@@ -425,12 +428,14 @@ actor PromptContextAccountingService {
             }
             let preflightIssues: [WorkspaceCodemapOperationIssue] = []
             do {
-                let presentation = try await WorkspaceCodemapPresentationCoordinator(store: store)
-                    .presentation(
-                        for: intent,
-                        rootScope: rootScope,
-                        logicalRootDisplayNamesByRootID: codemapLogicalRootDisplayNamesByRootID
-                    )
+                let presentation = try await WorkspaceCodemapPresentationCoordinator(
+                    store: store,
+                    policy: .optionalEnrichment(for: intent)
+                ).presentation(
+                    for: intent,
+                    rootScope: rootScope,
+                    logicalRootDisplayNamesByRootID: codemapLogicalRootDisplayNamesByRootID
+                )
                 codemapPresentation = WorkspaceCodemapPresentationIntentResolver.merging(
                     presentation,
                     preflightIssues: preflightIssues

@@ -43,7 +43,8 @@ package struct OpenCodeACPControllerModelDiscoveryClient: OpenCodeACPModelDiscov
             workspacePath: workspacePath,
             resumeSessionID: nil,
             attachments: [],
-            taskLabelKind: nil
+            taskLabelKind: nil,
+            runtimeSession: .sessionless
         )
         guard let provider = providerFactory(.openCode, nil) else { return nil }
         let support = try await provider.support(for: request)

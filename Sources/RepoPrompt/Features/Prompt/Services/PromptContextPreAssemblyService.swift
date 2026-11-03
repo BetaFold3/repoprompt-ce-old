@@ -261,7 +261,8 @@ enum PromptContextPreAssemblyService {
             store: request.store
         )
         let coordinator = presentationCoordinator ?? WorkspaceCodemapPresentationCoordinator(
-            store: request.store
+            store: request.store,
+            policy: .optionalEnrichment(for: plan.intent)
         )
         return try await coordinator.withPresentation(
             for: plan.intent,

@@ -60,7 +60,10 @@ final class AgentRunLiveSessionFallbackTests: XCTestCase {
         )
     }
 
-    func testActiveUnregisteredRunStateCollapsesToCompletedWithLastRecordedState() async throws {
+    /// Plan 2026-10-30 Step 1 replaced the earlier collapse to `completed`: a live session without
+    /// MCP control (a desktop root a paired device observes) reports its true running status and
+    /// live status text, and is still never reported as expired.
+    func testActiveUnregisteredRunStateReportsTrueRunningStatus() async throws {
         let window = makeWindow()
         defer { WindowStatesManager.shared.unregisterWindowState(window) }
         let viewModel = makeViewModel(windowID: window.windowID)
@@ -70,18 +73,102 @@ final class AgentRunLiveSessionFallbackTests: XCTestCase {
         let session = try await viewModel.ensureSessionReady(tabID: UUID())
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
         session.runState = .running
+        session.runningStatusText = "Reading files"
 
         let poll = try await service.execute(args: [
             "op": .string("poll"),
             "session_id": .string(sessionID.uuidString)
         ])
         let object = try XCTUnwrap(poll.objectValue)
-        XCTAssertEqual(object["status"]?.stringValue, AgentRunMCPSnapshot.Status.completed.rawValue)
-        let statusText = try XCTUnwrap(object["status_text"]?.stringValue)
-        XCTAssertTrue(
-            statusText.contains("last recorded state: running"),
-            "Unexpected status text: \(statusText)"
+        XCTAssertNotEqual(object["status"]?.stringValue, AgentRunMCPSnapshot.Status.expired.rawValue)
+        XCTAssertEqual(object["status"]?.stringValue, AgentRunMCPSnapshot.Status.running.rawValue)
+        XCTAssertEqual(object["status_text"]?.stringValue, "Reading files")
+        XCTAssertNil(object["interaction"]?.objectValue)
+        XCTAssertNil(session.mcpControlContext)
+    }
+
+    /// Step 1 final display fix: an idle live record whose persisted state is not loaded yet has no
+    /// settled outcome of its own, so its saved index state (failed/cancelled) is reported instead
+    /// of a synthesized `completed`. A live active run still outranks the index.
+    func testIdleUnloadedIndexedSessionReportsSavedIndexStateButActiveLiveRunWins() async throws {
+        let window = makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let viewModel = makeViewModel(windowID: window.windowID)
+        let service = makeService(window: window, viewModel: viewModel)
+
+        for savedState in [AgentSessionRunState.failed, .cancelled] {
+            let sessionID = UUID()
+            let tabID = UUID()
+            let session = try await viewModel.ensureSessionReady(tabID: tabID)
+            _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
+            installIndexEntry(viewModel, sessionID: sessionID, tabID: session.tabID, lastRunState: savedState)
+            session.hasLoadedPersistedState = false
+            session.runState = .idle
+
+            func poll() async throws -> [String: Value] {
+                let value = try await service.execute(args: [
+                    "op": .string("poll"),
+                    "session_id": .string(sessionID.uuidString)
+                ])
+                return try XCTUnwrap(value.objectValue)
+            }
+
+            let expected: AgentRunMCPSnapshot.Status = savedState == .failed ? .failed : .cancelled
+            let idle = try await poll()
+            XCTAssertEqual(idle["status"]?.stringValue, expected.rawValue, "\(savedState)")
+
+            session.runState = .running
+            session.runningStatusText = "Reading files"
+            let running = try await poll()
+            XCTAssertEqual(running["status"]?.stringValue, AgentRunMCPSnapshot.Status.running.rawValue, "\(savedState)")
+            XCTAssertEqual(running["status_text"]?.stringValue, "Reading files", "\(savedState)")
+            session.runState = .idle
+        }
+    }
+
+    private func installIndexEntry(
+        _ viewModel: AgentModeViewModel,
+        sessionID: UUID,
+        tabID: UUID,
+        lastRunState: AgentSessionRunState
+    ) {
+        let workspace = WorkspaceModel(
+            name: "Live Fallback Index",
+            repoPaths: [],
+            ephemeralFlag: true,
+            composeTabs: [ComposeTabState(id: tabID, name: "Root", activeAgentSessionID: sessionID)],
+            activeComposeTabID: tabID
         )
+        let owner = viewModel.test_receiveWorkspaceSwitchNotification(workspace)
+        let entry = AgentSessionIndexEntry(
+            id: sessionID,
+            tabID: tabID,
+            name: "Root",
+            lastUserMessageAt: Date(timeIntervalSince1970: 100),
+            savedAt: Date(timeIntervalSince1970: 100),
+            lastRunStateRaw: lastRunState.rawValue,
+            itemCount: 1,
+            agentKindRaw: nil,
+            agentModelRaw: nil,
+            agentReasoningEffortRaw: nil,
+            autoEditEnabled: false,
+            parentSessionID: nil,
+            hasUnknownConversationContent: false,
+            remoteHostID: nil,
+            remoteHostName: nil,
+            isMCPOriginated: false,
+            origin: nil,
+            profile: .standard,
+            worktreeBindingSummaries: [],
+            activeWorktreeMergeSummaries: []
+        )
+        viewModel.test_installSessionIndexSnapshot(
+            [sessionID: entry],
+            owner: owner,
+            latestOwner: owner,
+            activeWorkspace: workspace
+        )
+        XCTAssertEqual(viewModel.sessionIndex[sessionID]?.lastRunStateRaw, lastRunState.rawValue)
     }
 
     func testCancelOnUnregisteredLiveSessionReportsNotActiveInsteadOfExpiredHandle() async throws {
@@ -133,7 +220,8 @@ final class AgentRunLiveSessionFallbackTests: XCTestCase {
                 MCPServerViewModel.RequestMetadata(
                     connectionID: nil,
                     clientName: "agent-run-live-fallback-tests",
-                    windowID: window.windowID
+                    windowID: window.windowID,
+                    actorRoutedRunTab: nil
                 )
             },
             requireTargetWindow: { window },

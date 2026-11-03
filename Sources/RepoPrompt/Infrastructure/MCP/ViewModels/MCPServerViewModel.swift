@@ -425,6 +425,11 @@ final class MCPServerViewModel: ObservableObject {
         /// Replaces the Codex Search toggle read by the Knowledge research-worker web gate so tests
         /// never read or write real settings.
         var agentRunCodexWebSearchEnabledOverrideForTesting: Bool?
+        /// Replaces the shared workspace steering grant store so tests never touch real settings.
+        var workspaceSteeringGrantStoreOverrideForTesting: WorkspaceSteeringGrantStore?
+        /// Replaces the shared workspace approval manager for `workspace_steer request_grant` so tests
+        /// use isolated approval settings and never activate the app.
+        var workspaceApprovalManagerOverrideForTesting: WorkspaceApprovalManager?
         private var contextBuilderFollowUpOverrideForTesting: MCPWindowToolDependencies.RunMCPPlanOrQuestion?
         private var contextBuilderBeforeFinalReviewAuthorizationForTesting:
             MCPWindowToolDependencies.BeforeContextBuilderFinalReviewAuthorization?
@@ -774,6 +779,25 @@ final class MCPServerViewModel: ObservableObject {
                     await capturedPreparationHook?()
                 #endif
             }
+        )
+    }
+
+    private var workspaceSteeringToolService: WorkspaceSteeringMCPToolService {
+        #if DEBUG
+            let grantStoreOverride = workspaceSteeringGrantStoreOverrideForTesting
+            let approvalManagerOverride = workspaceApprovalManagerOverrideForTesting
+        #else
+            let grantStoreOverride: WorkspaceSteeringGrantStore? = nil
+            let approvalManagerOverride: WorkspaceApprovalManager? = nil
+        #endif
+        return WorkspaceSteeringMCPToolService(
+            captureRequestMetadata: { [self] in await captureRequestMetadata() },
+            isGatewayPrincipalConnection: { connectionID in
+                await ServerNetworkManager.shared.isGatewayPrincipalConnection(connectionID)
+            },
+            windows: { WindowStatesManager.shared.allWindows },
+            grantStore: { grantStoreOverride ?? .shared },
+            approvalManager: { approvalManagerOverride ?? .shared }
         )
     }
 
@@ -1353,6 +1377,10 @@ final class MCPServerViewModel: ObservableObject {
             guard let self else { throw MCPError.internalError("Window deallocated while executing agent_manage") }
             return try await agentManageToolService.execute(args: args)
         },
+        executeWorkspaceSteer: { [weak self] args in
+            guard let self else { throw MCPError.internalError("Window deallocated while executing workspace_steer") }
+            return try await workspaceSteeringToolService.execute(args: args)
+        },
         requireTargetWindow: { [weak self] in
             guard let self else { throw MCPError.internalError("Window deallocated while resolving target window") }
             return try requireTargetWindow()
@@ -1491,7 +1519,8 @@ final class MCPServerViewModel: ObservableObject {
         selectionCoordinator: selectionCoordinator,
         applyEditsApprovalStore: applyEditsApprovalStore,
         captureRequestMetadata: { [weak self] in
-            guard let self else { return MCPServerViewModel.RequestMetadata(connectionID: nil, clientName: nil, windowID: nil) }
+            // Deallocated window: no request connection, so no actor-side run tab.
+            guard let self else { return MCPServerViewModel.RequestMetadata(connectionID: nil, clientName: nil, windowID: nil, actorRoutedRunTab: nil) }
             return await captureRequestMetadata()
         },
         isGatewayPrincipalConnection: { connectionID in
@@ -1876,6 +1905,7 @@ final class MCPServerViewModel: ObservableObject {
             MCPAgentControlToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies),
             MCPAgentSessionControlToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies),
             MCPHistoryToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies),
+            MCPWorkspaceSteeringToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies),
             MCPCodeModeToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies)
         ]
     )
@@ -4084,11 +4114,14 @@ final class MCPServerViewModel: ObservableObject {
         workspaceContext: ContextBuilderWorkspaceContext?,
         reviewGitContext: FrozenPromptGitReviewContext
     ) {
-        let purpose: MCPRunPurpose = if let connectionID {
-            await ServerNetworkManager.shared.runPurpose(for: connectionID)
+        // One actor read: the purpose and the actor-side run tab (a routed connection without its
+        // run-tab binding resolves its run tab, never another context).
+        let routing = if let connectionID {
+            await ServerNetworkManager.shared.requestRoutingContext(for: connectionID)
         } else {
-            .unknown
+            ServerNetworkManager.RequestRoutingContext(runPurpose: nil, actorRoutedRunTab: nil)
         }
+        let purpose = routing.runPurpose ?? .unknown
 
         let explicitHint = try explicitContextBuilderHint(args: args, targetWindow: targetWindow)
         let existingBinding = connectionID.flatMap { existingTabContextBindingAcrossWindows(for: $0) }
@@ -4121,7 +4154,8 @@ final class MCPServerViewModel: ObservableObject {
                 explicitHint: explicitHint,
                 toolName: MCPWindowToolName.contextBuilder,
                 policy: .requireExplicitOrRunScoped,
-                runPurpose: purpose
+                runPurpose: purpose,
+                actorRoutedRunTab: routing.actorRoutedRunTab
             )
             guard case let .tabContextSnapshot(resolvedContext, source) = resolution else {
                 throw MCPError.invalidParams("context_builder requires a tab context snapshot.")
@@ -4722,11 +4756,14 @@ final class MCPServerViewModel: ObservableObject {
                   let context = readFileAutoSelectionContext(for: target.contextKey),
                   context.activeAgentSessionID == target.agentSessionID
             else { return nil }
+            // DEBUG probe of a bound read_file auto-selection context: resolves through the
+            // connection's binding, so no actor-side run tab.
             return await resolveFileToolLookupContext(from: RequestMetadata(
                 connectionID: target.connectionID,
                 clientName: nil,
                 windowID: target.contextKey.windowID,
-                runPurpose: .agentModeRun
+                runPurpose: .agentModeRun,
+                actorRoutedRunTab: nil
             ))
         }
 
@@ -5152,13 +5189,16 @@ final class MCPServerViewModel: ObservableObject {
             )
         }
 
+        // The auto-selection key is a bound connection's context (resolved through that binding)
+        // or active-tab compatibility (no connection): neither carries an actor-side run tab.
         let metadata = RequestMetadata(
             connectionID: {
                 if case let .bound(connectionID, _) = key.route { return connectionID }
                 return nil
             }(),
             clientName: nil,
-            windowID: key.windowID
+            windowID: key.windowID,
+            actorRoutedRunTab: nil
         )
         let authoritativeLookupContext = await resolveFileToolLookupContext(from: metadata)
         let lookupRootScope = authoritativeLookupContext.rootScope
@@ -5288,7 +5328,8 @@ final class MCPServerViewModel: ObservableObject {
             tabContextByConnectionID[connectionID]
         case .activeTabCompatibility:
             try? activeTabCompatibilitySnapshot(
-                metadata: RequestMetadata(connectionID: nil, clientName: nil, windowID: key.windowID),
+                // Active-tab compatibility by definition: no connection, no actor-side run tab.
+                metadata: RequestMetadata(connectionID: nil, clientName: nil, windowID: key.windowID, actorRoutedRunTab: nil),
                 toolName: "readFileAutoSelectionContext"
             )
         }

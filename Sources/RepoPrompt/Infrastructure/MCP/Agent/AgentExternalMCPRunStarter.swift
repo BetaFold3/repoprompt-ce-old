@@ -238,6 +238,10 @@ enum AgentExternalMCPRunStarter {
                     throw OMPQualificationInvocationError.contextReplaced
                 }
             #endif
+            // Step 5b: a linked delegated child dispatches only while its parent admission holds.
+            try agentModeVM.mcpRequireDelegatedChildDispatchFence(
+                agentModeVM.mcpDelegatedChildDispatchFence(for: sessionID)
+            )
 
             let delivery: AgentModeViewModel.MCPInstructionDispatch = if let dispatchInstruction {
                 try await dispatchInstruction(sessionID, target.tabID, message, workflow, agentModeVM)

@@ -24,8 +24,12 @@ final class ChatHistoryJSONOnlyTests: XCTestCase {
         let fileURL = try await service.saveChatSession(session, for: workspace)
         defer { try? FileManager.default.removeItem(at: fileURL.deletingLastPathComponent().deletingLastPathComponent()) }
 
-        XCTAssertTrue(fileURL.path.contains("/Application Support/RepoPrompt CE/Workspaces/"), fileURL.path)
-        XCTAssertFalse(fileURL.path.contains("/Application Support/RepoPrompt/Workspaces/"), fileURL.path)
+        // Default-path chats live under the shared workspaces root, which XCTest isolates from the
+        // live CE store; the production root itself keeps the CE naming.
+        XCTAssertTrue(fileURL.path.hasPrefix(WorkspaceStoragePaths.defaultRoot.path + "/"), fileURL.path)
+        XCTAssertFalse(fileURL.path.hasPrefix(WorkspaceStorageRoot.productionRootURL().path), fileURL.path)
+        let productionRoot = WorkspaceStorageRoot.productionRootURL().path
+        XCTAssertTrue(productionRoot.hasSuffix("/Application Support/RepoPrompt CE/Workspaces"), productionRoot)
 
         let loaded = try await service.loadChatSession(from: fileURL)
         XCTAssertEqual(loaded.name, "Current Session")

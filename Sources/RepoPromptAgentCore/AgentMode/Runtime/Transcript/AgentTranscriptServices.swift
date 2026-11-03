@@ -2535,6 +2535,58 @@ enum AgentSourceItemIDRepair {
     }
 }
 
+/// Canonical ownership of working items whose full turn the legacy importer cannot re-derive from
+/// user-row boundaries (O11): a request anchor under a distinct execution turn ID, or a requestless
+/// historical envelope. Reconciliation keeps those items in exactly those turns; every other item
+/// is imported as before.
+package struct AgentTranscriptWorkingTurnOwnership: Equatable {
+    package var turnIDByItemID: [UUID: UUID] = [:]
+    /// Owned items that are their turn's request anchor (the others are activities).
+    package var requestItemIDs: Set<UUID> = []
+    package var explicitTurnIDs: Set<UUID> = []
+
+    package init() {}
+}
+
+/// Why a saved input could not be placed at the conversation's execution end (O11). Nothing is
+/// changed for any refusal.
+package enum AgentTranscriptSavedInputRelocationRefusal: Equatable {
+    /// Several canonical occurrences, or several working copies, of the saved item.
+    case conflictingOccurrences
+    /// A shown occurrence is not this saved payload's bubble.
+    case inconsistentOccurrence
+    /// The working items and the canonical transcript disagree about where the item is shown.
+    case unsynchronizedWorkingItems
+    /// The proposed destination turn identity is already used.
+    case destinationCollision
+    /// The candidate failed its own postconditions.
+    case postconditionFailed
+    /// A retained full envelope (the item's own turn, a retained turn under the item's ID, or any
+    /// other full working turn) would not survive the existing ownership-aware reconciliation
+    /// unchanged (it would be regrouped, substituted, or dropped by a later rebuild).
+    case historicalEnvelopeNotReconcilable
+}
+
+/// A prepared placement: the edited canonical transcript and the matching working items.
+package struct AgentTranscriptSavedInputRelocationCandidate: Equatable {
+    package let transcript: AgentTranscript
+    package let workingItems: [AgentChatItem]
+    package let nextSequenceIndex: Int
+    /// The same user item (ID, payload, provenance, timestamp), with its new execution-end sequence.
+    package let userItem: AgentChatItem
+    /// The distinct, clean destination turn that the next attempt joins.
+    package let executionTurnID: UUID
+    /// The envelope the item left (kept with its ID, output and evidence), when it was shown.
+    package let historicalTurnID: UUID?
+}
+
+package enum AgentTranscriptSavedInputRelocation: Equatable {
+    /// The item already is the clean request of the final turn and the last working item.
+    case unchanged(userItem: AgentChatItem, executionTurnID: UUID)
+    case prepared(AgentTranscriptSavedInputRelocationCandidate)
+    case refused(AgentTranscriptSavedInputRelocationRefusal)
+}
+
 package enum AgentTranscriptIO {
     private static let hiddenTranscriptToolNames: Set<String> = [
         "wait_for_next_user_instruction",
@@ -2610,12 +2662,14 @@ package enum AgentTranscriptIO {
         nextSequenceIndex: Int? = nil,
         policy: AgentTranscriptImportPolicy = .canonical,
         compact: Bool = true,
-        protection: AgentTranscriptProjectionProtection = .none
+        protection: AgentTranscriptProjectionProtection = .none,
+        ownership: AgentTranscriptWorkingTurnOwnership = AgentTranscriptWorkingTurnOwnership()
     ) -> AgentTranscript {
         let transcript = importLegacyItems(
             filteredLegacyItems(items, policy: policy),
             terminalState: terminalState,
-            nextSequenceIndex: nextSequenceIndex
+            nextSequenceIndex: nextSequenceIndex,
+            ownership: ownership
         )
         return compact ? AgentTranscriptCompactor.compact(transcript, protection: protection) : transcript
     }
@@ -2761,7 +2815,8 @@ package enum AgentTranscriptIO {
     private static func transcriptByReplacingWorkingTurns(
         in transcript: AgentTranscript,
         with workingTranscript: AgentTranscript,
-        nextSequenceIndex: Int? = nil
+        nextSequenceIndex: Int? = nil,
+        explicitTurnIDs: Set<UUID> = []
     ) -> AgentTranscript {
         var remainingWorkingTurns = workingTranscript.turns
         var mergedTurns: [AgentTranscriptTurn] = []
@@ -2774,6 +2829,13 @@ package enum AgentTranscriptIO {
             }
             if let matchedIndex = remainingWorkingTurns.firstIndex(where: { $0.id == turn.id }) {
                 mergedTurns.append(remainingWorkingTurns.remove(at: matchedIndex))
+            } else if explicitTurnIDs.contains(turn.id) {
+                // An explicit canonical envelope is never stood in for by another rebuilt turn. One
+                // without request or activities (evidence only) has no rows to rebuild it from, so it
+                // stays exactly as it is.
+                if turn.request == nil, turn.allActivities.isEmpty {
+                    mergedTurns.append(turn)
+                }
             } else if !remainingWorkingTurns.isEmpty {
                 mergedTurns.append(remainingWorkingTurns.removeFirst())
             } else {
@@ -2806,16 +2868,32 @@ package enum AgentTranscriptIO {
         terminalState: AgentSessionRunState?
     ) -> AgentTranscript {
         var interruptedTurnsByID: [UUID: AgentTranscriptTurn] = [:]
+        // R5 interruption evidence is turn-level and never rebuilt from items: carried by turn ID.
+        var interruptionsByTurnID: [UUID: AgentTranscriptTurnInterruption] = [:]
+        // Phase 2 recovered-outcome markers are turn-level evidence too (review A F03-R1).
+        var recoveredOutcomesByTurnID: [UUID: AgentTranscriptTurnRecoveredOutcome] = [:]
         for turn in existingWorkingTranscript.turns {
+            if let interruption = turn.interruption {
+                interruptionsByTurnID[turn.id] = interruption
+            }
+            if let recoveredOutcome = turn.recoveredOutcome {
+                recoveredOutcomesByTurnID[turn.id] = recoveredOutcome
+            }
             guard turn.terminalState == .cancelled || turn.terminalState == .failed,
                   !turn.responseSpans.contains(where: { $0.lifecycle == .open })
             else { continue }
             interruptedTurnsByID[turn.id] = turn
         }
-        guard !interruptedTurnsByID.isEmpty else {
+        guard !interruptedTurnsByID.isEmpty || !interruptionsByTurnID.isEmpty || !recoveredOutcomesByTurnID.isEmpty else {
             return rebuiltWorkingTranscript
         }
         var preserved = rebuiltWorkingTranscript
+        for index in preserved.turns.indices where preserved.turns[index].interruption == nil {
+            preserved.turns[index].interruption = interruptionsByTurnID[preserved.turns[index].id]
+        }
+        for index in preserved.turns.indices where preserved.turns[index].recoveredOutcome == nil {
+            preserved.turns[index].recoveredOutcome = recoveredOutcomesByTurnID[preserved.turns[index].id]
+        }
         let finalIndex = preserved.turns.indices.last
         for index in preserved.turns.indices {
             let rebuiltTurn = preserved.turns[index]
@@ -2844,6 +2922,316 @@ package enum AgentTranscriptIO {
         return preserved
     }
 
+    // MARK: - Explicit canonical ownership (O11)
+
+    /// Whether a full working turn carries an identity the importer cannot re-derive from its rows:
+    /// it is import-shaped (one span under the turn's own deterministic span ID), and either its
+    /// request anchor is not its turn ID, or it has no request and is not the importer's leading
+    /// turn named by its first activity.
+    private static func isExplicitWorkingTurn(_ turn: AgentTranscriptTurn, isLeadingWorkingTurn: Bool) -> Bool {
+        if let request = turn.request {
+            guard turn.id != request.id else { return false }
+        } else if isLeadingWorkingTurn, let firstActivity = turn.allActivities.first, firstActivity.id == turn.id {
+            return false
+        }
+        return isImportShapedWorkingTurn(turn)
+    }
+
+    /// One response span under the turn's own deterministic span ID: the only full-turn shape the
+    /// existing reconciliation either re-derives from its rows (a normal turn) or keeps as an
+    /// explicit envelope. Multi-span, span-less, and non-deterministic-span turns are neither.
+    private static func isImportShapedWorkingTurn(_ turn: AgentTranscriptTurn) -> Bool {
+        turn.responseSpans.count == 1
+            && turn.responseSpans[0].id == deterministicSpanID(turnID: turn.id, ordinal: 0)
+    }
+
+    /// The explicit canonical ownership of the transcript's full working turns (empty for every
+    /// transcript the importer alone produced).
+    package static func explicitWorkingTurnOwnership(in transcript: AgentTranscript) -> AgentTranscriptWorkingTurnOwnership {
+        var ownership = AgentTranscriptWorkingTurnOwnership()
+        var isLeadingWorkingTurn = true
+        for turn in transcript.turns where turn.retentionTier == .full {
+            let isLeading = isLeadingWorkingTurn
+            isLeadingWorkingTurn = false
+            addExplicitOwnership(of: turn, isLeadingWorkingTurn: isLeading, to: &ownership)
+        }
+        return ownership
+    }
+
+    /// The explicit ownership of the final full working turn only: the incremental final-turn
+    /// path's whole context (earlier turns are reused unchanged, so they need no ownership).
+    package static func explicitFinalWorkingTurnOwnership(in transcript: AgentTranscript) -> AgentTranscriptWorkingTurnOwnership {
+        var ownership = AgentTranscriptWorkingTurnOwnership()
+        guard let finalIndex = transcript.turns.lastIndex(where: { $0.retentionTier == .full }) else { return ownership }
+        let isLeading = transcript.turns.firstIndex(where: { $0.retentionTier == .full }) == finalIndex
+        addExplicitOwnership(of: transcript.turns[finalIndex], isLeadingWorkingTurn: isLeading, to: &ownership)
+        return ownership
+    }
+
+    private static func addExplicitOwnership(
+        of turn: AgentTranscriptTurn,
+        isLeadingWorkingTurn: Bool,
+        to ownership: inout AgentTranscriptWorkingTurnOwnership
+    ) {
+        guard isExplicitWorkingTurn(turn, isLeadingWorkingTurn: isLeadingWorkingTurn) else { return }
+        ownership.explicitTurnIDs.insert(turn.id)
+        if let request = turn.request {
+            ownership.turnIDByItemID[request.id] = turn.id
+            ownership.requestItemIDs.insert(request.id)
+        }
+        for activity in turn.allActivities {
+            ownership.turnIDByItemID[activity.id] = turn.id
+        }
+    }
+
+    /// Keeps, for each rebuilt explicit turn, the envelope metadata its rows cannot re-derive: the
+    /// turn's start and, per same-ID span, its start, retained process run, and provider turn.
+    /// A closed, unchanged explicit envelope (same request, span IDs, and activity rows; no open span
+    /// before or after the rebuild) also keeps its recorded completion: the turn's terminal state,
+    /// last activity, and completion, and each span's lifecycle, last activity, and completion. A
+    /// changed or live turn (new rows, or a rebuilt open span) takes the rebuild; the rebuilt final
+    /// turn keeps a recorded terminal state only when the supplied run state does not decide
+    /// otherwise (`nil`, idle, or the same state).
+    private static func preservingExplicitTurnEnvelopes(
+        in rebuiltTranscript: AgentTranscript,
+        existingWorkingTranscript: AgentTranscript,
+        ownership: AgentTranscriptWorkingTurnOwnership,
+        terminalState: AgentSessionRunState?
+    ) -> AgentTranscript {
+        guard !ownership.explicitTurnIDs.isEmpty else { return rebuiltTranscript }
+        var existingTurnsByID: [UUID: AgentTranscriptTurn] = [:]
+        for turn in existingWorkingTranscript.turns where ownership.explicitTurnIDs.contains(turn.id) {
+            if existingTurnsByID[turn.id] == nil {
+                existingTurnsByID[turn.id] = turn
+            }
+        }
+        var preserved = rebuiltTranscript
+        let finalIndex = preserved.turns.indices.last
+        for index in preserved.turns.indices {
+            guard let existingTurn = existingTurnsByID[preserved.turns[index].id] else { continue }
+            var turn = preserved.turns[index]
+            turn.startedAt = existingTurn.startedAt
+            let isClosedUnchanged = turn.request?.id == existingTurn.request?.id
+                && turn.responseSpans.map(\.id) == existingTurn.responseSpans.map(\.id)
+                && turn.responseSpans.map { $0.activities.map(\.id) } == existingTurn.responseSpans.map { $0.activities.map(\.id) }
+                && !turn.responseSpans.contains { $0.lifecycle == .open }
+                && !existingTurn.responseSpans.contains { $0.lifecycle == .open }
+                && turn.completedAt != nil
+                && existingTurn.completedAt != nil
+            if isClosedUnchanged {
+                turn.lastActivityAt = existingTurn.lastActivityAt
+                turn.completedAt = existingTurn.completedAt
+                if index != finalIndex || terminalState == nil || terminalState == .idle || terminalState == existingTurn.terminalState {
+                    turn.terminalState = existingTurn.terminalState
+                }
+            }
+            for spanIndex in turn.responseSpans.indices {
+                let spanID = turn.responseSpans[spanIndex].id
+                guard let existingSpan = existingTurn.responseSpans.first(where: { $0.id == spanID }) else { continue }
+                turn.responseSpans[spanIndex].startedAt = existingSpan.startedAt
+                if turn.responseSpans[spanIndex].runID == nil {
+                    turn.responseSpans[spanIndex].runID = existingSpan.runID
+                }
+                if turn.responseSpans[spanIndex].providerTurnID == nil {
+                    turn.responseSpans[spanIndex].providerTurnID = existingSpan.providerTurnID
+                }
+                if isClosedUnchanged {
+                    turn.responseSpans[spanIndex].lifecycle = existingSpan.lifecycle
+                    turn.responseSpans[spanIndex].lastActivityAt = existingSpan.lastActivityAt
+                    turn.responseSpans[spanIndex].completedAt = existingSpan.completedAt
+                }
+            }
+            preserved.turns[index] = turn
+        }
+        return preserved
+    }
+
+    /// O11 conservative shape preflight for Send saved: every full working turn is import-shaped
+    /// (matched by ID or kept as an explicit envelope by the existing reconciliation, never
+    /// positionally substituted) and carries no user activity other than `exceptUserItemID` (a
+    /// mid-turn user row the importer would split into its own turn). Unsupported shapes refuse.
+    private static func hasSupportedWorkingEnvelopes(_ transcript: AgentTranscript, exceptUserItemID: UUID) -> Bool {
+        transcript.turns.allSatisfy { turn in
+            guard turn.retentionTier == .full else { return true }
+            return isImportShapedWorkingTurn(turn)
+                && !turn.allActivities.contains { $0.itemKind == .user && $0.id != exceptUserItemID }
+        }
+    }
+
+    /// Whether `turn` can receive a new execution of its request: no output, no execution
+    /// evidence, and no recovery attempt that already joins it.
+    private static func isCleanExecutionDestination(_ turn: AgentTranscriptTurn, referencedTurnIDs: Set<UUID>) -> Bool {
+        turn.retentionTier == .full
+            && turn.allActivities.isEmpty
+            && turn.interruption == nil
+            && turn.recoveredOutcome == nil
+            && turn.responseSpans.allSatisfy { $0.runID == nil && $0.providerTurnID == nil }
+            && !referencedTurnIDs.contains(turn.id)
+    }
+
+    /// O11 pure placement of one conclusively unsent saved input at the conversation's execution
+    /// end. The same user item (`savedItem.id`) leaves only its own occurrence: a request anchor or a
+    /// user activity, in any tier. Its envelope keeps its turn ID, spans, every other activity,
+    /// terminal state, interruption, and recovered outcome (a full envelope's rebuildable caches are
+    /// re-derived by the importer's rules; a compacted envelope's summary prose stays opaque, only
+    /// its request text is cleared). The item (shown copy, or `savedItem` when no occurrence
+    /// survives) gets the next sequence (one counter advance) and its original timestamp, under a
+    /// new destination turn `proposedExecutionTurnID` that carries no inherited evidence. A clean
+    /// final request that is also the last working item is reused (`unchanged`), so repeating the
+    /// preparation is idempotent. `referencedTurnIDs` are turns that recovery attempts already join:
+    /// such a turn is historical and never reused. No compaction or retiering runs here.
+    package static func relocatingSavedInput(
+        in transcript: AgentTranscript,
+        workingItems: [AgentChatItem],
+        savedItem: AgentChatItem,
+        isConsistentOccurrence: (AgentChatItem) -> Bool,
+        referencedTurnIDs: Set<UUID>,
+        terminalState: AgentSessionRunState?,
+        nextSequenceIndex: Int,
+        proposedExecutionTurnID: UUID
+    ) -> AgentTranscriptSavedInputRelocation {
+        let userItemID = savedItem.id
+        var locations: [(turnIndex: Int, spanIndex: Int?, activityIndex: Int?)] = []
+        for (turnIndex, turn) in transcript.turns.enumerated() {
+            if turn.request?.id == userItemID {
+                locations.append((turnIndex, nil, nil))
+            }
+            for (spanIndex, span) in turn.responseSpans.enumerated() {
+                for (activityIndex, activity) in span.activities.enumerated() where activity.id == userItemID {
+                    locations.append((turnIndex, spanIndex, activityIndex))
+                }
+            }
+        }
+        let workingIndices = workingItems.indices.filter { workingItems[$0].id == userItemID }
+        guard locations.count <= 1, workingIndices.count <= 1 else {
+            return .refused(.conflictingOccurrences)
+        }
+        let location = locations.first
+        // A canonical full-tier occurrence and its working copy are one logical item.
+        let isFullLocation = location.map { transcript.turns[$0.turnIndex].retentionTier == .full } ?? false
+        guard isFullLocation == !workingIndices.isEmpty else {
+            return .refused(.unsynchronizedWorkingItems)
+        }
+        var canonicalItem: AgentChatItem?
+        if let location {
+            let turn = transcript.turns[location.turnIndex]
+            if let spanIndex = location.spanIndex, let activityIndex = location.activityIndex {
+                canonicalItem = turn.responseSpans[spanIndex].activities[activityIndex].toItem()
+            } else {
+                canonicalItem = turn.request?.toItem()
+            }
+        }
+        let workingItem = workingIndices.first.map { workingItems[$0] }
+        for occurrence in [canonicalItem, workingItem].compactMap(\.self) {
+            guard occurrence.kind == .user, isConsistentOccurrence(occurrence) else {
+                return .refused(.inconsistentOccurrence)
+            }
+        }
+        let shownItem = workingItem ?? canonicalItem
+
+        // Before any reuse or mutation (conservative shape preflight): every retained full envelope
+        // must have a shape the existing ownership-aware reconciliation keeps (import-shaped, so it
+        // is matched by ID or kept as explicit, never positionally substituted), and none may carry a
+        // user activity the importer would split out (A's own occurrence is the one being removed).
+        // Otherwise the forced owner save of a reused turn, or a later rebuild, could regroup,
+        // substitute, or drop it, so the placement is refused (nothing changes).
+        guard hasSupportedWorkingEnvelopes(transcript, exceptUserItemID: userItemID) else {
+            return .refused(.historicalEnvelopeNotReconcilable)
+        }
+
+        if let location, location.spanIndex == nil, location.turnIndex == transcript.turns.indices.last,
+           let shownItem, workingItems.last?.id == userItemID,
+           isCleanExecutionDestination(transcript.turns[location.turnIndex], referencedTurnIDs: referencedTurnIDs)
+        {
+            return .unchanged(userItem: shownItem, executionTurnID: transcript.turns[location.turnIndex].id)
+        }
+
+        let executionTurnID = proposedExecutionTurnID
+        guard executionTurnID != userItemID,
+              !transcript.turns.contains(where: { $0.id == executionTurnID }),
+              !workingItems.contains(where: { $0.id == executionTurnID })
+        else {
+            return .refused(.destinationCollision)
+        }
+        var edited = transcript
+        var historicalTurnID: UUID?
+        if let location {
+            let turnIndex = location.turnIndex
+            var turn = edited.turns[turnIndex]
+            historicalTurnID = turn.id
+            if let spanIndex = location.spanIndex, let activityIndex = location.activityIndex {
+                turn.responseSpans[spanIndex].activities.remove(at: activityIndex)
+            } else {
+                turn.request = nil
+                turn.summary?.requestText = nil
+            }
+            if turn.conclusionActivityID == userItemID {
+                turn.conclusionActivityID = nil
+            }
+            if turn.retentionTier == .full {
+                finalizeTurn(
+                    &turn,
+                    priorTurns: edited.turns[..<turnIndex].filter { $0.retentionTier == .full },
+                    terminalState: nil,
+                    isCompleted: turn.completedAt != nil
+                )
+            }
+            edited.turns[turnIndex] = turn
+        }
+        var items = workingItems
+        if let workingIndex = workingIndices.first {
+            items.remove(at: workingIndex)
+        }
+        let sequenceIndex = max(
+            nextSequenceIndex,
+            edited.nextSequenceIndex,
+            (items.map(\.sequenceIndex).max() ?? -1) + 1
+        )
+        var movedItem = shownItem ?? savedItem
+        movedItem.sequenceIndex = sequenceIndex
+        items.append(movedItem)
+        let followingSequenceIndex = sequenceIndex + 1
+        var destinationOwnership = AgentTranscriptWorkingTurnOwnership()
+        destinationOwnership.turnIDByItemID[userItemID] = executionTurnID
+        destinationOwnership.requestItemIDs.insert(userItemID)
+        destinationOwnership.explicitTurnIDs.insert(executionTurnID)
+        guard let destination = importLegacyItems(
+            [movedItem],
+            terminalState: terminalState,
+            nextSequenceIndex: followingSequenceIndex,
+            ownership: destinationOwnership
+        ).turns.first else {
+            return .refused(.postconditionFailed)
+        }
+        edited.turns.append(destination)
+        edited.nextSequenceIndex = max(edited.nextSequenceIndex, followingSequenceIndex)
+
+        // Postconditions: exactly one logical occurrence, at the end, in the clean destination;
+        // every earlier turn kept in order; the working suffix ends with the same item.
+        let occurrenceCount = edited.turns.reduce(into: 0) { count, turn in
+            if turn.request?.id == userItemID { count += 1 }
+            count += turn.allActivities.count { $0.id == userItemID }
+        }
+        guard occurrenceCount == 1,
+              edited.turns.last?.id == executionTurnID,
+              edited.turns.last?.request?.id == userItemID,
+              edited.turns.last?.allActivities.isEmpty == true,
+              edited.turns.dropLast().map(\.id) == transcript.turns.map(\.id),
+              items.count(where: { $0.id == userItemID }) == 1,
+              items.last?.id == userItemID
+        else {
+            return .refused(.postconditionFailed)
+        }
+        return .prepared(AgentTranscriptSavedInputRelocationCandidate(
+            transcript: edited,
+            workingItems: items,
+            nextSequenceIndex: followingSequenceIndex,
+            userItem: movedItem,
+            executionTurnID: executionTurnID,
+            historicalTurnID: historicalTurnID
+        ))
+    }
+
     package static func rebuiltTranscriptPreservingCompactedPrefix(
         existingTranscript: AgentTranscript,
         workingItems: [AgentChatItem],
@@ -2860,6 +3248,9 @@ package enum AgentTranscriptIO {
         #endif
         let existingWorkingTranscript = workingDetailTranscript(from: existingTranscript)
         let rebuiltWorkingTranscript: AgentTranscript
+        // Explicit envelopes matter only for the full rebuild's merge: an incremental update keeps
+        // every earlier turn by ID and its own final-turn guard covers the final envelope.
+        var explicitTurnIDs: Set<UUID> = []
         if let earliestChangedIndex,
            !workingItems.isEmpty,
            let incrementallyUpdatedTranscript = incrementallyUpdatedTranscriptForFinalTurn(
@@ -2877,13 +3268,21 @@ package enum AgentTranscriptIO {
             #endif
             rebuiltWorkingTranscript = incrementallyUpdatedTranscript
         } else {
-            rebuiltWorkingTranscript = buildTranscript(
-                from: workingItems,
-                terminalState: terminalState,
-                nextSequenceIndex: nextSequenceIndex,
-                policy: policy,
-                compact: false,
-                protection: protection
+            let ownership = explicitWorkingTurnOwnership(in: existingWorkingTranscript)
+            explicitTurnIDs = ownership.explicitTurnIDs
+            rebuiltWorkingTranscript = preservingExplicitTurnEnvelopes(
+                in: buildTranscript(
+                    from: workingItems,
+                    terminalState: terminalState,
+                    nextSequenceIndex: nextSequenceIndex,
+                    policy: policy,
+                    compact: false,
+                    protection: protection,
+                    ownership: ownership
+                ),
+                existingWorkingTranscript: existingWorkingTranscript,
+                ownership: ownership,
+                terminalState: terminalState
             )
         }
         var mergedTranscript = transcriptByReplacingWorkingTurns(
@@ -2893,7 +3292,8 @@ package enum AgentTranscriptIO {
                 existingWorkingTranscript: existingWorkingTranscript,
                 terminalState: terminalState
             ),
-            nextSequenceIndex: nextSequenceIndex ?? rebuiltWorkingTranscript.nextSequenceIndex
+            nextSequenceIndex: nextSequenceIndex ?? rebuiltWorkingTranscript.nextSequenceIndex,
+            explicitTurnIDs: explicitTurnIDs
         )
         let reusableFrozenPrefixTurnCount = AgentTranscriptDurableFrontierSupport.validatedFrozenPrefixTurnCountForIncrementalReuse(
             in: existingTranscript
@@ -2982,13 +3382,23 @@ package enum AgentTranscriptIO {
             ))
         }
         let suffixItems = Array(items[finalTurnStartIndex...])
-        let rebuiltSuffixTranscript = buildTranscript(
-            from: suffixItems,
-            terminalState: terminalState,
-            nextSequenceIndex: nextSequenceIndex,
-            policy: policy,
-            compact: false,
-            protection: protection
+        // The suffix keeps the canonical execution turn of an explicitly owned final request (O11);
+        // only the final full working turn's ownership and envelope are needed here.
+        let existingWorkingTranscript = workingDetailTranscript(from: existingTranscript)
+        let ownership = explicitFinalWorkingTurnOwnership(in: existingWorkingTranscript)
+        let rebuiltSuffixTranscript = preservingExplicitTurnEnvelopes(
+            in: buildTranscript(
+                from: suffixItems,
+                terminalState: terminalState,
+                nextSequenceIndex: nextSequenceIndex,
+                policy: policy,
+                compact: false,
+                protection: protection,
+                ownership: ownership
+            ),
+            existingWorkingTranscript: existingWorkingTranscript,
+            ownership: ownership,
+            terminalState: terminalState
         )
         guard rebuiltSuffixTranscript.turns.count == 1,
               let rebuiltFinalTurn = rebuiltSuffixTranscript.turns.first,
@@ -3000,7 +3410,9 @@ package enum AgentTranscriptIO {
                 finalTurnItemCount: finalTurnItemCount
             ))
         }
-        guard existingFinalTurn.request?.id == rebuiltFinalTurn.request?.id else {
+        guard existingFinalTurn.request?.id == rebuiltFinalTurn.request?.id,
+              existingFinalTurn.id == rebuiltFinalTurn.id || !ownership.explicitTurnIDs.contains(existingFinalTurn.id)
+        else {
             return .rejected(.requestIDMismatch(
                 finalTurnStartIndex: finalTurnStartIndex,
                 finalTurnItemCount: finalTurnItemCount
@@ -3071,7 +3483,8 @@ package enum AgentTranscriptIO {
         terminalState: AgentSessionRunState,
         includeExplicitRepoPromptToolCalls: Bool,
         maxSequenceIndexExclusive: Int? = nil,
-        nonToolBoundary: Int
+        nonToolBoundary: Int,
+        protectedItemIDs: Set<UUID> = []
     ) -> Int {
         guard !items.isEmpty else { return 0 }
         var finalizedCount = 0
@@ -3080,6 +3493,14 @@ package enum AgentTranscriptIO {
             if let maxSequenceIndexExclusive,
                items[index].sequenceIndex >= maxSequenceIndexExclusive
             {
+                continue
+            }
+            // Step 4d5: a provider-history-associated tool row (a canonical Claude call or result,
+            // imported or live) is complete as projected: it is never finalized into a fallback.
+            if protectedItemIDs.contains(items[index].id),
+               items[index].kind == .toolCall || items[index].kind == .toolResult
+            {
+                consecutiveNonToolItems = 0
                 continue
             }
             switch items[index].kind {
@@ -3285,10 +3706,15 @@ package enum AgentTranscriptIO {
         items.lastIndex(where: { $0.kind == .user })
     }
 
+    /// Legacy import: each user item opens a turn (its own ID), and any other item joins the open
+    /// turn. `ownership` (O11) names the canonical turn of items whose explicit turn the user-row
+    /// boundaries cannot re-derive: such an item opens or joins exactly that turn, so reconciliation
+    /// never regroups explicitly owned historical output or renames a distinct execution turn.
     package static func importLegacyItems(
         _ items: [AgentChatItem],
         terminalState: AgentSessionRunState? = nil,
-        nextSequenceIndex: Int? = nil
+        nextSequenceIndex: Int? = nil,
+        ownership: AgentTranscriptWorkingTurnOwnership = AgentTranscriptWorkingTurnOwnership()
     ) -> AgentTranscript {
         guard !items.isEmpty else {
             return AgentTranscript(version: 3, turns: [], nextSequenceIndex: nextSequenceIndex ?? 0)
@@ -3338,10 +3764,10 @@ package enum AgentTranscriptIO {
             pendingStableExecutionIDsByToolName.removeAll(keepingCapacity: false)
         }
 
-        func ensureCurrentTurn(for item: AgentChatItem) {
+        func ensureCurrentTurn(for item: AgentChatItem, ownedTurnID: UUID?) {
             if currentTurn == nil {
                 currentTurn = AgentTranscriptTurn(
-                    id: item.id,
+                    id: ownedTurnID ?? item.id,
                     request: nil,
                     startedAt: item.timestamp,
                     lastActivityAt: item.timestamp,
@@ -3358,22 +3784,27 @@ package enum AgentTranscriptIO {
         }
 
         for item in orderedItems {
-            if item.kind == .user {
+            let ownedTurnID = ownership.turnIDByItemID[item.id]
+            if item.kind == .user, ownedTurnID == nil || ownership.requestItemIDs.contains(item.id) {
                 flushCurrentTurn(isCompleted: true, terminalState: nil)
+                let turnID = ownedTurnID ?? item.id
                 currentTurn = AgentTranscriptTurn(
-                    id: item.id,
+                    id: turnID,
                     request: AgentTranscriptRequestAnchor(from: item),
                     startedAt: item.timestamp,
                     lastActivityAt: nil,
                     completedAt: nil
                 )
                 currentSpan = AgentTranscriptProviderResponseSpan(
-                    id: deterministicSpanID(turnID: item.id, ordinal: 0),
+                    id: deterministicSpanID(turnID: turnID, ordinal: 0),
                     startedAt: item.timestamp
                 )
                 continue
             }
-            ensureCurrentTurn(for: item)
+            if let ownedTurnID, currentTurn?.id != ownedTurnID {
+                flushCurrentTurn(isCompleted: true, terminalState: nil)
+            }
+            ensureCurrentTurn(for: item, ownedTurnID: ownedTurnID)
             guard var span = currentSpan else { continue }
             var toolExecution = AgentTranscriptToolNormalizer.toolExecution(for: item, context: processingContext)
             if var resolvedToolExecution = toolExecution {

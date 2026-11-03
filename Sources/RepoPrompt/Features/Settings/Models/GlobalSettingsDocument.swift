@@ -7,7 +7,7 @@ import RepoPromptAgentCore
 /// Schema v1 contains copy settings, chat settings, and cross-workspace global
 /// defaults. Schema v2 adds optional scalar preference groups. Schema v4 adds
 /// workspace-scoped Agent Models profiles. Schema v5 protects persisted per-role OMP
-/// thinking intent. Scalar fields stay optional so missing
+/// thinking intent. Schema v6 protects workspace steering grants. Scalar fields stay optional so missing
 /// JSON fields fall back through the typed GlobalSettingsStore accessors without
 /// losing current default behavior.
 struct GlobalSettingsDocument: Codable {
@@ -17,7 +17,9 @@ struct GlobalSettingsDocument: Codable {
     static let baselineSchemaVersion = 2
     static let workspaceAgentModelsSchemaVersion = 4
     static let mcpAgentRoleOhMyPiThinkingSchemaVersion = 5
-    static let currentSchemaVersion = 5
+    /// Nonempty grants stamp v6 so builds without grant support preserve (never overwrite) them.
+    static let workspaceSteeringGrantsSchemaVersion = 6
+    static let currentSchemaVersion = 6
     /// Lineage marker for settings files written by this open-source CE schema family.
     ///
     /// CE inherited numeric schema versions from classic/internal builds, so version numbers
@@ -94,6 +96,9 @@ struct GlobalSettingsDocument: Codable {
         } == true
         if hasGlobalRoleThinking || hasWorkspaceRoleThinking {
             requiredVersion = max(requiredVersion, Self.mcpAgentRoleOhMyPiThinkingSchemaVersion)
+        }
+        if scalarPreferences?.workspaceSteeringGrants?.isEmpty == false {
+            requiredVersion = max(requiredVersion, Self.workspaceSteeringGrantsSchemaVersion)
         }
         return requiredVersion
     }
@@ -447,6 +452,9 @@ struct GlobalScalarPreferences: Codable, Equatable {
     /// Telegram attention notifications (enable flag and chat ID only; the bot token lives in
     /// secure storage, never here).
     var telegram: TelegramSettings?
+    /// One-way workspace→workspace steering grants; nil (the old-file default) means none.
+    /// Nonempty grants require schema v6. Written only through `WorkspaceSteeringGrantStore`.
+    var workspaceSteeringGrants: [WorkspaceSteeringGrant]?
 
     init(
         ui: UISettings? = nil,
@@ -457,7 +465,8 @@ struct GlobalScalarPreferences: Codable, Equatable {
         agentMode: AgentModeSettings? = nil,
         telemetry: TelemetrySettings? = nil,
         modelOverrides: ModelOverrideSettingsData? = nil,
-        telegram: TelegramSettings? = nil
+        telegram: TelegramSettings? = nil,
+        workspaceSteeringGrants: [WorkspaceSteeringGrant]? = nil
     ) {
         self.ui = ui
         self.promptPackaging = promptPackaging
@@ -468,6 +477,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
         self.telemetry = telemetry
         self.modelOverrides = modelOverrides
         self.telegram = telegram
+        self.workspaceSteeringGrants = workspaceSteeringGrants
     }
 
     struct UISettings: Codable, Equatable {
@@ -583,6 +593,9 @@ struct GlobalScalarPreferences: Codable, Equatable {
     }
 
     struct MCPSettings: Codable, Equatable {
+        /// Suggested `tailscale serve --https` port for the browser remote (Serve's 443 may be taken).
+        static let suggestedBrowserHTTPSPort = 8443
+
         var autoStart: Bool?
         var showModelPresets: Bool?
         var temporarilyDisablePresets: Bool?
@@ -590,6 +603,9 @@ struct GlobalScalarPreferences: Codable, Equatable {
         var remoteGatewayBindAddress: String?
         var remoteGatewayPort: Int?
         var remoteControlShowPairingDetails: Bool?
+        /// The owner's `tailscale serve --https=<port>` listener that forwards to this build's
+        /// gateway. Missing means unset: no browser HTTPS origin and no Telegram session links.
+        var remoteGatewayBrowserHTTPSPort: Int?
         /// `MCPStructuredResultsMode` raw value; nil or unknown reads as `off`.
         var structuredResults: String?
 
@@ -601,6 +617,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
             remoteGatewayBindAddress: String? = nil,
             remoteGatewayPort: Int? = nil,
             remoteControlShowPairingDetails: Bool? = nil,
+            remoteGatewayBrowserHTTPSPort: Int? = nil,
             structuredResults: String? = nil
         ) {
             self.autoStart = autoStart
@@ -610,7 +627,13 @@ struct GlobalScalarPreferences: Codable, Equatable {
             self.remoteGatewayBindAddress = remoteGatewayBindAddress
             self.remoteGatewayPort = remoteGatewayPort
             self.remoteControlShowPairingDetails = remoteControlShowPairingDetails
+            self.remoteGatewayBrowserHTTPSPort = remoteGatewayBrowserHTTPSPort
             self.structuredResults = structuredResults
+        }
+
+        /// A usable browser HTTPS port: 1–65535 and not 443 (left to other Serve configurations).
+        static func isValidBrowserHTTPSPort(_ port: Int) -> Bool {
+            (1 ... 65535).contains(port) && port != 443
         }
     }
 

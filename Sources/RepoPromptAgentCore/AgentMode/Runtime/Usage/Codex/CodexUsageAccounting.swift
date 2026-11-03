@@ -38,6 +38,9 @@ struct CodexUsageAccountingState: Equatable {
         /// Interval a same-turn refinement upserts; `nil` after a prospective rebaseline, where the
         /// next same-turn observation appends a new interval from `baselineTotal`.
         let intervalIndex: Int?
+        /// Highest context band applied to this turn's pricing so far. A refinement may upgrade
+        /// short → long but never downgrades, so a turn's displayed cost never decreases.
+        var appliedBandKind: OpenAIPricingContextBand.Kind?
     }
 
     var activeExecutionID: UUID?
@@ -78,19 +81,13 @@ struct CodexUsageAccountingState: Equatable {
     var unmeasuredMarkerIndexByTurnID: [String: Int] = [:]
 }
 
-/// Locally calculated API-equivalent estimate for the session (sum of disjoint owned intervals).
-/// `lower == upper` is a point estimate; otherwise the bounds come from conservative rate
-/// envelopes where a context band or the cache-write share could not be positively attributed.
-/// Never an invoice.
+/// Locally calculated API-equivalent point estimate for the session (sum of disjoint owned
+/// intervals). Legacy persisted intervals priced as a range by an older build contribute their
+/// lower bound, the `W = 0` / standard-band corner of that legacy range. Never an invoice.
 struct CodexCostEstimate: Equatable {
-    var lower: Decimal
-    var upper: Decimal
+    var amount: Decimal
     var currency: String
     var coverage: AgentProviderUsageRecord.Coverage
-
-    var isPoint: Bool {
-        lower == upper
-    }
 }
 
 /// Provenance of the pricing frozen into priced intervals, for the readout's details.
@@ -124,173 +121,135 @@ enum CodexUsagePricing {
 
     enum Estimate: Equatable {
         case point(Decimal)
-        case range(lower: Decimal, upper: Decimal)
-        /// Sum of the independently priceable components only; the true cost is at least this
-        /// and the excluded component is named. Never presented as a complete figure.
-        case partialSubtotal(Decimal, unpriced: String)
         case unavailable(String)
-
-        var bounds: (lower: Decimal, upper: Decimal)? {
-            switch self {
-            case let .point(value): (value, value)
-            case let .range(lower, upper): (lower, upper)
-            case let .partialSubtotal(value, _): (value, value)
-            case .unavailable: nil
-            }
-        }
-
-        var isComplete: Bool {
-            switch self {
-            case .point, .range: true
-            case .partialSubtotal, .unavailable: false
-            }
-        }
     }
 
     struct Applied: Equatable {
         let estimate: Estimate
-        /// `all`, `shortContext`, `longContext` or `envelope`; `nil` when unavailable.
+        /// `all`, `shortContext` or `longContext`; `nil` when no band could be applied.
         let bandKind: String?
-        /// Rates actually applied (lower and upper are equal outside an envelope).
-        let appliedLowerRates: OpenAIPricingRates?
-        let appliedUpperRates: OpenAIPricingRates?
+        /// The one rate set actually applied; `nil` when no band could be applied.
+        let appliedRates: OpenAIPricingRates?
+        /// A stated pricing assumption for the details (it never lowers coverage).
+        let assumption: String?
 
-        init(estimate: Estimate, bandKind: String?, appliedLowerRates: OpenAIPricingRates? = nil, appliedUpperRates: OpenAIPricingRates? = nil) {
+        init(estimate: Estimate, bandKind: String?, appliedRates: OpenAIPricingRates? = nil, assumption: String? = nil) {
             self.estimate = estimate
             self.bandKind = bandKind
-            self.appliedLowerRates = appliedLowerRates
-            self.appliedUpperRates = appliedUpperRates
+            self.appliedRates = appliedRates
+            self.assumption = assumption
         }
     }
 
-    /// Prices one owned interval: `ordinary input = I − C − W`, plus cached, cache-write and
-    /// reasoning-inclusive output at the frozen Standard/global list rates. Counts must be
-    /// non-negative, `C + W <= I` when known, and every rate an included component needs must be
-    /// listed; a missing necessary rate is unavailable, never free.
+    /// Diagnostic for a model listing short and long bands without an official qualifier.
+    static let unstatedContextThresholdAssumption = "long-context qualifier not stated; standard-context rates applied"
+    /// Diagnostic for a banded model when neither the context window nor the latest request size
+    /// proves the band.
+    static let unknownRequestSizeAssumption = "latest request size unavailable; standard-context rates applied"
+
+    /// Prices one owned interval as a single point: `ordinary input = I − C − W` at the input
+    /// rate, `C` at the cached-input rate, `W` at the cache-write rate and reasoning-inclusive
+    /// output at the output rate, all from the frozen Standard/global list prices. An absent
+    /// cache-write count is the installed v2 schema default of zero (the provider reported no
+    /// cache-write component). Counts must be non-negative and `C + W <= I`; a rate that an
+    /// included non-zero component needs must be listed, otherwise the interval is unavailable,
+    /// never free.
     ///
-    /// An unknown cache-write count is never normalized to zero: with a listed write rate the
-    /// `I − C` remainder is bounded over `W ∈ 0...I−C` as a range; without one, only the
-    /// independently priceable components form an explicitly partial subtotal.
-    static func estimate(_ delta: Delta, resolution: OpenAIModelPricingResolution) -> Applied {
+    /// Context band (model with a stated threshold), in order:
+    /// 1. `minimumBand == .longContext` (the open turn was already priced long) keeps the long
+    ///    band: refinements never downgrade a turn.
+    /// 2. A known `modelContextWindow` below the threshold proves no request can reach the long
+    ///    band: short.
+    /// 3. A positive `requestContextTokens` (the latest request's total input,
+    ///    `observation.last.inputTokens`, which the official `<272K context` qualifier applies
+    ///    to): short below the threshold, long at or above it. Zero or negative is missing.
+    /// 4. Otherwise the standard (short) band with `unknownRequestSizeAssumption`; the summed
+    ///    interval is never used, because it spans many requests.
+    /// A model listing a long band without a stated threshold uses the standard band and names
+    /// that assumption. Assumptions never lower coverage.
+    static func estimate(
+        _ delta: Delta,
+        requestContextTokens: Int64? = nil,
+        modelContextWindow: Int64? = nil,
+        minimumBand: OpenAIPricingContextBand.Kind? = nil,
+        resolution: OpenAIModelPricingResolution
+    ) -> Applied {
         guard let input = delta.input, let output = delta.output else {
             return Applied(estimate: .unavailable("input or output count missing"), bandKind: nil)
         }
         guard let cached = delta.cached else {
             return Applied(estimate: .unavailable("cached input count missing"), bandKind: nil)
         }
-        let cacheWrite = delta.cacheWrite
-        guard input >= 0, cached >= 0, output >= 0, (cacheWrite ?? 0) >= 0 else {
+        let cacheWrite = delta.cacheWrite ?? 0
+        guard input >= 0, cached >= 0, output >= 0, cacheWrite >= 0 else {
             return Applied(estimate: .unavailable("negative counter"), bandKind: nil)
         }
-        let (cacheSide, overflow) = cached.addingReportingOverflow(cacheWrite ?? 0)
+        let (cacheSide, overflow) = cached.addingReportingOverflow(cacheWrite)
         guard !overflow, cacheSide <= input else {
             return Applied(estimate: .unavailable("cached and cache-write input exceed input"), bandKind: nil)
         }
-        let pricing = resolution.pricing
+        let band: OpenAIPricingContextBand
+        var assumption: String?
+        switch selectBand(
+            resolution.pricing,
+            requestContextTokens: requestContextTokens.flatMap { $0 > 0 ? $0 : nil },
+            modelContextWindow: modelContextWindow.flatMap { $0 > 0 ? $0 : nil },
+            minimumBand: minimumBand
+        ) {
+        case let .success(selection):
+            band = selection.band
+            assumption = selection.assumption
+        case let .failure(reason):
+            return Applied(estimate: .unavailable(reason.message), bandKind: nil)
+        }
+        return Applied(
+            estimate: price(input: input, cached: cached, cacheWrite: cacheWrite, output: output, rates: band.rates),
+            bandKind: band.kind.rawValue,
+            appliedRates: band.rates,
+            assumption: assumption
+        )
+    }
+
+    private struct BandSelectionFailure: Error {
+        let message: String
+    }
+
+    /// The one band that applies to the interval (see `estimate` for the evidence order).
+    private static func selectBand(
+        _ pricing: OpenAIModelPricing,
+        requestContextTokens: Int64?,
+        modelContextWindow: Int64?,
+        minimumBand: OpenAIPricingContextBand.Kind?
+    ) -> Result<(band: OpenAIPricingContextBand, assumption: String?), BandSelectionFailure> {
         if let flat = pricing.flatRates {
-            return Applied(
-                estimate: combine([priceSet(input: input, cached: cached, cacheWrite: cacheWrite, output: output, rates: flat)]),
-                bandKind: OpenAIPricingContextBand.Kind.all.rawValue,
-                appliedLowerRates: flat,
-                appliedUpperRates: flat
-            )
+            return .success((OpenAIPricingContextBand(kind: .all, rates: flat), nil))
         }
-        // A summed interval below the official threshold proves every request in it used the
-        // short-context band; at or above it the band cannot be attributed and the envelope bounds it.
-        if let threshold = pricing.contextThresholdTokens, input < Int64(threshold),
-           let band = pricing.band(forContextTokens: Int(input))
-        {
-            return Applied(
-                estimate: combine([priceSet(input: input, cached: cached, cacheWrite: cacheWrite, output: output, rates: band.rates)]),
-                bandKind: band.kind.rawValue,
-                appliedLowerRates: band.rates,
-                appliedUpperRates: band.rates
-            )
+        func listed(_ kind: OpenAIPricingContextBand.Kind) -> OpenAIPricingContextBand? {
+            pricing.bands.first { $0.kind == kind }
         }
-        let envelope = pricing.rateEnvelope
-        let lowerRates = OpenAIPricingRates(
-            input: envelope.input?.lowerBound,
-            cachedInput: envelope.cachedInput?.lowerBound,
-            cacheWrite: envelope.cacheWrite?.lowerBound,
-            output: envelope.output?.lowerBound
-        )
-        let upperRates = OpenAIPricingRates(
-            input: envelope.input?.upperBound,
-            cachedInput: envelope.cachedInput?.upperBound,
-            cacheWrite: envelope.cacheWrite?.upperBound,
-            output: envelope.output?.upperBound
-        )
-        let combined = combine([
-            priceSet(input: input, cached: cached, cacheWrite: cacheWrite, output: output, rates: lowerRates),
-            priceSet(input: input, cached: cached, cacheWrite: cacheWrite, output: output, rates: upperRates)
-        ])
-        if case let .unavailable(reason) = combined {
-            return Applied(estimate: .unavailable("context band not attributable; \(reason)"), bandKind: nil)
-        }
-        return Applied(estimate: combined, bandKind: "envelope", appliedLowerRates: lowerRates, appliedUpperRates: upperRates)
-    }
-
-    /// Prices against one rate set, bounding or partially pricing an unknown cache-write count.
-    private static func priceSet(input: Int64, cached: Int64, cacheWrite: Int64?, output: Int64, rates: OpenAIPricingRates) -> Estimate {
-        if let cacheWrite {
-            return price(input: input, cached: cached, cacheWrite: cacheWrite, output: output, rates: rates)
-        }
-        let remainder = input - cached
-        if remainder == 0 {
-            return price(input: input, cached: cached, cacheWrite: 0, output: output, rates: rates)
-        }
-        if rates.cacheWrite != nil {
-            // W is somewhere in 0...I−C; both corners are priced and the interval bounds them.
-            let noWrites = price(input: input, cached: cached, cacheWrite: 0, output: output, rates: rates)
-            let allWrites = price(input: input, cached: cached, cacheWrite: remainder, output: output, rates: rates)
-            switch (noWrites, allWrites) {
-            case let (.point(first), .point(second)):
-                return first == second ? .point(first) : .range(lower: min(first, second), upper: max(first, second))
-            case let (.unavailable(reason), _), let (_, .unavailable(reason)):
-                return .unavailable(reason)
-            default:
-                return .unavailable("cache-write bound not priceable")
+        guard let threshold = pricing.contextThresholdTokens.map(Int64.init) else {
+            guard let standard = listed(.shortContext) else {
+                return .failure(.init(message: "no standard-context rates listed"))
             }
+            // Only a listed long band makes the missing qualifier an assumption worth naming.
+            return .success((standard, listed(.longContext) == nil ? nil : unstatedContextThresholdAssumption))
         }
-        // No listed write rate: the remainder's price is unknown (not proven ordinary input).
-        guard let outputRate = rates.output else { return .unavailable("output rate not listed") }
-        var subtotal = Decimal(output) * outputRate
-        if cached > 0 {
-            guard let cachedRate = rates.cachedInput else { return .unavailable("cached input rate not listed") }
-            subtotal += Decimal(cached) * cachedRate
+        let wanted: OpenAIPricingContextBand.Kind
+        var assumption: String?
+        if minimumBand == .longContext {
+            wanted = .longContext
+        } else if let modelContextWindow, modelContextWindow < threshold {
+            wanted = .shortContext
+        } else if let requestContextTokens {
+            wanted = requestContextTokens < threshold ? .shortContext : .longContext
+        } else {
+            wanted = .shortContext
+            assumption = unknownRequestSizeAssumption
         }
-        return .partialSubtotal(
-            subtotal / million,
-            unpriced: "\(remainder) input tokens (cache-write count unknown and no cache-write rate listed)"
-        )
-    }
-
-    /// Combines one or two rate-set estimates into a single conservative estimate.
-    private static func combine(_ estimates: [Estimate]) -> Estimate {
-        var lower: Decimal?
-        var upper: Decimal?
-        var subtotal: Decimal?
-        var unpriced: String?
-        for estimate in estimates {
-            switch estimate {
-            case let .point(value):
-                lower = lower.map { min($0, value) } ?? value
-                upper = upper.map { max($0, value) } ?? value
-            case let .range(low, high):
-                lower = lower.map { min($0, low) } ?? low
-                upper = upper.map { max($0, high) } ?? high
-            case let .partialSubtotal(value, reason):
-                subtotal = subtotal.map { min($0, value) } ?? value
-                unpriced = reason
-            case .unavailable:
-                return estimate
-            }
+        guard let band = listed(wanted) else {
+            return .failure(.init(message: "no listed rates for the request's context band"))
         }
-        if let subtotal {
-            return .partialSubtotal(min(subtotal, lower ?? subtotal), unpriced: unpriced ?? "")
-        }
-        guard let lower, let upper else { return .unavailable("nothing to price") }
-        return lower == upper ? .point(lower) : .range(lower: lower, upper: upper)
+        return .success((band, assumption))
     }
 
     private static func price(input: Int64, cached: Int64, cacheWrite: Int64, output: Int64, rates: OpenAIPricingRates) -> Estimate {
@@ -312,15 +271,19 @@ enum CodexUsagePricing {
     }
 
     /// `current − baseline` per component; `nil` when either side is missing. Overflow is unavailable.
+    /// A cache-write count absent from the baseline but present now uses the schema default 0 for
+    /// the baseline, so writes a provider starts reporting mid-session are neither dropped from
+    /// `C + W <= I` nor priced as ordinary input. A currently absent count stays absent.
     static func delta(from baseline: CodexUsageObservation.Counters, to current: CodexUsageObservation.Counters) -> Delta? {
         func component(_ from: Int?, _ to: Int?) -> Int64?? {
             guard let from, let to else { return .some(nil) }
             let (value, overflow) = Int64(to).subtractingReportingOverflow(Int64(from))
             return overflow ? nil : .some(value)
         }
+        let baselineCacheWrite = current.cacheWriteInputTokens == nil ? baseline.cacheWriteInputTokens : (baseline.cacheWriteInputTokens ?? 0)
         guard let input = component(baseline.inputTokens, current.inputTokens),
               let cached = component(baseline.cachedInputTokens, current.cachedInputTokens),
-              let cacheWrite = component(baseline.cacheWriteInputTokens, current.cacheWriteInputTokens),
+              let cacheWrite = component(baselineCacheWrite, current.cacheWriteInputTokens),
               let output = component(baseline.outputTokens, current.outputTokens),
               let reasoning = component(baseline.reasoningOutputTokens, current.reasoningOutputTokens)
         else { return nil }
@@ -663,9 +626,11 @@ extension AgentUsageAccumulator {
 
         var baseline = previous
         var upsertIndex: Int?
+        var bandFloor: OpenAIPricingContextBand.Kind?
         if let notifiedTurnID, let open = codexState.openTurn, open.turnID == notifiedTurnID {
             baseline = open.baselineTotal
             upsertIndex = open.intervalIndex
+            bandFloor = open.appliedBandKind
         }
         let openBaseline = baseline
         guard let delta = CodexUsagePricing.delta(from: baseline, to: total), !delta.hasNegativeComponent else {
@@ -699,30 +664,33 @@ extension AgentUsageAccumulator {
                 interval.requestedModelID = basis.requestedModelID
                 if let model = basis.requestedModelID, let resolution = basis.pricing.rates(forModelID: model) {
                     interval.resolvedModelID = resolution.resolvedModelID
-                    let applied = CodexUsagePricing.estimate(delta, resolution: resolution)
+                    // The band comes from the context window proof or the latest request's
+                    // prompt size (the official qualifier is per request), never the summed
+                    // interval, and never drops below a band this turn was already priced at.
+                    let applied = CodexUsagePricing.estimate(
+                        delta,
+                        requestContextTokens: observation.last?.inputTokens.map(Int64.init),
+                        modelContextWindow: observation.modelContextWindow.map(Int64.init),
+                        minimumBand: bandFloor,
+                        resolution: resolution
+                    )
                     interval.bandKind = applied.bandKind
                     switch applied.estimate {
                     case let .point(value):
+                        // The persisted schema keeps lower/upper; a point writes both equal.
                         interval.estimatedCostLowerUSD = value
                         interval.estimatedCostUpperUSD = value
-                        complete = true
-                    case let .range(lower, upper):
-                        interval.estimatedCostLowerUSD = lower
-                        interval.estimatedCostUpperUSD = upper
-                        complete = true
-                    case let .partialSubtotal(value, unpriced):
-                        interval.estimatedCostLowerUSD = value
-                        interval.estimatedCostUpperUSD = value
-                        diagnostics.append("partial subtotal: excludes \(unpriced)")
-                    case let .unavailable(reason):
-                        diagnostics.append("not priced: \(reason)")
-                    }
-                    if applied.estimate.bounds != nil {
                         interval.appliedPricing = .init(
                             snapshot: basis.pricing,
-                            lowerRates: applied.appliedLowerRates,
-                            upperRates: applied.appliedUpperRates
+                            lowerRates: applied.appliedRates,
+                            upperRates: applied.appliedRates
                         )
+                        if let assumption = applied.assumption {
+                            diagnostics.append(assumption)
+                        }
+                        complete = true
+                    case let .unavailable(reason):
+                        diagnostics.append("not priced: \(reason)")
                     }
                 } else {
                     diagnostics.append("no Standard/global list price for requested model \(basis.requestedModelID ?? "unknown")")
@@ -739,12 +707,14 @@ extension AgentUsageAccumulator {
         interval.coverage = complete && countsComplete && subsetsConsistent ? .complete : .partial
         interval.diagnostic = diagnostics.isEmpty ? nil : diagnostics.joined(separator: "; ")
 
+        let appliedBandKind = Self.higherBand(bandFloor, interval.bandKind.flatMap(OpenAIPricingContextBand.Kind.init(rawValue:)))
         codexState.lastAcceptedTotal = total
         settleTurn(notifiedTurnID)
         if let upsertIndex, var intervals = record?.codexIntervals, intervals.indices.contains(upsertIndex) {
             intervals[upsertIndex] = interval
             record?.codexIntervals = intervals
             bumpRevision()
+            codexState.openTurn?.appliedBandKind = appliedBandKind
         } else if let notifiedTurnID, let markerIndex = codexState.unmeasuredMarkerIndexByTurnID[notifiedTurnID],
                   var intervals = record?.codexIntervals, intervals.indices.contains(markerIndex)
         {
@@ -753,11 +723,16 @@ extension AgentUsageAccumulator {
             intervals[markerIndex] = interval
             record?.codexIntervals = intervals
             bumpRevision()
-            codexState.openTurn = .init(turnID: notifiedTurnID, baselineTotal: openBaseline, intervalIndex: markerIndex)
+            codexState.openTurn = .init(turnID: notifiedTurnID, baselineTotal: openBaseline, intervalIndex: markerIndex, appliedBandKind: appliedBandKind)
         } else {
             appendCodexInterval(interval, markUnmeasured: false)
             if let notifiedTurnID {
-                codexState.openTurn = .init(turnID: notifiedTurnID, baselineTotal: openBaseline, intervalIndex: (record?.codexIntervals?.count ?? 1) - 1)
+                codexState.openTurn = .init(
+                    turnID: notifiedTurnID,
+                    baselineTotal: openBaseline,
+                    intervalIndex: (record?.codexIntervals?.count ?? 1) - 1,
+                    appliedBandKind: appliedBandKind
+                )
             } else {
                 codexState.openTurn = nil
             }
@@ -766,10 +741,20 @@ extension AgentUsageAccumulator {
     }
 
     /// Nothing is charged from this checkpoint; a later same-turn observation appends from it.
+    /// The same turn keeps its band floor.
     private mutating func rebaselineProspectively(to total: CodexUsageObservation.Counters, notifiedTurnID: String?) {
         codexState.lastAcceptedTotal = total
-        codexState.openTurn = notifiedTurnID.map { .init(turnID: $0, baselineTotal: total, intervalIndex: nil) }
+        let floor = codexState.openTurn.flatMap { $0.turnID == notifiedTurnID ? $0.appliedBandKind : nil }
+        codexState.openTurn = notifiedTurnID.map { .init(turnID: $0, baselineTotal: total, intervalIndex: nil, appliedBandKind: floor) }
         settleTurn(notifiedTurnID)
+    }
+
+    /// `.longContext` outranks every other band; otherwise the newer kind wins.
+    private static func higherBand(
+        _ floor: OpenAIPricingContextBand.Kind?,
+        _ applied: OpenAIPricingContextBand.Kind?
+    ) -> OpenAIPricingContextBand.Kind? {
+        floor == .longContext ? .longContext : (applied ?? floor)
     }
 
     /// Records that `notifiedTurnID` owns the latest accepted checkpoint (settled, no longer
@@ -898,18 +883,17 @@ extension AgentUsageAccumulator {
         return .init(ratio: Decimal(cached) / Decimal(input), coverage: complete ? .complete : .partial)
     }
 
-    /// Sum of priced disjoint intervals. Any unpriced, partially priced or unmeasured interval,
-    /// or unmeasured history, makes coverage partial; `nil` when nothing could be priced.
+    /// Sum of priced disjoint intervals as one point. Legacy intervals persisted as a range
+    /// contribute their lower bound. Any unpriced, partially priced or unmeasured interval, or
+    /// unmeasured history, makes coverage partial; `nil` when nothing could be priced.
     var codexSessionCostEstimate: CodexCostEstimate? {
         guard let record, let intervals = record.codexIntervals else { return nil }
-        var lower = Decimal(0)
-        var upper = Decimal(0)
+        var amount = Decimal(0)
         var priced = 0
         var partial = record.hasUnmeasuredHistory
         for interval in intervals {
-            if let intervalLower = interval.estimatedCostLowerUSD, let intervalUpper = interval.estimatedCostUpperUSD {
-                lower += intervalLower
-                upper += intervalUpper
+            if let intervalAmount = interval.estimatedCostLowerUSD {
+                amount += intervalAmount
                 priced += 1
             } else {
                 partial = true
@@ -919,7 +903,7 @@ extension AgentUsageAccumulator {
             }
         }
         guard priced > 0 else { return nil }
-        return .init(lower: lower, upper: upper, currency: CodexUsagePricing.currency, coverage: partial ? .partial : .complete)
+        return .init(amount: amount, currency: CodexUsagePricing.currency, coverage: partial ? .partial : .complete)
     }
 
     /// Owned intervals whose cost could not be calculated (reroute, unbound basis, unlisted price,
@@ -927,12 +911,6 @@ extension AgentUsageAccumulator {
     /// markers are counted separately.
     var codexUnpricedIntervalCount: Int {
         record?.codexIntervals?.count(where: { $0.estimatedCostLowerUSD == nil && $0.coverage != .unavailable }) ?? 0
-    }
-
-    /// Priced intervals whose estimate is an explicitly partial subtotal (unknown cache-write
-    /// count with no listed write rate).
-    var codexPartialSubtotalIntervalCount: Int {
-        record?.codexIntervals?.count(where: { $0.estimatedCostLowerUSD != nil && $0.coverage == .partial && ($0.diagnostic?.hasPrefix("partial subtotal") ?? false) }) ?? 0
     }
 
     /// Dispatched turns (or unbound dispatches) that ended without any usage observation.

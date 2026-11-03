@@ -178,7 +178,7 @@ def generated_job_file_ticket(name: str) -> Optional[str]:
     return None
 
 
-PROTOCOL_VERSION = 19
+PROTOCOL_VERSION = 20
 TERMINAL_STATES = {"completed", "failed", "canceled"}
 LANE_NAMES = {"build", "debugArtifact", "liveApp", "release", "style"}
 LOG_TAIL_LINES = 30
@@ -271,6 +271,9 @@ RELEASE_TIMEOUT_SECONDS = 2 * 60 * 60
 # dependency resolution, 2026-10-16); a request without --timeout gets max(default, floor).
 # The measured floor is currently below the 3600 s default, so it does not raise that default.
 OPTIMIZED_LANE_TIMEOUT_FLOOR_SECONDS = 2 * 797
+# The optimized-incremental App lane (`--optimized-incremental`) keeps every other module WMO, so
+# it takes the same floor. Its cold builds so far (lab manifest, 473 s; production selector with
+# cloned dependency state, 514 s; both 2026-10-20, advisory single samples) are below that floor.
 SMOKE_AGENT_WAIT_SECONDS = 120.0
 
 IMPLEMENTED_OPERATIONS = {
@@ -337,9 +340,11 @@ Operation commands:
   ./conductor install-format-tools   # explicit Homebrew install of missing style tools
   ./conductor swift-build --product RepoPrompt|repoprompt-mcp|repoprompt-gateway|all
   ./conductor dsym [--product all|RepoPrompt|repoprompt-mcp|repoprompt-gateway|root-tests]   # regenerate debug dSYMs; never builds
-  ./conductor build [--fast] [--optimized]
+  ./conductor build [--fast] [--optimized | --optimized-incremental]
     --optimized packages the opt-in optimized-diagnostics lane (swift -c release, first-party DEBUG,
     Dev identity; needs SIGN_IDENTITY='Apple Development: ...'); each build takes minutes
+    --optimized-incremental packages the same lane with only RepoPromptApp non-WMO incremental (rest WMO)
+    for fast App edit loops; not a performance-acceptance lane; mutually exclusive with --optimized
   ./conductor package debug|release
   ./conductor test [--list | --filter <filter>] [--test-product <product>] [--no-xctest-deadlines] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
   ./conductor test-artifact --filter <filter> [--no-xctest-deadlines] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
@@ -348,13 +353,13 @@ Operation commands:
   ./conductor core-test [--list | --filter <filter>] [--test-product <product>] [--no-xctest-deadlines] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
   ./conductor install-debug-cli
   ./conductor debug-cli-status
-  ./conductor run [--optimized] [-- <app args...>]    # build/package, then FIFO coordinated launch
+  ./conductor run [--optimized | --optimized-incremental] [-- <app args...>]    # build/package, then FIFO coordinated launch
   ./conductor app status
   ./conductor app stop                                 # latest interactive stop intent
   ./conductor app launch-existing [-- <app args...>]   # launch existing DebugApps bundle without building
-  ./conductor app relaunch [--optimized] [-- <app args...>]   # latest interactive relaunch intent
-    run/app relaunch --optimized package and launch the same lane as build --optimized (minutes per build;
-    selection is per invocation, never sticky); launch-existing never builds and rejects --optimized
+  ./conductor app relaunch [--optimized | --optimized-incremental] [-- <app args...>]   # latest interactive relaunch intent
+    run/app relaunch --optimized[-incremental] package and launch the same lane as build (minutes per WMO build;
+    selection is per invocation, never sticky); launch-existing never builds and rejects both lane flags
   ./conductor smoke [--launch | --packaged-app <path>] [--artifact-manifest <path>] [--workspace <name>] [--window-id <id>] [--agent-run] [--execution-location-ui]
     --execution-location-ui uses REPOPROMPT_EXECUTION_LOCATION_UI_SMOKE_WAIT (default 3s) and _CYCLES (default 3); Accessibility permission is required.
     (without --launch/--packaged-app, requires the CE debug app to already be running and CLI installed)
@@ -2726,8 +2731,16 @@ class OutputSummarizer:
 
 OPTIMIZED_LANE_ARG = "optimized"
 OPTIMIZED_LANE_FLAG = "--optimized"
+OPTIMIZED_INCREMENTAL_LANE_ARG = "optimizedIncremental"
+OPTIMIZED_INCREMENTAL_LANE_FLAG = "--optimized-incremental"
+OPTIMIZED_LANE_FLAGS = (OPTIMIZED_LANE_FLAG, OPTIMIZED_INCREMENTAL_LANE_FLAG)
+OPTIMIZED_LANE_FLAG_ARGS = {
+    OPTIMIZED_LANE_FLAG: OPTIMIZED_LANE_ARG,
+    OPTIMIZED_INCREMENTAL_LANE_FLAG: OPTIMIZED_INCREMENTAL_LANE_ARG,
+}
+OPTIMIZED_LANES_EXCLUSIVE_REJECTION = "--optimized and --optimized-incremental are mutually exclusive; choose one lane"
 # `package_app.sh` configs the staged build-then-launch helper may forward (the debug lane is the default).
-DEBUG_APP_PACKAGE_CONFIGS = ("debug", "debug-optimized")
+DEBUG_APP_PACKAGE_CONFIGS = ("debug", "debug-optimized", "debug-optimized-incremental")
 LAUNCH_EXISTING_OPTIMIZED_REJECTION = (
     "launch-existing does not build; its lane is whatever the bundle was packaged with "
     "(see RepoPromptDebugProvenance.json)."
@@ -2744,6 +2757,26 @@ def is_optimized_lane_request(args: Dict[str, Any]) -> bool:
     return True
 
 
+def is_optimized_incremental_lane_request(args: Dict[str, Any]) -> bool:
+    """True for an optimized-incremental App lane request; the same set-only-when-true rule."""
+    if OPTIMIZED_INCREMENTAL_LANE_ARG not in args:
+        return False
+    if args[OPTIMIZED_INCREMENTAL_LANE_ARG] is not True:
+        raise ConductorError(f"request arg '{OPTIMIZED_INCREMENTAL_LANE_ARG}' must be true when present")
+    return True
+
+
+def debug_package_config_for_request(args: Dict[str, Any]) -> str:
+    """The `package_app.sh` debug config a lane-capable request selects; both lane keys is malformed."""
+    optimized = is_optimized_lane_request(args)
+    incremental = is_optimized_incremental_lane_request(args)
+    if optimized and incremental:
+        raise ConductorError(OPTIMIZED_LANES_EXCLUSIVE_REJECTION)
+    if incremental:
+        return "debug-optimized-incremental"
+    return "debug-optimized" if optimized else "debug"
+
+
 def optimized_lane_packaging_command(operation: Any, args: Dict[str, Any]) -> Optional[str]:
     """The user-facing command for an operation that packages a debug app and accepts --optimized
     (`build`, `run`, `app relaunch`); None for every other operation."""
@@ -2757,7 +2790,16 @@ def optimized_lane_packaging_command(operation: Any, args: Dict[str, Any]) -> Op
 def optimized_lane_timeout_hint(operation: Any, args: Dict[str, Any], effective_timeout: float) -> Optional[str]:
     """Actionable suffix for a timed-out lane job; None for every other job (messages unchanged)."""
     command = optimized_lane_packaging_command(operation, args)
-    if command is None or args.get(OPTIMIZED_LANE_ARG) is not True:
+    if command is None:
+        return None
+    if args.get(OPTIMIZED_INCREMENTAL_LANE_ARG) is True and args.get(OPTIMIZED_LANE_ARG) is not True:
+        return (
+            f"; optimized-incremental builds compile every module except RepoPromptApp as a whole module "
+            f"with no partial results; rerun with a longer limit: "
+            f"./conductor {command} --optimized-incremental --timeout <seconds> "
+            f"(this run allowed {effective_timeout:.0f}s)"
+        )
+    if args.get(OPTIMIZED_LANE_ARG) is not True:
         return None
     return (
         f"; optimized-lane builds compile whole modules with no partial results; "
@@ -3213,7 +3255,7 @@ class OperationRegistry:
                     "--package-root", str(self.repo_root)]
             return argv, ["build"], cwd, env, effective_timeout
         if operation == "build":
-            argv = [script("package_app.sh"), "debug-optimized" if is_optimized_lane_request(args) else "debug"]
+            argv = [script("package_app.sh"), debug_package_config_for_request(args)]
             if args.get("fastPackage"):
                 argv.append("fast")
             return argv, ["build", "debugArtifact"], cwd, env, effective_timeout
@@ -3274,7 +3316,7 @@ class OperationRegistry:
             return [script("install_debug_cli.sh"), "status"], lanes, cwd, env, effective_timeout
         if operation == "run":
             # Validate at dispatch too, independently of default-timeout calculation.
-            is_optimized_lane_request(args)
+            debug_package_config_for_request(args)
             return self._internal_argv("debug_app_build_then_launch", dict(args)), ["liveApp"], cwd, env, effective_timeout
         if operation == "app":
             subcommand = args.get("subcommand")
@@ -3284,11 +3326,11 @@ class OperationRegistry:
             if subcommand == "status":
                 return self._internal_argv("app_status", {}), lanes, cwd, env, effective_timeout
             if subcommand == "launch-existing":
-                if OPTIMIZED_LANE_ARG in args:
+                if OPTIMIZED_LANE_ARG in args or OPTIMIZED_INCREMENTAL_LANE_ARG in args:
                     raise ConductorError(LAUNCH_EXISTING_OPTIMIZED_REJECTION)
                 return self._internal_argv("app_launch_existing", dict(args)), ["liveApp"], cwd, env, effective_timeout
             if subcommand == "relaunch":
-                is_optimized_lane_request(args)  # independent of the timeout path, as for run
+                debug_package_config_for_request(args)  # independent of the timeout path, as for run
                 return self._internal_argv("debug_app_build_then_launch", dict(args)), ["liveApp"], cwd, env, effective_timeout
         if operation == "smoke":
             lanes = ["debugArtifact", "liveApp"]
@@ -3418,7 +3460,10 @@ class OperationRegistry:
             return MEDIUM_TIMEOUT_SECONDS
         if operation in {"test", "provider-test", "core-test"} and args.get("filter"):
             return FILTERED_TEST_TIMEOUT_SECONDS
-        if optimized_lane_packaging_command(operation, args) is not None and is_optimized_lane_request(args):
+        if (
+            optimized_lane_packaging_command(operation, args) is not None
+            and debug_package_config_for_request(args) != "debug"
+        ):
             return max(MEDIUM_TIMEOUT_SECONDS, OPTIMIZED_LANE_TIMEOUT_FLOOR_SECONDS)
         return MEDIUM_TIMEOUT_SECONDS
 
@@ -8181,7 +8226,7 @@ def operation_app_launch_existing(repo_root: Path, args: Dict[str, Any]) -> int:
 
 
 def operation_debug_app_build_then_launch(repo_root: Path, args: Dict[str, Any]) -> int:
-    package_config = "debug-optimized" if is_optimized_lane_request(args) else "debug"
+    package_config = debug_package_config_for_request(args)
     package_code, staged_bundle = package_debug_app_under_heavy(
         repo_root, "debug app build/package", package_config=package_config
     )
@@ -8860,12 +8905,17 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
         parser = argparse.ArgumentParser(prog="conductor build")
         parser.add_argument("--fast", action="store_true")
         parser.add_argument("--optimized", action="store_true")
+        parser.add_argument("--optimized-incremental", action="store_true")
         ns = parser.parse_args(rest)
+        if ns.optimized and ns.optimized_incremental:
+            raise ConductorError(OPTIMIZED_LANES_EXCLUSIVE_REJECTION)
         if ns.fast:
             args["fastPackage"] = True
         if ns.optimized:
             # Only when true: the default request's args and identity stay unchanged.
             args[OPTIMIZED_LANE_ARG] = True
+        if ns.optimized_incremental:
+            args[OPTIMIZED_INCREMENTAL_LANE_ARG] = True
     elif operation == "swift-build":
         parser = argparse.ArgumentParser(prog="conductor swift-build")
         parser.add_argument("--product", required=True, choices=["RepoPrompt", "repoprompt-mcp", "repoprompt-gateway", "all"])
@@ -8969,10 +9019,13 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
         if ns.filter:
             preflight_test_filter(paths.repo_root, operation, ns.filter)
     elif operation == "run":
-        # Only a leading --optimized selects the lane; everything after it keeps today's pass-through
-        # rule, so `run -- --optimized` and a second `--optimized` are application arguments.
-        if rest and rest[0] == OPTIMIZED_LANE_FLAG:
-            args[OPTIMIZED_LANE_ARG] = True
+        # Only a leading --optimized or --optimized-incremental selects a lane; everything after it keeps
+        # today's pass-through rule, so `run -- --optimized` and a repeat of the same flag are application
+        # arguments. The other lane flag right after the first is a mutually exclusive selection.
+        if rest and rest[0] in OPTIMIZED_LANE_FLAGS:
+            if len(rest) > 1 and rest[1] in OPTIMIZED_LANE_FLAGS and rest[1] != rest[0]:
+                raise ConductorError(OPTIMIZED_LANES_EXCLUSIVE_REJECTION)
+            args[OPTIMIZED_LANE_FLAG_ARGS[rest[0]]] = True
             rest = rest[1:]
         app_args = rest[1:] if rest and rest[0] == "--" else rest
         args["appArgs"] = app_args
@@ -8980,18 +9033,20 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
         if not rest or rest[0] not in {"status", "stop", "launch-existing", "relaunch"}:
             raise ConductorError(
                 "usage: ./conductor app status|stop | launch-existing [-- <app args...>] "
-                "| relaunch [--optimized] [-- <app args...>]"
+                "| relaunch [--optimized | --optimized-incremental] [-- <app args...>]"
             )
         args["subcommand"] = rest[0]
         trailing = rest[1:]
         if args["subcommand"] in {"status", "stop"} and trailing:
             raise ConductorError(f"app {args['subcommand']} does not accept application arguments")
         if args["subcommand"] in {"launch-existing", "relaunch"}:
-            if trailing and trailing[0] == OPTIMIZED_LANE_FLAG:
+            if trailing and trailing[0] in OPTIMIZED_LANE_FLAGS:
                 if args["subcommand"] == "launch-existing":
                     raise ConductorError(LAUNCH_EXISTING_OPTIMIZED_REJECTION)
-                # Only a leading --optimized before '--'; `relaunch -- --optimized` is an app argument.
-                args[OPTIMIZED_LANE_ARG] = True
+                if len(trailing) > 1 and trailing[1] in OPTIMIZED_LANE_FLAGS and trailing[1] != trailing[0]:
+                    raise ConductorError(OPTIMIZED_LANES_EXCLUSIVE_REJECTION)
+                # Only a leading lane flag before '--'; `relaunch -- --optimized` is an app argument.
+                args[OPTIMIZED_LANE_FLAG_ARGS[trailing[0]]] = True
                 trailing = trailing[1:]
             if trailing and trailing[0] != "--":
                 raise ConductorError(f"app {args['subcommand']} application arguments must follow '--'")

@@ -496,6 +496,85 @@ final class AgentContextExportResolverTests: XCTestCase {
         XCTAssertEqual(runtimeAccessCount.value, 0)
     }
 
+    func testDefaultExportOmitsPendingAutomaticCodemapsAfterShortBoundedWait() async throws {
+        let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositoryFixture.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/Source.swift": "struct Source { let exportPendingSentinel: Target }\n",
+                "Sources/Target.swift": "struct Target { func exportPendingTargetSymbol() {} }\n"
+            ]
+        )
+        let codemapFixture = try CodemapStoreFixture(name: #function)
+        addTeardownBlock {
+            await codemapFixture.shutdown()
+            repositoryFixture.cleanup()
+        }
+        // Every artifact demand stays busy, so automatic readiness can never settle.
+        let store = codemapFixture.makeStore(demandResultHook: { _, _ in
+            .busy(retryAfterMilliseconds: 1000)
+        })
+        _ = try await store.loadRoot(path: root.path)
+        let source = AgentContextExportSource(
+            tabID: UUID(),
+            promptText: "Review",
+            selection: StoredSelection(
+                selectedPaths: [root.appendingPathComponent("Sources/Source.swift").path],
+                codemapAutoEnabled: true
+            ),
+            selectedMetaPromptIDs: [],
+            tabName: "Agent Tab",
+            activeAgentSessionID: nil,
+            worktreeBindings: []
+        )
+        let clock = ContinuousClock()
+
+        // Selected-files popover model (default coordinator).
+        let modelStarted = clock.now
+        let model = await AgentContextExportResolver.resolveModel(
+            source: source,
+            store: store,
+            filePathDisplay: .relative,
+            codeMapUsage: .auto
+        )
+        let modelElapsed = modelStarted.duration(to: clock.now)
+        XCTAssertLessThan(modelElapsed, .seconds(5), "Selected-files model must not wait the full readiness deadline for pending automatic codemaps")
+        XCTAssertEqual(model.rows.map(\.kind), [.full])
+        XCTAssertTrue(model.codemapPresentation.orderedEntries.isEmpty)
+        switch model.codemapCoverage {
+        case .pending, .unavailable:
+            break
+        case .complete, .partial:
+            XCTFail("Pending automatic codemaps must report typed retry coverage")
+        }
+        XCTAssertFalse(model.codemapIssues.isEmpty)
+
+        // Export Context clipboard.
+        let clipboardStarted = clock.now
+        let clipboard = await AgentContextExportResolver.buildClipboardContent(
+            AgentContextClipboardRequest(
+                cfg: makeConfig(gitInclusion: .none, codeMapUsage: .auto),
+                source: source,
+                store: store,
+                lookupContext: model.lookupContext,
+                filePathDisplay: .relative,
+                onlyIncludeRootsWithSelectedFiles: true,
+                showCodeMapMarkers: true,
+                metaInstructions: [],
+                includeDatetimeInUserInstructions: false,
+                promptSectionsOrder: PromptAssemblyBuilder.defaultSectionOrder,
+                disabledPromptSections: [],
+                duplicateUserInstructionsAtTop: false,
+                reviewGitContext: .automaticOnly(),
+                completeGitDiffProvider: { "" }
+            )
+        )
+        let clipboardElapsed = clipboardStarted.duration(to: clock.now)
+        XCTAssertLessThan(clipboardElapsed, .seconds(5), "Export Context must not wait the full readiness deadline for pending automatic codemaps")
+        XCTAssertTrue(clipboard.contains("exportPendingSentinel"), clipboard)
+        XCTAssertFalse(clipboard.contains("exportPendingTargetSymbol"), clipboard)
+    }
+
     func testRevokedCodemapLifetimeOmitsStaleTargetBeforeModelPublication() async throws {
         let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
         defer { repositoryFixture.cleanup() }

@@ -17,7 +17,7 @@ package enum FDWriteError: Error, Equatable {
 
 package enum FDWriteSupport {
     @discardableResult
-    static func configureNoSigPipe(fd: Int32) -> Bool {
+    package static func configureNoSigPipe(fd: Int32) -> Bool {
         guard fd >= 0 else { return false }
         #if os(macOS) || os(iOS) || os(tvOS) || os(watchOS)
             return fcntl(fd, F_SETNOSIGPIPE, 1) != -1

@@ -587,11 +587,32 @@ actor ServerNetworkManager {
             if let helperPeerPID {
                 bootstrapPeerPIDByConnectionID[connectionID] = helperPeerPID
             }
-            if let helperPeerStartSeconds, let helperPeerStartMicroseconds {
-                debugHelperPeerIdentityByConnectionID[connectionID] = DebugHelperPeerIdentity(
+            // Captured through the production snapshot path from a one-entry process table that
+            // knows only the fixture peer (its parent is unknown, so no ancestry is recorded). The
+            // watchdog proof falls back to a live query when the snapshot lacks an agent PID, and
+            // the helper-exit watch never treats a missing ancestor as proof.
+            if let helperPeerPID, let helperPeerStartSeconds, let helperPeerStartMicroseconds {
+                let peer = MCPHelperProcessIdentity(
+                    pid: pid_t(helperPeerPID),
                     startSeconds: helperPeerStartSeconds,
                     startMicroseconds: helperPeerStartMicroseconds
                 )
+                if let snapshot = MCPHelperPeerProcessSnapshot.capture(
+                    peerPID: peer.pid,
+                    reader: DebugSingleProcessTableReader(entryPID: peer.pid, identity: peer)
+                ) {
+                    helperPeerProcessSnapshotByConnectionID[connectionID] = snapshot
+                }
+            }
+        }
+
+        /// A process table containing one process whose parent is launchd.
+        private struct DebugSingleProcessTableReader: MCPProcessTableReading {
+            let entryPID: pid_t
+            let identity: MCPHelperProcessIdentity
+
+            func entry(for pid: pid_t) -> MCPProcessTableEntry {
+                pid == entryPID ? .present(identity: identity, parentPID: 1, isZombie: false) : .absent
             }
         }
 
@@ -641,6 +662,13 @@ actor ServerNetworkManager {
         let connectionIsActive: Bool
         let runWasAdmitted: Bool
         let hasExpectedPIDAuthority: Bool
+        /// Whether the mapped connection is live and not being torn down (`isLiveNonTerminalConnection`).
+        /// Sampled only when the caller binds the evidence to a launch.
+        var connectionIsLiveNonTerminal = false
+        /// Whether the mapped connection's helper descends from exactly the agent process instance
+        /// registered for the caller's agent PID (`ancestryProvesAgentInstance`). Sampled only when
+        /// the caller binds the evidence to a launch.
+        var connectionProvesRequiredAgent = false
     }
 
     /// Verifies a route that has already been committed to the window's exact bidirectional run
@@ -649,9 +677,16 @@ actor ServerNetworkManager {
     /// match both the installed policy window and actor-local run window. The actor receipts are
     /// sampled again after the final MainActor mapping hop so actor reentrancy cannot validate stale
     /// policy, identity, connection, or expected-PID state.
+    ///
+    /// A non-nil `requiredAgentPID` binds the evidence to that launch: in both actor samples the
+    /// mapped connection must also be live and non-terminal, and its helper must descend from
+    /// exactly the agent process instance registered for that PID. A helper route retained from an
+    /// earlier launch of the same run then cannot certify a restarted launch, even while the older
+    /// launch's PID is still registered. `nil` keeps the launch-independent check.
     func hasAuthoritativeLiveRunRoute(
         runID: UUID,
-        expectedClientName: String
+        expectedClientName: String,
+        requiredAgentPID: pid_t?
     ) async -> Bool {
         let liveMapping = await MainActor.run { () -> (windowID: Int, connectionID: UUID)? in
             for window in WindowStatesManager.shared.allWindows {
@@ -664,14 +699,17 @@ actor ServerNetworkManager {
         }
         guard let liveMapping else { return false }
 
+        let requireLaunchProof = requiredAgentPID != nil
         let initialActorEvidence = liveRunRouteActorEvidence(
             runID: runID,
-            connectionID: liveMapping.connectionID
+            connectionID: liveMapping.connectionID,
+            requiredAgentPID: requiredAgentPID
         )
         guard Self.validatedLiveRunRouteEvidence(
             mappedWindowID: liveMapping.windowID,
             expectedClientName: expectedClientName,
-            evidence: initialActorEvidence
+            evidence: initialActorEvidence,
+            requireLaunchProof: requireLaunchProof
         ) else {
             return false
         }
@@ -684,20 +722,23 @@ actor ServerNetworkManager {
         }
         let finalActorEvidence = liveRunRouteActorEvidence(
             runID: runID,
-            connectionID: liveMapping.connectionID
+            connectionID: liveMapping.connectionID,
+            requiredAgentPID: requiredAgentPID
         )
         return Self.validatedLiveRunRouteAcrossFinalMappingHop(
             mappedWindowID: liveMapping.windowID,
             expectedClientName: expectedClientName,
             initialEvidence: initialActorEvidence,
             finalMappingIsLive: finalMappingIsLive,
-            finalEvidence: finalActorEvidence
+            finalEvidence: finalActorEvidence,
+            requireLaunchProof: requireLaunchProof
         )
     }
 
     private func liveRunRouteActorEvidence(
         runID: UUID,
-        connectionID: UUID
+        connectionID: UUID,
+        requiredAgentPID: pid_t?
     ) -> LiveRunRouteActorEvidence {
         LiveRunRouteActorEvidence(
             expectedRunID: runID,
@@ -709,19 +750,26 @@ actor ServerNetworkManager {
             admittedClientName: clientIDByConnection[connectionID],
             connectionIsActive: connections[connectionID] != nil,
             runWasAdmitted: admittedPolicyRunIDs.contains(runID),
-            hasExpectedPIDAuthority: expectedAgentPIDsByRunID[runID]?.isEmpty == false
+            hasExpectedPIDAuthority: expectedAgentPIDsByRunID[runID]?.isEmpty == false,
+            connectionIsLiveNonTerminal: requiredAgentPID != nil && isLiveNonTerminalConnection(connectionID),
+            connectionProvesRequiredAgent: requiredAgentPID.map {
+                ancestryProvesAgentInstance(connectionID: connectionID, runID: runID, agentPID: $0)
+            } ?? false
         )
     }
 
     nonisolated static func validatedLiveRunRouteEvidence(
         mappedWindowID: Int,
         expectedClientName: String,
-        evidence: LiveRunRouteActorEvidence
+        evidence: LiveRunRouteActorEvidence,
+        requireLaunchProof: Bool = false
     ) -> Bool {
         guard evidence.connectionIsActive,
               evidence.connectionRunID == evidence.expectedRunID,
               evidence.runWasAdmitted,
               evidence.hasExpectedPIDAuthority,
+              !requireLaunchProof
+              || (evidence.connectionIsLiveNonTerminal && evidence.connectionProvesRequiredAgent),
               MCPClientIdentity.matches(evidence.admittedClientName, expectedClientName)
         else {
             return false
@@ -745,12 +793,14 @@ actor ServerNetworkManager {
         expectedClientName: String,
         initialEvidence: LiveRunRouteActorEvidence,
         finalMappingIsLive: Bool,
-        finalEvidence: LiveRunRouteActorEvidence
+        finalEvidence: LiveRunRouteActorEvidence,
+        requireLaunchProof: Bool = false
     ) -> Bool {
         guard validatedLiveRunRouteEvidence(
             mappedWindowID: mappedWindowID,
             expectedClientName: expectedClientName,
-            evidence: initialEvidence
+            evidence: initialEvidence,
+            requireLaunchProof: requireLaunchProof
         ), finalMappingIsLive
         else {
             return false
@@ -758,7 +808,8 @@ actor ServerNetworkManager {
         return validatedLiveRunRouteEvidence(
             mappedWindowID: mappedWindowID,
             expectedClientName: expectedClientName,
-            evidence: finalEvidence
+            evidence: finalEvidence,
+            requireLaunchProof: requireLaunchProof
         )
     }
 
@@ -1212,13 +1263,34 @@ actor ServerNetworkManager {
             let executableIdentity: ExecutableFileIdentity?
         }
 
-        private struct DebugHelperPeerIdentity {
-            let startSeconds: Int64
-            let startMicroseconds: Int32
-        }
-
         private var debugExpectedProcessIdentityByRunID: [UUID: [pid_t: DebugExpectedProcessIdentity]] = [:]
-        private var debugHelperPeerIdentityByConnectionID: [UUID: DebugHelperPeerIdentity] = [:]
+        /// Manual helper-exit watch ticks (no polling task) and a test clock offset.
+        private var debugHelperExitWatchManualTicks = false
+        private var debugHelperExitWatchClockOffset: Duration = .zero
+        private var debugHelperExitGenerationGuardRejections = 0
+        /// Revocations that kept the run's routing because a live, ancestry-proven helper remains.
+        private var debugRoutingPreservingPolicyRevocations = 0
+        /// Routes of a preserving revocation's run that were not proven and were unrouted.
+        private var debugPrunedUnprovenRunRoutes = 0
+        /// Retained helper connections that received a changed run policy (turn start or revoke).
+        private var debugRetainedRunPolicyRefreshes = 0
+        /// Later-turn leases released early because the launch's helper was already routed.
+        private var debugProvenRouteEarlyReleases = 0
+        /// Awaited before each connection of a retained-policy refresh, so a test can change state
+        /// while the refresh is suspended.
+        private var debugRetainedRunPolicyRefreshSuspension: (@Sendable (UUID) async -> Void)?
+        /// Runs in a preserving revocation or routing cleanup after the prune's window-cleanup
+        /// MainActor hop, before the revoke-time refresh and the final check.
+        private var debugAfterRevocationPruneSuspension: (@Sendable () async -> Void)?
+        /// Window-side cleanups scheduled by `unrouteDependentsOfReleasedAgentIdentities` that
+        /// have not finished, awaited by tests. Each removes itself when it finishes, so the map
+        /// stays bounded in a long-running DEBUG app.
+        private var debugScheduledRunWindowCleanups: [UUID: Task<Void, Never>] = [:]
+        /// Awaited by every window-side cleanup of unrouted connections (a revocation's prune or a
+        /// proof loss's scheduled cleanup) right before its MainActor hop, with those connections.
+        private var debugBeforeRunWindowCleanupHop: (@Sendable ([UUID]) async -> Void)?
+        /// Test-only destination for accepted-socket terminal records.
+        private var debugTerminalRecordsDirectoryOverride: URL?
         private var debugLiveRunMappedOMPIdentityConnections: Set<UUID> = []
         private var debugOMPProcessCorrelationFieldsByConnectionIDForTesting: [UUID: [String: String]] = [:]
         private let debugQualificationRawIngress = OMPQualificationRawIngressRecorder()
@@ -1230,6 +1302,23 @@ actor ServerNetworkManager {
     private var toolExecutionWatchdogEnvironment = MCPToolExecutionWatchdogEnvironment.continuous()
     private var connectionLifecycleGenerationByID: [UUID: UInt64] = [:]
     private var bootstrapPeerPIDByConnectionID: [UUID: Int] = [:]
+    /// The helper peer's process identity and ancestor chain, captured at admission while it is
+    /// alive (same key set as `bootstrapPeerPIDByConnectionID` when the peer was readable).
+    private var helperPeerProcessSnapshotByConnectionID: [UUID: MCPHelperPeerProcessSnapshot] = [:]
+    private var helperProcessTableReader: any MCPProcessTableReading = MCPSystemProcessTableReader()
+    /// The run policy projection a connection was last given for its run route (what its
+    /// advertised tool list reflects). Compared with the run's current policy so a retained helper
+    /// is refreshed, with one `tools/list_changed`, exactly when its projection changed. Absent
+    /// means unknown, which always refreshes.
+    private var appliedRunPolicyProjectionByConnectionID: [UUID: AppliedRunPolicyProjection] = [:]
+    /// The agent process instance (PID plus start time) read when each expected agent PID was
+    /// registered for a run. A launch's connected evidence is proven against this instance only.
+    private var expectedAgentIdentityByRunID: [UUID: [pid_t: MCPHelperProcessIdentity]] = [:]
+    /// Pending helper-exit observations (see `openHelperExitObservationIfEligible`).
+    private var helperExitObservations: [UUID: HelperExitObservation] = [:]
+    private var helperExitPollingTask: Task<Void, Never>?
+    private var helperExitPollingTaskID: UUID?
+    private var helperExitWatchTickNanoseconds: UInt64 = 1_000_000_000
     private var terminalRecordClaimsByConnectionID: [UUID: MCPFirstTerminalRecordClaim] = [:]
     private var connectionTasks: [UUID: Task<Void, Never>] = [:]
     private var pendingConnections: [UUID: String] = [:]
@@ -1344,6 +1433,21 @@ actor ServerNetworkManager {
     }
 
     private var toolEventObservers: [UUID: [UUID: ToolEventObserver]] = [:]
+    /// Run-scoped observers of app-initiated connection loss (`AgentMCPRunConnectionLoss`).
+    private struct RunConnectionLossObserverRegistration {
+        let launch: AgentMCPRunLaunchIdentity
+        /// The launch's agent process instance (PID plus start time) read when the observer
+        /// registered, so a later process that reuses the PID never proves ownership. `nil` when
+        /// the process table could not be read then: the watchdog falls back to PID-only proof and
+        /// the helper-exit watch never addresses the launch.
+        let agentIdentity: MCPHelperProcessIdentity?
+        /// Connections that already existed when this launch registered: never this launch's own
+        /// helper unless its agent PID is proven.
+        let preexistingConnectionIDs: Set<UUID>
+        let observer: @Sendable (AgentMCPRunConnectionLoss) async -> Void
+    }
+
+    private var runConnectionLossObservers: [UUID: [UUID: RunConnectionLossObserverRegistration]] = [:]
     private var toolObserverUnregistrationsByRunID: [UUID: ToolObserverUnregistrationState] = [:]
     #if DEBUG
         private var debugBeforeToolEventObserverDeliveryForTesting: (@Sendable () async -> Void)?
@@ -1415,6 +1519,47 @@ actor ServerNetworkManager {
         var reservationConnectionID: UUID?
     }
 
+    /// Everything of a run policy that shapes a connection's advertised tools.
+    private struct AppliedRunPolicyProjection: Equatable {
+        let restrictedTools: Set<String>
+        let additionalTools: Set<String>
+        let allowedToolsOverride: Set<String>?
+        let sessionProfile: AgentSessionProfile
+        let purpose: MCPRunPurpose
+        let taskLabelKind: AgentModelCatalog.TaskLabelKind?
+        let allowsAgentExternalControlTools: Bool
+        /// Part of the advertised catalog (`code_mode`), so a change refreshes retained helpers.
+        let codeModeEligibility: MCPCodeModeEligibility
+
+        init(_ state: RunConnectionPolicyState) {
+            restrictedTools = state.restrictedTools
+            additionalTools = state.additionalTools ?? []
+            allowedToolsOverride = state.allowedToolsOverride
+            sessionProfile = state.sessionProfile
+            purpose = state.purpose
+            taskLabelKind = state.taskLabelKind
+            allowsAgentExternalControlTools = state.allowsAgentExternalControlTools
+            codeModeEligibility = state.codeModeEligibility
+        }
+
+        /// The run-policy part a pending-policy application writes to its connection.
+        init(_ policy: ClientConnectionPolicy) {
+            restrictedTools = policy.restrictedTools
+            additionalTools = policy.additionalTools ?? []
+            allowedToolsOverride = policy.allowedToolsOverride
+            sessionProfile = policy.sessionProfile
+            purpose = policy.purpose
+            taskLabelKind = policy.taskLabelKind
+            allowsAgentExternalControlTools = policy.allowsAgentExternalControlTools
+            // Normalized exactly as the run state stores it (`seedRunPolicyState`).
+            codeModeEligibility = MCPCodeModeEligibility.normalized(
+                policy.codeModeEligibility,
+                purpose: policy.purpose,
+                sessionProfile: policy.sessionProfile
+            )
+        }
+    }
+
     /// Run-scoped policy state captured when the first connection for a run is admitted.
     /// Used to rehydrate later handover/reconnect connections from server-maintained run mapping.
     private struct RunConnectionPolicyState {
@@ -1480,6 +1625,8 @@ actor ServerNetworkManager {
         private var debugPendingPolicyCommitIsSuspended = false
         private var debugPendingPolicyCommitResumeWaiters: [CheckedContinuation<Void, Never>] = []
         private var debugPendingPolicyReplacementSchedules: [(existing: UUID, replacement: UUID, runID: UUID)] = []
+        /// Every `handleConnectionReplaced` call (window-side and pending-policy replacements).
+        private var debugConnectionReplacements: [(existing: UUID, replacement: UUID, runID: UUID)] = []
     #endif
     private var expectedAgentPIDsByClient: [String: Set<pid_t>] = [:]
     private var expectedAgentPIDsByRunID: [UUID: Set<pid_t>] = [:]
@@ -1492,6 +1639,18 @@ actor ServerNetworkManager {
     // 🆕 Per-connection → windowID routing map
     private var connectionWindowMap: [UUID: Int] = [:]
     private var runIDByConnectionID: [UUID: UUID] = [:]
+    #if DEBUG
+        /// Where a request-originated window-route mutation suspends (`debugRequestWindowRouteHook`).
+        enum DebugRequestWindowRouteStage: Equatable {
+            /// Before the MainActor hop that decides (and performs) the mutation.
+            case beforeMutationHop
+            /// `mapConnectionToRunIDWithOutcome`: after the window registered the caller's run
+            /// mapping, before the run policy's application (and its run-tab bind).
+            case afterRunMappingRegistered
+        }
+
+        private var debugRequestWindowRouteHook: (@Sendable (_ stage: DebugRequestWindowRouteStage, _ runID: UUID, _ callerID: UUID) async -> Void)?
+    #endif
 
     private struct MCPConnectionCallLimiterWatchdogDiagnostics {
         let admittedCallCount: Int
@@ -1943,6 +2102,17 @@ actor ServerNetworkManager {
         var hasHandshake: Bool
         var principal: MCPConnectionPrincipal
         var lastUpdated: Date
+        /// Paired device of a per-device gateway app link (`remote:<device8>`), captured once from
+        /// the bootstrap name of a `.gateway`-principal connection. Never updated by the MCP
+        /// handshake and always nil for `.standard` connections. A `let` without a default, so every
+        /// construction site must state it.
+        let gatewayRemoteDeviceID: String?
+        /// Launch-credential generation under which this connection was admitted as `.gateway`
+        /// (0 for `.standard`). A later credential rotation advances the manager's generation, so a
+        /// live-principal query rejects a connection stamped at an older generation. A `let` without
+        /// a default, so every construction site must state it (copying the existing stamp on any
+        /// in-place identity update).
+        let gatewayCredentialGeneration: UInt64
     }
 
     /// Identity context per connection
@@ -1950,6 +2120,11 @@ actor ServerNetworkManager {
 
     /// Launch-scoped credential expected from the app-spawned gateway bootstrap client.
     private var gatewayLaunchCredential: String?
+
+    /// Monotonic generation advanced whenever `gatewayLaunchCredential` actually changes (a rotation
+    /// or clear). A gateway connection records the generation it was admitted under; a later change
+    /// makes `isGatewayPrincipalConnectionLive` reject that now-stale connection.
+    private var gatewayLaunchCredentialGeneration: UInt64 = 0
 
     /// Identity failure escalation tracking
     private var identityFailureWindowStart: Date?
@@ -1968,11 +2143,60 @@ actor ServerNetworkManager {
 
     func setGatewayLaunchCredential(_ credential: String?) {
         let trimmed = credential?.trimmingCharacters(in: .whitespacesAndNewlines)
-        gatewayLaunchCredential = trimmed?.isEmpty == false ? trimmed : nil
+        let normalized = trimmed?.isEmpty == false ? trimmed : nil
+        if normalized != gatewayLaunchCredential {
+            // A real credential change (rotation or clear) invalidates gateway identities admitted
+            // under the previous credential, so a live-principal query rejects the stale connection.
+            gatewayLaunchCredentialGeneration &+= 1
+        }
+        gatewayLaunchCredential = normalized
     }
 
     func isGatewayPrincipalConnection(_ connectionID: UUID) -> Bool {
         identityContextByConnection[connectionID]?.principal == .gateway
+    }
+
+    /// A stricter, lifetime-aware check than `isGatewayPrincipalConnection`: the connection must be
+    /// a `.gateway` principal that still exists, is not being removed, and was admitted under the
+    /// CURRENT launch credential. The passkey coordinator calls this AFTER a verifier await, keyed
+    /// by the OLD connection id it captured at ceremony begin, so a connection torn down (ordinary
+    /// removal, committed/watchdog removal, or a full server stop) or whose launch credential was
+    /// rotated during verification cannot yield a committed enrollment or a verified unlock.
+    func isGatewayPrincipalConnectionLive(_ connectionID: UUID) -> Bool {
+        guard let context = identityContextByConnection[connectionID],
+              context.principal == .gateway,
+              context.gatewayCredentialGeneration == gatewayLaunchCredentialGeneration,
+              connections[connectionID] != nil,
+              !connectionsBeingRemoved.contains(connectionID)
+        else {
+            return false
+        }
+        return true
+    }
+
+    /// The paired device behind a verified per-device gateway app link, or nil. Requires the
+    /// launch-credential `.gateway` principal; a `remote:` client name alone never qualifies.
+    func gatewayRemoteDeviceID(for connectionID: UUID) -> String? {
+        guard let context = identityContextByConnection[connectionID], context.principal == .gateway else {
+            return nil
+        }
+        return context.gatewayRemoteDeviceID
+    }
+
+    /// `remote:<id>` bootstrap names of gateway-principal connections identify a paired device
+    /// (`AppLinkPool` names each per-device link after its device ID). Other names (the default
+    /// link, phase-0 static tokens) carry no device identity.
+    nonisolated static func gatewayRemoteDeviceID(
+        bootstrapClientName: String?,
+        principal: MCPConnectionPrincipal
+    ) -> String? {
+        guard principal == .gateway,
+              let name = bootstrapClientName?.trimmingCharacters(in: .whitespacesAndNewlines),
+              name.hasPrefix("remote:"),
+              name.count > "remote:".count,
+              !name.contains(where: \.isWhitespace)
+        else { return nil }
+        return name
     }
 
     private enum GatewayPrincipalDecision: Equatable {
@@ -1993,6 +2217,27 @@ actor ServerNetworkManager {
         guard let trimmed, !trimmed.isEmpty else { return .standard }
         guard let expected = gatewayLaunchCredential, !expected.isEmpty else { return .invalid }
         return Self.constantTimeEquals(trimmed, expected) ? .gateway : .invalid
+    }
+
+    /// A bootstrap admission authenticates its principal against the launch credential once, before
+    /// any suspension, and captures that credential generation. `.standard` carries no credential;
+    /// a `.gateway` admission stays publishable only while that exact generation is still current,
+    /// so a rotation during policy, capacity, or accepted-delivery awaits fails it closed.
+    private func isAuthenticatedGatewayCredentialCurrent(
+        principal: MCPConnectionPrincipal,
+        gatewayCredentialGeneration: UInt64
+    ) -> Bool {
+        principal != .gateway || gatewayCredentialGeneration == gatewayLaunchCredentialGeneration
+    }
+
+    private func rejectBootstrapAdmissionBecauseGatewayCredentialRotated(
+        connectionID: UUID
+    ) -> BootstrapSocketServer.Admission {
+        log.warning("Rejecting bootstrap connection \(connectionID) - gateway credential rotated during admission")
+        return .reject(.rejected(
+            reason: "Gateway credential rotated during admission",
+            errorCode: MCPBootstrapErrorCode.approvalDenied.rawValue
+        ))
     }
 
     private nonisolated static func constantTimeEquals(_ lhs: String, _ rhs: String) -> Bool {
@@ -2485,6 +2730,12 @@ actor ServerNetworkManager {
     static var currentEffectiveWindowID: Int?
     @TaskLocal
     static var currentToolResultDelivery: MCPToolResultDeliveryTransaction?
+    /// The server-side invocation UUID of the `tools/call` being executed (the same `invocationID`
+    /// the dispatcher uses for denial, observer, and tool-card ownership). Local execution identity
+    /// only: never a provider-native tool-use ID or a cross-request deduplication key. A `code_mode`
+    /// executor passes it as the actual `parentInvocationID` of its children (plan §6 D3).
+    @TaskLocal
+    static var currentToolInvocationID: UUID?
     /// Non-wire origin of the current `tools/call` invocation (plan §6 D3). Set only by
     /// `invokeCodeModeChild`; wire calls keep `.transport`.
     @TaskLocal
@@ -2492,11 +2743,6 @@ actor ServerNetworkManager {
     /// Fresh per-invocation typed result capture for an in-process child; nil otherwise.
     @TaskLocal
     static var currentInProcessToolResultSink: MCPInProcessToolResultSink?
-    /// Observer-facing invocation ID of the tool provider currently executing (the same UUID
-    /// tool-event observers receive). A `code_mode` executor passes it as the actual
-    /// `parentInvocationID` of its children; nil outside provider dispatch.
-    @TaskLocal
-    static var currentToolInvocationID: UUID?
 
     /// The exact `tools/call` closure registered with the SDK for one connection.
     typealias RegisteredToolCall = @Sendable (CallTool.Parameters) async throws -> CallTool.Result
@@ -3019,7 +3265,7 @@ actor ServerNetworkManager {
         guard let clientID = clientIdentifier(forConnection: connectionID) else { return }
 
         // Resolve sessionKey - only update in-memory map for token-backed clients
-        let sessionKey = connections[connectionID]?.capabilityToken ?? capabilityTokenByConnection[connectionID]
+        let sessionKey = routingSessionKey(for: connectionID)
         if let sessionKey {
             let storageKey = bestStorageKey(for: clientID, in: Array(lastWindowByClientSession.keys))
             lastWindowByClientSession[storageKey, default: [:]][sessionKey] = windowID
@@ -3037,7 +3283,7 @@ actor ServerNetworkManager {
 
     private func clearPersistedWindowAffinity(for connectionID: UUID) {
         guard let clientID = clientIdentifier(forConnection: connectionID) else { return }
-        guard let sessionKey = connections[connectionID]?.capabilityToken ?? capabilityTokenByConnection[connectionID] else {
+        guard let sessionKey = routingSessionKey(for: connectionID) else {
             return
         }
 
@@ -3307,11 +3553,19 @@ actor ServerNetworkManager {
 
     /// Runs the given async operation with the TaskLocal connectionID and lifecycle correlation set.
     /// Use this to propagate the connection context across Task boundaries.
+    /// - Parameter toolInvocationID: when non-nil, also scopes `currentToolInvocationID`; `nil` keeps
+    ///   any inherited invocation identity unchanged.
     nonisolated static func withConnectionID<T>(
         _ connectionID: UUID?,
+        toolInvocationID: UUID? = nil,
         lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation? = nil,
         operation: () async throws -> T
     ) async rethrows -> T {
+        if let toolInvocationID {
+            return try await $currentToolInvocationID.withValue(toolInvocationID) {
+                try await withConnectionID(connectionID, lifecycleCorrelation: lifecycleCorrelation, operation: operation)
+            }
+        }
         #if DEBUG || EDIT_FLOW_PERF
             let effectiveLifecycleCorrelation = lifecycleCorrelation ?? EditFlowPerf.currentLifecycleCorrelation
             guard let effectiveLifecycleCorrelation else {
@@ -3730,7 +3984,7 @@ actor ServerNetworkManager {
             return nil
         }
 
-        runIDByConnectionID[connectionID] = resolved.runID
+        assignRunRoute(resolved.runID, to: connectionID)
         windowIDByRunID[resolved.runID] = resolved.windowID
         return resolved.runID
     }
@@ -3778,19 +4032,66 @@ actor ServerNetworkManager {
         return nil
     }
 
+    /// What `mapConnectionToRunIDWithOutcome` did.
+    enum RunMappingOutcome: Equatable {
+        /// The window maps the run to the connection.
+        case mapped
+        /// Request-originated only: the window maps the run to `holder`, a different connection,
+        /// at the registration or at the run policy's run-tab bind. The caller took nothing from
+        /// it; the connection is routed to the run actor-side with the run policy applied and
+        /// without the run-tab binding, so its tools resolve the run tab (`resolveTabContext`).
+        case yieldedToHolder(holder: UUID)
+        /// No window, or the window refused the registration.
+        case failed
+    }
+
     /// Map a connection to a runID for server-managed reconnect/handover scenarios.
     /// This creates the connectionID → runID mapping that enables tool tracking across connections.
+    /// `displacesHolder: false` (a request-originated affinity restore) yields to a different
+    /// window holder (see `mapConnectionToRunIDWithOutcome`) and returns false;
+    /// `registerRunIDMapping` would otherwise replace that holder.
     @discardableResult
     func mapConnectionToRunID(
         _ connectionID: UUID,
         runID: UUID,
         windowID explicitWindowID: Int? = nil,
         persistWindowBinding: Bool = true,
-        signalRouting: Bool = true
+        signalRouting: Bool = true,
+        displacesHolder: Bool = true,
+        refusalSource: String = "affinity_restore"
     ) async -> Bool {
+        await mapConnectionToRunIDWithOutcome(
+            connectionID,
+            runID: runID,
+            windowID: explicitWindowID,
+            persistWindowBinding: persistWindowBinding,
+            signalRouting: signalRouting,
+            displacesHolder: displacesHolder,
+            refusalSource: refusalSource
+        ) == .mapped
+    }
+
+    /// `mapConnectionToRunID` with its outcome. Request-originated (`displacesHolder: false`, a
+    /// Claude native client; `requestPathYieldsToDifferentHolder`), the whole operation never
+    /// replaces a different holder: the registration proceeds only when, at the mutation, the
+    /// window maps the run to no connection or to the caller, and the run policy's run-tab bind
+    /// that follows a registration is request-originated too, its yield propagated. A yield still
+    /// routes the connection to the run actor-side (when `persistWindowBinding`) and applies the
+    /// run policy without a run-tab bind, so the connection keeps the run's tool policy and
+    /// resolves the run tab (`resolveTabContext`), never a policy-less, active-tab route.
+    func mapConnectionToRunIDWithOutcome(
+        _ connectionID: UUID,
+        runID: UUID,
+        windowID explicitWindowID: Int? = nil,
+        persistWindowBinding: Bool = true,
+        signalRouting: Bool = true,
+        displacesHolder: Bool = true,
+        refusalSource: String = "affinity_restore"
+    ) async -> RunMappingOutcome {
+        // A read-only companion is never a run's primary route, holder or routing waiter.
         guard companionRoleByConnectionID[connectionID] == nil else {
             log.warning("mapConnectionToRunID: refusing to route read-only companion \(connectionID) to run \(runID)")
-            return false
+            return .failed
         }
         let resolvedWindowID: Int? = if let explicitWindowID {
             explicitWindowID
@@ -3801,7 +4102,7 @@ actor ServerNetworkManager {
         }
         guard let windowID = resolvedWindowID else {
             log.warning("mapConnectionToRunID: cannot map connection \(connectionID) to run \(runID) - no window assignment")
-            return false
+            return .failed
         }
 
         // Fast path: if this connection is already mapped to this run in this window,
@@ -3822,17 +4123,31 @@ actor ServerNetworkManager {
                 setConnectionWindowMapping(connectionID, windowID: windowID)
             }
             if persistWindowBinding {
-                runIDByConnectionID[connectionID] = runID
+                assignRunRoute(runID, to: connectionID)
             }
             windowIDByRunID[runID] = windowID
-            return true
+            return .mapped
         }
 
-        let registrationSucceeded = await MainActor.run { () -> Bool in
+        let yieldsToDifferentHolder = !displacesHolder && requestPathYieldsToDifferentHolder(connectionID: connectionID)
+        #if DEBUG
+            if yieldsToDifferentHolder {
+                await awaitDebugRequestWindowRouteHook(.beforeMutationHop, runID: runID, callerID: connectionID)
+            }
+        #endif
+        let registration = await MainActor.run { () -> (registered: Bool, yieldedTo: UUID?, filledEmptySlot: Bool) in
             guard let window = WindowStatesManager.shared.window(withID: windowID) else {
                 log.warning("mapConnectionToRunID: window \(windowID) not found for connection \(connectionID)")
-                return false
+                return (false, nil, false)
             }
+            // Decided at the mutation, in the same MainActor step as the registration.
+            if yieldsToDifferentHolder,
+               let holder = window.mcpServer.connectionIDByRunID[runID],
+               holder != connectionID
+            {
+                return (false, holder, false)
+            }
+            let slotWasEmpty = window.mcpServer.connectionIDByRunID[runID] == nil
 
             // Update bidirectional mappings in MCPServerViewModel
             let didRegister = window.mcpServer.registerRunIDMapping(
@@ -3844,23 +4159,65 @@ actor ServerNetworkManager {
             if didRegister {
                 connectionLog("mapConnectionToRunID: mapped connection \(connectionID) to runID \(runID) in window \(windowID)")
             }
-            return didRegister
+            return (didRegister, nil, didRegister && slotWasEmpty && !displacesHolder)
         }
+        if let holder = registration.yieldedTo {
+            // Routed actor-side with the run policy and no run-tab bind, as a yielded run-tab
+            // rebind leaves a routed caller: never a policy-less connection of the run's agent.
+            // The routing waiter is not signalled: the run's window mapping did not change (its
+            // holder signalled when it registered), and the caller holds no window mapping.
+            if persistWindowBinding {
+                if connectionWindowMap[connectionID] != windowID {
+                    setConnectionWindowMapping(connectionID, windowID: windowID)
+                }
+                assignRunRoute(runID, to: connectionID)
+            }
+            let policyApplied = runPolicyStateByRunID[runID] != nil
+            recordRequestYieldedToHolder(
+                event: "run_mapping_yielded_to_holder",
+                source: refusalSource,
+                runID: runID,
+                connectionID: connectionID,
+                holder: holder,
+                windowID: windowID,
+                extraFields: [
+                    "route_assigned": String(persistWindowBinding),
+                    "policy_applied": String(policyApplied)
+                ]
+            )
+            await applyRunPolicyStateIfAvailable(
+                runID: runID,
+                connectionID: connectionID,
+                persistWindowBinding: persistWindowBinding,
+                bindsRunTab: false
+            )
+            return .yieldedToHolder(holder: holder)
+        }
+        let registrationSucceeded = registration.registered
         guard registrationSucceeded else {
             log.warning("mapConnectionToRunID: registerRunIDMapping refused connection \(connectionID) run \(runID) window \(windowID)")
-            return false
+            return .failed
         }
 
+        if registration.filledEmptySlot {
+            recordRequestFilledEmptySlot(
+                mechanism: "run_mapping",
+                source: refusalSource,
+                runID: runID,
+                connectionID: connectionID,
+                windowID: windowID
+            )
+        }
         if persistWindowBinding, connectionWindowMap[connectionID] != windowID {
             setConnectionWindowMapping(connectionID, windowID: windowID)
         }
         if persistWindowBinding {
-            runIDByConnectionID[connectionID] = runID
+            assignRunRoute(runID, to: connectionID)
         }
         windowIDByRunID[runID] = windowID
         updateLiveRunAffinity(
             clientName: clientIdentifier(forConnection: connectionID) ?? "",
-            sessionKey: connections[connectionID]?.capabilityToken ?? capabilityTokenByConnection[connectionID],
+            sessionKey: routingSessionKey(for: connectionID),
             runID: runID,
             windowID: windowID,
             purpose: runPurposeByConnection[connectionID] ?? runPolicyStateByRunID[runID]?.purpose
@@ -3874,13 +4231,25 @@ actor ServerNetworkManager {
             )
         #endif
 
-        // Rehydrate run-scoped policy grants/restrictions on reconnect handovers.
-        await applyRunPolicyStateIfAvailable(
+        #if DEBUG
+            if yieldsToDifferentHolder {
+                await awaitDebugRequestWindowRouteHook(.afterRunMappingRegistered, runID: runID, callerID: connectionID)
+            }
+        #endif
+        // Rehydrate run-scoped policy grants/restrictions on reconnect handovers. The run-tab bind
+        // is part of the same operation: request-originated, it never replaces a holder installed
+        // since the registration (for example, an admission during a suspension above).
+        let tabBind = await applyRunPolicyStateIfAvailable(
             runID: runID,
             connectionID: connectionID,
-            persistWindowBinding: persistWindowBinding
+            persistWindowBinding: persistWindowBinding,
+            tabRebindDisplacesHolder: displacesHolder,
+            tabRebindRefusalSource: refusalSource
         )
-        return true
+        if case let .yieldedToHolder(holder) = tabBind {
+            return .yieldedToHolder(holder: holder)
+        }
+        return .mapped
     }
 
     private func mapConnectionToRunIDForPendingPolicy(
@@ -3908,11 +4277,11 @@ actor ServerNetworkManager {
         if connectionWindowMap[connectionID] != windowID {
             setConnectionWindowMapping(connectionID, windowID: windowID)
         }
-        runIDByConnectionID[connectionID] = runID
+        assignRunRoute(runID, to: connectionID)
         windowIDByRunID[runID] = windowID
         updateLiveRunAffinity(
             clientName: clientIdentifier(forConnection: connectionID) ?? "",
-            sessionKey: connections[connectionID]?.capabilityToken ?? capabilityTokenByConnection[connectionID],
+            sessionKey: routingSessionKey(for: connectionID),
             runID: runID,
             windowID: windowID,
             purpose: runPurposeByConnection[connectionID] ?? runPolicyStateByRunID[runID]?.purpose
@@ -3925,6 +4294,11 @@ actor ServerNetworkManager {
         return token
     }
 
+    /// Replaces the run's cached policy state with a newer one (an equal or older `updatedAt` changes
+    /// nothing). A policy-only writer (`preservingWorkspaceForPolicyRefresh`) supplies no workspace:
+    /// its `nil` means "not asserted", so the source workspace that exact-tab admission established
+    /// is kept when the run's window, nonnil tab, and purpose are unchanged. Every other field comes
+    /// from the new state, and any other writer's `nil` replaces (clears) the workspace.
     private func seedRunPolicyState(
         runID: UUID,
         windowID: Int,
@@ -3938,14 +4312,27 @@ actor ServerNetworkManager {
         taskLabelKind: AgentModelCatalog.TaskLabelKind? = nil,
         allowsAgentExternalControlTools: Bool = false,
         codeModeEligibility: MCPCodeModeEligibility = .native,
+        preservingWorkspaceForPolicyRefresh: Bool = false,
         updatedAt: Date
     ) {
-        if let existing = runPolicyStateByRunID[runID], existing.updatedAt >= updatedAt {
+        let existing = runPolicyStateByRunID[runID]
+        if let existing, existing.updatedAt >= updatedAt {
             return
+        }
+        var resolvedWorkspaceID = workspaceID
+        if preservingWorkspaceForPolicyRefresh,
+           workspaceID == nil,
+           let existing,
+           let tabID,
+           existing.tabID == tabID,
+           existing.windowID == windowID,
+           existing.purpose == purpose
+        {
+            resolvedWorkspaceID = existing.workspaceID
         }
         runPolicyStateByRunID[runID] = RunConnectionPolicyState(
             windowID: windowID,
-            workspaceID: workspaceID,
+            workspaceID: resolvedWorkspaceID,
             tabID: tabID,
             restrictedTools: restrictedTools,
             additionalTools: additionalTools,
@@ -3979,6 +4366,7 @@ actor ServerNetworkManager {
             taskLabelKind: policy.taskLabelKind,
             allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools,
             codeModeEligibility: policy.codeModeEligibility,
+            preservingWorkspaceForPolicyRefresh: true,
             updatedAt: policy.createdAt
         )
     }
@@ -4189,14 +4577,29 @@ actor ServerNetworkManager {
         }
     }
 
+    /// Writes the run's cached policy onto the connection. `persistWindowBinding` also assigns the
+    /// actor-side run route and the connection's window binding; `bindsRunTab` binds the run's tab
+    /// window-side, which registers the window's run mapping for this connection (and replaces
+    /// another connection holding it). A retained helper's refresh passes both false: it already
+    /// holds its route and window binding (its proof requires them), and it must never take the
+    /// window's run mapping from another connection. `tabRebindDisplacesHolder: false` (every
+    /// request-originated application: the rehydrate, a request-originated run mapping) makes the
+    /// run-tab bind yield to a different holder (`ensureTabBoundForRunIfPossible`). Returns the
+    /// run-tab bind's outcome (nil when no bind was attempted).
+    @discardableResult
     private func applyRunPolicyStateIfAvailable(
         runID: UUID,
         connectionID: UUID,
-        persistWindowBinding: Bool = true
-    ) async {
+        persistWindowBinding: Bool = true,
+        bindsRunTab: Bool = true,
+        tabRebindDisplacesHolder: Bool = true,
+        tabRebindRefusalSource: String = "tool_call"
+    ) async -> RunTabRebindOutcome? {
+        // A read-only companion derives its tools from its grant's run state; it never takes the
+        // run's policy, route, window binding or tab.
         guard companionRoleByConnectionID[connectionID] == nil,
               let cached = runPolicyStateByRunID[runID]
-        else { return }
+        else { return nil }
 
         restrictedToolsByConnection[connectionID] = cached.restrictedTools
         if let additional = cached.additionalTools {
@@ -4212,9 +4615,11 @@ actor ServerNetworkManager {
         sessionProfileByConnection[connectionID] = cached.sessionProfile
         codeModeEligibilityByConnection[connectionID] = cached.codeModeEligibility
         runPurposeByConnection[connectionID] = cached.purpose
+        // Recorded with the writes, before any suspension: the tool list announced below reflects it.
+        appliedRunPolicyProjectionByConnectionID[connectionID] = AppliedRunPolicyProjection(cached)
         preassignedConnections.insert(connectionID)
         if persistWindowBinding {
-            runIDByConnectionID[connectionID] = runID
+            assignRunRoute(runID, to: connectionID)
         }
 
         if persistWindowBinding, connectionWindowMap[connectionID] != cached.windowID {
@@ -4222,22 +4627,28 @@ actor ServerNetworkManager {
         }
         updateLiveRunAffinity(
             clientName: clientIdentifier(forConnection: connectionID) ?? "",
-            sessionKey: connections[connectionID]?.capabilityToken ?? capabilityTokenByConnection[connectionID],
+            sessionKey: routingSessionKey(for: connectionID),
             runID: runID,
             windowID: cached.windowID,
             purpose: cached.purpose
         )
 
-        _ = await ensureTabBoundForRunIfPossible(
-            connectionID: connectionID,
-            clientName: clientIdentifier(forConnection: connectionID),
-            runID: runID,
-            windowID: cached.windowID
-        )
+        var tabRebindOutcome: RunTabRebindOutcome?
+        if bindsRunTab {
+            tabRebindOutcome = await ensureTabBoundForRunIfPossible(
+                connectionID: connectionID,
+                clientName: clientIdentifier(forConnection: connectionID),
+                runID: runID,
+                windowID: cached.windowID,
+                displacesHolder: tabRebindDisplacesHolder,
+                refusalSource: tabRebindRefusalSource
+            )
+        }
 
         if connections[connectionID] != nil {
             await notifyToolListChanged(connectionID: connectionID)
         }
+        return tabRebindOutcome
     }
 
     func connectionID(for clientName: String, windowID: Int) -> UUID? {
@@ -4262,23 +4673,90 @@ actor ServerNetworkManager {
         runPolicyStateByRunID[runID]?.purpose
     }
 
+    /// The run's own tab from its policy state, for a connection routed to `runID` actor-side.
+    struct RunPolicyTab: Equatable {
+        let runID: UUID
+        let windowID: Int
+        let workspaceID: UUID?
+        let tabID: UUID
+    }
+
+    /// What request metadata captures from the actor in one read (`captureRequestMetadata`).
+    struct RequestRoutingContext {
+        let runPurpose: MCPRunPurpose?
+        let actorRoutedRunTab: RunPolicyTab?
+        /// `gatewayRemoteDeviceID(for:)` from the same read.
+        var gatewayRemoteDeviceID: String?
+    }
+
+    /// The connection's run purpose, actor-side run tab, and verified gateway device, read together.
+    func requestRoutingContext(for connectionID: UUID) -> RequestRoutingContext {
+        RequestRoutingContext(
+            runPurpose: runPurpose(for: connectionID),
+            actorRoutedRunTab: actorRoutedRunPolicyTab(for: connectionID),
+            gatewayRemoteDeviceID: gatewayRemoteDeviceID(for: connectionID)
+        )
+    }
+
+    /// The run tab of the connection's actor-side run route, when the run's policy names one. The
+    /// tab resolver (`resolveTabContext`) uses it for a routed connection without its run-tab
+    /// binding (a request that yielded the window's run mapping), never active-tab compatibility.
+    func actorRoutedRunPolicyTab(for connectionID: UUID) -> RunPolicyTab? {
+        guard let runID = runIDByConnectionID[connectionID],
+              let state = runPolicyStateByRunID[runID],
+              let tabID = state.tabID
+        else { return nil }
+        return RunPolicyTab(runID: runID, windowID: state.windowID, workspaceID: state.workspaceID, tabID: tabID)
+    }
+
+    enum RunTabRehydrateOutcome: Equatable {
+        /// Bound (or already bound) to the run tab.
+        case rehydrated
+        /// No Agent Mode run with a tab for the connection, or the bind failed.
+        case unavailable
+        /// The run policy was applied, but the run tab was not bound: a different connection holds
+        /// the run's window mapping. Nothing changed window-side; the connection's tools resolve
+        /// the run tab through its actor-side run route (`resolveTabContext`).
+        case yieldedToHolder
+
+        var didRehydrate: Bool {
+            self == .rehydrated
+        }
+    }
+
+    /// Applies the connection's Agent Mode run policy and binds the run tab. Every production
+    /// caller is request-originated (agent_run / agent_explore / agent_manage spawn-source and
+    /// launch-purpose resolution, ask_user controller provenance) and passes
+    /// `displacesHolder: false`, so a request never takes the window's run mapping from a
+    /// different holder (Claude native clients; `ensureTabBoundForRunIfPossible`).
     @discardableResult
-    func rehydrateRunTabContextForConnectionIfPossible(_ connectionID: UUID) async -> Bool {
+    func rehydrateRunTabContextForConnectionIfPossible(
+        _ connectionID: UUID,
+        displacesHolder: Bool
+    ) async -> RunTabRehydrateOutcome {
         guard companionRoleByConnectionID[connectionID] == nil,
               let runID = await runIDForConnection(connectionID),
               let cached = runPolicyStateByRunID[runID],
               cached.purpose == .agentModeRun,
               cached.tabID != nil
         else {
-            return false
+            return .unavailable
         }
-        await applyRunPolicyStateIfAvailable(runID: runID, connectionID: connectionID)
-        return await ensureTabBoundForRunIfPossible(
-            connectionID: connectionID,
-            clientName: clientIdentifier(forConnection: connectionID),
+        // One bind: the policy application's own run-tab bind, whose outcome decides.
+        let outcome = await applyRunPolicyStateIfAvailable(
             runID: runID,
-            windowID: cached.windowID
+            connectionID: connectionID,
+            tabRebindDisplacesHolder: displacesHolder,
+            tabRebindRefusalSource: "rehydrate"
         )
+        switch outcome {
+        case .alreadyBound, .bound:
+            return .rehydrated
+        case .yieldedToHolder:
+            return .yieldedToHolder
+        case .noRunTab, .failed, nil:
+            return .unavailable
+        }
     }
 
     typealias ConnectionApprovalHandler = @Sendable (UUID, MCP.Client.Info) async -> Bool
@@ -4335,6 +4813,9 @@ actor ServerNetworkManager {
         }
         for connectionID in connectionIDsForRun {
             runIDByConnectionID.removeValue(forKey: connectionID)
+            // The same per-connection state as an unroute (`unrouteRunConnections`): a connection
+            // with no run route carries no run-policy fingerprint.
+            appliedRunPolicyProjectionByConnectionID.removeValue(forKey: connectionID)
         }
         // The run's companion parks (its derived ceiling is now empty) but stays connected: its
         // grant is owned by the Codex controller that launched it and is disconnected when the
@@ -4412,6 +4893,646 @@ actor ServerNetworkManager {
 
         if let unregistration = toolObserverUnregistrationsByRunID[runID] {
             await unregistration.task.value
+        }
+    }
+
+    // MARK: - Run Connection-Loss Observers
+
+    @discardableResult
+    func registerRunConnectionLossObserver(
+        for runID: UUID,
+        launch: AgentMCPRunLaunchIdentity,
+        observer: @escaping @Sendable (AgentMCPRunConnectionLoss) async -> Void
+    ) -> UUID {
+        let token = UUID()
+        // A second observer of the same PID that read another instance makes the observer fallback
+        // disagree (`registeredAgentIdentity`), which releases the instance the first one read.
+        let identitiesBefore = registeredAgentIdentities(runID: runID)
+        defer {
+            unrouteDependentsOfReleasedAgentIdentities(
+                runID: runID,
+                identitiesBefore: identitiesBefore,
+                cause: "loss_observer_registered"
+            )
+        }
+        let agentIdentity: MCPHelperProcessIdentity? = switch helperProcessTableReader.entry(for: launch.agentProcessID) {
+        case let .present(identity, _, isZombie):
+            isZombie ? nil : identity
+        case .absent, .unreadable:
+            nil
+        }
+        if agentIdentity == nil {
+            connectionLog("Run connection-loss observer for run=\(runID) launch=\(launch.token): agent pid=\(launch.agentProcessID) identity unreadable; watchdog proof falls back to PID only and the helper-exit watch will not address this launch")
+        }
+        runConnectionLossObservers[runID, default: [:]][token] = RunConnectionLossObserverRegistration(
+            launch: launch,
+            agentIdentity: agentIdentity,
+            preexistingConnectionIDs: Set(connections.keys).union(bootstrapPeerPIDByConnectionID.keys),
+            observer: observer
+        )
+        return token
+    }
+
+    func unregisterRunConnectionLossObserver(for runID: UUID, token: UUID) {
+        // The observer's identity is the fallback registered instance (`registeredAgentIdentity`).
+        let identitiesBefore = registeredAgentIdentities(runID: runID)
+        defer {
+            unrouteDependentsOfReleasedAgentIdentities(
+                runID: runID,
+                identitiesBefore: identitiesBefore,
+                cause: "loss_observer_unregistered"
+            )
+        }
+        if var observers = runConnectionLossObservers[runID] {
+            observers.removeValue(forKey: token)
+            runConnectionLossObservers[runID] = observers.isEmpty ? nil : observers
+        }
+        // Pending helper-exit observations stop addressing the unregistered launch; one left with
+        // no addressees is cancelled.
+        for (observationID, var observation) in helperExitObservations where observation.runID == runID {
+            observation.addressees.removeAll { $0.observerToken == token }
+            if observation.addressees.isEmpty {
+                retireHelperExitObservation(observationID, outcome: "no_addressees")
+            } else {
+                helperExitObservations[observationID] = observation
+            }
+        }
+        stopHelperExitWatchPollingIfIdle()
+    }
+
+    private typealias RunConnectionLossDelivery = (
+        observer: @Sendable (AgentMCPRunConnectionLoss) async -> Void,
+        loss: AgentMCPRunConnectionLoss
+    )
+
+    /// The one loss builder for every reason: an immutable event addressed to `registration`'s
+    /// launch with the ownership evidence the caller proved.
+    private func runConnectionLossDelivery(
+        registration: RunConnectionLossObserverRegistration,
+        runID: UUID,
+        connectionID: UUID,
+        clientName: String?,
+        provenAgentProcessID: pid_t?,
+        toolName: String?,
+        reason: AgentMCPRunConnectionLoss.Reason,
+        closeReason: String
+    ) -> RunConnectionLossDelivery {
+        let loss = AgentMCPRunConnectionLoss(
+            runID: runID,
+            connectionID: connectionID,
+            clientName: clientName,
+            launchToken: registration.launch.token,
+            agentProcessID: provenAgentProcessID,
+            connectionPredatesLaunch: registration.preexistingConnectionIDs.contains(connectionID),
+            toolName: toolName,
+            reason: reason,
+            closeReason: closeReason
+        )
+        return (observer: registration.observer, loss: loss)
+    }
+
+    /// Watchdog ownership proof: whether the registration's agent process is in the connection's
+    /// helper ancestry. The admission snapshot decides when it contains the agent PID (so a
+    /// reparented or exited helper still proves its spawner), and then requires the same process
+    /// instance (start time) captured at registration, so a recycled PID never proves ownership.
+    /// When the snapshot is missing or lacks the PID, a live ancestry query decides. When the
+    /// agent identity could not be read at registration, proof falls back to the PID alone.
+    private func watchdogAncestryProves(
+        registration: RunConnectionLossObserverRegistration,
+        connectionID: UUID
+    ) -> Bool {
+        let agentPID = registration.launch.agentProcessID
+        let admission = helperPeerProcessSnapshotByConnectionID[connectionID]
+        if let captured = admission?.chainIdentity(of: agentPID) {
+            guard let agent = registration.agentIdentity else { return true }
+            return captured == agent
+        }
+        guard let peerPID = bootstrapPeerPIDByConnectionID[connectionID] else { return false }
+        guard let admission else {
+            guard let agent = registration.agentIdentity else {
+                return isAncestor(expectedPIDs: [agentPID], ofPid: pid_t(peerPID))
+            }
+            return MCPHelperPeerProcessSnapshot.capture(peerPID: pid_t(peerPID), reader: helperProcessTableReader)?
+                .chainContains(agent) ?? false
+        }
+        // The admission snapshot lacks the agent PID. A live query decides only while it still
+        // describes the helper process instance the snapshot captured: a recycled helper PID
+        // proves nothing.
+        guard let live = MCPHelperPeerProcessSnapshot.capture(peerPID: pid_t(peerPID), reader: helperProcessTableReader),
+              live.peer == admission.peer
+        else { return false }
+        guard let agent = registration.agentIdentity else {
+            return live.chainIdentity(of: agentPID) != nil
+        }
+        return live.chainContains(agent)
+    }
+
+    /// One addressed loss event per launch observer registered for the connection's run, for a
+    /// connection the execution watchdog is about to sever. Synchronous so the run route, the
+    /// observer set and each launch's ownership evidence are captured before the abort's first
+    /// suspension: later removal, reentrant routing or a successor launch's registration cannot
+    /// change them.
+    private func executionWatchdogRunConnectionLosses(
+        connectionID: UUID,
+        toolName: String,
+        callTimeRunID: UUID?
+    ) -> [RunConnectionLossDelivery] {
+        guard let runID = runIDByConnectionID[connectionID] ?? callTimeRunID,
+              let registrations = runConnectionLossObservers[runID]?.values
+        else { return [] }
+        let clientName = clientIDByConnection[connectionID]
+        return registrations.map { registration in
+            let launchPID = registration.launch.agentProcessID
+            let proven = watchdogAncestryProves(registration: registration, connectionID: connectionID)
+            return runConnectionLossDelivery(
+                registration: registration,
+                runID: runID,
+                connectionID: connectionID,
+                clientName: clientName,
+                provenAgentProcessID: proven ? launchPID : nil,
+                toolName: toolName,
+                reason: .toolExecutionWatchdog,
+                closeReason: TerminationReason.toolExecutionWatchdog.rawValue
+            )
+        }
+    }
+
+    // MARK: - Helper-Exit Watch
+
+    /// First terminal close reasons that never open a helper-exit watch: orderly run teardown,
+    /// manager shutdown (in-process MCP server restarts are out of scope), a replacement that
+    /// already routes the run, and the watchdog (which reports its own loss). Every other reason,
+    /// including unknown or future ones, is watched.
+    nonisolated static let helperExitWatchExcludedCloseReasons: Set<String> = [
+        TerminationReason.runCompleted.rawValue,
+        TerminationReason.runCancelled.rawValue,
+        TerminationReason.serverShutdown.rawValue,
+        TerminationReason.connectionReplaced.rawValue,
+        TerminationReason.toolExecutionWatchdog.rawValue
+    ]
+    /// An exited helper is reported only after this grace, so a Claude crash (which also kills
+    /// the helper) reaches the controller first. While a matching successor connection is
+    /// accepted but not yet routed, the wait extends to `helperRouteRestoreDeadline`.
+    nonisolated static let helperExitGrace: Duration = .seconds(2)
+    /// A helper that stays alive must restore the run route within this deadline.
+    nonisolated static let helperRouteRestoreDeadline: Duration = .seconds(20)
+
+    private struct HelperExitObservationAddressee {
+        let observerToken: UUID
+        let launch: AgentMCPRunLaunchIdentity
+        /// The launch's agent process instance as captured in the helper's admission ancestry.
+        let provenAgent: MCPHelperProcessIdentity
+    }
+
+    /// A closed run-routed helper connection whose helper process is being watched.
+    private struct HelperExitObservation {
+        let id: UUID
+        let connectionID: UUID
+        let runID: UUID
+        let sessionToken: String?
+        let clientName: String?
+        let closeReason: String
+        let helper: MCPHelperPeerProcessSnapshot
+        let openedAt: ContinuousClock.Instant
+        var addressees: [HelperExitObservationAddressee]
+    }
+
+    private func helperExitWatchNow() -> ContinuousClock.Instant {
+        #if DEBUG
+            return ContinuousClock.now.advanced(by: debugHelperExitWatchClockOffset)
+        #else
+            return ContinuousClock.now
+        #endif
+    }
+
+    /// Records a bootstrap helper peer and captures its process snapshot synchronously, while it
+    /// is alive.
+    private func setBootstrapPeerPID(_ pid: Int, for connectionID: UUID) {
+        bootstrapPeerPIDByConnectionID[connectionID] = pid
+        if let snapshot = MCPHelperPeerProcessSnapshot.capture(peerPID: pid_t(pid), reader: helperProcessTableReader) {
+            helperPeerProcessSnapshotByConnectionID[connectionID] = snapshot
+        } else {
+            helperPeerProcessSnapshotByConnectionID.removeValue(forKey: connectionID)
+        }
+    }
+
+    /// The single write path for a connection's run route. A route that becomes authoritative for
+    /// a run cancels that run's pending helper-exit observations it supersedes.
+    private func assignRunRoute(_ runID: UUID, to connectionID: UUID) {
+        runIDByConnectionID[connectionID] = runID
+        guard !helperExitObservations.isEmpty else { return }
+        for observation in helperExitObservations.values
+            where observation.runID == runID && isQualifyingHelperExitSuccessor(connectionID, for: observation)
+        {
+            retireHelperExitObservation(observation.id, outcome: "superseded successor=\(connectionID)")
+        }
+        stopHelperExitWatchPollingIfIdle()
+    }
+
+    /// A successor cancels an observation only once its run route for the same run is in place and
+    /// it is provably the same agent's helper: the same helper session token, or an admission
+    /// ancestry containing the same agent process instance. A merely accepted socket, or another
+    /// launch's helper, does not.
+    private func isQualifyingHelperExitSuccessor(
+        _ candidateID: UUID,
+        for observation: HelperExitObservation
+    ) -> Bool {
+        runIDByConnectionID[candidateID] == observation.runID
+            && isLiveMatchingHelperCandidate(candidateID, for: observation)
+    }
+
+    /// The route-independent half of both successor checks: a live, non-terminal connection other
+    /// than the observed one that is provably the observed agent's helper (the same helper session
+    /// token, or an admission ancestry containing an addressed agent process instance).
+    private func isLiveMatchingHelperCandidate(
+        _ candidateID: UUID,
+        for observation: HelperExitObservation
+    ) -> Bool {
+        guard candidateID != observation.connectionID,
+              isLiveNonTerminalConnection(candidateID)
+        else { return false }
+        if let token = observation.sessionToken, sessionToken(for: candidateID) == token {
+            return true
+        }
+        guard let snapshot = helperPeerProcessSnapshotByConnectionID[candidateID] else { return false }
+        return observation.addressees.contains { snapshot.chainContains($0.provenAgent) }
+    }
+
+    /// A registered connection whose teardown has not begun: not being removed, no terminal
+    /// record claimed, and not severed by the execution watchdog.
+    private func isLiveNonTerminalConnection(_ connectionID: UUID) -> Bool {
+        connections[connectionID] != nil
+            && !connectionsBeingRemoved.contains(connectionID)
+            && terminalRecordClaimsByConnectionID[connectionID] == nil
+            && !executionWatchdogTerminalConnections.contains(connectionID)
+    }
+
+    /// Whether a request-originated window-route mutation of the connection (the per-tool-call
+    /// run-tab rebind, the request rehydrate, the tool-call live-affinity restore, persisted-policy
+    /// hydration; `displacesHolder: false`) yields to a different holder of the run's window
+    /// mapping instead of replacing it. Scoped like run-route retention to Claude native client
+    /// identities; every other client keeps the displacing behaviour.
+    private func requestPathYieldsToDifferentHolder(connectionID: UUID) -> Bool {
+        Self.isClaudeNativeClient(clientIdentifier(forConnection: connectionID))
+    }
+
+    #if DEBUG
+        private func awaitDebugRequestWindowRouteHook(_ stage: DebugRequestWindowRouteStage, runID: UUID, callerID: UUID) async {
+            if let hook = debugRequestWindowRouteHook {
+                await hook(stage, runID, callerID)
+            }
+        }
+    #endif
+
+    /// Logs (and in DEBUG records) a request-originated window-route mutation that yielded the run's
+    /// window mapping to a different holder. `event` names the mechanism, `source` the request path.
+    private func recordRequestYieldedToHolder(
+        event: String,
+        source: String,
+        runID: UUID,
+        connectionID: UUID,
+        holder: UUID,
+        windowID: Int,
+        extraFields: [String: String] = [:]
+    ) {
+        connectionLog("Run routing: \(source) of connection \(connectionID) for run \(runID) in window \(windowID) yielded: holder \(holder) keeps the window's run mapping")
+        #if DEBUG
+            var fields = extraFields
+            fields["source"] = source
+            fields["holder_connection_id"] = holder.uuidString
+            fields["reason"] = "different_holder"
+            fields["window_id"] = String(windowID)
+            debugRecordRunRoutingEvent(runID: runID, event: event, connectionID: connectionID, fields: fields)
+        #else
+            _ = (event, extraFields)
+        #endif
+    }
+
+    /// Logs (and in DEBUG records `run_tab_rebound_empty_slot`) a request-originated window-route
+    /// mutation (`displacesHolder: false`) that took the run's empty window-mapping slot: a route
+    /// assignment re-creating the mapping (for example after a prune or a holder's removal
+    /// cleanup). `mechanism` is `run_tab_bind` or `run_mapping`; a yield never records it.
+    private func recordRequestFilledEmptySlot(
+        mechanism: String,
+        source: String,
+        runID: UUID,
+        connectionID: UUID,
+        windowID: Int
+    ) {
+        connectionLog("Run routing: \(source) of connection \(connectionID) took the empty window mapping of run \(runID) in window \(windowID) via \(mechanism)")
+        #if DEBUG
+            debugRecordRunRoutingEvent(
+                runID: runID,
+                event: "run_tab_rebound_empty_slot",
+                connectionID: connectionID,
+                fields: ["source": source, "mechanism": mechanism, "window_id": String(windowID)]
+            )
+        #endif
+    }
+
+    /// Whether the connection's helper is owned by one of the run's registered agent instances:
+    /// `ancestryProvesAgentInstance` holds for some expected PID of the run. The same rule as
+    /// launch-bound evidence, so retention, pruning, the turn-start refresh and early release all
+    /// decide ownership alike.
+    private func ancestryProvesExpectedAgent(connectionID: UUID, runID: UUID) -> Bool {
+        guard let expectedPIDs = expectedAgentPIDsByRunID[runID] else { return false }
+        return expectedPIDs.contains { agentPID in
+            ancestryProvesAgentInstance(connectionID: connectionID, runID: runID, agentPID: agentPID)
+        }
+    }
+
+    /// Run-route retention (later-turn route keeping, pruning, the turn-start policy refresh and
+    /// early release) is scoped to Claude native client identities. Every other client keeps the
+    /// full cleanup on revocation and gets no refresh.
+    private nonisolated static func retainsProvenRunRoutes(clientName: String?) -> Bool {
+        isClaudeNativeClient(clientName)
+    }
+
+    /// The Claude native client family (canonical family `claude-code`): the one scope of run-route
+    /// retention, the request-path yield to a different holder and the removal-time window
+    /// cleanup.
+    private nonisolated static func isClaudeNativeClient(_ clientName: String?) -> Bool {
+        MCPClientIdentity.canonicalFamilyID(clientName) == "claude-code"
+    }
+
+    /// The agent process instance registered for `pid` on the run: read when the PID was
+    /// registered as the run's expected agent, else when a launch's loss observer for that PID
+    /// registered. The observer fallback is deterministic: the one instance every readable
+    /// observer of the PID agrees on, and none (fail closed) when they disagree (a reused PID with
+    /// an earlier launch's observer still registered). The manager has no notion of a run's
+    /// current launch to prefer: expected-PID registration carries no launch token.
+    private func registeredAgentIdentity(runID: UUID, pid: pid_t) -> MCPHelperProcessIdentity? {
+        guard expectedAgentPIDsByRunID[runID]?.contains(pid) == true else { return nil }
+        if let identity = expectedAgentIdentityByRunID[runID]?[pid] {
+            return identity
+        }
+        let observed = Set(
+            (runConnectionLossObservers[runID] ?? [:]).values
+                .compactMap { $0.launch.agentProcessID == pid ? $0.agentIdentity : nil }
+        )
+        return observed.count == 1 ? observed.first : nil
+    }
+
+    /// The single ownership rule: `agentPID` is a registered expected PID of the run with a
+    /// registered process identity, the helper's ADMISSION snapshot contains exactly that identity
+    /// (same PID and start time), and that instance is still alive. No live re-capture: an
+    /// unreadable registration, a missing snapshot, a snapshot lacking the PID, or a PID reused
+    /// between registration and admission all fail closed. Binds evidence to one launch even while
+    /// an older launch's PID is still registered.
+    private func ancestryProvesAgentInstance(connectionID: UUID, runID: UUID, agentPID: pid_t) -> Bool {
+        guard let agent = registeredAgentIdentity(runID: runID, pid: agentPID),
+              let admission = helperPeerProcessSnapshotByConnectionID[connectionID],
+              admission.chainContains(agent),
+              case .alive = MCPHelperProcessLiveness.classify(agent, reader: helperProcessTableReader)
+        else { return false }
+        return true
+    }
+
+    /// Whether the connection is routed to the run, live and non-terminal, admitted for
+    /// `clientName`, bound to the run policy's window, and proven to belong to the run's agent (any
+    /// registered instance, or exactly the instance of `agentPID` when given). Window binding fails
+    /// closed: a run without cached run policy state has no window to match, and a connection
+    /// whose window binding differs from (or is missing for) the run policy's window holds no
+    /// proven route, so a later turn that installs the run's policy for another window never keeps
+    /// a helper bound to the old one.
+    private func connectionHoldsProvenRunRoute(
+        _ connectionID: UUID,
+        runID: UUID,
+        clientName: String,
+        agentPID: pid_t? = nil
+    ) -> Bool {
+        guard Self.retainsProvenRunRoutes(clientName: clientName),
+              runIDByConnectionID[connectionID] == runID,
+              isLiveNonTerminalConnection(connectionID),
+              MCPClientIdentity.matches(clientIDByConnection[connectionID], clientName),
+              let policyWindowID = runPolicyStateByRunID[runID]?.windowID,
+              connectionWindowMap[connectionID] == policyWindowID
+        else { return false }
+        if let agentPID {
+            return ancestryProvesAgentInstance(connectionID: connectionID, runID: runID, agentPID: agentPID)
+        }
+        return ancestryProvesExpectedAgent(connectionID: connectionID, runID: runID)
+    }
+
+    /// The run's routed connections that are live, non-terminal, admitted for `clientName`, and
+    /// ancestry-proven to belong to one of the run's currently registered agent instances.
+    private func liveProvenRouteConnectionIDs(for runID: UUID, clientName: String) -> [UUID] {
+        runIDByConnectionID.compactMap { connectionID, mappedRunID -> UUID? in
+            guard mappedRunID == runID,
+                  connectionHoldsProvenRunRoute(connectionID, runID: runID, clientName: clientName)
+            else { return nil }
+            return connectionID
+        }
+        .sorted { $0.uuidString < $1.uuidString }
+    }
+
+    private func helperExitObservationSuccessor(_ observation: HelperExitObservation) -> UUID? {
+        runIDByConnectionID.first { candidateID, runID in
+            runID == observation.runID && isQualifyingHelperExitSuccessor(candidateID, for: observation)
+        }?.key
+    }
+
+    /// A live connection that matches the observation's helper (same session token, or admission
+    /// ancestry containing an addressed agent instance) but has no run route yet: its admission
+    /// may still restore the route, so an exited helper is not reported before the route deadline.
+    private func helperExitObservationHasPendingUnroutedSuccessor(_ observation: HelperExitObservation) -> Bool {
+        connections.keys.contains { candidateID in
+            runIDByConnectionID[candidateID] == nil
+                && isLiveMatchingHelperCandidate(candidateID, for: observation)
+        }
+    }
+
+    /// Opens a helper-exit observation at a bootstrap helper connection's first terminal commit,
+    /// synchronously (before any suspension, while the run route is intact). Only a run-routed
+    /// connection of a run with loss observers, closed for a watched reason by a running manager,
+    /// and not a watchdog abort, is watched; only launches whose agent PID is in the helper's
+    /// admission ancestry are addressed.
+    private func openHelperExitObservationIfEligible(connectionID: UUID, closeReason: String) {
+        guard isRunningState,
+              !Self.helperExitWatchExcludedCloseReasons.contains(closeReason),
+              !executionWatchdogTerminalConnections.contains(connectionID),
+              bootstrapPeerPIDByConnectionID[connectionID] != nil,
+              let runID = runIDByConnectionID[connectionID],
+              let registrations = runConnectionLossObservers[runID],
+              !registrations.isEmpty
+        else { return }
+        // Production bootstrap registration always records the current generation
+        // (`registerAndStartBootstrapConnection`), so a mismatch on a routed, observed connection
+        // is unexpected: say so rather than silently disabling the watch.
+        guard connectionLifecycleGenerationByID[connectionID] == lifecycleGeneration else {
+            #if DEBUG
+                debugHelperExitGenerationGuardRejections += 1
+            #endif
+            log.warning("Helper-exit watch not opened: lifecycle generation mismatch connection=\(connectionID) run=\(runID) connection_generation=\(connectionLifecycleGenerationByID[connectionID].map { String($0) } ?? "none") manager_generation=\(lifecycleGeneration) close_reason=\(closeReason) observers=\(registrations.count)")
+            return
+        }
+        guard let helper = helperPeerProcessSnapshotByConnectionID[connectionID] else {
+            connectionLog("Helper-exit watch not opened: no admission process snapshot connection=\(connectionID) run=\(runID) close_reason=\(closeReason)")
+            return
+        }
+        var addressees: [HelperExitObservationAddressee] = []
+        for (observerToken, registration) in registrations {
+            // Proof requires the agent process instance read at registration (PID plus start
+            // time) in the admission ancestry; a recycled PID or an unreadable identity is no proof.
+            guard let agent = registration.agentIdentity, helper.chainContains(agent) else {
+                connectionLog("Helper-exit watch: launch \(registration.launch.token) agent_pid=\(registration.launch.agentProcessID) agent_start=\(registration.agentIdentity?.startDescription ?? "unknown") has no ancestry proof for connection=\(connectionID) run=\(runID); it gets no event")
+                continue
+            }
+            addressees.append(HelperExitObservationAddressee(
+                observerToken: observerToken,
+                launch: registration.launch,
+                provenAgent: agent
+            ))
+        }
+        guard !addressees.isEmpty else {
+            connectionLog("Helper-exit watch not opened: no launch proven for connection=\(connectionID) run=\(runID) close_reason=\(closeReason)")
+            return
+        }
+        let observation = HelperExitObservation(
+            id: UUID(),
+            connectionID: connectionID,
+            runID: runID,
+            sessionToken: sessionToken(for: connectionID),
+            clientName: clientIDByConnection[connectionID] ?? pendingConnections[connectionID],
+            closeReason: closeReason,
+            helper: helper,
+            openedAt: helperExitWatchNow(),
+            addressees: addressees
+        )
+        helperExitObservations[observation.id] = observation
+        connectionLog("Helper-exit watch opened observation=\(observation.id) connection=\(connectionID) run=\(runID) close_reason=\(closeReason) helper_pid=\(helper.peer.pid) helper_start=\(helper.peer.startDescription) addressees=\(addressees.count)")
+        ensureHelperExitWatchPolling()
+    }
+
+    private func retireHelperExitObservation(_ observationID: UUID, outcome: String) {
+        guard let observation = helperExitObservations.removeValue(forKey: observationID) else { return }
+        connectionLog("Helper-exit watch retired observation=\(observationID) connection=\(observation.connectionID) run=\(observation.runID) outcome=\(outcome)")
+    }
+
+    /// One pass over pending observations. Synchronous: each observation's final validation (no
+    /// successor, current addressees), loss construction and retirement happen with no suspension
+    /// in between; delivery is detached. Returns the number of losses delivered.
+    @discardableResult
+    private func runHelperExitWatchTick() -> Int {
+        guard !helperExitObservations.isEmpty else { return 0 }
+        let now = helperExitWatchNow()
+        var deliveries: [RunConnectionLossDelivery] = []
+        for observation in helperExitObservations.values.sorted(by: { $0.openedAt < $1.openedAt }) {
+            if let successorID = helperExitObservationSuccessor(observation) {
+                retireHelperExitObservation(observation.id, outcome: "superseded successor=\(successorID)")
+                continue
+            }
+            let registrations = runConnectionLossObservers[observation.runID] ?? [:]
+            let current = observation.addressees.compactMap { addressee -> (
+                addressee: HelperExitObservationAddressee,
+                registration: RunConnectionLossObserverRegistration
+            )? in
+                guard let registration = registrations[addressee.observerToken],
+                      registration.launch == addressee.launch
+                else { return nil }
+                return (addressee, registration)
+            }
+            guard !current.isEmpty else {
+                retireHelperExitObservation(observation.id, outcome: "no_addressees")
+                continue
+            }
+            let elapsed = observation.openedAt.duration(to: now)
+            let liveness = MCPHelperProcessLiveness.classify(observation.helper.peer, reader: helperProcessTableReader)
+            let reason: AgentMCPRunConnectionLoss.Reason
+            switch liveness {
+            case .exited:
+                guard elapsed >= Self.helperExitGrace else { continue }
+                if elapsed < Self.helperRouteRestoreDeadline,
+                   helperExitObservationHasPendingUnroutedSuccessor(observation)
+                {
+                    continue
+                }
+                reason = .helperExited
+            case .alive, .unknown:
+                guard elapsed >= Self.helperRouteRestoreDeadline else { continue }
+                reason = .routeNotRestored
+            }
+            for entry in current {
+                deliveries.append(runConnectionLossDelivery(
+                    registration: entry.registration,
+                    runID: observation.runID,
+                    connectionID: observation.connectionID,
+                    clientName: observation.clientName,
+                    provenAgentProcessID: entry.addressee.provenAgent.pid,
+                    toolName: nil,
+                    reason: reason,
+                    closeReason: observation.closeReason
+                ))
+            }
+            retireHelperExitObservation(observation.id, outcome: "\(reason.rawValue) liveness=\(liveness) losses=\(current.count)")
+        }
+        stopHelperExitWatchPollingIfIdle()
+        deliverRunConnectionLosses(deliveries)
+        return deliveries.count
+    }
+
+    /// Starts the single manager-owned poller while observations exist. It sleeps with
+    /// `Task.sleep(nanoseconds:)`, holds only a weak manager reference across sleeps, and ends
+    /// when the observations drain, the manager stops, or its lifecycle is invalidated.
+    private func ensureHelperExitWatchPolling() {
+        guard helperExitPollingTask == nil, !helperExitObservations.isEmpty else { return }
+        #if DEBUG
+            if debugHelperExitWatchManualTicks { return }
+        #endif
+        let pollerID = UUID()
+        let interval = helperExitWatchTickNanoseconds
+        let generation = lifecycleGeneration
+        helperExitPollingTaskID = pollerID
+        helperExitPollingTask = Task { [weak self] in
+            while true {
+                do {
+                    try await Task.sleep(nanoseconds: interval)
+                } catch {
+                    return
+                }
+                guard let manager = self,
+                      await manager.helperExitWatchPollerTick(pollerID: pollerID, lifecycleGeneration: generation)
+                else { return }
+            }
+        }
+    }
+
+    /// Returns whether the poller identified by `pollerID` should keep running.
+    private func helperExitWatchPollerTick(pollerID: UUID, lifecycleGeneration generation: UInt64) -> Bool {
+        guard helperExitPollingTaskID == pollerID, !Task.isCancelled else { return false }
+        guard isCurrentLifecycle(generation) else {
+            cancelHelperExitWatch()
+            return false
+        }
+        runHelperExitWatchTick()
+        return helperExitPollingTaskID == pollerID
+    }
+
+    private func stopHelperExitWatchPollingIfIdle() {
+        guard helperExitObservations.isEmpty, helperExitPollingTask != nil else { return }
+        helperExitPollingTask?.cancel()
+        helperExitPollingTask = nil
+        helperExitPollingTaskID = nil
+    }
+
+    /// Manager stop / lifecycle invalidation: drop every observation and stop the poller.
+    private func cancelHelperExitWatch() {
+        if !helperExitObservations.isEmpty {
+            connectionLog("Helper-exit watch cancelled \(helperExitObservations.count) observation(s): manager lifecycle ended")
+        }
+        helperExitObservations.removeAll()
+        helperExitPollingTask?.cancel()
+        helperExitPollingTask = nil
+        helperExitPollingTaskID = nil
+    }
+
+    /// Fire-and-forget: each observer runs in its own detached task, so a slow or stuck observer
+    /// can never delay containment or another observer.
+    private func deliverRunConnectionLosses(_ deliveries: [RunConnectionLossDelivery]) {
+        for delivery in deliveries {
+            let observer = delivery.observer
+            let loss = delivery.loss
+            Task.detached { await observer(loss) }
         }
     }
 
@@ -5355,6 +6476,11 @@ actor ServerNetworkManager {
             break
         }
         let principal = principalDecision.principal
+        // Captured synchronously with the principal decision, before the first suspension: the
+        // admission carries the generation it authenticated under, never a later current one.
+        let authenticatedGatewayCredentialGeneration: UInt64 = principal == .gateway
+            ? gatewayLaunchCredentialGeneration
+            : 0
 
         let companionAdmission: (runID: UUID, grantGeneration: UInt64)?
         switch companionAdmissionDecision(
@@ -5430,6 +6556,12 @@ actor ServerNetworkManager {
                 return rejectBootstrapAdmissionBecauseStopped(connectionID: connectionID)
             }
         #endif
+        guard isAuthenticatedGatewayCredentialCurrent(
+            principal: principal,
+            gatewayCredentialGeneration: authenticatedGatewayCredentialGeneration
+        ) else {
+            return rejectBootstrapAdmissionBecauseGatewayCredentialRotated(connectionID: connectionID)
+        }
 
         guard claimBootstrapAdmission(
             sessionToken: sessionToken,
@@ -5477,9 +6609,21 @@ actor ServerNetworkManager {
             )
             return rejectBootstrapAdmissionBecauseStopped(connectionID: connectionID)
         }
+        guard isAuthenticatedGatewayCredentialCurrent(
+            principal: principal,
+            gatewayCredentialGeneration: authenticatedGatewayCredentialGeneration
+        ) else {
+            releaseBootstrapAdmissionClaim(
+                sessionToken: sessionToken,
+                connectionID: connectionID,
+                lifecycleGeneration: admissionLifecycleGeneration
+            )
+            return rejectBootstrapAdmissionBecauseGatewayCredentialRotated(connectionID: connectionID)
+        }
         if let companionAdmission {
             // Re-validated after every suspension above: a grant replaced or cleared meanwhile
-            // rejects rather than admitting under a stale launch.
+            // rejects rather than admitting under a stale launch. Last check before the
+            // non-suspending accept, after the gateway credential recheck.
             guard recordAdmittedCompanion(
                 connectionID: connectionID,
                 sessionToken: sessionToken,
@@ -5505,6 +6649,7 @@ actor ServerNetworkManager {
             clientPid: clientPid,
             clientName: clientName,
             principal: principal,
+            gatewayCredentialGeneration: authenticatedGatewayCredentialGeneration,
             companionAdmission: companionAdmission
         )
     }
@@ -5578,6 +6723,7 @@ actor ServerNetworkManager {
         clientPid: Int,
         clientName: String?,
         principal: MCPConnectionPrincipal,
+        gatewayCredentialGeneration: UInt64,
         companionAdmission: (runID: UUID, grantGeneration: UInt64)? = nil
     ) -> BootstrapSocketServer.Admission {
         guard reserveBootstrapSlot(
@@ -5614,6 +6760,7 @@ actor ServerNetworkManager {
                     clientPid: clientPid,
                     clientName: clientName,
                     principal: principal,
+                    gatewayCredentialGeneration: gatewayCredentialGeneration,
                     companionAdmission: companionAdmission
                 )
             },
@@ -5634,6 +6781,7 @@ actor ServerNetworkManager {
         clientPid: Int,
         clientName: String?,
         principal: MCPConnectionPrincipal,
+        gatewayCredentialGeneration: UInt64,
         companionAdmission: (runID: UUID, grantGeneration: UInt64)? = nil
     ) async {
         guard let reservation = bootstrapReservations[connectionID],
@@ -5742,6 +6890,19 @@ actor ServerNetworkManager {
             )
             return
         }
+        // Accepted delivery and postAccept scheduling suspend after admission returned, so a
+        // gateway credential rotation may land here. Fail closed before any predecessor removal.
+        guard isAuthenticatedGatewayCredentialCurrent(
+            principal: principal,
+            gatewayCredentialGeneration: gatewayCredentialGeneration
+        ) else {
+            await abandonPendingBootstrapCommit(
+                connectionID: connectionID,
+                lifecycleGeneration: admissionLifecycleGeneration,
+                reason: "gateway credential rotated before publication"
+            )
+            return
+        }
 
         let committedPredecessorRemoval: CommittedConnectionRemoval?
         if let replacementCredit = committingReservation.replacementCredit {
@@ -5786,6 +6947,7 @@ actor ServerNetworkManager {
             clientPid: clientPid,
             clientName: clientName,
             principal: principal,
+            gatewayCredentialGeneration: gatewayCredentialGeneration,
             manager: preparedConnection
         ) else {
             if let committedPredecessorRemoval {
@@ -5943,7 +7105,8 @@ actor ServerNetworkManager {
                 sessionToken: sessionToken,
                 clientPid: clientPid,
                 clientName: clientName,
-                principal: .standard
+                principal: .standard,
+                gatewayCredentialGeneration: 0
             )
             guard admission.publishTransferredFD?(clientFD) == true else {
                 await rollbackBootstrapReservation(
@@ -5954,6 +7117,17 @@ actor ServerNetworkManager {
                 return nil
             }
             return admission
+        }
+
+        /// Enters the running state and activates the transferred-socket ledger exactly as
+        /// `start()` does, without starting the bootstrap listener or the maintenance loop, so a
+        /// test can drive the production bootstrap admission/commit with a socketpair.
+        func debugEnterRunningStateWithoutListenersForTesting() {
+            if !isRunningState {
+                lifecycleGeneration &+= 1
+            }
+            isRunningState = true
+            transferredBootstrapSockets.activate(lifecycleGeneration: lifecycleGeneration)
         }
 
         func debugContainsConnection(_ id: UUID) -> Bool {
@@ -6008,9 +7182,15 @@ actor ServerNetworkManager {
         clientPid: Int,
         clientName: String?,
         principal: MCPConnectionPrincipal,
+        gatewayCredentialGeneration: UInt64,
         manager: BootstrapSocketConnectionManager
     ) -> Bool {
-        guard isRunningState, self.lifecycleGeneration == lifecycleGeneration else {
+        guard isRunningState, self.lifecycleGeneration == lifecycleGeneration,
+              isAuthenticatedGatewayCredentialCurrent(
+                  principal: principal,
+                  gatewayCredentialGeneration: gatewayCredentialGeneration
+              )
+        else {
             return false
         }
 
@@ -6021,7 +7201,9 @@ actor ServerNetworkManager {
             source: .handshake,
             hasHandshake: false,
             principal: principal,
-            lastUpdated: Date()
+            lastUpdated: Date(),
+            gatewayRemoteDeviceID: Self.gatewayRemoteDeviceID(bootstrapClientName: clientName, principal: principal),
+            gatewayCredentialGeneration: principal == .gateway ? gatewayCredentialGeneration : 0
         )
         identityContextByConnection[connectionID] = identityContext
 
@@ -6031,15 +7213,7 @@ actor ServerNetworkManager {
         mcpACPLog("[MCP-ACP] registered bootstrap connection connection=\(connectionID) pendingClientName=\(clientName ?? "unknown")")
 
         connections[connectionID] = manager
-        bootstrapPeerPIDByConnectionID[connectionID] = clientPid
-        #if DEBUG
-            if let peerIdentity = processIdentity(of: pid_t(clientPid)) {
-                debugHelperPeerIdentityByConnectionID[connectionID] = DebugHelperPeerIdentity(
-                    startSeconds: peerIdentity.startSeconds,
-                    startMicroseconds: peerIdentity.startMicroseconds
-                )
-            }
-        #endif
+        setBootstrapPeerPID(clientPid, for: connectionID)
         callLimiters[connectionID] = MCPConnectionCallLimiters(
             limit: limiterLimit(for: connectionID),
             controlLimit: controlLimiterLimit(for: connectionID),
@@ -6464,6 +7638,7 @@ actor ServerNetworkManager {
         bootstrapSocketTask = nil
         maintenanceTask?.cancel()
         maintenanceTask = nil
+        cancelHelperExitWatch()
 
         // Invalidate synchronous transfer publication and close transferred-but-unregistered
         // sockets before awaiting listener teardown. This prevents old-lifecycle commits
@@ -6496,9 +7671,7 @@ actor ServerNetworkManager {
             connectionLifecycleGenerationByID.removeValue(forKey: id)
             registeredToolCallHandlers.removeValue(forKey: id)
             bootstrapPeerPIDByConnectionID.removeValue(forKey: id)
-            #if DEBUG
-                debugHelperPeerIdentityByConnectionID.removeValue(forKey: id)
-            #endif
+            helperPeerProcessSnapshotByConnectionID.removeValue(forKey: id)
             connectionTasks.removeValue(forKey: id)
             pendingConnections.removeValue(forKey: id)
             identityContextByConnection.removeValue(forKey: id)
@@ -6581,6 +7754,11 @@ actor ServerNetworkManager {
         {
             companionRoleByConnectionID.removeValue(forKey: id)
         }
+        // Belt and braces: shutdown awaited above. Unless a replacement lifecycle started meanwhile,
+        // no helper-exit observation or poller may survive this stop.
+        if !isRunningState {
+            cancelHelperExitWatch()
+        }
         emitDashboardUpdate()
     }
 
@@ -6594,11 +7772,13 @@ actor ServerNetworkManager {
         sessionProfileByConnection.removeAll()
         codeModeEligibilityByConnection.removeAll()
         runPurposeByConnection.removeAll()
+        appliedRunPolicyProjectionByConnectionID.removeAll()
         windowCountAtConnectionTime.removeAll()
         preassignedConnections.removeAll()
         pendingPoliciesByClient.removeAll()
         expectedAgentPIDsByClient.removeAll()
         expectedAgentPIDsByRunID.removeAll()
+        expectedAgentIdentityByRunID.removeAll()
         #if DEBUG
             debugExpectedProcessIdentityByRunID.removeAll()
             debugLiveRunMappedOMPIdentityConnections.removeAll()
@@ -6927,6 +8107,14 @@ actor ServerNetworkManager {
         capabilityTokenByConnection.removeValue(forKey: id)
     }
 
+    /// The helper session key of a connection for routing memory: the key of
+    /// `liveRunAffinityByClientSession` and `lastWindowByClientSession` (the connection's own
+    /// capability token, else the cached one). Every writer, lookup and removal of those maps
+    /// derives it here.
+    private func routingSessionKey(for connectionID: UUID) -> String? {
+        connections[connectionID]?.capabilityToken ?? capabilityTokenByConnection[connectionID]
+    }
+
     /// Returns the session token for a connection (from capability token cache or connection itself).
     func sessionToken(for connectionID: UUID) -> String? {
         capabilityTokenByConnection[connectionID] ?? connections[connectionID]?.capabilityToken
@@ -6950,13 +8138,25 @@ actor ServerNetworkManager {
             errno: context.errno,
             errorDescription: context.errorDescription
         )
+        let isFirstTerminalCommit = terminalRecordClaimsByConnectionID[connectionID] == nil
         var claim = terminalRecordClaimsByConnectionID[connectionID] ?? MCPFirstTerminalRecordClaim()
         guard let record = claim.claim(candidate) else { return }
         terminalRecordClaimsByConnectionID[connectionID] = claim
+        if isFirstTerminalCommit {
+            // Every terminal path commits here first, synchronously and while the run route is
+            // intact, so the first terminal reason decides whether the helper is watched.
+            openHelperExitObservationIfEligible(connectionID: connectionID, closeReason: record.reason)
+        }
 
+        let eventsDirectoryURL: URL
+        #if DEBUG
+            eventsDirectoryURL = debugTerminalRecordsDirectoryOverride ?? MCPFilesystemConstants.eventsDirectoryURL()
+        #else
+            eventsDirectoryURL = MCPFilesystemConstants.eventsDirectoryURL()
+        #endif
         if MCPTerminalRecordStore.writeBestEffort(
             record,
-            to: MCPFilesystemConstants.eventsDirectoryURL()
+            to: eventsDirectoryURL
         ) != nil {
             claim.markPersisted()
             terminalRecordClaimsByConnectionID[connectionID] = claim
@@ -6971,6 +8171,12 @@ actor ServerNetworkManager {
         runID: UUID,
         message: String? = nil
     ) async {
+        #if DEBUG
+            debugConnectionReplacements.append((existing: oldID, replacement: newID, runID: runID))
+            if debugConnectionReplacements.count > 64 {
+                debugConnectionReplacements.removeFirst(debugConnectionReplacements.count - 64)
+            }
+        #endif
         let oldToken = sessionToken(for: oldID)
         let newToken = sessionToken(for: newID)
 
@@ -7098,11 +8304,20 @@ actor ServerNetworkManager {
         _ id: UUID,
         toolName: String,
         invocationID: UUID,
+        callTimeRunID: UUID?,
         elapsedMilliseconds: Double,
         handlerPhase: MCPToolExecutionHandlerPhaseSnapshot?,
         handlerPhaseAgeMilliseconds: Double?
     ) async {
         guard executionWatchdogTerminalConnections.insert(id).inserted else { return }
+        // Captured and handed off right after the terminal commit, before any suspension (and
+        // before removal), so the owning run route and its launch observers are exact. Delivery is
+        // detached: observers learn of the loss and can never gate the abort below.
+        deliverRunConnectionLosses(executionWatchdogRunConnectionLosses(
+            connectionID: id,
+            toolName: toolName,
+            callTimeRunID: callTimeRunID
+        ))
         let activeToolExecutionScopeCount = activeToolScopeIDs(ownedBy: id).values.reduce(0) { $0 + $1.count }
         let limiterDiagnostics = await callLimiters[id]?.executionWatchdogDiagnostics()
         let phaseDescription = handlerPhase.map {
@@ -7244,6 +8459,27 @@ actor ServerNetworkManager {
         return didDetachContextBuilderContext
     }
 
+    /// Window-side cleanup of a removed connection, in every window: each run mapping that may
+    /// still point at it (the run it was routed to, any run a window maps to it, its reverse
+    /// mapping), removed only while it still points at it (`cleanupRunIDMapping` is
+    /// receipt-checked), so a mapping re-installed for another connection meanwhile is never
+    /// touched. Routing failure is not signalled.
+    @MainActor
+    private static func releaseRemovedConnectionRunWindowMappings(connectionID: UUID, routedRunID: UUID?) {
+        for window in WindowStatesManager.shared.allWindows {
+            var runIDs = Set(window.mcpServer.connectionIDByRunID.compactMap { $0.value == connectionID ? $0.key : nil })
+            if let routedRunID {
+                runIDs.insert(routedRunID)
+            }
+            if let reverse = window.mcpServer.connectionIDToRunID[connectionID] {
+                runIDs.insert(reverse)
+            }
+            for runID in runIDs {
+                window.mcpServer.cleanupRunIDMapping(runID: runID, connectionID: connectionID, signalRoutingFailure: false)
+            }
+        }
+    }
+
     func removeConnection(
         _ id: UUID,
         context: MCPConnectionCloseContext = .cleanupUnspecified
@@ -7368,6 +8604,7 @@ actor ServerNetworkManager {
         sessionProfileByConnection.removeValue(forKey: id)
         codeModeEligibilityByConnection.removeValue(forKey: id)
         runPurposeByConnection.removeValue(forKey: id)
+        appliedRunPolicyProjectionByConnectionID.removeValue(forKey: id)
         runIDByConnectionID.removeValue(forKey: id)
         pendingPolicyApplicationIDByConnectionID.removeValue(forKey: id)
         windowAssignmentByConnection.removeValue(forKey: id)
@@ -7392,6 +8629,13 @@ actor ServerNetworkManager {
             closeContext: context,
             responseDeliverySnapshot: responseDeliverySnapshot
         )
+        // A removed Claude native connection's window run mappings: the tab-context teardown above
+        // clears only a mapping its bound run tab carries, so one registered without (or left
+        // after) that binding would keep the run's window mapping on a dead connection, which a
+        // request-originated repair yields to. Context Builder discovery runs own their mappings.
+        if cleanupRunPurpose != .discoverRun, Self.isClaudeNativeClient(cleanupClientID ?? cleanupClientName) {
+            await Self.releaseRemovedConnectionRunWindowMappings(connectionID: id, routedRunID: cleanupRunID)
+        }
         #if DEBUG
             if cleanupRunPurpose == .discoverRun, let cleanupRunID {
                 debugRecordRunRoutingEvent(
@@ -7428,8 +8672,8 @@ actor ServerNetworkManager {
         // The session-token pin outlives the connection (until the grant ends) so a reconnect
         // keeps its companion role; the per-connection role does not.
         companionRoleByConnectionID.removeValue(forKey: id)
+        helperPeerProcessSnapshotByConnectionID.removeValue(forKey: id)
         #if DEBUG
-            debugHelperPeerIdentityByConnectionID.removeValue(forKey: id)
             debugLiveRunMappedOMPIdentityConnections.remove(id)
             debugOMPProcessCorrelationFieldsByConnectionIDForTesting.removeValue(forKey: id)
         #endif
@@ -7563,7 +8807,7 @@ actor ServerNetworkManager {
                 await reusableWindowForClient(newConnectionID: connectionID, clientName: clientName)
             },
             sessionKeyForConnection: { [self] connectionID in
-                connections[connectionID]?.capabilityToken ?? capabilityTokenByConnection[connectionID]
+                routingSessionKey(for: connectionID)
             },
             preferredLiveRunWindowID: { [self] clientName, sessionKey in
                 preferredLiveRunAffinity(for: clientName, sessionKey: sessionKey)?.windowID
@@ -7711,9 +8955,29 @@ actor ServerNetworkManager {
         pids.insert(pid)
         expectedAgentPIDsByClient[storageKey] = pids
         if let runID {
+            // A re-registration replaces (or drops) the PID's registered instance, which can take
+            // proof away from a helper of the earlier instance.
+            let identitiesBefore = registeredAgentIdentities(runID: runID)
+            defer {
+                unrouteDependentsOfReleasedAgentIdentities(
+                    runID: runID,
+                    identitiesBefore: identitiesBefore,
+                    cause: "expected_pid_reregistered"
+                )
+            }
             var runPIDs = expectedAgentPIDsByRunID[runID] ?? []
             runPIDs.insert(pid)
             expectedAgentPIDsByRunID[runID] = runPIDs
+            // The instance registered now: a later process reusing the PID never proves this launch.
+            if case let .present(identity, _, isZombie) = helperProcessTableReader.entry(for: pid), !isZombie {
+                expectedAgentIdentityByRunID[runID, default: [:]][pid] = identity
+            } else {
+                // Unreadable now: this PID has no registered instance, so it proves no route.
+                expectedAgentIdentityByRunID[runID]?.removeValue(forKey: pid)
+                if expectedAgentIdentityByRunID[runID]?.isEmpty == true {
+                    expectedAgentIdentityByRunID.removeValue(forKey: runID)
+                }
+            }
             #if DEBUG
                 if let identity = processIdentity(of: pid) {
                     let hasSuppliedExecutable = expectedProcessExecutablePath != nil
@@ -7797,6 +9061,18 @@ actor ServerNetworkManager {
     }
 
     private func removeExpectedAgentPID(_ pid: pid_t, forRunID runID: UUID) {
+        let identitiesBefore = registeredAgentIdentities(runID: runID)
+        defer {
+            unrouteDependentsOfReleasedAgentIdentities(
+                runID: runID,
+                identitiesBefore: identitiesBefore,
+                cause: "expected_pid_cleared"
+            )
+        }
+        expectedAgentIdentityByRunID[runID]?.removeValue(forKey: pid)
+        if expectedAgentIdentityByRunID[runID]?.isEmpty == true {
+            expectedAgentIdentityByRunID.removeValue(forKey: runID)
+        }
         guard var pids = expectedAgentPIDsByRunID[runID] else { return }
         pids.remove(pid)
         #if DEBUG
@@ -7804,6 +9080,8 @@ actor ServerNetworkManager {
         #endif
         if pids.isEmpty {
             expectedAgentPIDsByRunID.removeValue(forKey: runID)
+            // Never outlives the run's PID set.
+            expectedAgentIdentityByRunID.removeValue(forKey: runID)
             #if DEBUG
                 debugExpectedProcessIdentityByRunID.removeValue(forKey: runID)
             #endif
@@ -8383,6 +9661,7 @@ actor ServerNetworkManager {
                 taskLabelKind: taskLabelKind,
                 allowsAgentExternalControlTools: allowsAgentExternalControlTools,
                 codeModeEligibility: normalizedCodeModeEligibility,
+                preservingWorkspaceForPolicyRefresh: true,
                 updatedAt: policy.createdAt
             )
         }
@@ -8461,12 +9740,16 @@ actor ServerNetworkManager {
                 )
             }
         #endif
+        // A helper the run kept from an earlier turn is never admitted again; this turn's policy
+        // reaches it through `refreshRetainedRunPolicyForTurnStart`, which the bootstrap lease
+        // calls after releasing the global gate (never while the gate is held here).
         // A companion that attached before this run's policy (either arrival order) derives its
-        // tools from the reseeded run state; tell it the list changed. This is the only suspension
-        // and runs after the seed and the primary's pending-policy enqueue, which stay one
-        // synchronous step, so a stalled companion write never delays the primary's policy.
+        // tools from the reseeded run state; tell it the list changed. The seed and the primary's
+        // pending-policy enqueue above stay one synchronous step, and the notify is handed off
+        // rather than awaited: the bootstrap lease may hold the global gate across this call, so
+        // a stalled companion `tools/list_changed` write must never suspend it.
         if let runID {
-            await notifyCompanionToolListChanged(runID: runID)
+            Task { await self.notifyCompanionToolListChanged(runID: runID) }
         }
     }
 
@@ -8776,7 +10059,7 @@ actor ServerNetworkManager {
             purpose: MCPRunPurpose = .unknown,
             windowID: Int? = nil
         ) {
-            runIDByConnectionID[connectionID] = runID
+            assignRunRoute(runID, to: connectionID)
             if purpose != .unknown || runPurposeByConnection[connectionID] == nil {
                 runPurposeByConnection[connectionID] = purpose
             }
@@ -9048,10 +10331,10 @@ actor ServerNetworkManager {
                     activeToolScopeCount: activeScopeCount,
                     helperPeerPID: connectionID.flatMap { bootstrapPeerPIDByConnectionID[$0] },
                     helperPeerStartSeconds: connectionID.flatMap {
-                        debugHelperPeerIdentityByConnectionID[$0]?.startSeconds
+                        helperPeerProcessSnapshotByConnectionID[$0]?.peer.startSeconds
                     },
                     helperPeerStartMicroseconds: connectionID.flatMap {
-                        debugHelperPeerIdentityByConnectionID[$0]?.startMicroseconds
+                        helperPeerProcessSnapshotByConnectionID[$0]?.peer.startMicroseconds
                     }
                 )
                 debugConnectionHistory.append(entry)
@@ -9107,6 +10390,7 @@ actor ServerNetworkManager {
                 let identity = identityContext(for: entry.id)
                 let clientName = identity?.clientName ?? clientIdentifier(forConnection: entry.id) ?? (entry.clientName.isEmpty ? nil : entry.clientName)
                 let fingerprint = debugSessionFingerprint(forToken: entry.sessionKey)
+                let helperSnapshot = helperPeerProcessSnapshotByConnectionID[entry.id]
                 return [
                     "id": entry.id.uuidString,
                     "client_name": clientName ?? NSNull(),
@@ -9119,9 +10403,12 @@ actor ServerNetworkManager {
                     "created_at_ms": debugDateMilliseconds(entry.createdAt),
                     "last_tool_call_at_ms": entry.lastToolCallAt.map(debugDateMilliseconds) ?? NSNull(),
                     "total_tool_calls": entry.totalToolCalls,
+                    "run_id": runIDByConnectionID[entry.id]?.uuidString ?? NSNull(),
                     "helper_peer_pid": bootstrapPeerPIDByConnectionID[entry.id] ?? NSNull(),
-                    "helper_peer_start_seconds": debugHelperPeerIdentityByConnectionID[entry.id]?.startSeconds ?? NSNull(),
-                    "helper_peer_start_microseconds": debugHelperPeerIdentityByConnectionID[entry.id]?.startMicroseconds ?? NSNull(),
+                    "helper_peer_start_seconds": helperSnapshot?.peer.startSeconds ?? NSNull(),
+                    "helper_peer_start_microseconds": helperSnapshot?.peer.startMicroseconds ?? NSNull(),
+                    "helper_process_start": helperSnapshot?.peer.startDescription ?? NSNull(),
+                    "helper_ancestor_pids": helperSnapshot.map { $0.ancestorPIDs.map(Int.init) as Any } ?? NSNull(),
                     "idle_seconds": entry.idleSeconds ?? NSNull(),
                     "has_in_flight_calls": entry.hasInFlightCalls,
                     "active_tool_scope_count": entry.activeToolScopeCount,
@@ -10384,7 +11671,9 @@ actor ServerNetworkManager {
                     source: .handshake,
                     hasHandshake: true,
                     principal: principal,
-                    lastUpdated: Date()
+                    lastUpdated: Date(),
+                    gatewayRemoteDeviceID: Self.gatewayRemoteDeviceID(bootstrapClientName: clientName, principal: principal),
+                    gatewayCredentialGeneration: principal == .gateway ? gatewayLaunchCredentialGeneration : 0
                 )
             }
 
@@ -10702,6 +11991,281 @@ actor ServerNetworkManager {
             func debugIsExecutionWatchdogTerminal(connectionID: UUID) -> Bool {
                 executionWatchdogTerminalConnections.contains(connectionID)
             }
+
+            /// Seeds the bootstrap helper peer PID of a fixture connection (as admission records it).
+            func debugSetBootstrapPeerPID(connectionID: UUID, pid: pid_t) {
+                setBootstrapPeerPID(Int(pid), for: connectionID)
+            }
+
+            func debugSetTerminalRecordsDirectoryOverride(_ url: URL?) {
+                debugTerminalRecordsDirectoryOverride = url
+            }
+
+            func debugSetHelperProcessTableReader(_ reader: any MCPProcessTableReading) {
+                helperProcessTableReader = reader
+            }
+
+            /// Manual mode: observations never start the poller; tests drive `debugRunHelperExitWatchTick`.
+            func debugSetHelperExitWatchManualTicks(_ manual: Bool) {
+                debugHelperExitWatchManualTicks = manual
+            }
+
+            func debugSetHelperExitWatchTickNanoseconds(_ nanoseconds: UInt64) {
+                helperExitWatchTickNanoseconds = nanoseconds
+            }
+
+            func debugAdvanceHelperExitWatchClock(by duration: Duration) {
+                debugHelperExitWatchClockOffset += duration
+            }
+
+            @discardableResult
+            func debugRunHelperExitWatchTick() -> Int {
+                runHelperExitWatchTick()
+            }
+
+            func debugHelperExitObservationCount(runID: UUID? = nil) -> Int {
+                guard let runID else { return helperExitObservations.count }
+                return helperExitObservations.values.count(where: { $0.runID == runID })
+            }
+
+            func debugHelperExitObservationAddresseeTokens(connectionID: UUID) -> [UUID] {
+                helperExitObservations.values
+                    .filter { $0.connectionID == connectionID }
+                    .flatMap { $0.addressees.map(\.launch.token) }
+            }
+
+            var debugHelperExitWatchPollingActive: Bool {
+                helperExitPollingTask != nil
+            }
+
+            var debugHelperExitGenerationGuardRejectionCount: Int {
+                debugHelperExitGenerationGuardRejections
+            }
+
+            var debugRoutingPreservingPolicyRevocationCount: Int {
+                debugRoutingPreservingPolicyRevocations
+            }
+
+            var debugPrunedUnprovenRunRouteCount: Int {
+                debugPrunedUnprovenRunRoutes
+            }
+
+            var debugRetainedRunPolicyRefreshCount: Int {
+                debugRetainedRunPolicyRefreshes
+            }
+
+            var debugProvenRouteEarlyReleaseCount: Int {
+                debugProvenRouteEarlyReleases
+            }
+
+            /// Whether the connection's recorded run-policy fingerprint equals the run's current
+            /// projection; nil when the connection has no fingerprint or the run no policy state.
+            func debugAppliedRunPolicyProjectionMatchesRunPolicy(connectionID: UUID, runID: UUID) -> Bool? {
+                guard let applied = appliedRunPolicyProjectionByConnectionID[connectionID],
+                      let state = runPolicyStateByRunID[runID]
+                else { return nil }
+                return applied == AppliedRunPolicyProjection(state)
+            }
+
+            /// Whether any registered agent identity (or empty identity map) remains for the run.
+            func debugHasExpectedAgentIdentityEntry(runID: UUID) -> Bool {
+                expectedAgentIdentityByRunID[runID] != nil
+            }
+
+            func debugExpectedAgentPIDs(runID: UUID) -> Set<pid_t> {
+                expectedAgentPIDsByRunID[runID] ?? []
+            }
+
+            func debugSetRetainedRunPolicyRefreshSuspension(_ suspension: (@Sendable (UUID) async -> Void)?) {
+                debugRetainedRunPolicyRefreshSuspension = suspension
+            }
+
+            func debugSetAfterRevocationPruneSuspension(_ suspension: (@Sendable () async -> Void)?) {
+                debugAfterRevocationPruneSuspension = suspension
+            }
+
+            func debugSetBeforeRunWindowCleanupHop(_ suspension: (@Sendable ([UUID]) async -> Void)?) {
+                debugBeforeRunWindowCleanupHop = suspension
+            }
+
+            /// Drops only the connection's run-policy fingerprint (as an unroute does), leaving its
+            /// route and restricted set untouched.
+            func debugDropRunPolicyFingerprint(connectionID: UUID) {
+                appliedRunPolicyProjectionByConnectionID.removeValue(forKey: connectionID)
+            }
+
+            /// Awaits every window-side cleanup scheduled by a proof loss so far (including any
+            /// scheduled while awaiting).
+            func debugAwaitScheduledRunWindowCleanups() async {
+                while !debugScheduledRunWindowCleanups.isEmpty {
+                    let cleanups = Array(debugScheduledRunWindowCleanups.values)
+                    for cleanup in cleanups {
+                        await cleanup.value
+                    }
+                }
+            }
+
+            /// Records the admitted client identity of a fixture connection (as admission does).
+            func debugSetAdmittedClientIDForTesting(connectionID: UUID, clientID: String) {
+                clientIDByConnection[connectionID] = clientID
+            }
+
+            func debugAncestryProvesExpectedAgent(connectionID: UUID, runID: UUID) -> Bool {
+                ancestryProvesExpectedAgent(connectionID: connectionID, runID: runID)
+            }
+
+            /// The full ownership proof (`connectionHoldsProvenRunRoute`), window binding included.
+            func debugConnectionHoldsProvenRunRoute(connectionID: UUID, runID: UUID, clientName: String) -> Bool {
+                connectionHoldsProvenRunRoute(connectionID, runID: runID, clientName: clientName)
+            }
+
+            func debugRegisteredAgentIdentity(runID: UUID, pid: pid_t) -> MCPHelperProcessIdentity? {
+                registeredAgentIdentity(runID: runID, pid: pid)
+            }
+
+            /// The per-tool-call run-tab rebind exactly as a tool call runs it.
+            func debugRunScopedTabRebindFallbackForToolCall(
+                connectionID: UUID,
+                runID: UUID,
+                windowID: Int
+            ) async -> RunTabRebindOutcome {
+                await runScopedTabRebindFallbackForToolCall(connectionID: connectionID, runID: runID, windowID: windowID)
+            }
+
+            /// The `handleConnectionReplaced` calls so far that displace `existing` for `runID`.
+            func debugConnectionReplacementCount(existing: UUID, runID: UUID) -> Int {
+                debugConnectionReplacements.count { $0.existing == existing && $0.runID == runID }
+            }
+
+            /// Awaited at each `DebugRequestWindowRouteStage` of a request-originated window-route
+            /// mutation that yields to a different holder.
+            func debugSetRequestWindowRouteHook(
+                _ hook: (@Sendable (_ stage: DebugRequestWindowRouteStage, _ runID: UUID, _ callerID: UUID) async -> Void)?
+            ) {
+                debugRequestWindowRouteHook = hook
+            }
+
+            /// The production PRIORITY 2b step of tool-call window routing.
+            func debugRestoreRunAffinityForToolCall(connectionID: UUID, clientName: String) async -> Int? {
+                await restoreRunAffinityForToolCall(connectionID: connectionID, clientName: clientName)
+            }
+
+            /// The production persisted-policy hydration (tools/call, tools/list, resources/read).
+            func debugHydratePersistedAgentModePolicy(connectionID: UUID, reason: String) async -> Bool {
+                await hydratePersistedAgentModePolicyForConnectionIfNeeded(connectionID: connectionID, reason: reason)
+            }
+
+            /// Records a helper session's live run affinity as a routed helper's policy application does.
+            func debugSeedLiveRunAffinity(clientName: String, sessionKey: String, runID: UUID, windowID: Int, purpose: MCPRunPurpose) {
+                updateLiveRunAffinity(clientName: clientName, sessionKey: sessionKey, runID: runID, windowID: windowID, purpose: purpose)
+            }
+
+            func debugLiveRunAffinityRunIDs() -> Set<UUID> {
+                Set(liveRunAffinityByClientSession.values.flatMap { $0.values.map(\.runID) })
+            }
+
+            /// The run recorded by the live-run affinity of a helper session token, if any client has one.
+            func debugLiveRunAffinityRunID(sessionKey: String) -> UUID? {
+                liveRunAffinityByClientSession.values.lazy.compactMap { $0[sessionKey]?.runID }.first
+            }
+
+            func debugWindowIDForRunID(_ runID: UUID) -> Int? {
+                windowIDByRunID[runID]
+            }
+
+            func debugIsRunAdmitted(_ runID: UUID) -> Bool {
+                admittedPolicyRunIDs.contains(runID)
+            }
+
+            /// Stands in for a pending-policy application already past reservation for the run.
+            @discardableResult
+            func debugBeginPendingPolicyApplicationForTesting(runID: UUID) -> UUID {
+                let applicationID = UUID()
+                pendingPolicyApplicationIDByRunID[runID] = applicationID
+                return applicationID
+            }
+
+            func debugPendingPolicyApplicationID(runID: UUID) -> UUID? {
+                pendingPolicyApplicationIDByRunID[runID]
+            }
+
+            /// Marks the run's queued pending policy as reserved by `connectionID` (or clears the
+            /// reservation with nil), as a route installation awaiting it does. False when the run
+            /// has no queued policy.
+            @discardableResult
+            func debugSetPendingPolicyReservationForTesting(runID: UUID, connectionID: UUID?) -> Bool {
+                for key in Array(pendingPoliciesByClient.keys) {
+                    guard var queue = pendingPoliciesByClient[key],
+                          let index = queue.firstIndex(where: { $0.runID == runID })
+                    else { continue }
+                    queue[index].reservationConnectionID = connectionID
+                    pendingPoliciesByClient[key] = queue
+                    return true
+                }
+                return false
+            }
+
+            func debugMarkConnectionBeingRemovedForTesting(_ connectionID: UUID, _ isBeingRemoved: Bool) {
+                if isBeingRemoved {
+                    connectionsBeingRemoved.insert(connectionID)
+                } else {
+                    connectionsBeingRemoved.remove(connectionID)
+                }
+            }
+
+            /// Drops a fixture connection's recorded lifecycle generation, simulating a registration
+            /// path that never wrote it.
+            func debugForgetConnectionLifecycleGeneration(_ connectionID: UUID) {
+                connectionLifecycleGenerationByID.removeValue(forKey: connectionID)
+            }
+
+            /// Runs one tick of the live poller as its task would, with its captured lifecycle
+            /// generation (`staleLifecycle` passes an earlier one). `nil` when no poller exists.
+            func debugRunHelperExitWatchPollerTick(staleLifecycle: Bool) -> Bool? {
+                guard let pollerID = helperExitPollingTaskID else { return nil }
+                let generation = staleLifecycle ? lifecycleGeneration &- 1 : lifecycleGeneration
+                return helperExitWatchPollerTick(pollerID: pollerID, lifecycleGeneration: generation)
+            }
+
+            func debugHelperPeerProcessSnapshot(connectionID: UUID) -> MCPHelperPeerProcessSnapshot? {
+                helperPeerProcessSnapshotByConnectionID[connectionID]
+            }
+
+            /// Commits a fixture connection's first terminal record (as every terminal path does)
+            /// without removing it.
+            func debugCommitTerminalRecordForTesting(connectionID: UUID, reason: String) {
+                persistAcceptedSocketTerminalRecord(
+                    connectionID: connectionID,
+                    context: MCPConnectionCloseContext(reason: reason, initiator: .app)
+                )
+            }
+
+            func debugConnectionIsRegistered(connectionID: UUID) -> Bool {
+                connections[connectionID] != nil
+            }
+
+            /// Drives the production soft disconnect (no kill signal, no session cooldown): the
+            /// helper keeps its session token and is expected to reconnect.
+            func debugSoftDisconnectConnection(connectionID: UUID, reason: TerminationReason) async {
+                await softDisconnectConnection(connectionID, reason: reason, message: "debug soft disconnect")
+            }
+
+            /// Drives the production execution-watchdog abort for a registered fixture connection.
+            func debugAbortConnectionForExecutionWatchdog(
+                connectionID: UUID,
+                toolName: String,
+                callTimeRunID: UUID? = nil
+            ) async {
+                await abortConnectionForExecutionWatchdog(
+                    connectionID,
+                    toolName: toolName,
+                    invocationID: UUID(),
+                    callTimeRunID: callTimeRunID,
+                    elapsedMilliseconds: 0,
+                    handlerPhase: nil,
+                    handlerPhaseAgeMilliseconds: nil
+                )
+            }
         #endif
 
         struct DebugActiveToolScopeSnapshot: Equatable {
@@ -10930,6 +12494,16 @@ actor ServerNetworkManager {
         windowID: Int? = nil,
         runID: UUID? = nil
     ) async {
+        clearClientConnectionPolicySynchronously(for: clientName, windowID: windowID, runID: runID)
+    }
+
+    /// `clearClientConnectionPolicy` without a suspension point, for callers whose queue removal
+    /// must be synchronous with their checks (the early release).
+    private func clearClientConnectionPolicySynchronously(
+        for clientName: String,
+        windowID: Int?,
+        runID: UUID?
+    ) {
         pruneExpiredPolicies(for: clientName)
         let keys = matchingClientKeys(for: clientName, in: Array(pendingPoliciesByClient.keys))
         guard !keys.isEmpty else {
@@ -10990,9 +12564,18 @@ actor ServerNetworkManager {
         #endif
     }
 
-    /// Revokes a run-scoped pending policy and invalidates any reserved/in-flight application
-    /// before removing live routing state. This is the terminal cleanup counterpart to
-    /// PID-owned early gate release.
+    /// Revokes a run-scoped pending policy and invalidates any reserved/in-flight application.
+    /// This is the terminal cleanup counterpart to PID-owned early gate release (one turn's
+    /// routing wait timed out, failed or was cancelled), not an end-of-scope boundary: live
+    /// routing state is removed only when no live, ancestry-proven helper connection of the run
+    /// (admitted for `clientName`) remains. A long-lived agent process keeps its existing helper
+    /// across turns, so a later turn's lease never sees a new connection; that helper's route, run
+    /// policy state and live affinity stay in place (and pick up this turn's run policy), so its
+    /// later loss is still observed. The run's other, unproven routes are pruned. A proof lost
+    /// during the prune's hop or the refresh is handled where it is lost (the registration hook,
+    /// `unrouteDependentsOfReleasedAgentIdentities`); the one final check then clears the run's routing state
+    /// when no proven route is left. `cleanupRunRoutingState(for:windowID:)` remains the true
+    /// end-of-scope cleanup.
     func revokeClientConnectionPolicy(
         for clientName: String,
         windowID: Int,
@@ -11005,20 +12588,506 @@ actor ServerNetworkManager {
             windowID: windowID,
             runID: runID
         )
-        await cleanupRunRoutingState(for: runID, windowID: windowID)
+        // Sampled after the awaits above, so a helper that closed meanwhile is not preserved.
+        let prune = await pruneUnprovenRunRoutes(clientName: clientName, runID: runID)
+        if !prune.keptConnectionIDs.isEmpty {
+            // Backstop for a policy installed while no route was proven yet (turn-start refresh).
+            await refreshRetainedRunPolicy(
+                runID: runID,
+                connectionIDs: prune.keptConnectionIDs,
+                clientName: clientName
+            )
+        }
+        let preservedConnectionIDs = await finishRetainedRunRouting(
+            clientName: clientName,
+            windowID: windowID,
+            runID: runID
+        )
+        if !preservedConnectionIDs.isEmpty {
+            connectionLog("Run policy revoked for run=\(runID) client=\(clientName) window=\(windowID); routing preserved for live ancestry-proven helper connection(s) \(preservedConnectionIDs.map(\.uuidString).joined(separator: ","))")
+            #if DEBUG
+                debugRoutingPreservingPolicyRevocations += 1
+            #endif
+        }
         #if DEBUG
             debugRecordRunRoutingEvent(
                 runID: runID,
                 event: "policy_revoked",
                 fields: [
                     "client_name": clientName,
-                    "window_id": String(windowID)
+                    "window_id": String(windowID),
+                    "routing_preserved": String(!preservedConnectionIDs.isEmpty),
+                    "preserved_connection_count": String(preservedConnectionIDs.count),
+                    "pruned_connection_count": String(prune.prunedCount),
+                    "window_mapping_removed": String(prune.windowMappingRemoved)
                 ]
             )
         #endif
     }
 
+    /// The routing half of `revokeClientConnectionPolicy`, without touching any pending policy or
+    /// application ID: the run's unproven routes are pruned, and when no live, ancestry-proven
+    /// helper connection of the run (admitted for `clientName`) remains, `cleanupRunRoutingState`.
+    /// The lease calls it for failure or cancellation cleanup after an early release, which
+    /// cleared the turn's pending policy already (a newer turn's queued policy must stay).
+    func cleanupRunRoutingIfUnproven(for clientName: String, windowID: Int, runID: UUID) async {
+        let prune = await pruneUnprovenRunRoutes(clientName: clientName, runID: runID)
+        let preservedConnectionIDs = await finishRetainedRunRouting(
+            clientName: clientName,
+            windowID: windowID,
+            runID: runID
+        )
+        #if DEBUG
+            debugRecordRunRoutingEvent(
+                runID: runID,
+                event: "routing_cleanup_if_unproven",
+                fields: [
+                    "client_name": clientName,
+                    "window_id": String(windowID),
+                    "routing_preserved": String(!preservedConnectionIDs.isEmpty),
+                    "preserved_connection_count": String(preservedConnectionIDs.count),
+                    "pruned_connection_count": String(prune.prunedCount),
+                    "window_mapping_removed": String(prune.windowMappingRemoved)
+                ]
+            )
+        #endif
+    }
+
+    private struct RunRoutePrune {
+        /// The run's proven connections the partition kept (empty: nothing was proven).
+        var keptConnectionIDs: [UUID]
+        var prunedCount: Int
+        /// The prune's window-side cleanup removed a window's run mapping.
+        var windowMappingRemoved: Bool
+    }
+
+    /// The single prune of a revocation or routing cleanup, from one partition: every route of the
+    /// run that is not proven (`liveProvenRouteConnectionIDs`) is unrouted actor-side synchronously
+    /// with the partition, then one window-side hop removes the mappings that still point at a
+    /// pruned connection. Prunes nothing when nothing is proven (the final check then clears the
+    /// run's routing state), which is always the case for a non-Claude client. No recompute after
+    /// the hop: a kept connection that loses its proof meanwhile is unrouted by the change that
+    /// took it (`unrouteDependentsOfReleasedAgentIdentities`).
+    private func pruneUnprovenRunRoutes(clientName: String, runID: UUID) async -> RunRoutePrune {
+        let provenConnectionIDs = liveProvenRouteConnectionIDs(for: runID, clientName: clientName)
+        guard !provenConnectionIDs.isEmpty else {
+            return RunRoutePrune(keptConnectionIDs: [], prunedCount: 0, windowMappingRemoved: false)
+        }
+        let proven = Set(provenConnectionIDs)
+        let prunedConnectionIDs = unrouteRunConnections(
+            runID: runID,
+            runIDByConnectionID.compactMap { connectionID, mappedRunID in
+                mappedRunID == runID && !proven.contains(connectionID) ? connectionID : nil
+            }
+        )
+        guard !prunedConnectionIDs.isEmpty else {
+            return RunRoutePrune(keptConnectionIDs: provenConnectionIDs, prunedCount: 0, windowMappingRemoved: false)
+        }
+        let windowMappingRemoved = await cleanUpPrunedRunWindowMappings(
+            runID: runID,
+            prunedConnectionIDs: prunedConnectionIDs
+        )
+        #if DEBUG
+            if let suspension = debugAfterRevocationPruneSuspension {
+                await suspension()
+            }
+        #endif
+        return RunRoutePrune(
+            keptConnectionIDs: provenConnectionIDs,
+            prunedCount: prunedConnectionIDs.count,
+            windowMappingRemoved: windowMappingRemoved
+        )
+    }
+
+    /// The one full-cleanup decision of a revocation or routing cleanup, synchronous with its
+    /// check: when no route of the run is proven any more (none was, or every kept one closed or
+    /// lost its proof during the prune's hop or the refresh), `cleanupRunRoutingState`. Returns the
+    /// run's proven connections (empty after the cleanup).
+    private func finishRetainedRunRouting(clientName: String, windowID: Int, runID: UUID) async -> [UUID] {
+        let provenConnectionIDs = liveProvenRouteConnectionIDs(for: runID, clientName: clientName)
+        guard provenConnectionIDs.isEmpty else { return provenConnectionIDs }
+        await cleanupRunRoutingState(for: runID, windowID: windowID)
+        return []
+    }
+
+    /// Synchronously unroutes the given connections of the run actor-side (those not routed to it
+    /// are skipped): their run route, their run-policy fingerprint, and the live-run affinity of
+    /// their helper session (unless a connection still routed to the run shares it). Run-level
+    /// state stays. Returns the unrouted IDs.
+    private func unrouteRunConnections(runID: UUID, _ candidateIDs: [UUID]) -> [UUID] {
+        let unroutedConnectionIDs = candidateIDs.filter { runIDByConnectionID[$0] == runID }
+        guard !unroutedConnectionIDs.isEmpty else { return [] }
+        for connectionID in unroutedConnectionIDs {
+            runIDByConnectionID.removeValue(forKey: connectionID)
+            appliedRunPolicyProjectionByConnectionID.removeValue(forKey: connectionID)
+        }
+        let keptSessionKeys = Set(runIDByConnectionID.compactMap { connectionID, mappedRunID in
+            mappedRunID == runID ? routingSessionKey(for: connectionID) : nil
+        })
+        for connectionID in unroutedConnectionIDs {
+            guard let key = routingSessionKey(for: connectionID), !keptSessionKeys.contains(key) else { continue }
+            for clientKey in Array(liveRunAffinityByClientSession.keys) {
+                guard liveRunAffinityByClientSession[clientKey]?[key]?.runID == runID else { continue }
+                liveRunAffinityByClientSession[clientKey]?.removeValue(forKey: key)
+                if liveRunAffinityByClientSession[clientKey]?.isEmpty == true {
+                    liveRunAffinityByClientSession.removeValue(forKey: clientKey)
+                }
+            }
+        }
+        connectionLog("Unrouted route(s) \(unroutedConnectionIDs.map(\.uuidString).joined(separator: ",")) of run=\(runID)")
+        #if DEBUG
+            debugPrunedUnprovenRunRoutes += unroutedConnectionIDs.count
+        #endif
+        return unroutedConnectionIDs
+    }
+
+    /// Every agent instance registered for the run (`registeredAgentIdentity` of each expected
+    /// PID), whether or not that process is still alive.
+    private func registeredAgentIdentities(runID: UUID) -> Set<MCPHelperProcessIdentity> {
+        guard let pids = expectedAgentPIDsByRunID[runID] else { return [] }
+        return Set(pids.compactMap { registeredAgentIdentity(runID: runID, pid: $0) })
+    }
+
+    /// Event-driven ownership: runs synchronously at the end of a change that can take proof away
+    /// (an expected PID removed, a PID's registered instance replaced or dropped, a loss observer
+    /// unregistered), with `identitiesBefore` (`registeredAgentIdentities`) sampled at its start.
+    /// The change's dependents are found from registration and admission ancestry alone, never
+    /// from liveness: every routed connection of the run admitted for a Claude native client whose
+    /// ADMISSION snapshot contains an instance the change released (registered before, not after),
+    /// so a helper whose agent already exited is still found. Each dependent that no longer passes
+    /// the full proof (`connectionHoldsProvenRunRoute`, liveness included) is unrouted actor-side
+    /// in the same synchronous step (`unrouteRunConnections`); one still proven by another
+    /// registered instance is kept, and routes that never descended from a released instance are
+    /// never touched (an unproven fallback route is left to the revocation's prune). The
+    /// window-side cleanup of mappings that still point at an unrouted connection is scheduled.
+    /// Never clears run-level state (`cleanupRunRoutingState`): on a restart the old PID is cleared
+    /// while the new turn's seeded run policy and pending policy must stay for the new helper.
+    private func unrouteDependentsOfReleasedAgentIdentities(
+        runID: UUID,
+        identitiesBefore: Set<MCPHelperProcessIdentity>,
+        cause: String
+    ) {
+        let released = identitiesBefore.subtracting(registeredAgentIdentities(runID: runID))
+        guard !released.isEmpty else { return }
+        let lostProofConnectionIDs = runIDByConnectionID.compactMap { connectionID, mappedRunID -> UUID? in
+            guard mappedRunID == runID,
+                  let clientID = clientIDByConnection[connectionID],
+                  Self.retainsProvenRunRoutes(clientName: clientID),
+                  let admission = helperPeerProcessSnapshotByConnectionID[connectionID],
+                  released.contains(where: { admission.chainContains($0) }),
+                  !connectionHoldsProvenRunRoute(connectionID, runID: runID, clientName: clientID)
+            else { return nil }
+            return connectionID
+        }
+        let unroutedConnectionIDs = unrouteRunConnections(runID: runID, lostProofConnectionIDs)
+        guard !unroutedConnectionIDs.isEmpty else { return }
+        #if DEBUG
+            let debugCleanupID = UUID()
+        #endif
+        let cleanup = Task {
+            let windowMappingRemoved = await cleanUpPrunedRunWindowMappings(
+                runID: runID,
+                prunedConnectionIDs: unroutedConnectionIDs
+            )
+            #if DEBUG
+                debugRecordRunRoutingEvent(
+                    runID: runID,
+                    event: "proof_lost_routes_unrouted",
+                    fields: [
+                        "cause": cause,
+                        "unrouted_connection_count": String(unroutedConnectionIDs.count),
+                        "window_mapping_removed": String(windowMappingRemoved)
+                    ]
+                )
+                debugScheduledRunWindowCleanups.removeValue(forKey: debugCleanupID)
+            #else
+                _ = windowMappingRemoved
+            #endif
+        }
+        #if DEBUG
+            // Inserted before the actor-isolated task can run, so its own removal always follows.
+            debugScheduledRunWindowCleanups[debugCleanupID] = cleanup
+        #else
+            _ = cleanup
+        #endif
+    }
+
+    /// Window-side half of an unroute: removes the run's window mappings that still point at an
+    /// unrouted connection (one routed to the run again meanwhile is skipped). A mapping held by
+    /// any other connection is never touched, and nothing is re-pointed: a run whose window
+    /// mapping is gone falls back to the routing wait on later turns. Returns whether a window's
+    /// run mapping was removed.
+    @discardableResult
+    private func cleanUpPrunedRunWindowMappings(runID: UUID, prunedConnectionIDs: [UUID]) async -> Bool {
+        let stillPruned = prunedConnectionIDs.filter { runIDByConnectionID[$0] != runID }
+        guard !stillPruned.isEmpty else { return false }
+        #if DEBUG
+            if let suspension = debugBeforeRunWindowCleanupHop {
+                await suspension(stillPruned)
+            }
+        #endif
+        return await MainActor.run {
+            var removedMapping = false
+            for window in WindowStatesManager.shared.allWindows {
+                for connectionID in stillPruned {
+                    if window.mcpServer.connectionIDByRunID[runID] == connectionID {
+                        removedMapping = true
+                    }
+                    window.mcpServer.cleanupRunIDMapping(
+                        runID: runID,
+                        connectionID: connectionID,
+                        signalRoutingFailure: false
+                    )
+                }
+            }
+            return removedMapping
+        }
+    }
+
+    /// Gives the run's current policy to retained helper connections whose last applied projection
+    /// differs (an unchanged projection sends no `tools/list_changed`; only the projection decides,
+    /// a window-binding difference alone never triggers a refresh). A retained connection never
+    /// takes the fresh-mapping path that applies the run's policy (`mapConnectionToRunID`
+    /// short-circuits for an existing mapping). Before each connection, after any suspension: the
+    /// refresh stops once the run's projection is no longer the one it set out to apply (the newer
+    /// policy's install runs its own refresh), and the connection is proven again right before its
+    /// apply (`connectionHoldsProvenRunRoute` with `clientName` and, when given, exactly
+    /// `agentPID`'s instance), so one that closed, began teardown, lost its route or lost its
+    /// ownership proof meanwhile is skipped, never re-routed.
+    private func refreshRetainedRunPolicy(
+        runID: UUID,
+        connectionIDs: [UUID],
+        clientName: String,
+        agentPID: pid_t? = nil
+    ) async {
+        guard let target = runPolicyStateByRunID[runID].map(AppliedRunPolicyProjection.init) else { return }
+        for connectionID in connectionIDs {
+            #if DEBUG
+                if let suspension = debugRetainedRunPolicyRefreshSuspension {
+                    await suspension(connectionID)
+                }
+            #endif
+            guard let cached = runPolicyStateByRunID[runID], AppliedRunPolicyProjection(cached) == target else { return }
+            guard appliedRunPolicyProjectionByConnectionID[connectionID] != target,
+                  connectionHoldsProvenRunRoute(connectionID, runID: runID, clientName: clientName, agentPID: agentPID)
+            else { continue }
+            #if DEBUG
+                debugRetainedRunPolicyRefreshes += 1
+            #endif
+            // Proven synchronously above: the route and the window binding are already in place.
+            // Never re-binds the run tab, which would move the window's run mapping to this
+            // connection and schedule the replacement of the one holding it.
+            await applyRunPolicyStateIfAvailable(
+                runID: runID,
+                connectionID: connectionID,
+                persistWindowBinding: false,
+                bindsRunTab: false
+            )
+        }
+    }
+
+    /// Turn-start delivery: a newly installed run policy reaches the run's retained, proven helper
+    /// connections before the turn's message is sent, not only at the routing wait's revocation.
+    /// Called by the bootstrap lease after it released the global gate. Claude native clients
+    /// only: for every other client no route is ever proven, so nothing is refreshed.
+    func refreshRetainedRunPolicyForTurnStart(for clientName: String, runID: UUID) async {
+        guard Self.retainsProvenRunRoutes(clientName: clientName) else { return }
+        let retainedConnectionIDs = liveProvenRouteConnectionIDs(for: runID, clientName: clientName)
+        guard !retainedConnectionIDs.isEmpty else { return }
+        await refreshRetainedRunPolicy(runID: runID, connectionIDs: retainedConnectionIDs, clientName: clientName)
+    }
+
+    /// An application of the run's pending policy is past reservation, or a queued entry of the
+    /// run is reserved by a connection: a new helper is being routed by the policy.
+    private func runPolicyApplicationInFlight(_ runID: UUID) -> Bool {
+        pendingPolicyApplicationIDByRunID[runID] != nil
+            || pendingPoliciesByClient.values.contains { queue in
+                queue.contains { $0.runID == runID && $0.reservationConnectionID != nil }
+            }
+    }
+
+    /// The run's routed connections whose helper is proven to belong to exactly `agentPID`'s
+    /// registered agent instance (and live, non-terminal, admitted for `clientName`).
+    private func provenLaunchRouteConnectionIDs(runID: UUID, clientName: String, agentPID: pid_t) -> [UUID] {
+        runIDByConnectionID.compactMap { connectionID, mappedRunID -> UUID? in
+            guard mappedRunID == runID,
+                  connectionHoldsProvenRunRoute(connectionID, runID: runID, clientName: clientName, agentPID: agentPID)
+            else { return nil }
+            return connectionID
+        }
+        .sorted { $0.uuidString < $1.uuidString }
+    }
+
+    /// Finishes a later turn's routing without its 10 s wait: when the run already has a live,
+    /// non-terminal route admitted for `clientName` whose helper descends from exactly the agent
+    /// instance registered for `agentPID` (the launch that is running the turn), the turn's unused
+    /// pending policy is cleared (its queue entry; routing state stays) and this returns true.
+    /// Returns false, changing nothing, without that proof, or while an application of the run's
+    /// policy is in flight or reserved (a new helper is being routed by it; the normal wait
+    /// handles that). Ordering: the queue entry is removed synchronously with the checks that
+    /// admit the release, before any suspension, so no new helper can reserve it while the refresh
+    /// is suspended; only then is every proven connection of the run (any registered instance)
+    /// given the run's current projection. A false after that point (the projection changed, or
+    /// the launch's route lost its proof meanwhile) leaves the turn to the routing wait, whose
+    /// revocation finds no queue entry left and keeps the proven routes.
+    func releasePendingRunPolicyForProvenRoute(
+        for clientName: String,
+        windowID: Int,
+        runID: UUID,
+        agentPID: pid_t
+    ) async -> Bool {
+        guard Self.retainsProvenRunRoutes(clientName: clientName) else { return false }
+        guard await hasAuthoritativeLiveRunRoute(
+            runID: runID,
+            expectedClientName: clientName,
+            requiredAgentPID: agentPID
+        ) else {
+            #if DEBUG
+                await debugRecordProvenRouteReleaseRefusal(
+                    runID: runID,
+                    clientName: clientName,
+                    agentPID: agentPID,
+                    reason: "no_authoritative_live_route"
+                )
+            #endif
+            return false
+        }
+        // Re-checked synchronously after the route check's suspensions, and in the same step the
+        // turn's queue entry is removed.
+        guard !provenLaunchRouteConnectionIDs(runID: runID, clientName: clientName, agentPID: agentPID).isEmpty,
+              !runPolicyApplicationInFlight(runID),
+              let target = runPolicyStateByRunID[runID].map(AppliedRunPolicyProjection.init)
+        else {
+            #if DEBUG
+                await debugRecordProvenRouteReleaseRefusal(
+                    runID: runID,
+                    clientName: clientName,
+                    agentPID: agentPID,
+                    reason: runPolicyApplicationInFlight(runID)
+                        ? "policy_application_in_flight"
+                        : runPolicyStateByRunID[runID] == nil ? "no_run_policy" : "launch_route_not_proven"
+                )
+            #endif
+            return false
+        }
+        clearClientConnectionPolicySynchronously(for: clientName, windowID: windowID, runID: runID)
+        // Every proven connection of the run takes the run's current policy projection, by the
+        // same refresh as turn start (it may have found no proof then): clearing the pending
+        // policy must never leave a retained helper on an older projection.
+        await refreshRetainedRunPolicy(
+            runID: runID,
+            connectionIDs: liveProvenRouteConnectionIDs(for: runID, clientName: clientName),
+            clientName: clientName
+        )
+        // Re-checked after the refresh's suspensions: the launch's route is still proven, the
+        // run's projection is still the target, and every proven connection of the run carries it.
+        guard !provenLaunchRouteConnectionIDs(runID: runID, clientName: clientName, agentPID: agentPID).isEmpty,
+              runPolicyStateByRunID[runID].map(AppliedRunPolicyProjection.init) == target,
+              liveProvenRouteConnectionIDs(for: runID, clientName: clientName)
+              .allSatisfy({ appliedRunPolicyProjectionByConnectionID[$0] == target })
+        else {
+            #if DEBUG
+                await debugRecordProvenRouteReleaseRefusal(
+                    runID: runID,
+                    clientName: clientName,
+                    agentPID: agentPID,
+                    reason: "post_refresh_recheck_failed"
+                )
+            #endif
+            return false
+        }
+        connectionLog("Released the pending policy of run=\(runID) client=\(clientName) window=\(windowID): its launch's helper (agent pid=\(agentPID)) is already routed")
+        #if DEBUG
+            debugProvenRouteEarlyReleases += 1
+            debugRecordRunRoutingEvent(
+                runID: runID,
+                event: "policy_released_for_proven_route",
+                fields: [
+                    "client_name": clientName,
+                    "window_id": String(windowID),
+                    "agent_pid": String(agentPID)
+                ]
+            )
+        #endif
+        return true
+    }
+
+    #if DEBUG
+        /// Records why `releasePendingRunPolicyForProvenRoute` refused, with the route evidence of
+        /// every window's live connection for the run, so a live run can tell which proof failed.
+        private func debugRecordProvenRouteReleaseRefusal(
+            runID: UUID,
+            clientName: String,
+            agentPID: pid_t,
+            reason: String
+        ) async {
+            let mappedConnectionID = await MainActor.run { () -> UUID? in
+                for window in WindowStatesManager.shared.allWindows {
+                    if let connectionID = window.mcpServer.liveConnectionID(forRunID: runID) {
+                        return connectionID
+                    }
+                }
+                return nil
+            }
+            var fields: [String: String] = [
+                "reason": reason,
+                "client_name": clientName,
+                "agent_pid": String(agentPID),
+                "window_mapped_connection": mappedConnectionID?.uuidString ?? "nil",
+                "actor_routed_connections": runIDByConnectionID.filter { $0.value == runID }
+                    .keys.map(\.uuidString).sorted().joined(separator: ","),
+                "expected_pids": (expectedAgentPIDsByRunID[runID].map { $0.sorted().map(String.init) } ?? [])
+                    .joined(separator: ","),
+                "policy_application_in_flight": String(runPolicyApplicationInFlight(runID))
+            ]
+            let evidenceConnectionID = mappedConnectionID
+                ?? runIDByConnectionID.first(where: { $0.value == runID })?.key
+            if let evidenceConnectionID {
+                let evidence = liveRunRouteActorEvidence(
+                    runID: runID,
+                    connectionID: evidenceConnectionID,
+                    requiredAgentPID: agentPID
+                )
+                fields["evidence_connection"] = evidenceConnectionID.uuidString
+                fields["connection_run_matches"] = String(evidence.connectionRunID == runID)
+                fields["policy_window_id"] = evidence.policyWindowID.map(String.init) ?? "nil"
+                fields["cached_window_id"] = evidence.cachedWindowID.map(String.init) ?? "nil"
+                fields["connection_window_id"] = evidence.connectionWindowID.map(String.init) ?? "nil"
+                fields["assigned_window_id"] = evidence.assignedWindowID.map(String.init) ?? "nil"
+                fields["admitted_client_name"] = evidence.admittedClientName ?? "nil"
+                fields["connection_is_active"] = String(evidence.connectionIsActive)
+                fields["run_was_admitted"] = String(evidence.runWasAdmitted)
+                fields["has_expected_pid_authority"] = String(evidence.hasExpectedPIDAuthority)
+                fields["connection_live_non_terminal"] = String(evidence.connectionIsLiveNonTerminal)
+                fields["connection_proves_agent"] = String(evidence.connectionProvesRequiredAgent)
+                fields["holds_proven_run_route"] = String(
+                    connectionHoldsProvenRunRoute(evidenceConnectionID, runID: runID, clientName: clientName, agentPID: agentPID)
+                )
+            }
+            debugRecordRunRoutingEvent(runID: runID, event: "proven_route_release_refused", fields: fields)
+        }
+    #endif
+
+    /// The run policy alone owns the restricted set of a connection routed to a run (or carrying
+    /// a run-policy fingerprint): every run-policy application, refresh and restore point rewrites
+    /// that set, so a per-connection edit would either be silently dropped or lift a run
+    /// restriction. The per-connection restriction APIs therefore do nothing on such a connection.
+    private func restrictionEditIsFencedByRunPolicy(_ connectionID: UUID, api: String) -> Bool {
+        guard runIDByConnectionID[connectionID] != nil
+            || appliedRunPolicyProjectionByConnectionID[connectionID] != nil
+        else { return false }
+        #if DEBUG
+            connectionLog(
+                "DEBUG \(api) ignored for connection \(connectionID): its restricted set is owned by run \(runIDByConnectionID[connectionID]?.uuidString ?? "nil")'s policy"
+            )
+        #endif
+        return true
+    }
+
+    /// Replaces the connection's restricted set. A no-op on a connection whose set the run policy
+    /// owns (`restrictionEditIsFencedByRunPolicy`).
     func setRestrictedTools(for connectionID: UUID, tools: Set<String>) async {
+        guard !restrictionEditIsFencedByRunPolicy(connectionID, api: "setRestrictedTools") else { return }
         let sanitized = Self.sanitizedRoutingRestrictedTools(tools)
         restrictedToolsByConnection[connectionID] = sanitized
         if connections[connectionID] != nil {
@@ -11026,7 +13095,10 @@ actor ServerNetworkManager {
         }
     }
 
+    /// Adds to the connection's restricted set. A no-op on a connection whose set the run policy
+    /// owns (`restrictionEditIsFencedByRunPolicy`).
     func addRestrictedTools(for connectionID: UUID, names: [String]) async {
+        guard !restrictionEditIsFencedByRunPolicy(connectionID, api: "addRestrictedTools") else { return }
         let sanitized = Self.sanitizedRoutingRestrictedTools(Set(names))
         guard !sanitized.isEmpty else { return }
         var existing = restrictedToolsByConnection[connectionID] ?? []
@@ -11037,7 +13109,10 @@ actor ServerNetworkManager {
         }
     }
 
+    /// Removes the connection's restricted set. A no-op on a connection whose set the run policy
+    /// owns (`restrictionEditIsFencedByRunPolicy`), so it never lifts a run restriction.
     func clearRestrictedTools(for connectionID: UUID) async {
+        guard !restrictionEditIsFencedByRunPolicy(connectionID, api: "clearRestrictedTools") else { return }
         if restrictedToolsByConnection.removeValue(forKey: connectionID) != nil,
            connections[connectionID] != nil
         {
@@ -11090,6 +13165,44 @@ actor ServerNetworkManager {
         }
     }
 
+    /// PRIORITY 2b of tool-call window routing (a connection with no window mapping): the helper
+    /// session's same-process live run affinity, then its persisted window affinity. Returns the
+    /// window chosen. Request-originated: the run mapping never replaces a different holder
+    /// (`mapConnectionToRunIDWithOutcome`); a yield leaves the call routed to the window and the
+    /// run actor-side, with the run policy and no window run mapping.
+    private func restoreRunAffinityForToolCall(connectionID: UUID, clientName: String) async -> Int? {
+        let managerToken = connections[connectionID]?.capabilityToken
+        let cachedToken = capabilityTokenByConnection[connectionID]
+        let sessionKey = managerToken ?? cachedToken
+        mcpRoutingInternalDebugLog("[PRIORITY 2b] client='\(clientName)' managerToken=\(managerToken?.prefix(8) ?? "nil") cachedToken=\(cachedToken?.prefix(8) ?? "nil") sessionKey=\(sessionKey?.prefix(8) ?? "nil")")
+        if let liveAffinity = preferredLiveRunAffinity(for: clientName, sessionKey: sessionKey) {
+            setConnectionWindowMapping(connectionID, windowID: liveAffinity.windowID)
+            let outcome = await mapConnectionToRunIDWithOutcome(
+                connectionID,
+                runID: liveAffinity.runID,
+                windowID: liveAffinity.windowID,
+                displacesHolder: false,
+                refusalSource: "tool_call_affinity_restore"
+            )
+            if outcome == .mapped {
+                recordLiveAffinityRouteRestoredIfAssigned(
+                    connectionID: connectionID,
+                    runID: liveAffinity.runID,
+                    windowID: liveAffinity.windowID,
+                    path: "tool_call"
+                )
+            }
+            connectionLog("Tool call: restored live run affinity for connection \(connectionID) → runID \(liveAffinity.runID) outcome=\(outcome)")
+            return liveAffinity.windowID
+        }
+        if let preferredWindowID = await preferredWindowID(for: clientName, sessionKey: sessionKey) {
+            setConnectionWindowMapping(connectionID, windowID: preferredWindowID)
+            connectionLog("Tool call: auto-routed connection \(connectionID) to window \(preferredWindowID) via persisted routing affinity for client '\(clientName)'")
+            return preferredWindowID
+        }
+        return nil
+    }
+
     @discardableResult
     private func hydratePersistedAgentModePolicyForConnectionIfNeeded(
         connectionID: UUID,
@@ -11108,18 +13221,37 @@ actor ServerNetworkManager {
             mcpPolicyLog("skipping persisted policy hydration for gateway-principal connection=\(connectionID) reason=\(reason) client=\(clientName)")
             return false
         }
-        let sessionKey = connections[connectionID]?.capabilityToken ?? capabilityTokenByConnection[connectionID]
+        let sessionKey = routingSessionKey(for: connectionID)
         if let liveAffinity = preferredLiveRunAffinity(for: clientName, sessionKey: sessionKey) {
             guard shouldAllowPersistedAgentModeRestore(clientName: clientName, purpose: liveAffinity.purpose) else {
                 return false
             }
             setConnectionWindowMapping(connectionID, windowID: liveAffinity.windowID)
-            let restored = await mapConnectionToRunID(
+            // Request-originated (tools/list, tools/call, resources/read): never replaces a
+            // different holder of the run's window mapping. A yield still hydrates the run policy
+            // (routed actor-side, no run-tab bind).
+            let outcome = await mapConnectionToRunIDWithOutcome(
                 connectionID,
                 runID: liveAffinity.runID,
-                windowID: liveAffinity.windowID
+                windowID: liveAffinity.windowID,
+                displacesHolder: false,
+                refusalSource: "persisted_policy_hydration"
             )
+            if case .yieldedToHolder = outcome {
+                await updateRoutingRecordForConnection(connectionID, clientID: clientName)
+                mcpPolicyLog(
+                    "hydrated run policy without the window's run mapping reason=\(reason) client=\(clientName) connection=\(connectionID) window=\(liveAffinity.windowID) runID=\(liveAffinity.runID.uuidString)"
+                )
+                return runPolicyStateByRunID[liveAffinity.runID] != nil
+            }
+            let restored = outcome == .mapped
             if restored {
+                recordLiveAffinityRouteRestoredIfAssigned(
+                    connectionID: connectionID,
+                    runID: liveAffinity.runID,
+                    windowID: liveAffinity.windowID,
+                    path: "persisted_policy_hydration:\(reason)"
+                )
                 await updateRoutingRecordForConnection(connectionID, clientID: clientName)
                 await notifyToolListChanged(connectionID: connectionID)
                 mcpPolicyLog(
@@ -11152,8 +13284,38 @@ actor ServerNetworkManager {
         if !mapped {
             await applyRunPolicyStateIfAvailable(runID: liveAffinity.runID, connectionID: connectionID)
         }
+        recordLiveAffinityRouteRestoredIfAssigned(
+            connectionID: connectionID,
+            runID: liveAffinity.runID,
+            windowID: liveAffinity.windowID,
+            path: "routing_fallback:\(reason)"
+        )
         await updateRoutingRecordForConnection(connectionID, clientID: clientName)
         await notifyToolListChanged(connectionID: connectionID)
+    }
+
+    /// DEBUG run-routing history: a live-run affinity restore assigned the connection's run route
+    /// (an assignment like `policy_applied`, outside pending-policy application).
+    private func recordLiveAffinityRouteRestoredIfAssigned(
+        connectionID: UUID,
+        runID: UUID,
+        windowID: Int,
+        path: String
+    ) {
+        #if DEBUG
+            guard runIDByConnectionID[connectionID] == runID else { return }
+            debugRecordRunRoutingEvent(
+                runID: runID,
+                event: "live_affinity_route_restored",
+                connectionID: connectionID,
+                fields: [
+                    "path": path,
+                    "window_id": String(windowID)
+                ]
+            )
+        #else
+            _ = (connectionID, runID, windowID, path)
+        #endif
     }
 
     private func applyRoutingFallback(
@@ -11174,7 +13336,7 @@ actor ServerNetworkManager {
             return
         }
 
-        let sessionKey = connections[connectionID]?.capabilityToken ?? capabilityTokenByConnection[connectionID]
+        let sessionKey = routingSessionKey(for: connectionID)
         if let liveAffinity = preferredLiveRunAffinity(for: clientName, sessionKey: sessionKey) {
             await applyLiveRunAffinity(liveAffinity, clientName: clientName, connectionID: connectionID, reason: "session-token")
             return
@@ -11441,7 +13603,7 @@ actor ServerNetworkManager {
             await applyRoutingFallback(clientName: clientName, connectionID: connectionID, clientPid: clientPid)
             return .fallback
         }
-        let sessionKey = connections[connectionID]?.capabilityToken ?? capabilityTokenByConnection[connectionID]
+        let sessionKey = routingSessionKey(for: connectionID)
         let liveAffinity = preferredLiveRunAffinity(for: clientName, sessionKey: sessionKey)
         var queue = pendingPoliciesByClient[matchedQueueEntry.key] ?? []
         mcpRoutingLog("Applying FIFO policy client=\(clientName) matchedKey=\(matchedQueueEntry.key) connectionID=\(connectionID) queueLength=\(queue.count) policyWindow=\(matchedQueueEntry.policy.windowID)")
@@ -11552,7 +13714,7 @@ actor ServerNetworkManager {
         cacheRunPolicyStateIfNeeded(policy)
         if let runID = policy.runID {
             admittedPolicyRunIDs.insert(runID)
-            runIDByConnectionID[connectionID] = runID
+            assignRunRoute(runID, to: connectionID)
         }
         if let additional = policy.additionalTools {
             additionalToolsByConnection[connectionID] = additional
@@ -11561,6 +13723,19 @@ actor ServerNetworkManager {
         }
         connectionWindowMap[connectionID] = policy.windowID
         windowAssignmentByConnection[connectionID] = policy.windowID
+        // The fingerprint describes what was written: recorded only when the policy's written
+        // projection equals the run state's (what a later turn's refresh compares against;
+        // explicit per-connection restrictions are not part of it). A newer run state, which
+        // `cacheRunPolicyStateIfNeeded` keeps, leaves no fingerprint, so the next refresh corrects
+        // the connection.
+        if let runID = policy.runID,
+           let seeded = runPolicyStateByRunID[runID],
+           AppliedRunPolicyProjection(seeded) == AppliedRunPolicyProjection(policy)
+        {
+            appliedRunPolicyProjectionByConnectionID[connectionID] = AppliedRunPolicyProjection(policy)
+        } else {
+            appliedRunPolicyProjectionByConnectionID.removeValue(forKey: connectionID)
+        }
 
         #if DEBUG
             await debugSuspendPendingPolicyRouteInstallationIfNeeded()
@@ -11776,7 +13951,7 @@ actor ServerNetworkManager {
         if let runID = policy.runID {
             updateLiveRunAffinity(
                 clientName: clientName,
-                sessionKey: connections[connectionID]?.capabilityToken ?? capabilityTokenByConnection[connectionID],
+                sessionKey: routingSessionKey(for: connectionID),
                 runID: runID,
                 windowID: policy.windowID,
                 purpose: policy.purpose
@@ -11893,6 +14068,8 @@ actor ServerNetworkManager {
         restoreRunScopedState: Bool
     ) {
         if restoreConnectionScopedState {
+            // The restored state was not announced as a run policy projection: unknown again.
+            appliedRunPolicyProjectionByConnectionID.removeValue(forKey: connectionID)
             if let restrictedTools = restorePoint.restrictedTools {
                 restrictedToolsByConnection[connectionID] = restrictedTools
             } else {
@@ -11934,7 +14111,7 @@ actor ServerNetworkManager {
                 windowAssignmentByConnection.removeValue(forKey: connectionID)
             }
             if let runID = restorePoint.runID {
-                runIDByConnectionID[connectionID] = runID
+                assignRunRoute(runID, to: connectionID)
             } else {
                 runIDByConnectionID.removeValue(forKey: connectionID)
             }
@@ -12028,25 +14205,69 @@ actor ServerNetworkManager {
         return (resolved.routed, resolved.replacementToken)
     }
 
+    /// What a run-tab rebind did. Only `alreadyBound` and `bound` leave the connection bound to the
+    /// run tab; every other outcome leaves its window-side binding as it was.
+    enum RunTabRebindOutcome: Equatable {
+        /// Already bound to the run tab and run in the window (nothing changed).
+        case alreadyBound
+        /// Bound to the run tab, registering the window's run mapping for the connection.
+        case bound
+        /// Request-originated only: at the mutation the window mapped the run to `holder`, a
+        /// different connection. Nothing changed window-side.
+        case yieldedToHolder(holder: UUID)
+        /// The run policy names no tab.
+        case noRunTab
+        /// The window or the tab's workspace is gone, or the bind threw.
+        case failed
+
+        var keepsRunTabBinding: Bool {
+            self == .alreadyBound || self == .bound
+        }
+    }
+
+    private enum RunTabRebindDecision {
+        case alreadyBound(workspaceID: UUID?)
+        /// `filledEmptySlot`: a request-originated bind took the run's empty window-mapping slot.
+        case bound(workspaceID: UUID, filledEmptySlot: Bool)
+        case yielded(holder: UUID)
+    }
+
+    /// Binds the connection to its run's cached tab in `windowID` (registering the window's run
+    /// mapping for it, which replaces a different holder). `displacesHolder: false` is every
+    /// request-originated bind (the per-tool-call rebind, the rehydrate, the run-tab bind of a
+    /// request-originated run mapping): for a Claude native client
+    /// (`requestPathYieldsToDifferentHolder`) it binds only when, at the mutation, the window maps
+    /// the run to no connection or to the caller, and otherwise yields, changing nothing. No
+    /// evidence sampled before the hop authorizes a replacement. Admission, pending-policy
+    /// application and handover keep the default, where a fresh helper legitimately replaces the
+    /// old holder.
     @discardableResult
     private func ensureTabBoundForRunIfPossible(
         connectionID: UUID,
         clientName: String?,
         runID: UUID,
-        windowID: Int
-    ) async -> Bool {
+        windowID: Int,
+        displacesHolder: Bool = true,
+        refusalSource: String = "tool_call"
+    ) async -> RunTabRebindOutcome {
         // A read-only companion never takes the run's tab binding: its reads resolve through the
         // primary's context, and binding it would make the next primary "replace" (terminate) it.
-        guard companionRoleByConnectionID[connectionID] == nil else { return false }
+        guard companionRoleByConnectionID[connectionID] == nil else { return .failed }
         guard
             let cached = runPolicyStateByRunID[runID],
             let tabID = cached.tabID
         else {
-            return false
+            return .noRunTab
         }
         let resolvedClientName = clientName ?? clientIdentifier(forConnection: connectionID)
+        let yieldsToDifferentHolder = !displacesHolder && requestPathYieldsToDifferentHolder(connectionID: connectionID)
+        #if DEBUG
+            if yieldsToDifferentHolder {
+                await awaitDebugRequestWindowRouteHook(.beforeMutationHop, runID: runID, callerID: connectionID)
+            }
+        #endif
         do {
-            let bindingResult = try await MainActor.run { () throws -> (didBind: Bool, workspaceID: UUID?) in
+            let decision = try await MainActor.run { () throws -> RunTabRebindDecision in
                 guard let windowState = WindowStatesManager.shared.window(withID: windowID) else {
                     throw MCPError.invalidParams("Window \(windowID) not found")
                 }
@@ -12054,12 +14275,20 @@ actor ServerNetworkManager {
                 let alreadyBoundTab = windowState.mcpServer.boundTabID(forConnection: connectionID) == tabID
                 let alreadyBoundRun = windowState.mcpServer.connectionIDToRunID[connectionID] == runID
                 if alreadyBoundTab, alreadyBoundRun {
-                    return (false, cached.workspaceID)
+                    return .alreadyBound(workspaceID: cached.workspaceID)
                 }
                 let resolvedWorkspaceID = cached.workspaceID ?? windowState.workspaceManager.resolveComposeTabRoutingSnapshot(for: tabID)?.workspaceID
                 guard let workspaceID = resolvedWorkspaceID else {
                     throw MCPError.invalidParams("Tab \(tabID) not found in any workspace for window \(windowID)")
                 }
+                // Decided at the mutation, in the same MainActor step as the bind.
+                if yieldsToDifferentHolder,
+                   let holder = windowState.mcpServer.connectionIDByRunID[runID],
+                   holder != connectionID
+                {
+                    return .yielded(holder: holder)
+                }
+                let filledEmptySlot = !displacesHolder && windowState.mcpServer.connectionIDByRunID[runID] == nil
                 try windowState.mcpServer.bindTabForConnection(
                     connectionID: connectionID,
                     clientName: resolvedClientName,
@@ -12069,7 +14298,36 @@ actor ServerNetworkManager {
                     runID: runID,
                     explicitlyBound: false
                 )
-                return (true, workspaceID)
+                return .bound(
+                    workspaceID: workspaceID,
+                    filledEmptySlot: filledEmptySlot && windowState.mcpServer.connectionIDByRunID[runID] == connectionID
+                )
+            }
+            let bindingResult: (didBind: Bool, workspaceID: UUID?)
+            switch decision {
+            case let .alreadyBound(workspaceID):
+                bindingResult = (false, workspaceID)
+            case let .bound(workspaceID, filledEmptySlot):
+                bindingResult = (true, workspaceID)
+                if filledEmptySlot {
+                    recordRequestFilledEmptySlot(
+                        mechanism: "run_tab_bind",
+                        source: refusalSource,
+                        runID: runID,
+                        connectionID: connectionID,
+                        windowID: windowID
+                    )
+                }
+            case let .yielded(holder):
+                recordRequestYieldedToHolder(
+                    event: "tab_rebind_yielded_to_holder",
+                    source: refusalSource,
+                    runID: runID,
+                    connectionID: connectionID,
+                    holder: holder,
+                    windowID: windowID
+                )
+                return .yieldedToHolder(holder: holder)
             }
             if let workspaceID = bindingResult.workspaceID, workspaceID != cached.workspaceID {
                 seedRunPolicyState(
@@ -12091,11 +14349,31 @@ actor ServerNetworkManager {
             if bindingResult.didBind {
                 connectionLog("Tab binding: rebound connection \(connectionID) to cached run tab \(tabID) for run \(runID) in window \(windowID)")
             }
-            return true
+            return bindingResult.didBind ? .bound : .alreadyBound
         } catch {
             log.warning("ensureTabBoundForRunIfPossible: failed run=\(runID) tab=\(tabID) window=\(windowID) connection=\(connectionID) error=\(error.localizedDescription)")
-            return false
+            return .failed
         }
+    }
+
+    /// The per-tool-call run-tab rebind (a reconnect handover that left the caller without a bound
+    /// tab): never replaces a different holder of the run's window mapping (Claude native clients;
+    /// `ensureTabBoundForRunIfPossible`). Every outcome lets the tool
+    /// call proceed with the caller's actor-side routing; a refusal or failure only means the call
+    /// runs without a run-tab rebind, as a failed bind always has.
+    private func runScopedTabRebindFallbackForToolCall(
+        connectionID: UUID,
+        runID: UUID,
+        windowID: Int
+    ) async -> RunTabRebindOutcome {
+        let clientName = clientIdentifier(forConnection: connectionID)
+        return await ensureTabBoundForRunIfPossible(
+            connectionID: connectionID,
+            clientName: clientName,
+            runID: runID,
+            windowID: windowID,
+            displacesHolder: false
+        )
     }
 
     func registerHandlers(for server: MCP.Server, connectionID: UUID) async {
@@ -12993,7 +15271,11 @@ actor ServerNetworkManager {
                         EditFlowPerf.Dimensions(toolName: toolName)
                     ) {
                         // Wrap entire call so inner services can query current routing hints.
-                        await Self.withConnectionID(connectionID, lifecycleCorrelation: lifecycleCorrelation) {
+                        await Self.withConnectionID(
+                            connectionID,
+                            toolInvocationID: invocationID,
+                            lifecycleCorrelation: lifecycleCorrelation
+                        ) {
                             await Self.$currentTabContextHint.withValue(capturedTabContextHint) {
                                 let permitPreDispatchEnvelopeState = EditFlowPerf.begin(
                                     EditFlowPerf.Stage.MCPToolCall.permitPreDispatchEnvelope,
@@ -13121,23 +15403,11 @@ actor ServerNetworkManager {
                                        chosenID == nil,
                                        let clientName = await self.clientIdentifier(forConnection: connectionID)
                                     {
-                                        let managerToken = await self.connections[connectionID]?.capabilityToken
-                                        let cachedToken = await self.capabilityTokenByConnection[connectionID]
-                                        let sessionKey = managerToken ?? cachedToken
-                                        mcpRoutingInternalDebugLog("[PRIORITY 2b] client='\(clientName)' managerToken=\(managerToken?.prefix(8) ?? "nil") cachedToken=\(cachedToken?.prefix(8) ?? "nil") sessionKey=\(sessionKey?.prefix(8) ?? "nil")")
-                                        if let liveAffinity = await self.preferredLiveRunAffinity(for: clientName, sessionKey: sessionKey) {
-                                            chosenID = liveAffinity.windowID
-                                            await self.setConnectionWindowMapping(connectionID, windowID: liveAffinity.windowID)
-                                            _ = await self.mapConnectionToRunID(
-                                                connectionID,
-                                                runID: liveAffinity.runID,
-                                                windowID: liveAffinity.windowID
-                                            )
-                                            connectionLog("Tool call: restored live run affinity for connection \(connectionID) → runID \(liveAffinity.runID)")
-                                        } else if let preferredWindowID = await self.preferredWindowID(for: clientName, sessionKey: sessionKey) {
-                                            chosenID = preferredWindowID
-                                            await self.setConnectionWindowMapping(connectionID, windowID: preferredWindowID)
-                                            connectionLog("Tool call: auto-routed connection \(connectionID) to window \(preferredWindowID) via persisted routing affinity for client '\(clientName)'")
+                                        if let windowID = await self.restoreRunAffinityForToolCall(
+                                            connectionID: connectionID,
+                                            clientName: clientName
+                                        ) {
+                                            chosenID = windowID
                                         }
                                     }
 
@@ -13407,10 +15677,10 @@ actor ServerNetworkManager {
                                        let runID = observerRunIDForCallbacksFinal,
                                        let windowID = chosenID
                                     {
-                                        let clientName = await self.clientIdentifier(forConnection: connectionID)
-                                        _ = await self.ensureTabBoundForRunIfPossible(
+                                        // Never replaces a different holder of the run's window
+                                        // mapping; whatever the outcome, the call proceeds.
+                                        _ = await self.runScopedTabRebindFallbackForToolCall(
                                             connectionID: connectionID,
-                                            clientName: clientName,
                                             runID: runID,
                                             windowID: windowID
                                         )
@@ -13494,7 +15764,8 @@ actor ServerNetworkManager {
                                 let executionTraceOrigin = await executionWatchdogEnvironment.now()
                                 let handlerPhaseRecorder = MCPToolExecutionHandlerPhaseRecorder(
                                     origin: executionTraceOrigin,
-                                    now: { await executionWatchdogEnvironment.now() }
+                                    now: { await executionWatchdogEnvironment.now() },
+                                    synchronousNow: executionWatchdogEnvironment.synchronousNow
                                 )
 
                                 @Sendable func dispatchResolvedProvider(_ operation: @escaping @Sendable () async throws -> Value) async throws -> Value {
@@ -13589,14 +15860,14 @@ actor ServerNetworkManager {
                                                     throw ToolDispatchAdmissionError.windowTerminal
                                                 }
                                             }
+                                            // `currentToolInvocationID` is already scoped to this call's
+                                            // `invocationID` by `withConnectionID` (one shared authority).
                                             let value = try await MCPToolExecutionHandlerPhaseContext.$recorder.withValue(handlerPhaseRecorder) {
-                                                try await Self.$currentToolInvocationID.withValue(invocationID) {
-                                                    try await EditFlowPerf.measure(
-                                                        EditFlowPerf.Stage.MCPToolCall.resolvedProviderDispatch,
-                                                        EditFlowPerf.Dimensions(toolName: toolName),
-                                                        operation: operation
-                                                    )
-                                                }
+                                                try await EditFlowPerf.measure(
+                                                    EditFlowPerf.Stage.MCPToolCall.resolvedProviderDispatch,
+                                                    EditFlowPerf.Dimensions(toolName: toolName),
+                                                    operation: operation
+                                                )
                                             }
                                             await emitExecutionTrace(.handlerCompleted, cancellationOutcome: "success")
                                             EditFlowPerf.lifecycleEvent(
@@ -13812,6 +16083,7 @@ actor ServerNetworkManager {
                                             connectionID,
                                             toolName: toolName,
                                             invocationID: invocationID,
+                                            callTimeRunID: observerRunIDForCallbacksFinal,
                                             elapsedMilliseconds: max(0, abortNow.mcpMilliseconds - executionTraceOrigin.mcpMilliseconds),
                                             handlerPhase: handlerPhase,
                                             handlerPhaseAgeMilliseconds: handlerPhaseAgeMilliseconds

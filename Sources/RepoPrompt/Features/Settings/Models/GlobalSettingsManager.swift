@@ -1326,6 +1326,36 @@ class GlobalSettingsStore: ObservableObject {
         }
     }
 
+    /// The saved browser HTTPS port, or nil when unset or invalid (including 443).
+    func mcpRemoteGatewayBrowserHTTPSPort() -> Int? {
+        guard let port = scalarPreferences.mcp?.remoteGatewayBrowserHTTPSPort,
+              GlobalScalarPreferences.MCPSettings.isValidBrowserHTTPSPort(port)
+        else { return nil }
+        return port
+    }
+
+    /// Saves a valid browser HTTPS port, or clears it with nil, and returns whether the value is
+    /// now saved. An invalid port (including 443) is rejected without a write; a failed save
+    /// restores the previous value (the same contract as the Telegram setters).
+    @discardableResult
+    func setMCPRemoteGatewayBrowserHTTPSPort(_ port: Int?) -> Bool {
+        if let port, !GlobalScalarPreferences.MCPSettings.isValidBrowserHTTPSPort(port) {
+            return false
+        }
+        let before = scalarPreferences
+        updateMCPScalar(commit: false) { settings in
+            settings.remoteGatewayBrowserHTTPSPort = port
+        }
+        if save() {
+            return true
+        }
+        if scalarPreferences != before {
+            objectWillChange.send()
+            scalarPreferences = before
+        }
+        return false
+    }
+
     func remoteControlShowPairingDetails() -> Bool {
         scalarPreferences.mcp?.remoteControlShowPairingDetails ?? true
     }
@@ -1709,6 +1739,95 @@ class GlobalSettingsStore: ObservableObject {
             scalarPreferences = before
         }
         return false
+    }
+
+    // MARK: - Workspace steering grants
+
+    /// In-memory copy for display. Another running build sharing the file may have changed the
+    /// grants since; every save and grant write re-adopts the on-disk list first.
+    func workspaceSteeringGrants() -> [WorkspaceSteeringGrant] {
+        scalarPreferences.workspaceSteeringGrants ?? []
+    }
+
+    /// Grants currently on disk, for permission checks: [] when no file exists, nil when the file
+    /// is unreadable or a preserved (future/foreign) schema.
+    func persistedWorkspaceSteeringGrants() -> [WorkspaceSteeringGrant]? {
+        switch GlobalSettingsFileStore.readWorkspaceSteeringGrants(at: fileStore.fileURL) {
+        case .missingFile: []
+        case let .grants(grants): grants
+        case .preservedSchema, .unreadable: nil
+        }
+    }
+
+    func refreshWorkspaceSteeringGrantsFromDisk() {
+        adoptPersistedWorkspaceSteeringGrants()
+    }
+
+    /// Applies `mutation` to the on-disk grant list and saves, all under the cross-process
+    /// settings lock. `saved` is true when the save succeeded or nothing changed; on failure the
+    /// previous preferences are restored (the Telegram setter contract), so grants change only
+    /// on a successful save. Returns nil without running `mutation` or writing when the lock is
+    /// unavailable or the on-disk grants can't be read. Callers validate through
+    /// `WorkspaceSteeringGrantStore`.
+    func updateWorkspaceSteeringGrantsAndSave<Outcome>(
+        _ mutation: (inout [WorkspaceSteeringGrant]) -> Outcome
+    ) -> (outcome: Outcome, saved: Bool)? {
+        let locked = GlobalSettingsFileLock.withExclusiveLock(for: fileStore.fileURL) { () -> (Outcome, Bool)? in
+            guard adoptPersistedWorkspaceSteeringGrants() == .adopted else { return nil }
+            let before = scalarPreferences
+            var grants = before.workspaceSteeringGrants ?? []
+            let outcome = mutation(&grants)
+            let updated = grants.isEmpty ? nil : grants
+            guard updated != before.workspaceSteeringGrants else { return (outcome, true) }
+            updateScalarPreferences(commit: false) { $0.workspaceSteeringGrants = updated }
+            if writeDocument() {
+                return (outcome, true)
+            }
+            if scalarPreferences != before {
+                objectWillChange.send()
+                scalarPreferences = before
+            }
+            return (outcome, false)
+        }
+        guard let locked, let result = locked else {
+            noteSaveFailedWithoutWriting()
+            return nil
+        }
+        return result
+    }
+
+    private enum WorkspaceSteeringGrantAdoption {
+        case adopted
+        case preservedSchema
+        case unreadable
+    }
+
+    /// Replaces the in-memory grants with the on-disk list (none when the file is missing) so a
+    /// whole-document save never writes back a grant another build removed (or drops one it
+    /// added). Memory is left alone when the file can't be read; callers must not write then.
+    @discardableResult
+    private func adoptPersistedWorkspaceSteeringGrants() -> WorkspaceSteeringGrantAdoption {
+        let persisted: [WorkspaceSteeringGrant]
+        switch GlobalSettingsFileStore.readWorkspaceSteeringGrants(at: fileStore.fileURL) {
+        case .missingFile: persisted = []
+        case let .grants(grants): persisted = grants
+        case .preservedSchema: return .preservedSchema
+        case .unreadable: return .unreadable
+        }
+        let adopted = persisted.isEmpty ? nil : persisted
+        if scalarPreferences.workspaceSteeringGrants != adopted {
+            objectWillChange.send()
+            scalarPreferences.workspaceSteeringGrants = adopted
+        }
+        return .adopted
+    }
+
+    /// Surfaces a save that was refused before writing (settings lock unavailable or grants
+    /// unreadable) without replacing an existing block reason.
+    private func noteSaveFailedWithoutWriting() {
+        print("⚠️ Skipped saving global settings at \(fileStore.fileURL.path): settings lock unavailable or on-disk grants unreadable.")
+        guard persistenceBlockReason == nil else { return }
+        persistenceBlockReason = fileStore.blockReason ?? .saveFailed
     }
 
     func modelResponsesOverrides() -> [String: Bool] {
@@ -2715,8 +2834,26 @@ class GlobalSettingsStore: ObservableObject {
         )
     }
 
+    /// Saves under the cross-process settings lock after adopting the on-disk grants. Writes
+    /// nothing, and reports `.saveFailed` unless another block reason is set, when the lock is
+    /// unavailable or the on-disk grants can't be read. A preserved (future/foreign) file is left
+    /// to the file store, which refuses the write with its own reason.
     @discardableResult
     private func save() -> Bool {
+        let locked = GlobalSettingsFileLock.withExclusiveLock(for: fileStore.fileURL) { () -> Bool? in
+            switch adoptPersistedWorkspaceSteeringGrants() {
+            case .adopted, .preservedSchema: writeDocument()
+            case .unreadable: nil
+            }
+        }
+        guard let locked, let written = locked else {
+            noteSaveFailedWithoutWriting()
+            return false
+        }
+        return written
+    }
+
+    private func writeDocument() -> Bool {
         do {
             try fileStore.save(makeDocument())
             if persistenceBlockReason != fileStore.blockReason {

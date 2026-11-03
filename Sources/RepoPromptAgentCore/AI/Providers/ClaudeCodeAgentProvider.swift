@@ -35,6 +35,9 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
     private let mcpHost: any AgentMCPHosting
     private let toolTracking: AgentToolTrackingController
     private var streamTask: Task<Void, Never>?
+    /// R6 launch ownership (mandatory for this managed headless caller while registration is on).
+    private let launchAuthority: AgentRuntimeLaunchAuthority
+    private let worktreePath: String?
 
     private var enableDebugLogging: Bool {
         config.enableDebugLogging
@@ -47,8 +50,12 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
         runner: CLIProcessRunner,
         config: ClaudeCodeAgentConfig,
         mcpHost: any AgentMCPHosting,
-        environmentResolver: any ClaudeCodeLaunchEnvironmentResolving = ClaudeCodeLaunchEnvironmentResolver()
+        environmentResolver: any ClaudeCodeLaunchEnvironmentResolving = ClaudeCodeLaunchEnvironmentResolver(),
+        worktreePath: String? = nil,
+        launchAuthority: AgentRuntimeLaunchAuthority = .production
     ) {
+        self.launchAuthority = launchAuthority
+        self.worktreePath = worktreePath
         self.runner = runner
         self.config = config
         self.environmentResolver = environmentResolver
@@ -382,13 +389,25 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
                             let expectedPIDRunID = context.runID
                             let expectedPIDClientName = self.config.runtimeVariant.agentKind.mcpClientNameHint
                             let expectedPIDMCPHost = self.mcpHost
+                            let resumeSessionID = message.resumeSessionID?.trimmingCharacters(in: .whitespacesAndNewlines)
+                            let requestedPermission = self.config.permissionMode.trimmingCharacters(in: .whitespacesAndNewlines)
+                            let launch = self.launchAuthority.makeLaunch(AgentRuntimeLaunchContext(
+                                family: .claudeHeadless,
+                                provider: .claude(self.config.runtimeVariant),
+                                session: message.runtimeSession,
+                                worktreePath: self.worktreePath ?? context.workingDirectory,
+                                conversationID: resumeSessionID?.isEmpty == false ? resumeSessionID : nil,
+                                permission: .claude(permissionMode: requestedPermission.isEmpty ? nil : requestedPermission)
+                            ))
                             let stream = try await self.runner.runStreaming(
                                 args: args,
                                 stdin: userMessage, // Pass the user message via stdin
                                 outputMode: .auto(.streamJson),
                                 timeout: 6000, // 100 minute timeout (matches Codex)
                                 additionalEnvironment: additionalEnvironment,
-                                additionalRemovedKeys: context.launchEnvironment?.removedEnvironmentKeys ?? [],
+                                // Managed launch boundary: an inherited runtime marker never reaches the child.
+                                additionalRemovedKeys: Set([ProcessLauncher.runtimeMarkerEnvironmentKey])
+                                    .union(context.launchEnvironment?.removedEnvironmentKeys ?? []),
                                 onProcessStarted: { pid in
                                     guard let expectedPIDClientName else { return }
                                     await expectedPIDMCPHost.registerExpectedAgentPID(
@@ -406,7 +425,8 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
                                         for: expectedPIDClientName,
                                         runID: expectedPIDRunID
                                     )
-                                }
+                                },
+                                launchOwnership: launch
                             )
                             try await AsyncScope.withCleanup({}, cleanup: {
                                 await self.runner.cancelAll()
@@ -428,6 +448,8 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
                                 var timedOut = false
                                 var eventCount = 0
                                 var sawCompletion = false
+                                // R6: the conversation the CLI reports (a fresh `session_id` too).
+                                var observedSessionID: String?
 
                                 do {
                                     outerLoop: for try await event in stream {
@@ -444,6 +466,9 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
                                                 }
                                                 if let events = try? self.parseStreamEvents(lineData), !events.isEmpty {
                                                     for event in events {
+                                                        if case let .completion(_, _, providerSessionID?) = event {
+                                                            observedSessionID = providerSessionID
+                                                        }
                                                         let mapped = self.mapToAIStreamResult(event)
                                                         if mapped.type == "message_stop" {
                                                             sawCompletion = true
@@ -454,6 +479,12 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
                                                         if sawStopThisChunk { break }
                                                     }
                                                 }
+                                            }
+                                            if let launch, let observed = observedSessionID {
+                                                observedSessionID = nil
+                                                // Recorded for the launch's session; a failure is reported
+                                                // by the launch and never changes this run's outcome.
+                                                await launch.recordObservedConversation(observed)
                                             }
                                             if sawStopThisChunk {
                                                 break outerLoop
@@ -506,7 +537,9 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
                                         continuation.finish()
                                         return
                                     } else {
-                                        throw AIProviderError.apiError(source: NSError(domain: "ClaudeCLI", code: -999, userInfo: [NSLocalizedDescriptionKey: "Claude CLI did not report a termination status."]))
+                                        // Output ended with neither a completion nor a termination
+                                        // status: the CLI process was lost (review A F06).
+                                        throw HeadlessProviderProcessLostError(message: "Claude CLI did not report a termination status.")
                                     }
                                 }
 

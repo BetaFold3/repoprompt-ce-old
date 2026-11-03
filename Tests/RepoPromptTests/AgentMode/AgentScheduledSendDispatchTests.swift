@@ -988,7 +988,7 @@ final class AgentScheduledSendDispatchTests: XCTestCase {
         harness.session.isScheduledDispatchInFlight = false
 
         XCTAssertFalse(harness.viewModel.scheduledSendBusyState(tabID: harness.tabID).isBusy)
-        harness.session.pendingInstructions = ["queued follow-up"]
+        harness.session.setUntrackedPendingInstructionsForTesting(["queued follow-up"])
         XCTAssertTrue(harness.viewModel.scheduledSendBusyState(tabID: harness.tabID).hasPendingInstructions)
         harness.session.pendingInstructions = []
         harness.session.runState = .waitingForUser
@@ -1247,12 +1247,218 @@ final class AgentScheduledSendDispatchTests: XCTestCase {
         XCTAssertEqual(probe.startCount, 1)
     }
 
-    func testProviderAcceptanceIsDerivedFromRunStateForNonCodexRunners() {
+    /// Lossless restart F2: Send now on a new-session start held by unresolved recovery elsewhere
+    /// in the workspace records consent, says why in the banner, stays blocked with Run alongside,
+    /// and dispatches exactly once when the blocker clears.
+    func testSendNowOnRecoveryBlockedNewSessionShowsWhyAndDispatchesOnceWhenResolved() async throws {
+        let harness = try await makeHarness(windowID: 4325)
+        harness.viewModel.test_establishPersistenceWorkspace(harness.workspace)
+        let clock = DispatchFakeClock(now: Date())
+        let coordinator = AgentScheduledSendCoordinator(clock: clock.clock)
+        harness.viewModel.attachScheduledSendCoordinator(coordinator)
+        let interruptedTabID = UUID()
+        let interrupted = try await harness.viewModel.ensureSessionReady(tabID: interruptedTabID)
+        let interruptedSessionID = try XCTUnwrap(harness.viewModel.ensureSessionBoundToTab(interrupted))
+        // An unresolved receipt transfer of another open session: its recovery is unresolved.
+        let otherHold = AgentScheduledSendTransferHold(
+            sessionID: interruptedSessionID,
+            scheduleID: UUID(),
+            scheduleAttemptID: UUID(),
+            reason: .awaitingRecovery
+        )
+        coordinator.holdTransfer(otherHold)
+
+        let notBefore = clock.now.addingTimeInterval(3600)
+        let scheduleID = try await harness.viewModel.installScheduledSend(
+            text: "Start after recovery",
+            on: harness.session,
+            notBefore: notBefore,
+            runAlongsideOtherSessions: false,
+            isNewSessionStart: true
+        ).get()
+        let probe = DispatchProbe()
+        harness.viewModel.scheduledDispatchRunStarter = { [probe] _, _, _, _ in
+            probe.startCount += 1
+            return .sent
+        }
+        let workspaceID = harness.workspace.id
+        XCTAssertEqual(
+            harness.viewModel.scheduledSendRecoveryBlocker(inWorkspace: workspaceID, excluding: UUID())?.unresolvedOpenSessionIDs,
+            [interruptedSessionID]
+        )
+        XCTAssertTrue(harness.viewModel.hasUnresolvedRecoverySession(inWorkspace: workspaceID, excluding: UUID()))
+
+        for runAlongside in [false, true] {
+            let message = await harness.viewModel.sendScheduledSendNow(
+                tabID: harness.tabID,
+                scheduleID: scheduleID,
+                runAlongsideOtherSessions: runAlongside
+            )
+            XCTAssertNil(message, "Consent is recorded; the reason is shown persistently, not as an error")
+            try await waitUntil("blocked disposition recorded (runAlongside \(runAlongside))") {
+                coordinator.recoveryBlocker(scheduleID: scheduleID) != nil
+            }
+            guard case let .blocked(blocker) = coordinator.disposition(scheduleID: scheduleID) else {
+                return XCTFail("expected a blocked disposition, got \(coordinator.disposition(scheduleID: scheduleID))")
+            }
+            XCTAssertEqual(blocker.unresolvedOpenSessionIDs, [interruptedSessionID])
+            try await waitUntil("banner shows why") {
+                harness.viewModel.makeComposerProps(tabID: harness.tabID).scheduledSend?.recoveryBlockedMessage
+                    == "Will send after 1 session in this workspace finishes recovery. Review Needs Attention…"
+            }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            XCTAssertEqual(probe.startCount, 0, "The recovery gate holds; Run alongside never bypasses it")
+            XCTAssertNil(harness.session.lastScheduledDispatch)
+        }
+        XCTAssertEqual(harness.session.pendingScheduledSendRecord?.runAlongsideOtherSessions, true)
+
+        // Review B F2-R2: the Scheduled Messages dashboard row shows the same blocker.
+        let dashboard = AgentScheduledMessagesViewModel(agentModeVM: harness.viewModel, metadataRecords: { _ in [] })
+        await dashboard.reload()
+        XCTAssertEqual(
+            dashboard.rows.count { $0.props?.id == scheduleID },
+            1,
+            "The blocked schedule is listed once with live props: \(dashboard.rows.map(\.statusText))"
+        )
+        let row = try XCTUnwrap(dashboard.rows.first { $0.props?.id == scheduleID })
+        XCTAssertEqual(
+            row.props?.recoveryBlockedMessage,
+            harness.viewModel.makeComposerProps(tabID: harness.tabID).scheduledSend?.recoveryBlockedMessage
+        )
+        XCTAssertNotNil(row.props?.recoveryBlockedMessage)
+
+        coordinator.releaseTransferHold(scheduleID: otherHold.scheduleID, scheduleAttemptID: otherHold.scheduleAttemptID)
+        try await waitUntil("consented send dispatched once the blocker cleared") {
+            harness.session.lastScheduledDispatch != nil
+        }
+        XCTAssertEqual(probe.startCount, 1)
+        XCTAssertNil(coordinator.recoveryBlocker(scheduleID: scheduleID))
+        coordinator.recordDidChange()
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertEqual(probe.startCount, 1, "Exactly one dispatch")
+        await dashboard.reload()
+        let sentSessionID = try XCTUnwrap(harness.session.activeAgentSessionID)
+        XCTAssertFalse(
+            dashboard.rows.contains { $0.props?.id == scheduleID || $0.sessionID == sentSessionID },
+            "The sent schedule's row is gone: \(dashboard.rows.map(\.statusText))"
+        )
+    }
+
+    /// Review B F2-R1: the itemized predicate keeps the pre-F2 membership for unbound tabs. A tab
+    /// in a state that blocks once bound (mandatory recovery without its dependencies) never
+    /// blocks while unbound, because the per-session predicate needs a durable session ID
+    /// (`scheduledSendHasUnresolvedRecovery` guard); binding it makes it an attributed blocker.
+    func testUnboundTabWithUnresolvedRecoveryStateKeepsThePreF2GateMembership() async throws {
+        let harness = try await makeHarness(windowID: 4327)
+        harness.viewModel.test_establishPersistenceWorkspace(harness.workspace)
+        harness.viewModel.attachScheduledSendCoordinator(AgentScheduledSendCoordinator())
+        let workspaceID = harness.workspace.id
+        let unbound = try await harness.viewModel.ensureSessionReady(tabID: UUID())
+        XCTAssertNil(unbound.activeAgentSessionID)
+        unbound.recoveryAdmissionMode = .mandatory
+        XCTAssertNil(unbound.recoveryLane)
+
+        XCTAssertFalse(harness.viewModel.scheduledSendHasUnresolvedRecovery(unbound))
+        XCTAssertNil(harness.viewModel.scheduledSendRecoveryBlocker(inWorkspace: workspaceID, excluding: UUID()))
+        XCTAssertFalse(harness.viewModel.hasUnresolvedRecoverySession(inWorkspace: workspaceID, excluding: UUID()))
+
+        let boundID = try XCTUnwrap(harness.viewModel.ensureSessionBoundToTab(unbound))
+        XCTAssertTrue(harness.viewModel.scheduledSendHasUnresolvedRecovery(unbound))
+        let blocker = harness.viewModel.scheduledSendRecoveryBlocker(inWorkspace: workspaceID, excluding: UUID())
+        XCTAssertEqual(blocker?.unresolvedOpenSessionIDs, [boundID])
+        XCTAssertEqual(blocker?.unattributed, false)
+        XCTAssertTrue(harness.viewModel.hasUnresolvedRecoverySession(inWorkspace: workspaceID, excluding: UUID()))
+        XCTAssertNil(
+            harness.viewModel.scheduledSendRecoveryBlocker(inWorkspace: workspaceID, excluding: boundID),
+            "The schedule's own session is excluded from the workspace gate"
+        )
+    }
+
+    /// Lossless restart F2: a Send now the scheduler refuses returns a reason instead of nothing.
+    func testSendNowRefusedByClosedStartupAdmissionReturnsAReason() async throws {
+        let harness = try await makeHarness(windowID: 4326)
+        let coordinator = AgentScheduledSendCoordinator(startupAdmission: .awaitingRecovery)
+        harness.viewModel.attachScheduledSendCoordinator(coordinator)
+        let scheduleID = try await harness.viewModel.installScheduledSend(
+            text: "While recovery checks",
+            on: harness.session,
+            notBefore: Date().addingTimeInterval(3600),
+            runAlongsideOtherSessions: false,
+            isNewSessionStart: false
+        ).get()
+        let message = await harness.viewModel.sendScheduledSendNow(
+            tabID: harness.tabID,
+            scheduleID: scheduleID,
+            runAlongsideOtherSessions: false
+        )
+        XCTAssertEqual(
+            message,
+            AgentModeViewModel.scheduledSendNowRefusalMessage(.startupAdmissionClosed(.awaitingRecovery))
+        )
+    }
+
+    func testSendNowRefusalMessagesAreDistinctForEveryRefusal() {
+        let refusals: [AgentScheduledSendNowRefusal] = [
+            .startupAdmissionClosed(.awaitingRecovery),
+            .startupAdmissionClosed(.recoveryFailed("boom")),
+            .transferHeld,
+            .confirmationPending,
+            .scheduleNotFound
+        ]
+        let messages = refusals.map(AgentModeViewModel.scheduledSendNowRefusalMessage)
+        XCTAssertEqual(Set(messages).count, refusals.count, "\(messages)")
+        XCTAssertFalse(messages.contains { $0.isEmpty })
+        XCTAssertFalse(messages[1].contains("boom"), "Raw recovery errors are not shown")
+        XCTAssertEqual(messages[3], AgentModeViewModel.scheduledSendConfirmationChangedMessage)
+    }
+
+    /// Lossless restart F2 banner wording: a crash hold, a session restriction, and a workspace
+    /// restriction each produce visible, plain blocked feedback; a dispatching attempt shows none.
+    func testRecoveryBlockedBannerWordingNamesWhatToResolve() {
+        var record = makeRecord(notBefore: Date())
+        record.isNewSessionStart = true
+        record.state = .needsConfirmation
+        record.confirmationReason = .missedWhileClosed
+        func message(_ blocker: AgentScheduledSendRecoveryBlocker) -> String? {
+            AgentScheduledSendProps(tabID: UUID(), scheduledSend: record, recoveryBlocker: blocker).recoveryBlockedMessage
+        }
+        XCTAssertEqual(
+            message(AgentScheduledSendRecoveryBlocker(interruptedSessionIDs: [UUID(), UUID()])),
+            "Will send after 2 interrupted sessions in this workspace are resolved: choose It stopped (not Dismiss) in Needs Attention…"
+        )
+        XCTAssertEqual(
+            message(AgentScheduledSendRecoveryBlocker(interruptedSessionIDs: [UUID()])),
+            "Will send after 1 interrupted session in this workspace is resolved: choose It stopped (not Dismiss) in Needs Attention…"
+        )
+        XCTAssertEqual(
+            message(AgentScheduledSendRecoveryBlocker(restrictedSessionIDs: [UUID()])),
+            "Will send after 1 unchecked session in this workspace is resolved. Restart RepoPrompt to check again."
+        )
+        XCTAssertEqual(
+            message(AgentScheduledSendRecoveryBlocker(workspaceRestriction: "unreadable", destinationUnresolved: true)),
+            "Waiting: this workspace couldn't be checked for interrupted work. Restart RepoPrompt to check again."
+        )
+        XCTAssertEqual(
+            message(AgentScheduledSendRecoveryBlocker(destinationUnresolved: true)),
+            "Waiting until this session's recovery is resolved."
+        )
+        XCTAssertNotNil(message(AgentScheduledSendRecoveryBlocker(unattributed: true)))
+        XCTAssertNil(AgentScheduledSendProps(tabID: UUID(), scheduledSend: record).recoveryBlockedMessage)
+        record.state = .dispatching
+        XCTAssertNil(message(AgentScheduledSendRecoveryBlocker(interruptedSessionIDs: [UUID()])))
+    }
+
+    func testProviderAcceptanceIsDerivedFromRunStateForNonCodexRunners() async throws {
         typealias Accept = AgentModeViewModel
+        // A Codex fallback outcome carries a store-issued queue receipt from a real temporary lane.
+        let recovery = try await RecoveryLaneFixture.make("ScheduledAcceptanceCodexFallback")
+        defer { recovery.tearDown() }
+        let admitted = try await recovery.queuedIdentity("scheduled fallback")
+        let queueReceipt = try XCTUnwrap(admitted.queueReceipt)
         XCTAssertTrue(Accept.scheduledProviderAccepted(outcome: .sent, agent: .codexExec, runState: .idle))
         XCTAssertTrue(
             Accept.scheduledProviderAccepted(
-                outcome: .queuedFallback(queueID: UUID(), reason: .activeWithoutAuthoritativeIdentity),
+                outcome: .queuedFallback(receipt: queueReceipt, reason: .activeWithoutAuthoritativeIdentity),
                 agent: .codexExec,
                 runState: .idle
             ),
@@ -2615,6 +2821,151 @@ final class AgentScheduledSendDispatchTests: XCTestCase {
         XCTAssertEqual(harness.session.scheduledSendPersistedUpdatedAt, persistedRecord.updatedAt, "Local revision matches the exact installed record")
     }
 
+    func testInitialCreationKeepsItsAuthorityWhenTheContextChangesAfterTheDurableCommit() async throws {
+        let harness = try await makeHarness(windowID: 4380)
+        let sessionID = try XCTUnwrap(harness.viewModel.ensureSessionBoundToTab(harness.session))
+        harness.session.appendItem(.user("first save creates the file"))
+        harness.session.isDirty = true
+
+        // The exclusive creation commits; before its authority is adopted, the persistence
+        // context stops being current (for example, a workspace switch flush).
+        let elsewhere = WorkspaceModel(name: "Elsewhere", repoPaths: [harness.storageURL.path], customStoragePath: harness.storageURL)
+        let flips = DispatchProbe()
+        harness.viewModel.test_initialPersistenceCommittedHook = { [harness, flips, elsewhere] _ in
+            flips.startCount += 1
+            harness.viewModel.test_persistenceWorkspaceOverride = elsewhere
+        }
+        let first = await harness.viewModel.saveSessionDetailed(for: harness.tabID)
+        harness.viewModel.test_initialPersistenceCommittedHook = nil
+        XCTAssertEqual(flips.startCount, 1, "The context flipped after the durable commit")
+        XCTAssertTrue(first.didWriteDurably, "The creation commit is reported honestly as a durable write")
+        XCTAssertFalse(first.isCleanSuccess, "Its authority was not used for the current save: not a clean projection")
+        XCTAssertTrue(harness.session.isDirty, "The projection stays dirty for a fresh owner-current save")
+        XCTAssertEqual(harness.session.persistedIncarnationSessionID, sessionID, "The committed creation is this owner's incarnation")
+        let created = try XCTUnwrap(harness.session.persistenceState(for: sessionID), "Creation authority is retained for the originating owner")
+
+        // The same in-memory owner becomes current again: newer edits save under the original
+        // creation authority instead of re-attempting creation (`sessionAlreadyExists`).
+        harness.viewModel.test_persistenceWorkspaceOverride = harness.workspace
+        harness.session.appendItem(.user("edit after the context returned"))
+        harness.session.isDirty = true
+        let saved = await harness.viewModel.flushSave(for: harness.tabID)
+        XCTAssertTrue(saved, "The creator keeps saving its own file")
+        let persisted = try await harness.persistedSession()
+        XCTAssertTrue(persisted.toLiveItems().contains { $0.text == "edit after the context returned" })
+        XCTAssertEqual(persisted.lifecycle?.lifecycle?.incarnationID, created.stamp.incarnationID, "Same incarnation; nothing was recreated")
+    }
+
+    func testInitialCreationStaysDurableWhenTheRestOfThatSaveWritesNothing() async throws {
+        // The owner changes after the creation committed, before the full write.
+        let flipped = try await makeHarness(windowID: 4383)
+        let flippedID = try XCTUnwrap(flipped.viewModel.ensureSessionBoundToTab(flipped.session))
+        flipped.session.appendItem(.user("created before the owner changed"))
+        flipped.session.isDirty = true
+        let flips = DispatchProbe()
+        flipped.viewModel.test_saveSessionBeforeWriteHook = { [flipped, flips] held in
+            flips.startCount += 1
+            _ = flipped.viewModel.test_installPersistentSessionBinding(sessionID: UUID(), on: held)
+        }
+        let flippedOutcome = await flipped.viewModel.saveSessionDetailed(for: flipped.tabID)
+        flipped.viewModel.test_saveSessionBeforeWriteHook = nil
+        XCTAssertEqual(flips.startCount, 1, "The owner changed after the durable creation")
+        XCTAssertTrue(flippedOutcome.didWriteDurably, "The committed creation is never reported as not written")
+        XCTAssertFalse(flippedOutcome.isCleanSuccess)
+        let created = try await flipped.viewModel.test_dataService.loadAgentSession(id: flippedID, for: flipped.workspace)
+        XCTAssertTrue(try XCTUnwrap(created).toLiveItems().contains { $0.text == "created before the owner changed" })
+
+        // The full write after the creation fails.
+        let failing = try await makeHarness(windowID: 4384)
+        let failingID = try XCTUnwrap(failing.viewModel.ensureSessionBoundToTab(failing.session))
+        failing.session.appendItem(.user("created before the full write failed"))
+        failing.session.isDirty = true
+        addTeardownBlock {
+            await AgentSessionDataService.shared.test_setSessionWriteFailureInjector(nil)
+        }
+        failing.viewModel.test_saveSessionBeforeWriteHook = { [failing, failingID] _ in
+            await failing.viewModel.test_dataService.test_setSessionWriteFailureInjector { url -> Error? in
+                guard url.lastPathComponent.contains(failingID.uuidString) else { return nil }
+                return InjectedSecondWriteFailure()
+            }
+        }
+        let failedOutcome = await failing.viewModel.saveSessionDetailed(for: failing.tabID)
+        failing.viewModel.test_saveSessionBeforeWriteHook = nil
+        await failing.viewModel.test_dataService.test_setSessionWriteFailureInjector(nil)
+        XCTAssertTrue(failedOutcome.didWriteDurably, "The committed creation is never reported as not written")
+        XCTAssertFalse(failedOutcome.isCleanSuccess, "The failed write is not a clean projection")
+        XCTAssertTrue(failing.session.isDirty, "The projection stays dirty")
+        XCTAssertNotNil(failing.session.persistenceState(for: failingID), "The creator keeps its authority")
+        let createdBeforeFailure = try await failing.viewModel.test_dataService.loadAgentSession(id: failingID, for: failing.workspace)
+        XCTAssertTrue(
+            try XCTUnwrap(createdBeforeFailure).toLiveItems().contains { $0.text == "created before the full write failed" },
+            "The durable outcome names content the creation actually committed"
+        )
+        let retried = await failing.viewModel.flushSave(for: failing.tabID)
+        XCTAssertTrue(retried, "A later save writes normally under the created incarnation")
+    }
+
+    func testFreshScheduleInstallRollsBackWhenTheTabIsReboundDuringCreation() async throws {
+        let harness = try await makeHarness(windowID: 4386)
+        let replacementID = UUID()
+        let rebinds = DispatchProbe()
+        // The creation commits and is adopted; the tab is rebound before the full write.
+        harness.viewModel.test_saveSessionBeforeWriteHook = { [harness, rebinds] held in
+            guard rebinds.startCount == 0 else { return }
+            rebinds.startCount += 1
+            _ = harness.viewModel.test_installPersistentSessionBinding(sessionID: replacementID, on: held)
+        }
+        let install = await harness.viewModel.installScheduledSend(
+            text: "Rebound during creation",
+            on: harness.session,
+            notBefore: Date().addingTimeInterval(600),
+            runAlongsideOtherSessions: false,
+            isNewSessionStart: false
+        )
+        harness.viewModel.test_saveSessionBeforeWriteHook = nil
+        XCTAssertEqual(rebinds.startCount, 1, "The tab was rebound after the durable creation")
+        if case .success = install {
+            XCTFail("A schedule is never kept on a tab rebound away from its created session")
+        }
+        XCTAssertEqual(harness.session.activeAgentSessionID, replacementID)
+        XCTAssertNil(harness.session.scheduledSend, "Rolled back: the replacement session never carries the schedule")
+        XCTAssertNil(harness.session.scheduledSendWorkspaceID)
+    }
+
+    func testRestoredBindingToADeletedSessionIsReleasedInsteadOfBecomingAnUnsaveableCreator() async throws {
+        let owner = try await makeHarness(windowID: 4381)
+        let sessionID = try XCTUnwrap(owner.viewModel.ensureSessionBoundToTab(owner.session))
+        owner.session.appendItem(.user("history that was deleted"))
+        owner.session.isDirty = true
+        let ownerSaved = await owner.viewModel.flushSave(for: owner.tabID)
+        XCTAssertTrue(ownerSaved)
+        try await owner.viewModel.test_dataService.deleteAgentSession(id: sessionID, for: owner.workspace)
+
+        // Restart inside the crash window: the tombstone committed, the workspace unbind did not.
+        let restored = try await makeHarness(windowID: 4382, workspace: owner.workspace, storageURL: owner.storageURL)
+        XCTAssertNotNil(restored.viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: restored.session))
+        let outcome = await restored.viewModel.hydrateMaterializedRemoteSession(restored.session)
+        XCTAssertEqual(outcome, .rejected, "A deleted UUID is never adopted as a genuine creator")
+        XCTAssertFalse(restored.session.hasLoadedPersistedState)
+        XCTAssertNotEqual(restored.session.persistedLoadDisposition, .noPayload)
+        XCTAssertNil(restored.session.persistenceState(for: sessionID))
+        try await waitUntil("the existing deletion cleanup released the deleted binding") {
+            restored.viewModel.sessions[restored.tabID] == nil
+        }
+
+        // The tab is usable again under a fresh identity; the deleted UUID is never recreated.
+        let fresh = try await restored.viewModel.ensureSessionReady(tabID: restored.tabID)
+        XCTAssertFalse(fresh === restored.session)
+        let freshID = try XCTUnwrap(restored.viewModel.ensureSessionBoundToTab(fresh))
+        XCTAssertNotEqual(freshID, sessionID)
+        fresh.appendItem(.user("typed after the restart"))
+        fresh.isDirty = true
+        let freshSaved = await restored.viewModel.flushSave(for: restored.tabID)
+        XCTAssertTrue(freshSaved, "The released tab saves durably again")
+        let deleted = try await restored.viewModel.test_dataService.loadAgentSession(id: sessionID, for: restored.workspace)
+        XCTAssertNil(deleted, "The deleted session stays deleted")
+    }
+
     func testMaterializedRemoteHydrationRejectsRebindDuringHeldLoadWithoutDeclaringLoaded() async throws {
         let harness = try await makeHarness(windowID: 4373)
         let existingID = UUID()
@@ -2908,6 +3259,8 @@ final class AgentScheduledSendDispatchTests: XCTestCase {
 private struct DispatchWaitTimeout: Error {}
 
 private struct InjectedDispatchRecoveryFailure: Error {}
+
+private struct InjectedSecondWriteFailure: Error {}
 
 private struct InjectedResyncReadFailure: Error {}
 

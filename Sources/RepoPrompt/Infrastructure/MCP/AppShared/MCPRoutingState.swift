@@ -46,8 +46,28 @@ enum MCPRoutingStateStore {
     /// Set to true to enable debug logging for MCP routing state operations
     static var debugLoggingEnabled = false
     private static var url: URL {
-        MCPFilesystemConstants.identity.routingStateURL()
+        #if DEBUG
+            if let xcTestIsolatedURL {
+                return xcTestIsolatedURL
+            }
+        #endif
+        return MCPFilesystemConstants.identity.routingStateURL()
     }
+
+    #if DEBUG
+        /// Every `ServerNetworkManager` saves its whole routing snapshot, so a test process must
+        /// never load or rewrite the user's Application Support routing file (mirrors
+        /// `GlobalSettingsStore`'s XCTest isolation). One temporary file per test process.
+        private static let xcTestIsolatedURL: URL? = {
+            guard NSClassFromString("XCTestCase") != nil || NSClassFromString("XCTest.XCTestCase") != nil else {
+                return nil
+            }
+            return FileManager.default.temporaryDirectory
+                .appendingPathComponent("RepoPromptCE-XCTest-MCPRouting", isDirectory: true)
+                .appendingPathComponent(UUID().uuidString, isDirectory: true)
+                .appendingPathComponent(MCPFilesystemConstants.identity.routingStateFileName, isDirectory: false)
+        }()
+    #endif
 
     static func load() -> MCPRoutingState {
         let decoder = JSONDecoder()

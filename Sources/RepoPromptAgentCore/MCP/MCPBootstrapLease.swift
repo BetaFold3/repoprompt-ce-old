@@ -34,7 +34,8 @@ package struct MCPBootstrapLeaseSpec {
     /// of an explicitly registered expected agent process.
     package let requiresExpectedAgentPID: Bool
     /// Per-run `code_mode` exposure (plan §6 D3). Always `.native` for Knowledge and
-    /// non-Agent Mode runs; not persisted and not consumed by policy installation yet.
+    /// non-Agent Mode runs; not persisted. Agent Mode leases forward it to connection-policy
+    /// installation through `agentModePolicyInstaller`; the headless default installer does not.
     package let codeModeEligibility: MCPCodeModeEligibility
 
     init(
@@ -90,7 +91,9 @@ package struct MCPBootstrapLeaseSpec {
 /// ## Lifecycle
 /// 1. `acquire()` — registers routing, acquires the gate, installs and arms the policy
 /// 2. PID-owned policies release the gate immediately; routing state stays retained by the lease
-/// 3. `releaseWhenRouted()` — waits for routing (or timeout) and cleans retained state
+/// 3. `releaseWhenRouted()` — waits for routing (or timeout) and cleans retained state.
+///    A later turn whose launch's helper is already routed may instead finish with
+///    `releaseWithProvenExistingRoute(agentPID:)`, which skips the wait and never revokes.
 /// 4. `cancelAndCleanup()` — emergency cleanup on cancellation
 ///
 /// ## Additional operations (agent-mode specific)
@@ -106,6 +109,8 @@ package actor MCPBootstrapLease {
             let didClearPolicy: Bool
             let didClearSuccessfulRoutingPolicy: Bool
             let didRevokePolicy: Bool
+            let didReleaseWithProvenExistingRoute: Bool
+            let didCleanUpRoutingAfterEarlyRelease: Bool
             let routingCleanupCount: Int
             let terminalCleanupRequestCount: Int
             let terminalCleanupRawRequestCount: Int
@@ -120,6 +125,8 @@ package actor MCPBootstrapLease {
                 didClearPolicy: didClearSuccessfulRoutingPolicy || didRevokePolicy,
                 didClearSuccessfulRoutingPolicy: didClearSuccessfulRoutingPolicy,
                 didRevokePolicy: didRevokePolicy,
+                didReleaseWithProvenExistingRoute: didReleaseWithProvenExistingRoute,
+                didCleanUpRoutingAfterEarlyRelease: didCleanUpRoutingAfterEarlyRelease,
                 routingCleanupCount: routingCleanupCount,
                 terminalCleanupRequestCount: terminalCleanupRequestCount,
                 terminalCleanupRawRequestCount: terminalCleanupRequestEntries.count,
@@ -139,6 +146,8 @@ package actor MCPBootstrapLease {
     private let expectedPIDPolicyArmer: (MCPBootstrapLeaseSpec) async -> Bool
     private let successfulRoutingPolicyClearer: (MCPBootstrapLeaseSpec) async -> Void
     private let policyClearer: (MCPBootstrapLeaseSpec) async -> Void
+    private let provenRoutePolicyReleaser: (MCPBootstrapLeaseSpec, pid_t) async -> Bool
+    private let retainedRunPolicyRefresher: (MCPBootstrapLeaseSpec) async -> Void
 
     private var hasAcquired = false
     private var hasReleased = false
@@ -152,6 +161,12 @@ package actor MCPBootstrapLease {
     private var didCleanupRouting = false
     private var didClearSuccessfulRoutingPolicy = false
     private var didRevokePolicy = false
+    /// The turn's pending policy was released because its launch's helper was already routed;
+    /// later failure or cancellation cleanup never revokes it again.
+    private var didReleaseWithProvenExistingRoute = false
+    /// Failure or cancellation cleanup after an early release ran the host's routing-only cleanup
+    /// (`cleanupRunRoutingIfUnproven`), at most once.
+    private var didCleanUpRoutingAfterEarlyRelease = false
     #if DEBUG
         private var routingCleanupCount = 0
         private var terminalCleanupRequestCount = 0
@@ -178,7 +193,17 @@ package actor MCPBootstrapLease {
     ///     `mcpHost.installClientConnectionPolicy(...)`.
     ///   - expectedPIDPolicyArmer: Confirms the intended pending policy is uniquely PID-owned.
     ///   - successfulRoutingPolicyClearer: Clears only the pending per-run policy after successful routing.
-    ///   - policyClearer: Revokes the per-run policy and routing state on failure/timeout.
+    ///   - policyClearer: Revokes the per-run pending policy on failure/timeout. The default
+    ///     (`revokeClientConnectionPolicy`) clears the run's routing state only when no live,
+    ///     ancestry-proven helper connection of the run remains, so a helper a long-lived agent
+    ///     kept from an earlier turn stays routed.
+    ///   - provenRoutePolicyReleaser: Clears the turn's pending policy when the launch's helper is
+    ///     already routed (see `releaseWithProvenExistingRoute`). Defaults to
+    ///     `mcpHost.releasePendingRunPolicyForProvenRoute(...)`.
+    ///   - retainedRunPolicyRefresher: Delivers the installed turn policy to the run's retained,
+    ///     proven helper connections. Runs after the global gate is released (PID-owned policies
+    ///     only) and before `acquire()` returns, so before the turn's message is sent. Defaults to
+    ///     `mcpHost.refreshRetainedRunPolicyForTurnStart(...)`.
     init(
         spec: MCPBootstrapLeaseSpec,
         runCoordinator: AgentRunCoordinator,
@@ -186,7 +211,9 @@ package actor MCPBootstrapLease {
         policyInstaller: ((MCPBootstrapLeaseSpec) async -> Void)? = nil,
         expectedPIDPolicyArmer: ((MCPBootstrapLeaseSpec) async -> Bool)? = nil,
         successfulRoutingPolicyClearer: ((MCPBootstrapLeaseSpec) async -> Void)? = nil,
-        policyClearer: ((MCPBootstrapLeaseSpec) async -> Void)? = nil
+        policyClearer: ((MCPBootstrapLeaseSpec) async -> Void)? = nil,
+        provenRoutePolicyReleaser: ((MCPBootstrapLeaseSpec, pid_t) async -> Bool)? = nil,
+        retainedRunPolicyRefresher: ((MCPBootstrapLeaseSpec) async -> Void)? = nil
     ) {
         self.spec = spec
         let mcpHost = runCoordinator.mcpHost
@@ -199,6 +226,8 @@ package actor MCPBootstrapLease {
         self.successfulRoutingPolicyClearer =
             successfulRoutingPolicyClearer ?? Self.defaultSuccessfulRoutingPolicyClearer(mcpHost)
         self.policyClearer = policyClearer ?? Self.defaultPolicyClearer(mcpHost)
+        self.provenRoutePolicyReleaser = provenRoutePolicyReleaser ?? Self.defaultProvenRoutePolicyReleaser(mcpHost)
+        self.retainedRunPolicyRefresher = retainedRunPolicyRefresher ?? Self.defaultRetainedRunPolicyRefresher(mcpHost)
     }
 
     // MARK: - Core Lifecycle
@@ -335,6 +364,19 @@ package actor MCPBootstrapLease {
                 // process-global gate before spawning so independent sessions may initialize
                 // concurrently; the routing waiter and policy remain owned by this lease.
                 await releaseOwnedGate(reason: "expected_pid_policy_armed")
+                // Cancellation may have landed during the gate release or the refresh below: the
+                // lease never reports success after it (cleanup is idempotent).
+                if shouldAbortAcquire {
+                    await cancelAndCleanup()
+                    return false
+                }
+                // Turn-start delivery to a retained helper, outside the global gate: a slow
+                // `tools/list_changed` write never holds up other sessions' bootstrap.
+                await retainedRunPolicyRefresher(spec)
+                if shouldAbortAcquire {
+                    await cancelAndCleanup()
+                    return false
+                }
             }
             acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) acquire() completed")
             return true
@@ -348,7 +390,9 @@ package actor MCPBootstrapLease {
 
     /// Waits for routing and releases legacy gate ownership once established or timed out.
     /// PID-owned policies have already released the gate but retain this routing/policy cleanup.
-    /// If routing fails/times out, clears the pending policy entry.
+    /// If routing fails/times out, revokes the pending policy entry; the host clears the run's
+    /// routing only when no live, ancestry-proven helper remains (a later turn of a long-lived
+    /// agent keeps its existing helper, so no new connection arrives and the wait times out).
     @discardableResult
     package func releaseWhenRouted(timeoutMs: Int = 10000) async -> Bool {
         if hasReleased {
@@ -401,19 +445,80 @@ package actor MCPBootstrapLease {
             )
         #endif
 
-        if !routed {
+        // Cancellation cleanup may have run while the wait was suspended; it already revoked the
+        // policy and cleaned routing, and neither is repeated.
+        if !routed, !didRevokePolicy, !didReleaseWithProvenExistingRoute {
             acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) routing wait failed or timed out; clearing connection policy")
             didRevokePolicy = true
             await policyClearer(spec)
         }
-        await runCoordinator.cleanupRouting(runID: spec.runID)
-        didCleanupRouting = true
-        #if DEBUG
-            routingCleanupCount += 1
-        #endif
+        if !didCleanupRouting {
+            didCleanupRouting = true
+            await runCoordinator.cleanupRouting(runID: spec.runID)
+            #if DEBUG
+                routingCleanupCount += 1
+            #endif
+        }
 
         return routed
     }
+
+    /// A later turn of a launch that kept its helper: no new connection will arrive, so instead of
+    /// waiting out `releaseWhenRouted`'s timeout, the lease asks the host to release the turn's
+    /// pending policy when the run already has a live route proven to belong to `agentPID`'s launch.
+    /// On success it finishes like a routed release (the waiter is cleaned up, any owned gate is
+    /// released, and later failure or cancellation cleanup never revokes) and returns true. Returns
+    /// false, leaving the lease untouched for `releaseWhenRouted`, when the route is not proven (a
+    /// first turn or a restarted launch, whose new helper must still be routed by the policy).
+    package func releaseWithProvenExistingRoute(agentPID: pid_t) async -> Bool {
+        guard hasAcquired, policyInstalled, !hasReleased, !cleanupRequested, !Task.isCancelled else { return false }
+        let released = await provenRoutePolicyReleaser(spec, agentPID)
+        // Cancellation cleanup that ran or was requested meanwhile owns the lease's cleanup.
+        guard released, !hasReleased, !cleanupRequested else { return false }
+        hasReleased = true
+        didReleaseWithProvenExistingRoute = true
+        didRouteSuccessfully = true
+        // The host already cleared the policy; the successful-routing clear has nothing left to do.
+        didClearSuccessfulRoutingPolicy = true
+        acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) launch helper already routed; released without the routing wait")
+        #if DEBUG
+            await mcpHost.debugRecordRunRoutingEvent(
+                runID: spec.runID,
+                event: "route_wait_skipped_proven_route",
+                connectionID: nil,
+                fields: [
+                    "client_name": spec.clientName ?? "nil",
+                    "agent_pid": String(agentPID),
+                    "gate_id": spec.gateID.uuidString
+                ]
+            )
+        #endif
+        await releaseOwnedGate(reason: "proven_existing_route")
+        if routingRegistered, !didCleanupRouting {
+            didCleanupRouting = true
+            await runCoordinator.cleanupRouting(runID: spec.runID)
+            #if DEBUG
+                routingCleanupCount += 1
+            #endif
+        }
+        return true
+    }
+
+    #if DEBUG
+        /// Records that the runner did not attempt the proven-route early release, and why.
+        package func debugRecordProvenRouteReleaseSkipped(reason: String) async {
+            await mcpHost.debugRecordRunRoutingEvent(
+                runID: spec.runID,
+                event: "proven_route_release_skipped",
+                connectionID: nil,
+                fields: [
+                    "reason": reason,
+                    "client_name": spec.clientName ?? "nil",
+                    "gate_id": spec.gateID.uuidString
+                ]
+            )
+        }
+    #endif
 
     /// Clears only this run's installed policy after routing completed successfully.
     /// This preserves retained routing, affinity, mappings, gate state, and provider reuse.
@@ -612,15 +717,17 @@ package actor MCPBootstrapLease {
                 ]
             )
         #endif
-        if routingRegistered, !didSignalRoutingFailure {
+        // An early release finished the run's routing as routed: no failure is signalled for it.
+        if routingRegistered, !didSignalRoutingFailure, !didReleaseWithProvenExistingRoute {
             didSignalRoutingFailure = true
             await routingWaiter.notifyFailed(runID: spec.runID)
         }
         await releaseOwnedGate(reason: reason)
-        if policyInstalled, !didRevokePolicy {
+        if policyInstalled, !didRevokePolicy, !didReleaseWithProvenExistingRoute {
             didRevokePolicy = true
             await policyClearer(spec)
         }
+        await cleanUpRoutingAfterEarlyReleaseIfNeeded()
         if routingRegistered, !didCleanupRouting {
             didCleanupRouting = true
             await runCoordinator.cleanupRouting(runID: spec.runID)
@@ -648,6 +755,19 @@ package actor MCPBootstrapLease {
         #endif
     }
 
+    /// After an early release the turn's policy is gone and is never revoked, but a failed or
+    /// cancelled turn still owes the run the revoke's routing half: the host clears the run's
+    /// routing when its agent is no longer provable (and prunes unproven routes otherwise),
+    /// without touching any pending policy. At most once per lease.
+    private func cleanUpRoutingAfterEarlyReleaseIfNeeded() async {
+        guard didReleaseWithProvenExistingRoute,
+              !didCleanUpRoutingAfterEarlyRelease,
+              let clientName = spec.clientName
+        else { return }
+        didCleanUpRoutingAfterEarlyRelease = true
+        await mcpHost.cleanupRunRoutingIfUnproven(for: clientName, windowID: spec.windowID, runID: spec.runID)
+    }
+
     private func performDeferredRoutingCleanup(reason: String) async {
         #if DEBUG
             await mcpHost.debugRecordRunRoutingEvent(
@@ -662,10 +782,11 @@ package actor MCPBootstrapLease {
             )
         #endif
         await releaseOwnedGate(reason: reason)
-        if policyInstalled, !didRevokePolicy {
+        if policyInstalled, !didRevokePolicy, !didReleaseWithProvenExistingRoute {
             didRevokePolicy = true
             await policyClearer(spec)
         }
+        await cleanUpRoutingAfterEarlyReleaseIfNeeded()
         if routingRegistered, !didCleanupRouting {
             didCleanupRouting = true
             await runCoordinator.cleanupRouting(runID: spec.runID)
@@ -748,6 +869,33 @@ package actor MCPBootstrapLease {
         }
     }
 
+    private static func defaultProvenRoutePolicyReleaser(
+        _ mcpHost: any AgentMCPHosting
+    ) -> (MCPBootstrapLeaseSpec, pid_t) async -> Bool {
+        { spec, agentPID in
+            guard let clientName = spec.clientName else { return false }
+            return await mcpHost.releasePendingRunPolicyForProvenRoute(
+                for: clientName,
+                windowID: spec.windowID,
+                runID: spec.runID,
+                agentPID: agentPID
+            )
+        }
+    }
+
+    private static func defaultRetainedRunPolicyRefresher(
+        _ mcpHost: any AgentMCPHosting
+    ) -> (MCPBootstrapLeaseSpec) async -> Void {
+        { spec in
+            guard let clientName = spec.clientName else { return }
+            await mcpHost.refreshRetainedRunPolicyForTurnStart(for: clientName, runID: spec.runID)
+        }
+    }
+
+    /// Revokes the run's pending policy. The host keeps the run's proven routes, run policy state
+    /// and live affinity while a live, ancestry-proven helper connection of the run remains (and
+    /// unroutes the run's unproven connections), and otherwise clears them
+    /// (`cleanupRunRoutingState`).
     private static func defaultPolicyClearer(
         _ mcpHost: any AgentMCPHosting
     ) -> (MCPBootstrapLeaseSpec) async -> Void {

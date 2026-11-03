@@ -211,6 +211,10 @@ struct AgentRunMCPToolService {
     static let defaultWaitTimeoutSeconds = MCPTimeoutPolicy.agentLifecycleDefaultWaitSeconds
     static let defaultStartTaskLabelKind: AgentModelCatalog.TaskLabelKind = .pair
     nonisolated static let statusUpdateSliceSeconds: TimeInterval = 2
+    /// Sampling interval for waits on live sessions that have no MCP control registration
+    /// (desktop roots observed through the phone app link). They have no wait cursor, so the
+    /// session store cannot signal a change; the wait samples the truthful live snapshot instead.
+    nonisolated static let liveUnregisteredWaitPollSeconds: TimeInterval = 1
     #if DEBUG
         static let ompQualificationAuthorizationCleanupDeadlineNanoseconds: UInt64 = 5_000_000_000
         static let ompQualificationAuthorizationMinimumSeconds: TimeInterval = 5
@@ -248,6 +252,7 @@ struct AgentRunMCPToolService {
         /// run parallel in-process.
         nonisolated(unsafe) static var statusUpdateSliceSecondsOverride: TimeInterval?
         nonisolated(unsafe) static var waitClockNowOverride: (@Sendable () -> ContinuousClock.Instant)?
+        nonisolated(unsafe) static var liveUnregisteredWaitPollSecondsOverride: TimeInterval?
     #endif
 
     nonisolated static func normalizedStatusTextKey(_ text: String?) -> String? {
@@ -274,6 +279,15 @@ struct AgentRunMCPToolService {
             }
         #endif
         return statusUpdateSliceSeconds
+    }
+
+    private nonisolated static var resolvedLiveUnregisteredWaitPollSeconds: TimeInterval {
+        #if DEBUG
+            if let override = liveUnregisteredWaitPollSecondsOverride {
+                return max(0.001, override)
+            }
+        #endif
+        return liveUnregisteredWaitPollSeconds
     }
 
     private nonisolated static func resolvedWaitClockNow(_ clock: ContinuousClock) -> ContinuousClock.Instant {
@@ -412,6 +426,14 @@ struct AgentRunMCPToolService {
             _ ownerStartMicroseconds: Int32
         ) async -> Bool)?
         var testDispatchSteerInstruction: ((
+            _ sessionID: UUID,
+            _ text: String,
+            _ workflow: AgentWorkflowDefinition?,
+            _ agentModeVM: AgentModeViewModel
+        ) async throws -> AgentModeViewModel.MCPInstructionDispatch)?
+        /// Replaces the remote attention-root send (`remoteRootDispatchInstruction`) only; gating,
+        /// targeting, and snapshot projection still run.
+        var testDispatchRemoteRootInstruction: ((
             _ sessionID: UUID,
             _ text: String,
             _ workflow: AgentWorkflowDefinition?,
@@ -659,6 +681,7 @@ struct AgentRunMCPToolService {
             )
             _ = await agentModeVM.cancelAgentRun(
                 target: exactTarget,
+                cause: .ordinary,
                 completion: .terminalPublished
             )
         }
@@ -975,6 +998,30 @@ struct AgentRunMCPToolService {
         // A Knowledge start is always credited to the identity frozen by outer admission.
         let admittedCallerSessionID = knowledgeCaller?.admittedCallerSessionID ?? innerAdmittedCallerSessionID
         let admittedCallerProfile: AgentSessionProfile? = knowledgeCaller == nil ? nil : .knowledge
+        let revalidateSpawnDelegation: () throws -> Void = { [weak agentModeVM] in
+            guard let agentModeVM else {
+                throw MCPError.invalidParams(
+                    "agent_run.start: the agent window closed while the request was in flight. Nothing was started."
+                )
+            }
+            try agentModeVM.mcpRevalidateDelegationCommit(
+                sourceTabID: parentSourceTabID,
+                expectedCallerSessionID: admittedCallerSessionID,
+                targetSessionID: resolvedTabID.flatMap { agentModeVM.mcpExistingSessionID(forTabID: $0) },
+                operation: "agent_run.start",
+                expectedCallerProfile: admittedCallerProfile
+            )
+        }
+        // Step 5b: freeze, synchronously with admission, this call's dispatcher invocation UUID, the
+        // admitted parent, its active run attempt, and its recovery lane. Nil (unchanged) for an
+        // independent caller or a parent without durable recovery admission.
+        let delegatedChildLinkAdmission = try agentModeVM.mcpAdmitDelegatedChildLink(
+            sourceTabID: parentSourceTabID,
+            admittedCallerSessionID: admittedCallerSessionID,
+            invocationID: metadata.toolInvocationID,
+            operation: "agent_run.start",
+            revalidateDelegation: revalidateSpawnDelegation
+        )
         if let knowledgeCaller {
             if resolvedSelection.agentRaw == nil {
                 // K4: freeze the admitted parent's live provider, model, and effort synchronously
@@ -1097,13 +1144,8 @@ struct AgentRunMCPToolService {
                 ? false
                 : effectiveParentWorktreeInheritance,
             delegationCommitCheck: {
-                try agentModeVM.mcpRevalidateDelegationCommit(
-                    sourceTabID: parentSourceTabID,
-                    expectedCallerSessionID: admittedCallerSessionID,
-                    targetSessionID: resolvedTabID.flatMap { agentModeVM.mcpExistingSessionID(forTabID: $0) },
-                    operation: "agent_run.start",
-                    expectedCallerProfile: admittedCallerProfile
-                )
+                try revalidateSpawnDelegation()
+                try agentModeVM.mcpRequireDelegatedChildLinkAdmissionCurrent(delegatedChildLinkAdmission)
             },
             childSessionProfile: knowledgeCaller == nil ? nil : .knowledge
         )
@@ -1448,6 +1490,8 @@ struct AgentRunMCPToolService {
                     target: target
                 )
             }
+            // The parent admission must survive worktree preparation's awaits.
+            try agentModeVM.mcpRequireDelegatedChildLinkAdmissionCurrent(delegatedChildLinkAdmission)
         } catch {
             WorktreeStartupInstrumentation.record(
                 .failed,
@@ -1542,6 +1586,35 @@ struct AgentRunMCPToolService {
                 }
             }
         #endif
+        if let delegatedChildLinkAdmission {
+            // Step 5b: the child's covering save and the parent's link commit are acknowledged
+            // before any child dispatch; a failure or cancellation here dispatches nothing.
+            do {
+                try await agentModeVM.mcpCommitDelegatedChildLink(
+                    delegatedChildLinkAdmission,
+                    childTabID: target.tabID,
+                    childSessionID: targetSessionID
+                )
+                // Immediately before the start: a cancelled call starts nothing.
+                try Task.checkCancellation()
+            } catch {
+                WorktreeStartupInstrumentation.record(
+                    .failed,
+                    context: worktreeStartupContext,
+                    fallback: error is CancellationError ? .cancellation : nil
+                )
+                #if DEBUG
+                    await performTerminalQualificationCleanup(
+                        error is CancellationError ? "cancellation" : "delegated_child_link",
+                        false,
+                        error is CancellationError ? .cancellation : nil
+                    )
+                #else
+                    await agentModeVM.mcpDiscardSessionTarget(target)
+                #endif
+                throw error
+            }
+        }
         let outcome: AgentExternalMCPRunStarter.StartOutcome
         do {
             WorktreeStartupInstrumentation.record(.providerStart, context: worktreeStartupContext)
@@ -1560,7 +1633,31 @@ struct AgentRunMCPToolService {
                 outcome = try await OhMyPiAgentModeSmokeGate.$invocationStartContext.withValue(
                     ompQualificationStartContext
                 ) {
-                    try await startRun(
+                    try await MCPDelegatedChildDispatchFence.$current.withValue(delegatedChildLinkAdmission) {
+                        // One-shot: inherited unstructured work never arms the fence after the start.
+                        defer { delegatedChildLinkAdmission?.releaseDispatchFence() }
+                        return try await startRun(
+                            target,
+                            message,
+                            metadata,
+                            bindCurrentRequestToTab,
+                            agentModeVM,
+                            selection.agentRaw,
+                            selection.modelRaw,
+                            selectionReasoningEffortRaw,
+                            selection.taskLabelKind,
+                            selection.ohMyPiThinkingSelections,
+                            workflow,
+                            spawnParentSessionID,
+                            oracleLaunchSource.source
+                        )
+                    }
+                }
+            #else
+                outcome = try await MCPDelegatedChildDispatchFence.$current.withValue(delegatedChildLinkAdmission) {
+                    // One-shot: inherited unstructured work never arms the fence after the start.
+                    defer { delegatedChildLinkAdmission?.releaseDispatchFence() }
+                    return try await startRun(
                         target,
                         message,
                         metadata,
@@ -1576,22 +1673,6 @@ struct AgentRunMCPToolService {
                         oracleLaunchSource.source
                     )
                 }
-            #else
-                outcome = try await startRun(
-                    target,
-                    message,
-                    metadata,
-                    bindCurrentRequestToTab,
-                    agentModeVM,
-                    selection.agentRaw,
-                    selection.modelRaw,
-                    selectionReasoningEffortRaw,
-                    selection.taskLabelKind,
-                    selection.ohMyPiThinkingSelections,
-                    workflow,
-                    spawnParentSessionID,
-                    oracleLaunchSource.source
-                )
             #endif
             #if DEBUG
                 if worktreeStartupBenchmarkToken != nil {
@@ -1604,6 +1685,7 @@ struct AgentRunMCPToolService {
                         } else {
                             await agentModeVM.cancelAgentRun(
                                 tabID: target.tabID,
+                                cause: .ordinary,
                                 completion: .terminalPublished
                             )
                         }
@@ -1695,7 +1777,8 @@ struct AgentRunMCPToolService {
                 }
                 let liveSnapshot = await currentSnapshot(
                     sessionID: outcome.snapshot.sessionID,
-                    agentModeVM: agentModeVM
+                    agentModeVM: agentModeVM,
+                    unregisteredRunIdentity: false
                 )
                 guard let connectionID = metadata.connectionID,
                       let runID = liveSnapshot.runID
@@ -1936,6 +2019,25 @@ struct AgentRunMCPToolService {
         if initialSnapshot.isActionableForMCPWait || selection.timeoutSeconds <= 0 {
             return AgentMCPWaitPolicy.attaching(selection, to: decoratedRunValue(snapshot: initialSnapshot))
         }
+        if isLiveUnregisteredWaitTarget(sessionID: sessionID, agentModeVM: agentModeVM) {
+            let rawValue = try await sampleLiveUnregisteredWait(
+                sessionIDs: [sessionID],
+                shape: .single,
+                agentModeVM: agentModeVM,
+                metadata: context.metadata,
+                timeoutSeconds: selection.timeoutSeconds,
+                includeStatusUpdates: includeStatusUpdates,
+                initialSnapshots: [initialSnapshot]
+            )
+            let value = await finalDecoratedSingleWaitValue(
+                from: rawValue,
+                sessionID: sessionID,
+                agentModeVM: agentModeVM,
+                workflow: nil,
+                initialDelivery: nil
+            )
+            return AgentMCPWaitPolicy.attaching(selection, to: value)
+        }
         let value = try await waitForInterestingState(
             sessionID: sessionID,
             agentModeVM: agentModeVM,
@@ -1977,6 +2079,21 @@ struct AgentRunMCPToolService {
                 snapshots: initialSnapshots,
                 pendingSessionIDs: pendingSessionIDs(from: initialSnapshots)
             ))
+        }
+
+        if sessionIDs.allSatisfy({ agentModeVM.mcpWaitCursor(sessionID: $0) == nil }),
+           sessionIDs.contains(where: { isLiveUnregisteredWaitTarget(sessionID: $0, agentModeVM: agentModeVM) })
+        {
+            let value = try await sampleLiveUnregisteredWait(
+                sessionIDs: sessionIDs,
+                shape: .multi,
+                agentModeVM: agentModeVM,
+                metadata: metadata,
+                timeoutSeconds: timeoutSeconds,
+                includeStatusUpdates: includeStatusUpdates,
+                initialSnapshots: initialSnapshots
+            )
+            return AgentMCPWaitPolicy.attaching(selection, to: value)
         }
 
         let waitScopeToken = await beginAgentRunWait(metadata, Set(sessionIDs), timeoutSeconds)
@@ -2331,7 +2448,11 @@ struct AgentRunMCPToolService {
                 "The requested run_id is not the current run for this session; refusing to cancel a different run."
             )
         }
-        guard await agentModeVM.cancelAgentRun(target: cancelTarget, completion: .terminalPublished) else {
+        guard await agentModeVM.cancelAgentRun(
+            target: cancelTarget,
+            cause: .userCancel,
+            completion: .terminalPublished
+        ) else {
             throw MCPError.invalidParams(
                 "The requested run is no longer current; refusing to cancel a different run."
             )
@@ -2351,22 +2472,26 @@ struct AgentRunMCPToolService {
             operation: "agent_run.cancel",
             knowledgeCaller: knowledgeCaller
         )
+        let metadata = await captureRequestMetadata()
+        let expectedRunID = try parseCancelRunID(args)
+        if isRemoteRootControl(
+            metadata: metadata,
+            sessionID: sessionID,
+            agentModeVM: agentModeVM,
+            knowledgeCaller: knowledgeCaller
+        ) {
+            return try await executeRemoteRootCancel(
+                expectedRunID: expectedRunID,
+                sessionID: sessionID,
+                metadata: metadata,
+                agentModeVM: agentModeVM
+            )
+        }
         let initialSnapshot = await currentSnapshot(sessionID: sessionID, agentModeVM: agentModeVM)
-        let expectedRunID: UUID?
-        if args["run_id"] != nil {
-            guard let expectedRunIDRaw = normalizedString(args["run_id"]),
-                  let parsedExpectedRunID = UUID(uuidString: expectedRunIDRaw)
-            else {
-                throw MCPError.invalidParams("agent_run cancel run_id must be a non-empty UUID string when provided.")
-            }
-            expectedRunID = parsedExpectedRunID
-            guard initialSnapshot.runID == parsedExpectedRunID else {
-                throw MCPError.invalidParams(
-                    "The requested run_id is not the current run for this session; refusing to cancel a different run."
-                )
-            }
-        } else {
-            expectedRunID = nil
+        if let expectedRunID, initialSnapshot.runID != expectedRunID {
+            throw MCPError.invalidParams(
+                "The requested run_id is not the current run for this session; refusing to cancel a different run."
+            )
         }
         if initialSnapshot.status == .expired {
             throw MCPError.invalidParams(agentRunExpiredHandleRecoveryNote)
@@ -2374,10 +2499,16 @@ struct AgentRunMCPToolService {
         if initialSnapshot.status.isTerminal {
             throw MCPError.invalidParams("The run is not currently active (status: \(initialSnapshot.status.rawValue)) and cannot be cancelled.")
         }
-        guard agentModeVM.mcpControlledSession(sessionID: sessionID)?.runState.isActive == true else {
+        guard let controlledSession = agentModeVM.mcpControlledSession(sessionID: sessionID) else {
+            // A live session outside MCP control (for example a desktop root) can report
+            // `running` without being cancellable through this tool.
+            throw MCPError.invalidParams(
+                "This session is not under agent_run control, so agent_run cannot cancel it."
+            )
+        }
+        guard controlledSession.runState.isActive else {
             throw MCPError.invalidParams("The run is not currently active and cannot be cancelled.")
         }
-        let metadata = await captureRequestMetadata()
         let cancelResult = try await withHeartbeat(
             metadata.connectionID,
             toolName,
@@ -2419,6 +2550,23 @@ struct AgentRunMCPToolService {
             operation: "agent_run.steer",
             knowledgeCaller: knowledgeCaller
         )
+
+        // A verified paired device steering (running) or following up (idle) a desktop root uses
+        // the normal send path without installing MCP control (plan Step 1).
+        if isRemoteRootControl(
+            metadata: metadata,
+            sessionID: sessionID,
+            agentModeVM: agentModeVM,
+            knowledgeCaller: knowledgeCaller
+        ) {
+            return try await executeRemoteRootSteer(
+                args: args,
+                sessionID: sessionID,
+                text: text,
+                workflow: workflow,
+                agentModeVM: agentModeVM
+            )
+        }
 
         // Plan §6.3/§6.4: resolve the frozen parent family and validate the active wait selection
         // before the steering mutation or any control-context reactivation, so an invalid explicit
@@ -2551,6 +2699,97 @@ struct AgentRunMCPToolService {
         // Non-waiting steers have no wait policy to report.
         guard let steerWaitSelection else { return steeredValue }
         return AgentMCPWaitPolicy.attaching(steerWaitSelection, to: steeredValue)
+    }
+
+    // MARK: - Remote attention-root control (paired gateway devices)
+
+    /// One synchronous gate over already-captured request metadata: true only for a verified
+    /// paired-device caller (`.gateway` principal plus its per-device app-link identity, never a
+    /// client name alone) targeting a remote-controllable desktop root. Every other caller or
+    /// session keeps the ordinary MCP control rules.
+    private func isRemoteRootControl(
+        metadata: RequestMetadata,
+        sessionID: UUID,
+        agentModeVM: AgentModeViewModel,
+        knowledgeCaller: KnowledgeCaller?
+    ) -> Bool {
+        knowledgeCaller == nil
+            && metadata.gatewayRemoteDeviceID != nil
+            && agentModeVM.remoteAttentionRootSession(sessionID: sessionID) != nil
+    }
+
+    private func parseCancelRunID(_ args: [String: Value]) throws -> UUID? {
+        guard args["run_id"] != nil else { return nil }
+        guard let raw = normalizedString(args["run_id"]), let runID = UUID(uuidString: raw) else {
+            throw MCPError.invalidParams("agent_run cancel run_id must be a non-empty UUID string when provided.")
+        }
+        return runID
+    }
+
+    private func executeRemoteRootCancel(
+        expectedRunID: UUID?,
+        sessionID: UUID,
+        metadata: RequestMetadata,
+        agentModeVM: AgentModeViewModel
+    ) async throws -> Value {
+        let cancelResult = try await withHeartbeat(
+            metadata.connectionID,
+            toolName,
+            "cancelling",
+            "Cancelling the agent run..."
+        ) {
+            // The view model re-resolves the root and its guarded cancel target synchronously.
+            try await agentModeVM.remoteRootCancelRun(sessionID: sessionID, expectedRunID: expectedRunID)
+            await Task.yield()
+            return await currentSnapshot(sessionID: sessionID, agentModeVM: agentModeVM).toValue()
+        }
+        if let parsed = cancelResult.objectValue.flatMap(Self.snapshot(from:)) {
+            return decoratedRunValue(snapshot: parsed)
+        }
+        return cancelResult
+    }
+
+    private func executeRemoteRootSteer(
+        args: [String: Value],
+        sessionID: UUID,
+        text: String,
+        workflow: AgentWorkflowDefinition?,
+        agentModeVM: AgentModeViewModel
+    ) async throws -> Value {
+        // A desktop root has no MCP wait registration, so steer-and-wait is not offered; the
+        // instruction is still delivered and the caller polls for updates.
+        let waitRequested = parseBool(args["wait"]) == true
+            || (parseBool(args["wait"]) == nil && args["timeout_seconds"] != nil)
+        let warning: String? = waitRequested
+            ? "Waiting is not available for remote control of a desktop session; the instruction was accepted without waiting. Poll for updates."
+            : nil
+        let delivery = try await dispatchRemoteRootInstruction(
+            sessionID: sessionID,
+            text: text,
+            workflow: workflow,
+            agentModeVM: agentModeVM
+        )
+        await Task.yield()
+        let snapshot = await currentSnapshot(sessionID: sessionID, agentModeVM: agentModeVM)
+        return decoratedRunValue(snapshot: snapshot, workflow: workflow, delivery: delivery, warning: warning)
+    }
+
+    private func dispatchRemoteRootInstruction(
+        sessionID: UUID,
+        text: String,
+        workflow: AgentWorkflowDefinition?,
+        agentModeVM: AgentModeViewModel
+    ) async throws -> AgentModeViewModel.MCPInstructionDispatch {
+        #if DEBUG
+            if let testDispatchRemoteRootInstruction {
+                return try await testDispatchRemoteRootInstruction(sessionID, text, workflow, agentModeVM)
+            }
+        #endif
+        return try await agentModeVM.remoteRootDispatchInstruction(
+            sessionID: sessionID,
+            text: text,
+            workflow: workflow
+        )
     }
 
     private func clearFollowUpPendingAfterSteerFailure(
@@ -2696,6 +2935,28 @@ struct AgentRunMCPToolService {
                 )
         #endif
         let metadata = await captureRequestMetadata()
+        // A verified paired device answering a desktop root's pending question: exact question
+        // only, attributed to the authenticated device, with no MCP control installed (plan Step 1).
+        // The view model re-resolves the root and the exact interaction synchronously.
+        if isRemoteRootControl(
+            metadata: metadata,
+            sessionID: sessionID,
+            agentModeVM: agentModeVM,
+            knowledgeCaller: knowledgeCaller
+        ), let deviceID = metadata.gatewayRemoteDeviceID {
+            let dispatch = try await agentModeVM.remoteRootResolvePendingQuestion(
+                sessionID: sessionID,
+                interactionID: interactionID,
+                payload: payload,
+                resolvedBy: deviceID
+            )
+            await Task.yield()
+            return await decoratedRunValue(
+                snapshot: currentSnapshot(sessionID: sessionID, agentModeVM: agentModeVM),
+                workflow: workflow,
+                delivery: dispatch
+            )
+        }
         // Attribute `resolved_by` to the resolving MCP client identity. Remote gateway
         // devices connect through per-device app links named `remote:<device8>`, so
         // their storage key already carries the remote namespace.
@@ -2966,6 +3227,149 @@ struct AgentRunMCPToolService {
         )
     }
 
+    private enum LiveUnregisteredWaitShape {
+        case single
+        case multi
+    }
+
+    /// True for a live session with no MCP control registration at all (not merely no wait
+    /// cursor), such as a desktop root the phone app link observes. The cursor-based wait would
+    /// report an expired handle for it even though the session is alive and truthfully running;
+    /// a registered session without a cursor keeps the ordinary expired-handle reporting.
+    private func isLiveUnregisteredWaitTarget(sessionID: UUID, agentModeVM: AgentModeViewModel) -> Bool {
+        guard agentModeVM.mcpWaitCursor(sessionID: sessionID) == nil,
+              agentModeVM.mcpRegistration(sessionID: sessionID) == nil
+        else { return false }
+        return ((try? agentModeVM.authoritativeLiveSession(for: sessionID)) ?? nil) != nil
+    }
+
+    /// Mixed-wait lane for one live unregistered target: samples its truthful snapshot like
+    /// `sampleLiveUnregisteredWait` and reports through the same first-result arbitration as the
+    /// controlled targets' cursor lanes, so their wait scope and delegated-question handling stay
+    /// unchanged while this target can still win.
+    private nonisolated func sampleLiveUnregisteredWaitAnyLane(
+        sessionID: UUID,
+        agentModeVM: AgentModeViewModel,
+        timeoutSeconds: TimeInterval,
+        includeStatusUpdates: Bool,
+        baselineKey: String?
+    ) async -> WaitAnyResult {
+        let clock = ContinuousClock()
+        let deadline = Self.resolvedWaitClockNow(clock).advanced(by: .seconds(timeoutSeconds))
+        let pollSeconds = Self.resolvedLiveUnregisteredWaitPollSeconds
+        while true {
+            let remaining = Self.timeInterval(from: Self.resolvedWaitClockNow(clock).duration(to: deadline))
+            guard remaining > 0 else { return WaitAnyResult(sessionID: sessionID, disposition: .timedOut) }
+            do {
+                try await Task.sleep(nanoseconds: UInt64(min(remaining, pollSeconds) * 1_000_000_000))
+            } catch {
+                return WaitAnyResult(sessionID: sessionID, disposition: .cancelled)
+            }
+            let snapshot = await currentSnapshot(sessionID: sessionID, agentModeVM: agentModeVM)
+            if isInterestingSnapshot(snapshot) {
+                return WaitAnyResult(sessionID: sessionID, disposition: .actionable(snapshot))
+            }
+            if includeStatusUpdates, Self.shouldReturnStatusUpdate(baselineKey: baselineKey, latest: snapshot) {
+                return WaitAnyResult(sessionID: sessionID, disposition: .statusUpdate(snapshot))
+            }
+        }
+    }
+
+    /// Bounded sampling wait for live unregistered sessions. It re-reads the truthful live
+    /// snapshot every `liveUnregisteredWaitPollSeconds` until one session is actionable, a
+    /// running session's status text changes (when status updates were requested), or the
+    /// deadline passes. It never registers control or creates a wait scope.
+    private func sampleLiveUnregisteredWait(
+        sessionIDs: [UUID],
+        shape: LiveUnregisteredWaitShape,
+        agentModeVM: AgentModeViewModel,
+        metadata: RequestMetadata,
+        timeoutSeconds: TimeInterval,
+        includeStatusUpdates: Bool,
+        initialSnapshots: [AgentRunMCPSnapshot]
+    ) async throws -> Value {
+        let clock = ContinuousClock()
+        let deadline = Self.resolvedWaitClockNow(clock).advanced(by: .seconds(timeoutSeconds))
+        let pollSeconds = Self.resolvedLiveUnregisteredWaitPollSeconds
+        let baselineKeys: [UUID: String?] = Dictionary(
+            initialSnapshots.map { ($0.sessionID, Self.normalizedStatusTextKey($0.statusText)) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        return try await withHeartbeat(
+            metadata.connectionID,
+            toolName,
+            "waiting",
+            "Waiting for the agent run to finish or request input..."
+        ) { [self] in
+            var latest = initialSnapshots
+            while true {
+                try Task.checkCancellation()
+                let remaining = Self.timeInterval(from: Self.resolvedWaitClockNow(clock).duration(to: deadline))
+                guard remaining > 0 else {
+                    let representative = latest.first(where: \.isStartupPendingForMCPWait) ?? latest[0]
+                    let result = representative.isStartupPendingForMCPWait ? "startup_pending" : "timed_out"
+                    return liveUnregisteredWaitValue(
+                        shape: shape,
+                        sessionIDs: sessionIDs,
+                        trigger: representative,
+                        result: result,
+                        snapshots: latest
+                    )
+                }
+                try await Task.sleep(nanoseconds: UInt64(min(remaining, pollSeconds) * 1_000_000_000))
+                latest = await collectCurrentSnapshots(sessionIDs: sessionIDs, agentModeVM: agentModeVM)
+                if let ready = latest.first(where: { isInterestingSnapshot($0) }) {
+                    return liveUnregisteredWaitValue(
+                        shape: shape,
+                        sessionIDs: sessionIDs,
+                        trigger: ready,
+                        result: ready.status == .expired ? "expired" : "snapshot_ready",
+                        snapshots: latest
+                    )
+                }
+                if includeStatusUpdates,
+                   let updated = latest.first(where: {
+                       Self.shouldReturnStatusUpdate(baselineKey: baselineKeys[$0.sessionID] ?? nil, latest: $0)
+                   })
+                {
+                    return liveUnregisteredWaitValue(
+                        shape: shape,
+                        sessionIDs: sessionIDs,
+                        trigger: updated,
+                        result: "status_update",
+                        snapshots: latest
+                    )
+                }
+            }
+        }
+    }
+
+    private nonisolated func liveUnregisteredWaitValue(
+        shape: LiveUnregisteredWaitShape,
+        sessionIDs: [UUID],
+        trigger: AgentRunMCPSnapshot,
+        result: String,
+        snapshots: [AgentRunMCPSnapshot]
+    ) -> Value {
+        switch shape {
+        case .single:
+            guard result != "snapshot_ready" else { return trigger.toValue() }
+            var object = trigger.asObject()
+            object["_meta"] = .object(["wait_result": .string(result)])
+            return .object(object)
+        case .multi:
+            return decoratedMultiWaitValue(
+                snapshot: trigger,
+                sessionIDs: sessionIDs,
+                result: result,
+                snapshots: snapshots,
+                pendingSessionIDs: result == "status_update"
+                    ? pendingSessionIDs(from: snapshots).filter { $0 != trigger.sessionID }
+                    : pendingSessionIDs(from: snapshots)
+            )
+        }
+    }
+
     private func timedOutWaitValue(
         sessionID: UUID,
         agentModeVM: AgentModeViewModel
@@ -3224,8 +3628,11 @@ struct AgentRunMCPToolService {
         includeStatusUpdates: Bool = false,
         hasDeliverableDelegatedQuestion: @escaping @Sendable () async -> Bool = { false }
     ) async throws -> Value {
-        let cursors = await MainActor.run {
-            sessionIDs.compactMap { agentModeVM.mcpWaitCursor(sessionID: $0) }
+        let (cursors, liveUnregisteredIDs) = await MainActor.run {
+            (
+                sessionIDs.compactMap { agentModeVM.mcpWaitCursor(sessionID: $0) },
+                sessionIDs.filter { isLiveUnregisteredWaitTarget(sessionID: $0, agentModeVM: agentModeVM) }
+            )
         }
         guard !cursors.isEmpty else {
             return decoratedMultiWaitValue(
@@ -3235,12 +3642,31 @@ struct AgentRunMCPToolService {
                 pendingSessionIDs: sessionIDs
             )
         }
+        // A mixed wait (controlled plus live unregistered targets) adds one sampling lane per
+        // unregistered target to the controlled cursor lanes, so either kind of target can win.
+        let baselineKeys: [UUID: String?] = Dictionary(
+            initialSnapshots.map { ($0.sessionID, Self.normalizedStatusTextKey($0.statusText)) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let samplingLanes: [(UUID, @Sendable () async -> WaitAnyResult)] = liveUnregisteredIDs.map { sessionID in
+            let baselineKey = baselineKeys[sessionID] ?? nil
+            return (sessionID, { [self] in
+                await sampleLiveUnregisteredWaitAnyLane(
+                    sessionID: sessionID,
+                    agentModeVM: agentModeVM,
+                    timeoutSeconds: timeoutSeconds,
+                    includeStatusUpdates: includeStatusUpdates,
+                    baselineKey: baselineKey
+                )
+            })
+        }
         let result = await Self.waitUntilFirstActionable(
             cursors: cursors,
             fallbackSessionID: sessionIDs[0],
             timeoutSeconds: timeoutSeconds,
             includeStatusUpdates: includeStatusUpdates,
-            hasDeliverableDelegatedQuestion: hasDeliverableDelegatedQuestion
+            hasDeliverableDelegatedQuestion: hasDeliverableDelegatedQuestion,
+            additionalLanes: samplingLanes
         )
         let snapshots = await collectCurrentSnapshots(sessionIDs: sessionIDs, agentModeVM: agentModeVM)
         switch result.disposition {
@@ -3320,9 +3746,10 @@ struct AgentRunMCPToolService {
         fallbackSessionID: UUID,
         timeoutSeconds: TimeInterval,
         includeStatusUpdates: Bool = false,
-        hasDeliverableDelegatedQuestion: @escaping @Sendable () async -> Bool = { false }
+        hasDeliverableDelegatedQuestion: @escaping @Sendable () async -> Bool = { false },
+        additionalLanes: [(UUID, @Sendable () async -> WaitAnyResult)] = []
     ) async -> WaitAnyResult {
-        let operations: [@Sendable () async -> WaitAnyResult] = cursors.map { cursor in
+        var operations: [@Sendable () async -> WaitAnyResult] = cursors.map { cursor in
             { await Self.waitUntilActionable(
                 cursor: cursor,
                 timeoutSeconds: timeoutSeconds,
@@ -3330,9 +3757,10 @@ struct AgentRunMCPToolService {
                 hasDeliverableDelegatedQuestion: hasDeliverableDelegatedQuestion
             ) }
         }
+        operations.append(contentsOf: additionalLanes.map { _, operation in operation })
         return await resolveFirstWaitAny(
             operations: operations,
-            sessionOrder: cursors.map(\.registration.sessionID),
+            sessionOrder: cursors.map(\.registration.sessionID) + additionalLanes.map { sessionID, _ in sessionID },
             fallbackSessionID: fallbackSessionID
         )
     }
@@ -4125,10 +4553,15 @@ struct AgentRunMCPToolService {
         return stored
     }
 
+    /// `unregisteredRunIdentity` controls only whether the live unregistered projection reports the
+    /// session's current `run_id` (so a paired device can guard its Stop). The OMP qualification
+    /// transaction passes false: its run identity authority is the registration-bound snapshot, and
+    /// a run-ID-less unregistered fallback must keep failing closed as `run_identity_missing`.
     private func currentSnapshot(
         sessionID: UUID,
         registration suppliedRegistration: AgentRunSessionStore.Registration? = nil,
-        agentModeVM: AgentModeViewModel
+        agentModeVM: AgentModeViewModel,
+        unregisteredRunIdentity: Bool = true
     ) async -> AgentRunMCPSnapshot {
         let registration = suppliedRegistration ?? agentModeVM.mcpRegistration(sessionID: sessionID)
         let storedSnapshot: AgentRunMCPSnapshot? = if let registration {
@@ -4147,11 +4580,17 @@ struct AgentRunMCPToolService {
             return providedSnapshot
         }
         guard let registration else {
+            // No MCP registration: the live session (true run state and pending interaction)
+            // outranks the last saved index entry, which is only a cold-session fallback.
+            if let liveSnapshot = liveUnregisteredSessionSnapshot(
+                sessionID: sessionID,
+                agentModeVM: agentModeVM,
+                includesRunIdentity: unregisteredRunIdentity
+            ) {
+                return liveSnapshot
+            }
             if let indexedSnapshot = indexedSessionSnapshot(sessionID: sessionID, agentModeVM: agentModeVM) {
                 return indexedSnapshot
-            }
-            if let liveSnapshot = liveUnregisteredSessionSnapshot(sessionID: sessionID, agentModeVM: agentModeVM) {
-                return liveSnapshot
             }
             return Self.agentRunExpiredSnapshot(sessionID: sessionID)
         }
@@ -4164,33 +4603,56 @@ struct AgentRunMCPToolService {
         if let indexedSnapshot = indexedSessionSnapshot(sessionID: sessionID, agentModeVM: agentModeVM) {
             return indexedSnapshot
         }
-        if let liveSnapshot = liveUnregisteredSessionSnapshot(sessionID: sessionID, agentModeVM: agentModeVM) {
+        if let liveSnapshot = liveUnregisteredSessionSnapshot(
+            sessionID: sessionID,
+            agentModeVM: agentModeVM,
+            includesRunIdentity: unregisteredRunIdentity
+        ) {
             return liveSnapshot
         }
         return Self.agentRunExpiredSnapshot(sessionID: sessionID)
     }
 
-    /// Last-resort fallback before synthesizing an expired snapshot: a session
-    /// that is live in the window (bound to an open tab) but has no MCP control
-    /// registration, no stored snapshot, and no session-index entry yet — for
-    /// example a fork-staged destination session that has never run. Reporting
-    /// such a session as expired is a lie the remote gateway watch relays
-    /// verbatim as `session_expired`, failing freshly forked tabs on paired
-    /// clients (incident 2026-07-27). Mirrors the indexed projection's
-    /// conservative status collapse so both unregistered paths share one
-    /// vocabulary. Truly unknown/deleted sessions still synthesize expired.
+    /// A session that is live in the window (bound to an open tab) but has no MCP control
+    /// registration, for example a user-driven desktop root or a fork-staged destination that has
+    /// never run. It outranks the session index (plan 2026-10-30 Step 1): it reports the true
+    /// running / waiting status and the structured pending interaction, so a paired remote sees
+    /// what the desktop sees. Settled states keep the indexed vocabulary (incident 2026-07-27:
+    /// a live session is never reported as expired). Truly unknown/deleted sessions still
+    /// synthesize expired.
     private func liveUnregisteredSessionSnapshot(
         sessionID: UUID,
-        agentModeVM: AgentModeViewModel
+        agentModeVM: AgentModeViewModel,
+        includesRunIdentity: Bool
     ) -> AgentRunMCPSnapshot? {
         guard let live = (try? agentModeVM.authoritativeLiveSession(for: sessionID)) ?? nil,
               live.activeAgentSessionID == sessionID
         else { return nil }
-        let rawState = live.runState.rawValue
-        let status = indexedSessionStatus(from: rawState)
-        let statusText = indexedSessionStatusText(rawState: rawState, status: status)
+        let interaction = agentModeVM.mcpPendingInteraction(for: live)
+        // An idle record whose persisted state is not loaded yet carries no settled outcome of its
+        // own (it would read completed with no rows): its saved index entry supplies the last
+        // recorded state (for example failed or cancelled). Live active/waiting state, a pending
+        // interaction, and a never-indexed session keep the live projection.
+        if !live.hasLoadedPersistedState,
+           !live.runState.isActive,
+           interaction == nil,
+           agentModeVM.sessionIndex[sessionID] != nil
+        {
+            return nil
+        }
+        let status = Self.liveUnregisteredStatus(for: live, hasPendingInteraction: interaction != nil)
+        let statusText: String? = if status.isTerminal {
+            indexedSessionStatusText(rawState: live.runState.rawValue, status: status)
+        } else if let running = live.runningStatusText?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !running.isEmpty
+        {
+            running
+        } else {
+            nil
+        }
         return AgentRunMCPSnapshot(
             sessionID: sessionID,
+            runID: includesRunIdentity ? live.runID : nil,
             tabID: live.tabID,
             sessionName: agentModeVM.sessionIndex[sessionID]?.name,
             agentRaw: live.selectedAgent.rawValue,
@@ -4200,7 +4662,7 @@ struct AgentRunMCPToolService {
             status: status,
             statusText: statusText,
             latestAssistantPreview: nil,
-            interaction: nil,
+            interaction: interaction,
             transcriptItemCount: live.transcriptProjectionCounts.canonicalVisibleRowCount,
             updatedAt: live.lastActivityAt,
             parentSessionID: live.parentSessionID,
@@ -4208,6 +4670,39 @@ struct AgentRunMCPToolService {
             worktreeBindings: [],
             activeWorktreeMerges: live.worktreeMergeOperations.activeWorktreeMergeSummaries
         )
+    }
+
+    /// The live session's own status, mapped like `AgentModeViewModel.mcpSnapshot(for:)`: a
+    /// pending interaction or a waiting run state is `waiting_for_input`, a running run is
+    /// `running`, and settled states keep their terminal status (idle reads as completed).
+    private static func liveUnregisteredStatus(
+        for live: AgentTabSession,
+        hasPendingInteraction: Bool
+    ) -> AgentRunMCPSnapshot.Status {
+        if hasPendingInteraction {
+            return .waitingForInput
+        }
+        switch live.runState {
+        case .running:
+            return .running
+        case .waitingForUser, .waitingForQuestion, .waitingForApproval:
+            return .waitingForInput
+        case .completed:
+            return .completed
+        case .failed:
+            return .failed
+        case .cancelled:
+            return .cancelled
+        case .idle:
+            switch live.transcript.turns.last?.terminalState {
+            case .failed:
+                return .failed
+            case .cancelled:
+                return .cancelled
+            default:
+                return .completed
+            }
+        }
     }
 
     private func indexedSessionSnapshot(

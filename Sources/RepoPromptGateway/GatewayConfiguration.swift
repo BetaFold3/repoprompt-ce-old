@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptRemoteWire
 import RepoPromptShared
 
 struct GatewayConfiguration: Equatable {
@@ -21,6 +22,8 @@ struct GatewayConfiguration: Equatable {
         static let appLinkMaximumReconnectAttempts = "REPOPROMPT_GATEWAY_APP_LINK_MAX_RECONNECT_ATTEMPTS"
         static let allowWildcardBind = "REPOPROMPT_GATEWAY_ALLOW_WILDCARD_BIND"
         static let allowStaticTokenAuth = "REPOPROMPT_GATEWAY_ALLOW_STATIC_TOKEN_AUTH"
+        static let browserOrigin = "REPOPROMPT_GATEWAY_BROWSER_ORIGIN"
+        static let passkeyPolicyVersion = "REPOPROMPT_GATEWAY_PASSKEY_POLICY_VERSION"
     }
 
     let bindHost: String
@@ -45,6 +48,31 @@ struct GatewayConfiguration: Equatable {
     /// Paired-device tickets are the normal remote path; this flag must be explicitly
     /// enabled for the static token to authorize a WebSocket hello.
     let allowStaticTokenAuth: Bool
+    /// The build channel this gateway binary belongs to. It comes from the same compile-time
+    /// flag as the app's `RemoteControlBuildIdentity.current`, so a gateway always reports its own
+    /// app build. `/healthz` publishes it so a browser can pick the matching identity and discovery
+    /// channel.
+    let buildChannel: RemoteControlBuildChannel
+    /// Lowercased `host:port` of the browser HTTPS origin (an owner-run `tailscale serve`
+    /// listener forwarding here), accepted as a request Host besides the bind address. Nil when
+    /// no browser origin was configured.
+    let browserOriginAuthority: String?
+    /// The remote-passkey policy wire version this gateway speaks. ONLY `1` is accepted. This is a
+    /// compatibility guard, NOT an opt-in: a capable gateway always understands and enforces
+    /// capability-1 trust snapshots regardless of this flag. The flag exists so a deployment can
+    /// assert the version it expects and fail fast against an incompatible future projection.
+    let passkeyPolicyVersion: Int
+
+    /// The only passkey policy wire version this gateway build implements.
+    static let supportedPasskeyPolicyVersion = 1
+
+    static var compiledBuildChannel: RemoteControlBuildChannel {
+        #if DEBUG
+            .debug
+        #else
+            .release
+        #endif
+    }
 
     var listenAddressDescription: String {
         "\(bindHost):\(port)"
@@ -87,6 +115,8 @@ struct GatewayConfiguration: Equatable {
             name: "app link maximum reconnect attempts"
         ) ?? (parentPID == nil ? nil : 24)
         let allowWildcardBind = values.allowWildcardBind
+        let browserOriginAuthority = try parseBrowserOriginAuthority(values.browserOrigin)
+        let passkeyPolicyVersion = try parsePasskeyPolicyVersion(values.passkeyPolicyVersion)
 
         guard allowWildcardBind || !isWildcardBindHost(bindHost) else {
             throw GatewayConfigurationError.wildcardBindRequiresExplicitOptIn(bindHost)
@@ -107,8 +137,37 @@ struct GatewayConfiguration: Equatable {
             processLeaseFileURL: processLeaseFile,
             appLinkMaximumReconnectAttempts: appLinkMaximumReconnectAttempts,
             allowWildcardBind: allowWildcardBind,
-            allowStaticTokenAuth: values.allowStaticTokenAuth
+            allowStaticTokenAuth: values.allowStaticTokenAuth,
+            buildChannel: compiledBuildChannel,
+            browserOriginAuthority: browserOriginAuthority,
+            passkeyPolicyVersion: passkeyPolicyVersion
         )
+    }
+
+    /// Accepts an absent flag (defaults to the supported version) or an explicit value that must
+    /// equal the supported version. Any other value fails fast.
+    private static func parsePasskeyPolicyVersion(_ raw: String?) throws -> Int {
+        guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
+            return supportedPasskeyPolicyVersion
+        }
+        guard let value = Int(raw), value == supportedPasskeyPolicyVersion else {
+            throw GatewayConfigurationError.unsupportedPasskeyPolicyVersion(raw)
+        }
+        return value
+    }
+
+    /// Accepts only `https://host:port` with an explicit port and nothing else (no credentials,
+    /// path, query, or fragment). Empty means unset.
+    private static func parseBrowserOriginAuthority(_ raw: String?) throws -> String? {
+        guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return nil }
+        guard let origin = try? RemoteGatewayOrigin(string: raw),
+              origin.scheme == "https",
+              !origin.host.isEmpty,
+              (1 ... 65535).contains(origin.port)
+        else {
+            throw GatewayConfigurationError.invalidBrowserOrigin(raw)
+        }
+        return GatewayHostAllowlist.authority(host: origin.host, port: origin.port)
     }
 
     private static func parsePort(_ raw: String?, defaultValue: Int) throws -> Int {
@@ -150,6 +209,8 @@ enum GatewayConfigurationError: Error, Equatable, CustomStringConvertible {
     case invalidPort(String)
     case invalidInteger(name: String, value: String)
     case wildcardBindRequiresExplicitOptIn(String)
+    case invalidBrowserOrigin(String)
+    case unsupportedPasskeyPolicyVersion(String)
 
     var description: String {
         switch self {
@@ -163,6 +224,10 @@ enum GatewayConfigurationError: Error, Equatable, CustomStringConvertible {
             "Invalid gateway \(name): \(value)"
         case let .wildcardBindRequiresExplicitOptIn(host):
             "Wildcard gateway bind host requires explicit opt-in: \(host)"
+        case let .invalidBrowserOrigin(value):
+            "Invalid gateway browser origin (expected https://host:port): \(value)"
+        case let .unsupportedPasskeyPolicyVersion(value):
+            "Unsupported gateway passkey policy version (only 1 is accepted): \(value)"
         }
     }
 }
@@ -183,6 +248,8 @@ private struct ParsedValues {
     var appLinkMaximumReconnectAttempts: String?
     var allowWildcardBind: Bool
     var allowStaticTokenAuth: Bool
+    var browserOrigin: String?
+    var passkeyPolicyVersion: String?
 
     init(environment: [String: String]) {
         bindHost = environment[GatewayConfiguration.EnvironmentKey.bindHost]
@@ -200,6 +267,8 @@ private struct ParsedValues {
         appLinkMaximumReconnectAttempts = environment[GatewayConfiguration.EnvironmentKey.appLinkMaximumReconnectAttempts]
         allowWildcardBind = Self.parseBool(environment[GatewayConfiguration.EnvironmentKey.allowWildcardBind]) ?? false
         allowStaticTokenAuth = Self.parseBool(environment[GatewayConfiguration.EnvironmentKey.allowStaticTokenAuth]) ?? false
+        browserOrigin = environment[GatewayConfiguration.EnvironmentKey.browserOrigin]
+        passkeyPolicyVersion = environment[GatewayConfiguration.EnvironmentKey.passkeyPolicyVersion]
     }
 
     mutating func apply(arguments: [String]) throws {
@@ -250,6 +319,8 @@ private struct ParsedValues {
             case "--parent-pid": parentPID = value
             case "--process-lease-file": processLeaseFile = value
             case "--app-link-max-reconnect-attempts": appLinkMaximumReconnectAttempts = value
+            case "--browser-origin": browserOrigin = value
+            case "--passkey-policy-version": passkeyPolicyVersion = value
             case "--allow-wildcard-bind":
                 allowWildcardBind = Self.parseBool(value) ?? true
             case "--allow-static-token-auth":

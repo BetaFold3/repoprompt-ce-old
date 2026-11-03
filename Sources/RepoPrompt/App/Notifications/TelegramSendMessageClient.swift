@@ -148,6 +148,8 @@ struct TelegramSendMessageClient {
     /// Telegram's documented `sendMessage` text limit. Enforced conservatively in UTF-16 units.
     static let maximumTextUTF16Count = 4096
     static let requestTimeout: TimeInterval = 15
+    /// Label of the optional inline URL button that opens the session in the paired browser.
+    static let openSessionButtonText = "Open session"
 
     private let httpClient: any HTTPClient
 
@@ -155,9 +157,15 @@ struct TelegramSendMessageClient {
         self.httpClient = httpClient
     }
 
-    func send(text: String, to chatID: TelegramChatID, token: TelegramBotToken) async -> TelegramSendResult {
+    /// `openSessionURL` adds one inline-keyboard URL button; the text stays plain.
+    func send(
+        text: String,
+        to chatID: TelegramChatID,
+        token: TelegramBotToken,
+        openSessionURL: URL? = nil
+    ) async -> TelegramSendResult {
         guard !text.isEmpty, text.utf16.count <= Self.maximumTextUTF16Count,
-              let request = Self.makeRequest(text: text, chatID: chatID, token: token)
+              let request = Self.makeRequest(text: text, chatID: chatID, token: token, openSessionURL: openSessionURL)
         else {
             return .failed(.invalidMessage)
         }
@@ -190,7 +198,12 @@ struct TelegramSendMessageClient {
         }
     }
 
-    static func makeRequest(text: String, chatID: TelegramChatID, token: TelegramBotToken) -> URLRequest? {
+    static func makeRequest(
+        text: String,
+        chatID: TelegramChatID,
+        token: TelegramBotToken,
+        openSessionURL: URL? = nil
+    ) -> URLRequest? {
         var components = URLComponents()
         components.scheme = "https"
         components.host = "api.telegram.org"
@@ -201,7 +214,13 @@ struct TelegramSendMessageClient {
         case let .numeric(value): NSNumber(value: value)
         case let .username(name): name
         }
-        guard let body = try? JSONSerialization.data(withJSONObject: ["chat_id": chatValue, "text": text]) else {
+        var payload: [String: Any] = ["chat_id": chatValue, "text": text]
+        if let openSessionURL {
+            payload["reply_markup"] = [
+                "inline_keyboard": [[["text": openSessionButtonText, "url": openSessionURL.absoluteString]]]
+            ]
+        }
+        guard let body = try? JSONSerialization.data(withJSONObject: payload) else {
             return nil
         }
 

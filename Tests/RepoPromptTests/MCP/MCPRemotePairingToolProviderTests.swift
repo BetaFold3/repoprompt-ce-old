@@ -249,7 +249,8 @@ final class MCPRemotePairingToolProviderTests: XCTestCase {
         let metadata = MCPServerViewModel.RequestMetadata(
             connectionID: connectionID,
             clientName: "repoprompt-gateway",
-            windowID: 1
+            windowID: 1,
+            actorRoutedRunTab: nil
         )
         return MCPRemotePairingToolProvider.ExecutionDependencies(
             captureRequestMetadata: { metadata },

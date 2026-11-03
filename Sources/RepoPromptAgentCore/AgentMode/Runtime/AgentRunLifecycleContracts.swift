@@ -82,16 +82,36 @@ package struct AgentRunOwnership: Equatable, Hashable {
     package let attemptID: UUID
     package let binding: AgentRunBindingIdentity
     package let turnEpoch: AgentRunTurnEpoch?
+    /// The provider kind (`AgentProviderKind` raw value) the run was started with, captured once
+    /// when the attempt began; every recovery writer that can create the run attempt records this,
+    /// never the session's provider at write time. `nil` when not captured (fails closed).
+    package let providerKindRaw: String?
+    /// The run-start registration mark (`AgentRuntimeLaunchAuthority.runStartRegistrationMark`),
+    /// captured once with `providerKindRaw` from the authority the session's managed launchers use.
+    /// Only the run-attempt creator that precedes the run's first provider write records it.
+    package let runtimeRegistrationRaw: String?
 
     init(
         attemptID: UUID = UUID(),
         binding: AgentRunBindingIdentity,
-        turnEpoch: AgentRunTurnEpoch? = nil
+        turnEpoch: AgentRunTurnEpoch? = nil,
+        providerKindRaw: String? = nil,
+        runtimeRegistrationRaw: String? = nil
     ) {
         self.attemptID = attemptID
         self.binding = binding
         self.turnEpoch = turnEpoch
+        self.providerKindRaw = providerKindRaw
+        self.runtimeRegistrationRaw = runtimeRegistrationRaw
     }
+}
+
+/// The user item a run attempt's own input owns (F1): its terminal outcome is attributed to that
+/// item's execution turn (relocated saved input included), never to a later queued item or, when
+/// the item is gone, to an earlier turn.
+package struct AgentRunAttemptInputAttribution: Equatable {
+    package let attemptID: UUID
+    package let userItemID: UUID
 }
 
 @MainActor
@@ -191,6 +211,8 @@ package struct AgentRunLifecycleTracker: Equatable {
         bindingTransitionGeneration: UInt64 = 0,
         attemptID: UUID = UUID(),
         turnEpoch: AgentRunTurnEpoch? = nil,
+        providerKindRaw: String? = nil,
+        runtimeRegistrationRaw: String? = nil,
         timestampUptimeNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds
     ) -> AgentRunOwnership {
         let ownership = AgentRunOwnership(
@@ -201,7 +223,9 @@ package struct AgentRunLifecycleTracker: Equatable {
                 persistentBindingGeneration: persistentBindingGeneration,
                 bindingTransitionGeneration: bindingTransitionGeneration
             ),
-            turnEpoch: turnEpoch
+            turnEpoch: turnEpoch,
+            providerKindRaw: providerKindRaw,
+            runtimeRegistrationRaw: runtimeRegistrationRaw
         )
         activeOwnership = ownership
         liveness = AgentRunLivenessSnapshot(

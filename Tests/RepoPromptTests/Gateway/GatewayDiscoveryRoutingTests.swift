@@ -39,6 +39,22 @@ final class GatewayDiscoveryRoutingTests: XCTestCase {
         XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 503)
     }
 
+    func testHealthRouteReportsCompiledBuildChannel() async throws {
+        let fixture = try await makeFixture(connectAppLink: false)
+        let url = try XCTUnwrap(URL(string: "http://127.0.0.1:\(fixture.port)/healthz"))
+        let (data, response) = try await URLSession.shared.data(from: url)
+
+        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(object["status"] as? String, "ok")
+        XCTAssertEqual(object["service"] as? String, "repoprompt-gateway")
+        #if DEBUG
+            XCTAssertEqual(object["channel"] as? String, "debug")
+        #else
+            XCTAssertEqual(object["channel"] as? String, "release")
+        #endif
+    }
+
     private func makeFixture(
         connectAppLink: Bool,
         peerObserver: (@Sendable (String) -> Void)? = nil

@@ -15,6 +15,7 @@ enum MCPWindowToolGroup: CaseIterable, Hashable {
     case agentControl
     case agentSessionControl
     case history
+    case workspaceSteering
     /// Last so adding it leaves every earlier catalog position unchanged.
     case codeMode
 
@@ -70,6 +71,8 @@ enum MCPWindowToolGroup: CaseIterable, Hashable {
             ]
         case .history:
             [MCPWindowToolName.history]
+        case .workspaceSteering:
+            [MCPWindowToolName.workspaceSteer]
         case .codeMode:
             [MCPWindowToolName.codeMode]
         }

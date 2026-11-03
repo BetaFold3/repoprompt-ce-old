@@ -57,11 +57,20 @@ struct AgentScheduledSendBanner: View {
                         .lineLimit(2)
                         .accessibilityIdentifier("agent.scheduledSend.recoveryMessage")
                 }
+                if let recoveryBlockedMessage = props.recoveryBlockedMessage {
+                    Text(recoveryBlockedMessage)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.orange)
+                        .lineLimit(2)
+                        .hoverTooltip(recoveryBlockedMessage)
+                        .accessibilityIdentifier("agent.scheduledSend.recoveryBlockedMessage")
+                }
                 if let actionError {
                     Text(actionError)
                         .font(.system(size: 10))
                         .foregroundStyle(.red)
                         .lineLimit(1)
+                        .hoverTooltip(actionError)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -100,7 +109,7 @@ struct AgentScheduledSendBanner: View {
         .controlSize(.small)
         .disabled(isActionInFlight)
         .padding(.horizontal, 10)
-        .frame(height: props.recoveryMessage == nil ? 48 : 64)
+        .frame(height: bannerHeight)
         .background(Color.secondary.opacity(0.07), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 9, style: .continuous)
@@ -291,6 +300,13 @@ struct AgentScheduledSendBanner: View {
             isActionInFlight = false
             actionError = error
         }
+    }
+
+    private var bannerHeight: CGFloat {
+        // Every optional line under the status grows the fixed height so none is clipped.
+        48 + (props.recoveryMessage == nil ? 0 : 16)
+            + (props.recoveryBlockedMessage == nil ? 0 : 26)
+            + (actionError == nil ? 0 : 14)
     }
 
     private var isDispatching: Bool {

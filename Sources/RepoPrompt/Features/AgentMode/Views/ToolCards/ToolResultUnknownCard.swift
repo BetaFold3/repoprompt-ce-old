@@ -5,6 +5,8 @@ import SwiftUI
 struct UnknownToolResultCard: View {
     let item: AgentChatItem
     let title: String
+    /// Optional small source label, e.g. the external MCP server.
+    var sourceLabel: String?
     @State private var isExpanded = false
 
     private var status: ToolCardStatus {
@@ -30,6 +32,7 @@ struct UnknownToolResultCard: View {
             iconName: toolIcon(for: item.toolName),
             iconColor: ToolCardAccentResolver.color(for: item.toolName),
             title: title,
+            sourceLabel: sourceLabel,
             subtitle: subtitle,
             status: status,
             timestamp: item.timestamp,

@@ -385,6 +385,22 @@ struct WorkspaceCodemapBindingDemand: Equatable {
     let language: LanguageType
 }
 
+/// Why a demand's ready completion was refused for lease or byte capacity.
+struct WorkspaceCodemapCompletionCapacityBusy: Equatable {
+    enum Scope: Equatable {
+        /// The overlay's per-root lease or byte budget.
+        case overlayRoot
+        /// Only the overlay's process budget (the overlay is shared by every root on the engine).
+        case overlayProcess
+        /// The artifact store's active-lease admission, shared by every store on that admission.
+        case artifactLeaseAdmission(ObjectIdentifier)
+    }
+
+    let reason: WorkspaceCodemapLiveOverlayBusyReason
+    let rootEpoch: WorkspaceCodemapRootEpoch
+    let scope: Scope
+}
+
 package enum WorkspaceCodemapBindingRegistrationResult {
     case registered(adoptedReadyCount: Int)
     case exactDuplicate
@@ -616,6 +632,16 @@ struct WorkspaceCodemapBindingEngineHooks {
     #endif
 
     static let none = WorkspaceCodemapBindingEngineHooks()
+}
+
+/// What `releaseOwnerKeepingAdmitted` did with an owner's outstanding demand.
+enum WorkspaceCodemapOwnerReleaseDisposition: Equatable {
+    /// Queued request(s) were cancelled; nothing was admitted.
+    case cancelledQueued
+    /// An admitted request keeps running to completion; nothing admitted was cancelled.
+    case admittedContinues
+    /// The owner had no queued or admitted request.
+    case nothingOutstanding
 }
 
 struct WorkspaceCodemapBindingEngineCounters: Equatable {

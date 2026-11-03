@@ -34,7 +34,10 @@ final class RemotePairingIdentityStoreTests: XCTestCase {
         var invalid = registry
         invalid.schemaVersion = 999
         try RemotePairingTestSupport.writeRegistry(invalid, to: url)
-        XCTAssertEqual(RemotePairingIdentityStore.load(from: url), .failure(.invalidRegistry))
+        // Schema 2 contract: a version newer than this build understands is reported distinctly as
+        // `.unsupportedSchemaVersion` (not the generic `.invalidRegistry`) so recovery guidance can
+        // differ. A truly malformed/garbage file still maps to `.invalidRegistry`.
+        XCTAssertEqual(RemotePairingIdentityStore.load(from: url), .failure(.unsupportedSchemaVersion(999)))
     }
 
     func testValidRoundTripAndRevokeClearsPushMetadata() throws {

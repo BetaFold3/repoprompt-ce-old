@@ -3545,7 +3545,10 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             lookupContext: workspaceContext?.lookupContext
                 ?? mcpConfiguration?.nestedTabContext.frozenLookupContext
         )
-        return AgentMessage(systemPrompt: systemPrompt, userMessage: userMessage)
+        var message = AgentMessage(systemPrompt: systemPrompt, userMessage: userMessage)
+        // Context Builder runs are not Agent Mode sessions: explicitly sessionless (R6).
+        message.runtimeSession = .sessionless
+        return message
     }
 
     private func buildAgentUserMessage(

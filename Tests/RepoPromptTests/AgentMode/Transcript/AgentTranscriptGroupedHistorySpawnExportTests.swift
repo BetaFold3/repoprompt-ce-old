@@ -121,7 +121,10 @@ final class AgentTranscriptGroupedHistorySpawnExportTests: XCTestCase {
                 .items
                 .first { $0.kind == .toolCall }
         )
-        XCTAssertEqual(ToolCallCardStateResolver.status(for: item), .running)
+        // Step 4d6: a result-less remote call renders neutral; run-scoped cancel eligibility is unchanged.
+        XCTAssertNil(item.toolResultJSON)
+        XCTAssertEqual(ToolCallCardStateResolver.status(for: item), .neutral)
+        XCTAssertTrue(ToolCallCardStateResolver.allowsRunScopedCancel(for: item))
     }
 
     func testSpartanLogXMLEscapesHostileToolNameAttributesConsistently() throws {
@@ -161,6 +164,7 @@ final class AgentTranscriptGroupedHistorySpawnExportTests: XCTestCase {
         XCTAssertEqual(item.toolName, sanitizedToolName)
         XCTAssertNotNil(item.toolResultJSON)
         XCTAssertNotEqual(ToolCallCardStateResolver.status(for: item), .running)
+        XCTAssertEqual(ToolCallCardStateResolver.status(for: item), .success)
     }
 
     func testSpartanLogXMLAgentRunPreviewRoundTripsThroughRemoteTranscriptProjector() throws {

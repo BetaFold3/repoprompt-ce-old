@@ -154,4 +154,24 @@ final class ClaudeSDKProtocolCodecTests: XCTestCase {
         let message = try XCTUnwrap(object["message"] as? [String: Any])
         XCTAssertEqual(message["role"] as? String, "user")
     }
+
+    func testUserMessageOutboundUUIDIsOptionalTopLevelAndLowercase() throws {
+        let legacy = try ClaudeSDKProtocolCodec.encodeUserMessage(text: "Continue", sessionID: "session-1")
+        let explicitNil = try ClaudeSDKProtocolCodec.encodeUserMessage(text: "Continue", sessionID: "session-1", messageUUID: nil)
+        let legacyObject = try XCTUnwrap(JSONSerialization.jsonObject(with: legacy) as? [String: Any])
+        let nilObject = try XCTUnwrap(JSONSerialization.jsonObject(with: explicitNil) as? [String: Any])
+        XCTAssertEqual(NSDictionary(dictionary: nilObject), NSDictionary(dictionary: legacyObject), "no UUID keeps the legacy frame")
+        XCTAssertEqual(Set(legacyObject.keys), ["type", "message", "parent_tool_use_id", "session_id"])
+        XCTAssertNil(legacyObject["uuid"])
+
+        let uuid = try XCTUnwrap(UUID(uuidString: "A1B2C3D4-E5F6-4711-8899-AABBCCDDEEFF"))
+        let withUUID = try ClaudeSDKProtocolCodec.encodeUserMessage(text: "Continue", sessionID: "session-1", messageUUID: uuid)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: withUUID) as? [String: Any])
+        XCTAssertEqual(object["uuid"] as? String, "a1b2c3d4-e5f6-4711-8899-aabbccddeeff")
+        var withoutUUID = object
+        withoutUUID.removeValue(forKey: "uuid")
+        XCTAssertEqual(NSDictionary(dictionary: withoutUUID), NSDictionary(dictionary: legacyObject), "only the top-level uuid is added")
+        let message = try XCTUnwrap(object["message"] as? [String: Any])
+        XCTAssertNil(message["uuid"])
+    }
 }
