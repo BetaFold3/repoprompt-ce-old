@@ -10,7 +10,7 @@ What landed:
 Decisions at closure:
 - D3: the navigation HUD's mirrored focus fix was not implemented. Its gate is now satisfied (the five source conditions were confirmed and the model HUD was live-validated), so it may land later without re-adjudication if a navigation-HUD focus failure is observed. The navigation HUD already shares the November dismissal repair.
 - D4: no wrong-window routing was reported after the dismissal repair, so no routing fix was made. The pre-specified fallback-only re-resolve remains the response if `hud-routing` logs ever show the race.
-- Still deferred: same-tab session replacement and cross-family identity coverage, and low-level dropped-token tracing (B-R1-P2a).
+- Former deferrals, closed the same day at the owner's request: a local cross-family switch (Codex to Claude Code) was confirmed to keep the same session object and still request focus; replacing the session object under the same tab while the picker is open was confirmed to fail the commit and publish no focus (both now tested in `AgentModeChatSwitchActivationTests`); and DEBUG `composer-focus` tracing now records `drop` (`inactive`, `superseded`), `seed` and `resign` lines (B-R1-P2a). OracleA and OracleB reviewed that change with no P0/P1 findings; their P2/P3 findings were fixed. The new log lines have not yet been observed in a running app.
 
 Durable invariants now live in the [quick model/handoff HUD contract](../../quick-model-picker-and-handoff-hud.md). The original plan follows intact except for its status lines and owner decision; its historical pending statements are not current guidance.
 

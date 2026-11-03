@@ -843,6 +843,130 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
         }
     }
 
+    /// A cross-family local switch (Codex → Claude Code) mutates the existing tab session in
+    /// place, so the presentation-time identity pin still matches and focus is restored.
+    func testModelSelectionHUDCrossFamilyLocalCommitKeepsSessionIdentityAndRequestsFocus() async throws {
+        try await withFixture { fixture in
+            fixture.sessionA.hasSentFirstMessage = false
+            fixture.sessionA.replaceItems([])
+            fixture.viewModel.refreshDerivedTranscriptState(for: fixture.sessionA)
+            configureHUDCodexProvider(fixture)
+            fixture.window.apiSettingsViewModel.isClaudeCodeConnected = true
+            fixture.viewModel.test_setAvailableAgents([.codexExec, .claudeCode])
+            XCTAssertEqual(fixture.sessionA.selectedAgent, .codexExec)
+            XCTAssertTrue(fixture.viewModel.canSelectAgentInCurrentChat(.claudeCode, tabID: fixture.tabAID))
+
+            let sourceSession = try XCTUnwrap(fixture.viewModel.sessions[fixture.tabAID])
+            XCTAssertTrue(sourceSession === fixture.sessionA)
+            let sourceIdentity = ObjectIdentifier(sourceSession)
+
+            let hud = AgentModelSelectionHUDViewModel()
+            hud.present(mode: .switchModel) {
+                fixture.viewModel.makeModelSelectionHUDPresentation(
+                    mode: .switchModel,
+                    sourceTabID: fixture.tabAID,
+                    windowID: fixture.window.windowID
+                )
+            }
+            XCTAssertTrue(hud.isPresented)
+            let claudeLeaf = try XCTUnwrap(
+                hud.filteredLeaves.first {
+                    if case let .local(agent: .claudeCode, modelRaw, _) = $0.commitPayload {
+                        return modelRaw != AgentModel.defaultModel.rawValue
+                    }
+                    return false
+                },
+                "Expected a selectable Claude Code leaf; got \(hud.filteredLeaves.map(\.commitPayload))"
+            )
+            guard case let .local(_, claudeModelRaw, _) = claudeLeaf.commitPayload else {
+                return XCTFail("Expected a local model selection")
+            }
+
+            clearComposerFocusRequest(fixture)
+            await hud.commit(claudeLeaf)
+
+            XCTAssertNil(hud.errorMessage)
+            XCTAssertFalse(hud.isPresented)
+            XCTAssertEqual(fixture.sessionA.selectedAgent, .claudeCode)
+            XCTAssertEqual(fixture.sessionA.selectedModelRaw, claudeModelRaw)
+            XCTAssertEqual(fixture.viewModel.selectedAgent, .claudeCode)
+            let liveSession = try XCTUnwrap(fixture.viewModel.sessions[fixture.tabAID])
+            XCTAssertTrue(
+                liveSession === sourceSession,
+                "A cross-family provider switch must keep the same tab session object."
+            )
+            XCTAssertEqual(ObjectIdentifier(liveSession), sourceIdentity)
+            let focusRequest = try XCTUnwrap(fixture.viewModel.ui.composer.focusRequest)
+            XCTAssertEqual(focusRequest.tabID, fixture.tabAID)
+            XCTAssertEqual(focusRequest.reason, .modelSelectionCommitted)
+        }
+    }
+
+    /// A same-tab session-object replacement under an open picker invalidates the
+    /// presentation's identity pin: the commit and the focus callback both fail closed.
+    func testModelSelectionHUDRejectsSameTabSessionObjectReplacement() async throws {
+        try await withFixture { fixture in
+            fixture.sessionA.hasSentFirstMessage = false
+            fixture.sessionA.replaceItems([])
+            fixture.viewModel.refreshDerivedTranscriptState(for: fixture.sessionA)
+            configureHUDCodexProvider(fixture)
+            fixture.sessionA.selectedAgent = .codexExec
+            fixture.sessionA.selectedModelRaw = AgentModel.defaultModel.rawValue
+
+            let presentation = fixture.viewModel.makeModelSelectionHUDPresentation(
+                mode: .switchModel,
+                sourceTabID: fixture.tabAID,
+                windowID: fixture.window.windowID
+            )
+            XCTAssertNil(presentation.unavailableMessage)
+            let focusCallback = try XCTUnwrap(presentation.onSuccessfulModelSelection)
+            let hud = AgentModelSelectionHUDViewModel()
+            hud.present(mode: .switchModel) { presentation }
+            XCTAssertTrue(hud.isPresented)
+            let leaf = try XCTUnwrap(
+                localCodexLeaf(in: hud.filteredLeaves, excludingModelRaw: fixture.sessionA.selectedModelRaw)
+            )
+
+            let replacement = AgentTabSession(tabID: fixture.tabAID)
+            replacement.selectedAgent = .codexExec
+            replacement.selectedModelRaw = AgentModel.defaultModel.rawValue
+            replacement.selectedReasoningEffortRaw = nil
+            fixture.viewModel.test_installLiveSession(replacement)
+            defer { fixture.viewModel.test_installLiveSession(fixture.sessionA) }
+            XCTAssertTrue(fixture.viewModel.sessions[fixture.tabAID] === replacement)
+            XCTAssertEqual(fixture.viewModel.currentTabID, fixture.tabAID)
+            let replacementAgent = replacement.selectedAgent
+            let replacementModelRaw = replacement.selectedModelRaw
+            let replacementEffortRaw = replacement.selectedReasoningEffortRaw
+
+            clearComposerFocusRequest(fixture)
+            await hud.commit(leaf)
+            XCTAssertTrue(hud.isPresented, "A rejected commit keeps the HUD open with its error.")
+            XCTAssertEqual(
+                hud.errorMessage,
+                AgentModelSelectionCommitError.sourceUnavailable.localizedDescription
+            )
+            XCTAssertNil(fixture.viewModel.ui.composer.focusRequest)
+
+            do {
+                try await presentation.commit(leaf)
+                XCTFail("Expected an identity-pinned presentation to reject session replacement")
+            } catch {
+                XCTAssertEqual(error as? AgentModelSelectionCommitError, .sourceUnavailable)
+            }
+            XCTAssertTrue(fixture.viewModel.sessions[fixture.tabAID] === replacement)
+            XCTAssertEqual(replacement.selectedAgent, replacementAgent)
+            XCTAssertEqual(replacement.selectedModelRaw, replacementModelRaw)
+            XCTAssertEqual(replacement.selectedReasoningEffortRaw, replacementEffortRaw)
+
+            focusCallback()
+            XCTAssertNil(
+                fixture.viewModel.ui.composer.focusRequest,
+                "An identity-pinned callback must not focus a replacement session's composer."
+            )
+        }
+    }
+
     /// Lowest faithful layer for the shell receiver: the production `.activeComposeTabChanged`
     /// post drives `AgentHUDActiveTabChangeGate.handle`, the same handler the shell calls.
     /// The shell's SwiftUI `onReceive` subscription and the redraw-driven regression it replaced
