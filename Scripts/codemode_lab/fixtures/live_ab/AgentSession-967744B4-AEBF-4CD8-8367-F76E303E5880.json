@@ -1,0 +1,497 @@
+{
+ "id": "967744B4-AEBF-4CD8-8367-F76E303E5880",
+ "agentKind": "codexExec",
+ "agentModel": "gpt-6.1-sol",
+ "agentReasoningEffort": "medium",
+ "codexModel": "gpt-6.1-sol",
+ "codexReasoningEffort": "high",
+ "codexConversationID": "01a1a1f7-443e-7f71-b3e8-6a0f8404b795",
+ "providerSessionID": null,
+ "lastRunState": "completed",
+ "codexRolloutPath": "__FIXTURE__/rollout-2026-11-03T22-11-39-01a1a1f7-443e-7f71-b3e8-6a0f8404b795.jsonl",
+ "providerUsage": {
+  "schemaVersion": 1,
+  "hasUnmeasuredHistory": true,
+  "turns": [],
+  "claudeSegments": [],
+  "codexIntervals": [
+   {
+    "executionID": "C1599D82-7625-4849-85B8-5BF4DD9EC68F",
+    "threadID": "01a1a1f7-443e-7f71-b3e8-6a0f8404b795",
+    "turnID": "01a1a1f7-47c9-7ec3-9edc-b7a40197a6ac",
+    "turnAttribution": "notified",
+    "ordinal": 2,
+    "inputTokens": 67637,
+    "cachedInputTokens": 33536,
+    "cacheWriteInputTokens": 0,
+    "outputTokens": 84,
+    "reasoningOutputTokens": 0,
+    "coverage": "complete",
+    "requestedModelID": "gpt-6.1-sol",
+    "resolvedModelID": "gpt-6.1-sol"
+   },
+   {
+    "executionID": "E34011F7-405B-43CE-9AC3-AD5D5CD84691",
+    "threadID": "01a1a1f7-443e-7f71-b3e8-6a0f8404b795",
+    "turnID": "01a1a1f7-47c9-7ec3-9edc-b7a40197a6ac",
+    "turnAttribution": "notified",
+    "ordinal": 1,
+    "inputTokens": null,
+    "cachedInputTokens": null,
+    "cacheWriteInputTokens": null,
+    "outputTokens": null,
+    "reasoningOutputTokens": null,
+    "coverage": "partial",
+    "requestedModelID": null,
+    "resolvedModelID": null
+   },
+   {
+    "executionID": "E34011F7-405B-43CE-9AC3-AD5D5CD84691",
+    "threadID": "01a1a1f7-443e-7f71-b3e8-6a0f8404b795",
+    "turnID": "01a1a201-7f06-7a73-bf99-9f8cc3e7c831",
+    "turnAttribution": "notified",
+    "ordinal": 6,
+    "inputTokens": 173297,
+    "cachedInputTokens": 171776,
+    "cacheWriteInputTokens": 0,
+    "outputTokens": 330,
+    "reasoningOutputTokens": 0,
+    "coverage": "complete",
+    "requestedModelID": "gpt-6.1-sol",
+    "resolvedModelID": "gpt-6.1-sol"
+   },
+   {
+    "executionID": "E34011F7-405B-43CE-9AC3-AD5D5CD84691",
+    "threadID": "01a1a1f7-443e-7f71-b3e8-6a0f8404b795",
+    "turnID": "01a1a205-e655-7872-a195-63984eb15da8",
+    "turnAttribution": "notified",
+    "ordinal": 8,
+    "inputTokens": 71389,
+    "cachedInputTokens": 70144,
+    "cacheWriteInputTokens": 0,
+    "outputTokens": 121,
+    "reasoningOutputTokens": 0,
+    "coverage": "complete",
+    "requestedModelID": "gpt-6.1-sol",
+    "resolvedModelID": "gpt-6.1-sol"
+   },
+   {
+    "executionID": "89663F2E-7DAD-43A3-A8C9-A6BD0E400735",
+    "threadID": "01a1a1f7-443e-7f71-b3e8-6a0f8404b795",
+    "turnID": "01a1a205-e655-7872-a195-63984eb15da8",
+    "turnAttribution": "notified",
+    "ordinal": 1,
+    "inputTokens": null,
+    "cachedInputTokens": null,
+    "cacheWriteInputTokens": null,
+    "outputTokens": null,
+    "reasoningOutputTokens": null,
+    "coverage": "partial",
+    "requestedModelID": null,
+    "resolvedModelID": null
+   },
+   {
+    "executionID": "89663F2E-7DAD-43A3-A8C9-A6BD0E400735",
+    "threadID": "01a1a1f7-443e-7f71-b3e8-6a0f8404b795",
+    "turnID": "01a1a20c-0de6-7413-b8b3-6523bbe03f01",
+    "turnAttribution": "notified",
+    "ordinal": 3,
+    "inputTokens": 73004,
+    "cachedInputTokens": 72192,
+    "cacheWriteInputTokens": 0,
+    "outputTokens": 75,
+    "reasoningOutputTokens": 0,
+    "coverage": "complete",
+    "requestedModelID": "gpt-6.1-sol",
+    "resolvedModelID": "gpt-6.1-sol"
+   },
+   {
+    "executionID": "89663F2E-7DAD-43A3-A8C9-A6BD0E400735",
+    "threadID": "01a1a1f7-443e-7f71-b3e8-6a0f8404b795",
+    "turnID": "01a1a20c-3369-79e0-9a88-fee24d4ae2fa",
+    "turnAttribution": "notified",
+    "ordinal": 5,
+    "inputTokens": 74126,
+    "cachedInputTokens": 73216,
+    "cacheWriteInputTokens": 0,
+    "outputTokens": 75,
+    "reasoningOutputTokens": 0,
+    "coverage": "complete",
+    "requestedModelID": "gpt-6.1-sol",
+    "resolvedModelID": "gpt-6.1-sol"
+   },
+   {
+    "executionID": "89663F2E-7DAD-43A3-A8C9-A6BD0E400735",
+    "threadID": null,
+    "turnID": "01a1a20d-18ac-7b43-b996-ca85283c6303",
+    "turnAttribution": "notified",
+    "ordinal": 5,
+    "inputTokens": null,
+    "cachedInputTokens": null,
+    "cacheWriteInputTokens": null,
+    "outputTokens": null,
+    "reasoningOutputTokens": null,
+    "coverage": "unavailable",
+    "requestedModelID": null,
+    "resolvedModelID": null
+   },
+   {
+    "executionID": "59A47617-66D4-4506-9AB3-1EEA753B1004",
+    "threadID": "01a1a1f7-443e-7f71-b3e8-6a0f8404b795",
+    "turnID": "01a1a20d-18ac-7b43-b996-ca85283c6303",
+    "turnAttribution": "notified",
+    "ordinal": 1,
+    "inputTokens": null,
+    "cachedInputTokens": null,
+    "cacheWriteInputTokens": null,
+    "outputTokens": null,
+    "reasoningOutputTokens": null,
+    "coverage": "partial",
+    "requestedModelID": null,
+    "resolvedModelID": null
+   },
+   {
+    "executionID": "59A47617-66D4-4506-9AB3-1EEA753B1004",
+    "threadID": "01a1a1f7-443e-7f71-b3e8-6a0f8404b795",
+    "turnID": "01a1a20d-d1d8-7d73-8913-46d454723586",
+    "turnAttribution": "notified",
+    "ordinal": 3,
+    "inputTokens": 70263,
+    "cachedInputTokens": 34816,
+    "cacheWriteInputTokens": 0,
+    "outputTokens": 139,
+    "reasoningOutputTokens": 0,
+    "coverage": "complete",
+    "requestedModelID": "gpt-6.1-sol",
+    "resolvedModelID": "gpt-6.1-sol"
+   }
+  ]
+ },
+ "transcript": {
+  "turns": [
+   {
+    "id": "44E91DBB-8413-401D-BA93-14BFBCB584C4",
+    "conclusionActivityID": "0DA32A3B-0A5F-4B2D-A43D-4602BE421667",
+    "request": {
+     "text": "<redacted>"
+    },
+    "responseSpans": [
+     {
+      "lifecycle": "completed",
+      "activities": [
+       {
+        "id": "C724D1BF-F3EF-4F43-AA5F-8246946B35DB",
+        "role": "toolExecution",
+        "itemKind": "toolResult",
+        "toolExecution": {
+         "toolName": "code_mode",
+         "status": "success",
+         "invocationID": "B290D3F9-1A71-5E20-AB5D-DE2DE37127C7",
+         "toolIsError": false
+        }
+       },
+       {
+        "id": "3047996A-2CB3-475D-8D3C-518B7807398D",
+        "role": "toolExecution",
+        "itemKind": "toolResult",
+        "toolExecution": {
+         "toolName": "read_file",
+         "status": "success",
+         "invocationID": "D012FD85-6C6C-431C-8895-47BD4035A48B",
+         "toolIsError": false
+        }
+       },
+       {
+        "id": "0DA32A3B-0A5F-4B2D-A43D-4602BE421667",
+        "role": "assistant",
+        "itemKind": "assistant",
+        "text": "{\"authority\":\"Reference\",\"tool_used\":\"mcp__RepoPromptCE_Direct.code_mode\",\"error\":null}"
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "id": "80CC993A-DE13-4F29-9214-4545A42F3FC6",
+    "conclusionActivityID": "E3FD1809-AD65-4518-BA17-38FE7110B80E",
+    "request": {
+     "text": "<redacted>"
+    },
+    "responseSpans": [
+     {
+      "lifecycle": "completed",
+      "activities": [
+       {
+        "id": "D73F57C5-79FD-4CA6-BD6E-B30E4DBB8F36",
+        "role": "toolExecution",
+        "itemKind": "toolResult",
+        "toolExecution": {
+         "toolName": "code_mode",
+         "status": "failed",
+         "invocationID": "8113FA76-2FB9-5053-A8FA-BD473E9FEAD9",
+         "toolIsError": true
+        }
+       },
+       {
+        "id": "48DFA88F-25BE-4AA5-AF25-3CBADBAE7C2C",
+        "role": "toolExecution",
+        "itemKind": "toolResult",
+        "toolExecution": {
+         "toolName": "code_mode",
+         "status": "failed",
+         "invocationID": "E45DE839-2AED-55ED-BF4F-DCA32A762671",
+         "toolIsError": true
+        }
+       },
+       {
+        "id": "762DA681-8DB1-4691-923D-E9BD715774AE",
+        "role": "toolExecution",
+        "itemKind": "toolResult",
+        "toolExecution": {
+         "toolName": "code_mode",
+         "status": "failed",
+         "invocationID": "21DA51F9-A30A-5897-BCE4-7491B151323D",
+         "toolIsError": true
+        }
+       },
+       {
+        "id": "6E5EF471-395A-4BAF-9768-6044619E6AA6",
+        "role": "toolExecution",
+        "itemKind": "toolResult",
+        "toolExecution": {
+         "toolName": "code_mode",
+         "status": "failed",
+         "invocationID": "87869F89-CFEA-586D-A63C-5F3B342D1703",
+         "toolIsError": true
+        }
+       },
+       {
+        "id": "C14BE76E-352A-46F6-8F6D-7580965B9570",
+        "role": "toolExecution",
+        "itemKind": "toolResult",
+        "toolExecution": {
+         "toolName": "read_file",
+         "status": "success",
+         "invocationID": "F77262E5-92D6-482F-87AE-8C5C75F483EF",
+         "toolIsError": false
+        }
+       },
+       {
+        "id": "DB227E40-B55D-4CA9-B835-A7EF88069F41",
+        "role": "toolExecution",
+        "itemKind": "toolResult",
+        "toolExecution": {
+         "toolName": "get_code_structure",
+         "status": "failed",
+         "invocationID": "FA7ECFDE-292F-4EB1-AC27-2A8D86C913CD",
+         "toolIsError": true
+        }
+       },
+       {
+        "id": "E3FD1809-AD65-4518-BA17-38FE7110B80E",
+        "role": "assistant",
+        "itemKind": "assistant",
+        "text": "[{\"check\":1,\"outcome\":\"error\",\"reason\":\"Routing override _windowID rejected.\"},{\"check\":2,\"outcome\":\"error\",\"reason\":\"tools.apply_edits is not a function; no child calls executed.\"},{\"check\":3,\"outcome\":\"error\",\"reason\":\"Executor CPU-time limit exceeded after approximately 2 seconds.\"},{\"check\":4,\"o"
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "id": "B8B16993-0D3F-48B9-9E91-944C06074AA0",
+    "conclusionActivityID": "9F4DB4E0-DC3A-4C7C-AC4D-E46F94030AAD",
+    "request": {
+     "text": "<redacted>"
+    },
+    "responseSpans": [
+     {
+      "lifecycle": "completed",
+      "activities": [
+       {
+        "id": "C12CBA86-8E88-4E62-89B9-A4829A089B39",
+        "role": "toolExecution",
+        "itemKind": "toolResult",
+        "toolExecution": {
+         "toolName": "code_mode",
+         "status": "success",
+         "invocationID": "6FE3ABAB-3302-5CC7-9072-19F046120A9D",
+         "toolIsError": false
+        }
+       },
+       {
+        "id": "FACCBF52-BA73-4352-985A-08FFF03B3153",
+        "role": "toolExecution",
+        "itemKind": "toolResult",
+        "toolExecution": {
+         "toolName": "read_file",
+         "status": "success",
+         "invocationID": "D4603057-1EE5-4C7D-B681-799BC3B15A04",
+         "toolIsError": false
+        }
+       },
+       {
+        "id": "28C43F87-38FF-4013-94B3-6071D09CD4CA",
+        "role": "toolExecution",
+        "itemKind": "toolResult",
+        "toolExecution": {
+         "toolName": "get_code_structure",
+         "status": "success",
+         "invocationID": "2107D14B-25B0-4C55-9B9E-3649141148B1",
+         "toolIsError": false
+        }
+       },
+       {
+        "id": "9F4DB4E0-DC3A-4C7C-AC4D-E46F94030AAD",
+        "role": "assistant",
+        "itemKind": "assistant",
+        "text": "{\"read_file\":{\"isError\":false,\"authority\":\"Reference\"},\"get_code_structure\":{\"isError\":false,\"status\":\"ready\",\"returned_content\":true,\"returned_files\":1,\"codemap_content_tokens\":170}}"
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "id": "4FBA9EFB-E187-4D27-A259-9748650C60EB",
+    "conclusionActivityID": "9155422C-F3BE-422C-A4BA-5E0235701567",
+    "request": {
+     "text": "<redacted>"
+    },
+    "responseSpans": [
+     {
+      "lifecycle": "completed",
+      "activities": [
+       {
+        "id": "DBC42A02-8703-450A-BC79-AB7F2AC597F2",
+        "role": "toolExecution",
+        "itemKind": "toolResult",
+        "toolExecution": {
+         "toolName": "code_mode",
+         "status": "success",
+         "invocationID": "30B752F3-CADB-5198-A274-E8378BA3A285",
+         "toolIsError": false
+        }
+       },
+       {
+        "id": "A84F9681-8EF9-47DF-988E-6CC63FA274FB",
+        "role": "toolExecution",
+        "itemKind": "toolResult",
+        "toolExecution": {
+         "toolName": "read_file",
+         "status": "success",
+         "invocationID": "48FCF51E-6E36-4977-8F81-F111F35504A8",
+         "toolIsError": false
+        }
+       },
+       {
+        "id": "9155422C-F3BE-422C-A4BA-5E0235701567",
+        "role": "assistant",
+        "itemKind": "assistant",
+        "text": "{\"tag\":\"warm-a\",\"authority\":\"Reference\"}"
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "id": "E7339DB9-5716-4A32-AD77-24996EFE83FE",
+    "conclusionActivityID": "03494A00-D7C7-4EE5-BF07-0DB38049DD21",
+    "request": {
+     "text": "<redacted>"
+    },
+    "responseSpans": [
+     {
+      "lifecycle": "completed",
+      "activities": [
+       {
+        "id": "120F6578-D5D1-44A6-8D1F-A54CD737EFB5",
+        "role": "toolExecution",
+        "itemKind": "toolResult",
+        "toolExecution": {
+         "toolName": "code_mode",
+         "status": "success",
+         "invocationID": "BEEC611A-7006-5955-8C39-6A2CE6E394CE",
+         "toolIsError": false
+        }
+       },
+       {
+        "id": "16D6A853-D046-4AE2-9BEA-E59C2684B3C8",
+        "role": "toolExecution",
+        "itemKind": "toolResult",
+        "toolExecution": {
+         "toolName": "read_file",
+         "status": "success",
+         "invocationID": "DDBDFFE1-8DB8-4D47-8963-6ECC04ED1799",
+         "toolIsError": false
+        }
+       },
+       {
+        "id": "03494A00-D7C7-4EE5-BF07-0DB38049DD21",
+        "role": "assistant",
+        "itemKind": "assistant",
+        "text": "{\"tag\":\"warm-b\",\"authority\":\"Reference\"}"
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "id": "8E3004C2-6BC8-4A27-97E4-4C00655C27FC",
+    "terminalState": "cancelled",
+    "request": {
+     "text": "<redacted>"
+    },
+    "responseSpans": [
+     {
+      "lifecycle": "completed",
+      "activities": [
+       {
+        "id": "96942CDB-11D2-42E3-81D3-F26FBF4F988A",
+        "role": "toolExecution",
+        "itemKind": "toolResult",
+        "toolExecution": {
+         "toolName": "code_mode",
+         "status": "cancelled",
+         "invocationID": "AAA76789-027D-59B3-A078-D8194A7718C1",
+         "toolIsError": true
+        }
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "id": "17550694-7E3D-4BF5-B9EC-EA2026E0E9FB",
+    "terminalState": "completed",
+    "conclusionActivityID": "1E310116-9FCF-4F3E-980E-1D41C17A576D",
+    "request": {
+     "text": "<redacted>"
+    },
+    "responseSpans": [
+     {
+      "runID": "F1A2601B-4AA0-4B4C-9285-D3334555303D",
+      "lifecycle": "completed",
+      "activities": [
+       {
+        "id": "069D6764-53E9-4001-8389-C2F49C4B6044",
+        "role": "toolExecution",
+        "itemKind": "toolResult",
+        "toolExecution": {
+         "toolName": "read_file",
+         "status": "success",
+         "invocationID": "8D8E14D8-49C4-52DA-8722-CEB0E12E828F",
+         "toolIsError": false
+        }
+       },
+       {
+        "id": "1E310116-9FCF-4F3E-980E-1D41C17A576D",
+        "role": "assistant",
+        "itemKind": "assistant",
+        "text": "{\"authority\":\"Reference\",\"tool_used\":\"mcp__RepoPromptCE__read_file\",\"error\":null}"
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ }
+}

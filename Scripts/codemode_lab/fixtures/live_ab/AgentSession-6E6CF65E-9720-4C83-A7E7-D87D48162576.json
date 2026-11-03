@@ -1,0 +1,72 @@
+{
+ "id": "6E6CF65E-9720-4C83-A7E7-D87D48162576",
+ "agentKind": "codexExec",
+ "agentModel": "gpt-6.1-sol",
+ "agentReasoningEffort": "medium",
+ "codexModel": "gpt-6.1-sol",
+ "codexReasoningEffort": "high",
+ "codexConversationID": "01a1a1f6-97ac-7d62-af2e-5e1f0ce241a4",
+ "providerSessionID": null,
+ "lastRunState": "completed",
+ "codexRolloutPath": "__FIXTURE__/rollout-2026-11-03T22-10-54-01a1a1f6-97ac-7d62-af2e-5e1f0ce241a4.jsonl",
+ "providerUsage": {
+  "schemaVersion": 1,
+  "hasUnmeasuredHistory": true,
+  "turns": [],
+  "claudeSegments": [],
+  "codexIntervals": [
+   {
+    "executionID": "69CFD176-F804-47FC-B63E-1D37EB5E550E",
+    "threadID": "01a1a1f6-97ac-7d62-af2e-5e1f0ce241a4",
+    "turnID": "01a1a1f6-9aa6-7e71-b8eb-f8d9d687c5ae",
+    "turnAttribution": "notified",
+    "ordinal": 2,
+    "inputTokens": 62076,
+    "cachedInputTokens": 30720,
+    "cacheWriteInputTokens": 0,
+    "outputTokens": 118,
+    "reasoningOutputTokens": 0,
+    "coverage": "complete",
+    "requestedModelID": "gpt-6.1-sol",
+    "resolvedModelID": "gpt-6.1-sol"
+   }
+  ]
+ },
+ "transcript": {
+  "turns": [
+   {
+    "id": "6570FAAB-1BAD-4969-8F94-E2516007DF7B",
+    "terminalState": "completed",
+    "conclusionActivityID": "0C3F0B6F-35C0-4A87-AA44-956BB337C78E",
+    "request": {
+     "text": "<redacted>"
+    },
+    "responseSpans": [
+     {
+      "runID": "45FE7FEE-C0E8-4A7E-B50B-AE90C729CD37",
+      "lifecycle": "completed",
+      "activities": [
+       {
+        "id": "AE07564E-ADAA-4B90-921F-BBB8CD9BB182",
+        "role": "toolExecution",
+        "itemKind": "toolResult",
+        "toolExecution": {
+         "toolName": "read_file",
+         "status": "success",
+         "invocationID": "CF5212EA-D4FC-566B-B4C5-A2A0E5C74F21",
+         "toolIsError": false
+        }
+       },
+       {
+        "id": "0C3F0B6F-35C0-4A87-AA44-956BB337C78E",
+        "role": "assistant",
+        "itemKind": "assistant",
+        "text": "{\"authority\":\"Reference\",\"tool_used\":\"mcp__RepoPromptCE__read_file\"}"
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ }
+}

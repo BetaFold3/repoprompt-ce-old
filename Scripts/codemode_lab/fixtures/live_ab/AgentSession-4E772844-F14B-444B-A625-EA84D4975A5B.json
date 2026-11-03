@@ -1,0 +1,325 @@
+{
+ "id": "4E772844-F14B-444B-A625-EA84D4975A5B",
+ "agentKind": "claudeCode",
+ "agentModel": "sonnet:medium",
+ "agentReasoningEffort": null,
+ "codexModel": null,
+ "codexReasoningEffort": null,
+ "codexConversationID": null,
+ "providerSessionID": "ab76fba5-c1bb-40fe-bf68-5b2feeaea497",
+ "lastRunState": "completed",
+ "providerUsage": {
+  "schemaVersion": 1,
+  "hasUnmeasuredHistory": true,
+  "turns": [
+   {
+    "diagnostic": "monetary checkpoint rejected: monetaryScopeUnsupported",
+    "outcome": "completed",
+    "turnID": "1DC04952-EC2F-4D66-9BE1-B8F1953A5947",
+    "cacheCreationInputTokens": 80506,
+    "cacheReadInputTokens": 79860,
+    "segmentIndex": 0,
+    "executionID": "3ACE01D0-F140-404B-A3E6-9E050F343DCB",
+    "coverage": "complete",
+    "inputTokens": 4,
+    "acceptedResultID": "4eaa26f3-7b6d-4483-96ea-2d33a544bf9b",
+    "outputTokens": 191
+   },
+   {
+    "diagnostic": "monetary checkpoint rejected: monetaryScopeUnsupported",
+    "outcome": "completed",
+    "turnID": "C6337038-5983-45DA-9E12-4B5284A7076D",
+    "cacheCreationInputTokens": 1356,
+    "cacheReadInputTokens": 161519,
+    "segmentIndex": 0,
+    "executionID": "3ACE01D0-F140-404B-A3E6-9E050F343DCB",
+    "coverage": "complete",
+    "inputTokens": 6,
+    "acceptedResultID": "bf6c8e60-6192-4848-aef3-930a1f93cc9b",
+    "outputTokens": 748
+   },
+   {
+    "diagnostic": "monetary checkpoint rejected: monetaryScopeUnsupported",
+    "outcome": "completed",
+    "turnID": "A8B7C102-5940-40CB-B90B-179A3481B74F",
+    "cacheCreationInputTokens": 2021,
+    "cacheReadInputTokens": 164367,
+    "segmentIndex": 0,
+    "executionID": "3ACE01D0-F140-404B-A3E6-9E050F343DCB",
+    "coverage": "complete",
+    "inputTokens": 6,
+    "acceptedResultID": "318a1c56-e832-413b-b5eb-dca0f1a54395",
+    "outputTokens": 465
+   },
+   {
+    "diagnostic": "monetary checkpoint rejected: monetaryScopeUnsupported; original result reported error_during_execution",
+    "outcome": "interrupted",
+    "turnID": "7C6580B0-228F-4815-A22D-D47C0DAD63EE",
+    "cacheCreationInputTokens": 0,
+    "cacheReadInputTokens": 0,
+    "segmentIndex": 0,
+    "executionID": "3ACE01D0-F140-404B-A3E6-9E050F343DCB",
+    "coverage": "complete",
+    "inputTokens": 0,
+    "acceptedResultID": "84e307db-7e44-444e-9ab2-528e0b2b074a",
+    "outputTokens": 0
+   },
+   {
+    "diagnostic": "monetary checkpoint rejected: monetaryScopeUnsupported",
+    "outcome": "completed",
+    "turnID": "212C62D7-CB5A-4BA1-8C5B-1D51AB80D73A",
+    "cacheCreationInputTokens": 29457,
+    "cacheReadInputTokens": 138671,
+    "segmentIndex": 1,
+    "executionID": "660DF53E-65A3-4DD0-95AF-4D118E12C1CB",
+    "coverage": "complete",
+    "inputTokens": 6,
+    "acceptedResultID": "84546eca-e98c-48f7-ae54-2d8c576451cf",
+    "outputTokens": 159
+   }
+  ],
+  "claudeSegments": [
+   {
+    "executionID": "3ACE01D0-F140-404B-A3E6-9E050F343DCB",
+    "state": "closed",
+    "coverage": "unavailable",
+    "contractID": "claude-native.tokens-only.v1@2.1.316",
+    "resetGeneration": 0,
+    "provider": "claude"
+   },
+   {
+    "executionID": "660DF53E-65A3-4DD0-95AF-4D118E12C1CB",
+    "state": "open",
+    "coverage": "unavailable",
+    "contractID": "claude-native.tokens-only.v1@2.1.316",
+    "resetGeneration": 0,
+    "provider": "claude"
+   }
+  ],
+  "codexIntervals": []
+ },
+ "transcript": {
+  "turns": [
+   {
+    "id": "62BB9285-550A-453F-BDAE-46B93291E807",
+    "conclusionActivityID": "1757BE98-1D1E-40B2-9277-158127AB1603",
+    "request": {
+     "text": "<redacted>"
+    },
+    "responseSpans": [
+     {
+      "lifecycle": "completed",
+      "activities": [
+       {
+        "id": "A3AF9644-4C3A-402F-872E-2283B80B4F28",
+        "role": "toolExecution",
+        "itemKind": "toolResult",
+        "toolExecution": {
+         "toolName": "code_mode",
+         "status": "success",
+         "invocationID": "AE083B97-3F9B-4CE7-8204-2672E155F93C",
+         "toolIsError": false
+        }
+       },
+       {
+        "id": "E59DC71D-48EA-4B3E-BB45-0342BE6FCAFF",
+        "role": "toolExecution",
+        "itemKind": "toolResult",
+        "toolExecution": {
+         "toolName": "read_file",
+         "status": "success",
+         "invocationID": "2533C8F9-6784-4654-A823-90FF20177EB7",
+         "codeModeParentInvocationID": "AE083B97-3F9B-4CE7-8204-2672E155F93C",
+         "toolIsError": false
+        }
+       },
+       {
+        "id": "1757BE98-1D1E-40B2-9277-158127AB1603",
+        "role": "assistant",
+        "itemKind": "assistant",
+        "text": "{\"authority\":\"Reference\",\"tool_used\":\"mcp__RepoPromptCE__code_mode\",\"error\":null}"
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "id": "58B55F72-47F5-4BA1-80C5-C05861CED88C",
+    "conclusionActivityID": "8B47B2D4-AF19-4BA7-A93C-7A505CB06FDB",
+    "request": {
+     "text": "<redacted>"
+    },
+    "responseSpans": [
+     {
+      "lifecycle": "completed",
+      "activities": [
+       {
+        "id": "D634D17F-0997-48C5-948B-B1E5201FBB62",
+        "role": "toolExecution",
+        "itemKind": "toolResult",
+        "toolExecution": {
+         "toolName": "code_mode",
+         "status": "failed",
+         "invocationID": "6187A566-B083-4A65-BC88-EEEB27B51CAB",
+         "toolIsError": true
+        }
+       },
+       {
+        "id": "CCAACE3A-1BA3-46EC-B16F-A883BB89DEC4",
+        "role": "toolExecution",
+        "itemKind": "toolResult",
+        "toolExecution": {
+         "toolName": "code_mode",
+         "status": "failed",
+         "invocationID": "98827490-07DC-4722-AA8C-7B4A809B88B7",
+         "toolIsError": true
+        }
+       },
+       {
+        "id": "AC653F00-F41A-4926-9091-FDE1CB71FD8E",
+        "role": "toolExecution",
+        "itemKind": "toolResult",
+        "toolExecution": {
+         "toolName": "code_mode",
+         "status": "failed",
+         "invocationID": "3388AB26-4B8E-4424-B48B-1CF8A3844E1C",
+         "toolIsError": true
+        }
+       },
+       {
+        "id": "CAC0019A-E7A8-48E9-AF7C-9452BB983466",
+        "role": "toolExecution",
+        "itemKind": "toolResult",
+        "toolExecution": {
+         "toolName": "code_mode",
+         "status": "failed",
+         "invocationID": "DB29D209-D7D9-4750-9141-C63E64308F14",
+         "toolIsError": true
+        }
+       },
+       {
+        "id": "8B47B2D4-AF19-4BA7-A93C-7A505CB06FDB",
+        "role": "assistant",
+        "itemKind": "assistant",
+        "text": "```json\n[\n  {\"check\":1,\"outcome\":\"error\",\"status\":\"script_error (script_exception)\",\"reason\":\"code_mode children may not override routing (context_id, _tabID, _windowID, window_id). The child read_file call failed with tool_error.\"},\n  {\"check\":2,\"outcome\":\"error\",\"status\":\"script_error (script_exce"
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "id": "1D8B596D-1557-4745-8DBB-BD13A68A04A1",
+    "conclusionActivityID": "6BD4EBC7-9C4C-442D-AB9E-99CAD8749877",
+    "request": {
+     "text": "<redacted>"
+    },
+    "responseSpans": [
+     {
+      "lifecycle": "completed",
+      "activities": [
+       {
+        "id": "4F5AD9B0-FA74-4168-8D97-F07B6B405113",
+        "role": "toolExecution",
+        "itemKind": "toolResult",
+        "toolExecution": {
+         "toolName": "code_mode",
+         "status": "success",
+         "invocationID": "50417E9C-0BB7-4C34-9BDC-759C8981202E",
+         "toolIsError": false
+        }
+       },
+       {
+        "id": "847B18F9-E595-4295-926E-9D9CC369F9AF",
+        "role": "toolExecution",
+        "itemKind": "toolResult",
+        "toolExecution": {
+         "toolName": "read_file",
+         "status": "success",
+         "invocationID": "D4211919-A441-4365-9A98-A64182B51A91",
+         "codeModeParentInvocationID": "50417E9C-0BB7-4C34-9BDC-759C8981202E",
+         "toolIsError": false
+        }
+       },
+       {
+        "id": "2666B779-33BC-436D-809B-649ECEF69414",
+        "role": "toolExecution",
+        "itemKind": "toolResult",
+        "toolExecution": {
+         "toolName": "get_code_structure",
+         "status": "success",
+         "invocationID": "F3167359-07DA-454F-9A60-9C34346BD5D8",
+         "codeModeParentInvocationID": "50417E9C-0BB7-4C34-9BDC-759C8981202E",
+         "toolIsError": false
+        }
+       },
+       {
+        "id": "6BD4EBC7-9C4C-442D-AB9E-99CAD8749877",
+        "role": "assistant",
+        "itemKind": "assistant",
+        "text": "Both children succeeded in the single `code_mode` call (2 calls, 0 failed, 0 retries).\n\n```json\n[\n  {\"child\":\"read_file\",\"isError\":false,\"lines\":\"1-6 of 46\",\"authority\":\"Reference\"},\n  {\"child\":\"get_code_structure\",\"isError\":false,\"status\":\"ready\",\"returned_files\":1,\"role\":\"seed\",\"tokens\":170,\"issue"
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "id": "834082E5-EAED-4965-A88E-6A8ED139AFA0",
+    "terminalState": "cancelled",
+    "request": {
+     "text": "<redacted>"
+    },
+    "responseSpans": [
+     {
+      "lifecycle": "completed",
+      "activities": [
+       {
+        "id": "53B03E1B-B1E9-4A3D-B17D-CDB1DBDCCB55",
+        "role": "toolExecution",
+        "itemKind": "toolResult",
+        "toolExecution": {
+         "toolName": "code_mode",
+         "status": "failed",
+         "invocationID": "EC9DD201-EB3A-420D-9D95-3661CBCD0393",
+         "toolIsError": true
+        }
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "id": "E4B773C2-28D4-4184-84A0-FFF272783970",
+    "terminalState": "completed",
+    "conclusionActivityID": "EDEBD15D-BB72-4AAC-99C9-DB4D0899FD7B",
+    "request": {
+     "text": "<redacted>"
+    },
+    "responseSpans": [
+     {
+      "runID": "F0E3C91F-EA28-4CBF-B2AC-AB4BF93743F0",
+      "lifecycle": "completed",
+      "activities": [
+       {
+        "id": "5088F1B7-35CE-47A0-96AB-2609F9306EA2",
+        "role": "toolExecution",
+        "itemKind": "toolResult",
+        "toolExecution": {
+         "toolName": "read_file",
+         "status": "success",
+         "invocationID": "AD6E11D2-BA1A-4850-ADD3-5172B061D90E",
+         "toolIsError": false
+        }
+       },
+       {
+        "id": "EDEBD15D-BB72-4AAC-99C9-DB4D0899FD7B",
+        "role": "assistant",
+        "itemKind": "assistant",
+        "text": "```json\n{\"authority\":\"Reference\",\"tool_used\":\"mcp__RepoPromptCE__read_file\",\"error\":null}\n```"
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ }
+}

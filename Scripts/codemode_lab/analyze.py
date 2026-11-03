@@ -45,6 +45,10 @@ def check_rows(rows, where="input"):
             raise BadInput(f"{where} row {i}: multi-turn session row (seq={r.get('seq')!r}, turn={r.get('turn')!r}); "
                            "session runs are not supported by this harness")
         if r["kind"] not in KINDS: raise BadInput(f"{where} row {i}: unknown kind {r['kind']!r}")
+        if r.get("qualification_only"):
+            raise BadInput(f"{where} row {i}: qualification-only row (live_ab.py collect --turn-index); not a fresh gate sample")
+        if r.get("graded") is False and r["rc"] == 0:
+            raise BadInput(f"{where} row {i}: completed run was never graded (live_ab.py collect --no-grade is inspection-only)")
         if r["task"] in TASKS and TASKS[r["task"]]["kind"] != r["kind"]:
             raise BadInput(f"{where} row {i}: task {r['task']} has kind {r['kind']!r}, expected {TASKS[r['task']]['kind']!r}")
 
@@ -93,8 +97,10 @@ def gate(rows, a, b, n=2000):
     per_kind = {k: ratio_ci(usable, a, b, [t for t in tasks if kind[t] == k], n) for k in KINDS}
     lost = [t for t in all_tasks if attempted.get((a, t)) and attempted.get((b, t))
             and majority(attempted[(b, t)]) and not majority(attempted[(a, t)])]
-    violations = sum(1 for r in rows if r["arm"] == a and r.get("shell_calls", 0) > 0)
-    violation_tools = sorted({t for r in rows if r["arm"] == a for t in r.get("violation_tools") or []})
+    # A violation in either arm fails the comparison: a contaminated baseline is not a valid reference.
+    violations = sum(1 for r in rows if r.get("shell_calls", 0) > 0)
+    baseline_violations = sum(1 for r in rows if r["arm"] == b and r.get("shell_calls", 0) > 0)
+    violation_tools = sorted({t for r in rows for t in r.get("violation_tools") or []})
     unusable = sum(1 for r in rows if not C.row_is_usable(r))
     reps = min((len(usable[(x, t)]) for t in all_tasks for x in (a, b)), default=0)
     worst = max((v[0] for v in per_kind.values() if v), default=float("nan"))
@@ -111,7 +117,7 @@ def gate(rows, a, b, n=2000):
     if unusable: missing.append(f"{unusable} unusable rows (prune and re-run, README Recovery)")
     verdict = "FAIL" if fail else "INCOMPLETE" if missing else "PASS"
     return {"pair": (a, b), "per_kind": per_kind, "all": ratio_ci(usable, a, b, tasks, n), "lost_majority": lost,
-            "violations": violations, "violation_tools": violation_tools, "unusable_rows": unusable, "min_reps": reps, "tasks": len(tasks), "reasons": fail + missing,
+            "violations": violations, "baseline_violations": baseline_violations, "violation_tools": violation_tools, "unusable_rows": unusable, "min_reps": reps, "tasks": len(tasks), "reasons": fail + missing,
             "verdict": verdict + ("" if reps >= MIN_REPS else f" (exploratory: {reps} reps < {MIN_REPS})")}
 
 
@@ -146,7 +152,7 @@ def print_gate(g):
     for k in KINDS: print(f"| {k} | {fmt(g['per_kind'][k])} | ≤ ×{COST_BOUND:.2f} |")
     print(f"| all | {fmt(g['all'])} | reported |\n")
     tools = f" ({', '.join(g['violation_tools'])})" if g["violation_tools"] else ""
-    print(f"Majority-correct lost (all attempts): {', '.join(g['lost_majority']) or 'none'}. Violations: {g['violations']}{tools}. "
+    print(f"Majority-correct lost (all attempts): {', '.join(g['lost_majority']) or 'none'}. Violations (both arms): {g['violations']}, baseline {g['baseline_violations']}{tools}. "
           f"Unusable rows: {g['unusable_rows']}. A claimed saving shows only where the interval is below 1 (§7.3).\n")
     if g["reasons"]: print("Reasons: " + "; ".join(g["reasons"]) + ".\n")
 

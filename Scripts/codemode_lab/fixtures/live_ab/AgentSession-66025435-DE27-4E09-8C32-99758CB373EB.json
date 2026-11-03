@@ -1,0 +1,78 @@
+{
+ "id": "66025435-DE27-4E09-8C32-99758CB373EB",
+ "agentKind": "claudeCode",
+ "agentModel": "sonnet:medium",
+ "agentReasoningEffort": null,
+ "codexModel": null,
+ "codexReasoningEffort": null,
+ "codexConversationID": null,
+ "providerSessionID": "f204942e-e16a-439a-8f25-420c53c61c25",
+ "lastRunState": "completed",
+ "providerUsage": {
+  "schemaVersion": 1,
+  "hasUnmeasuredHistory": true,
+  "turns": [
+   {
+    "segmentIndex": 0,
+    "cacheReadInputTokens": 78819,
+    "executionID": "C3D689E2-5C80-4A5C-BAF1-360EADD0B675",
+    "inputTokens": 4,
+    "cacheCreationInputTokens": 79283,
+    "coverage": "complete",
+    "diagnostic": "monetary checkpoint rejected: monetaryScopeUnsupported",
+    "turnID": "6142EDA4-7BE0-4E42-864F-F7044D2F3C6B",
+    "outputTokens": 138,
+    "outcome": "completed",
+    "acceptedResultID": "ff8bc182-d80c-4274-a7bb-16d8f35a5829"
+   }
+  ],
+  "claudeSegments": [
+   {
+    "executionID": "C3D689E2-5C80-4A5C-BAF1-360EADD0B675",
+    "state": "open",
+    "coverage": "unavailable",
+    "contractID": "claude-native.tokens-only.v1@2.1.316",
+    "resetGeneration": 0,
+    "provider": "claude"
+   }
+  ],
+  "codexIntervals": []
+ },
+ "transcript": {
+  "turns": [
+   {
+    "id": "6B9BC748-F7F8-48D5-A052-AD8A53282961",
+    "terminalState": "completed",
+    "conclusionActivityID": "7374B8BB-19CA-4AF9-8C3B-470888F92536",
+    "request": {
+     "text": "<redacted>"
+    },
+    "responseSpans": [
+     {
+      "runID": "46B86794-D2BF-4168-B7DA-91D53F90898A",
+      "lifecycle": "completed",
+      "activities": [
+       {
+        "id": "5ED76D11-CDF6-4E8E-983A-478CD2D79D25",
+        "role": "toolExecution",
+        "itemKind": "toolResult",
+        "toolExecution": {
+         "toolName": "read_file",
+         "status": "success",
+         "invocationID": "41B1168B-D4B0-4C45-9B95-6927D1B0A631",
+         "toolIsError": false
+        }
+       },
+       {
+        "id": "7374B8BB-19CA-4AF9-8C3B-470888F92536",
+        "role": "assistant",
+        "itemKind": "assistant",
+        "text": "{\"authority\":\"Reference\",\"tool_used\":\"read_file\"}"
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ }
+}

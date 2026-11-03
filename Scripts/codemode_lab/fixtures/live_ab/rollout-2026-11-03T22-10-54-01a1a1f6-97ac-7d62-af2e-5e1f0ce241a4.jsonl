@@ -1,0 +1,10 @@
+{"type": "session_meta", "payload": {"id": "01a1a1f6-97ac-7d62-af2e-5e1f0ce241a4", "cli_version": "0.162.0-alpha.17.2", "originator": "repoprompt"}}
+{"type": "event_msg", "payload": {"type": "task_started", "turn_id": "01a1a1f6-9aa6-7e71-b8eb-f8d9d687c5ae"}}
+{"type": "turn_context", "payload": {"turn_id": "01a1a1f6-9aa6-7e71-b8eb-f8d9d687c5ae", "model": "gpt-6.1-sol", "effort": "medium"}}
+{"type": "event_msg", "payload": {"type": "item_completed", "turn_id": "01a1a1f6-9aa6-7e71-b8eb-f8d9d687c5ae", "item": {"type": "UserMessage", "id": "01a1a1f6-9e7d-77b2-a2c1-aa5bd92f2a09"}}}
+{"type": "response_item", "payload": {"type": "custom_tool_call", "name": "exec", "namespace": null, "call_id": "call_9d96c11232d248aaa1ee489e49b1f2c0"}}
+{"type": "token_usage_record", "payload": {"thread_id": "01a1a1f6-97ac-7d62-af2e-5e1f0ce241a4", "turn_id": "01a1a1f6-9aa6-7e71-b8eb-f8d9d687c5ae", "turn_token_usage": {"input_tokens": 30841, "cached_input_tokens": 0, "cache_write_input_tokens": 0, "output_tokens": 96, "reasoning_output_tokens": 0, "total_tokens": 30937}}}
+{"type": "event_msg", "payload": {"type": "item_completed", "turn_id": "01a1a1f6-9aa6-7e71-b8eb-f8d9d687c5ae", "item": {"type": "McpToolCall", "id": "exec-c9d20296-35ac-4d1e-aac5-b5494e6a7462", "server": "RepoPromptCE", "tool": "read_file", "status": "completed"}}}
+{"type": "event_msg", "payload": {"type": "item_completed", "turn_id": "01a1a1f6-9aa6-7e71-b8eb-f8d9d687c5ae", "item": {"type": "AgentMessage", "id": "msg_02b2730315fa3df0016ae9f984dcc48191b0f5861d2929c6bd"}}}
+{"type": "token_usage_record", "payload": {"thread_id": "01a1a1f6-97ac-7d62-af2e-5e1f0ce241a4", "turn_id": "01a1a1f6-9aa6-7e71-b8eb-f8d9d687c5ae", "turn_token_usage": {"input_tokens": 62076, "cached_input_tokens": 30720, "cache_write_input_tokens": 0, "output_tokens": 118, "reasoning_output_tokens": 0, "total_tokens": 62194}}}
+{"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "01a1a1f6-9aa6-7e71-b8eb-f8d9d687c5ae", "last_agent_message": "{\"authority\":\"Reference\",\"tool_used\":\"mcp__RepoPromptCE__read_file\"}"}}
