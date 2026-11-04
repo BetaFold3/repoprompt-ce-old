@@ -46,6 +46,117 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         XCTAssertEqual(signatures, Self.expectedSignatures)
     }
 
+    func testClaudeAgentPromptsQualifyRepoPromptToolReferencesAtTheRenderBoundary() throws {
+        let server = MCPIntegrationHelper.repoPromptMCPServerName
+        // This is the production renderer used by MCPConfigExportService for Claude launches.
+        let configJSON = try RepoPromptMCPServerConfiguration.repoPrompt.prettyPrintedWrappedSettingsJSON()
+        let config = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(configJSON.utf8)) as? [String: Any])
+        let servers = try XCTUnwrap(config["mcpServers"] as? [String: [String: Any]])
+        XCTAssertEqual(Set(servers.keys), [server])
+        XCTAssertEqual(servers[server]?["args"] as? [String], [], "Claude's default helper launch reaches the no-args preflight")
+        let roles: [AgentModelCatalog.TaskLabelKind?] = [nil, .explore, .engineer, .pair, .design]
+        var claudePrompts = roles.map { role in
+            (
+                role.map { "\($0)" } ?? "default",
+                SystemPromptService.agentModePrompt(agentKind: .claudeCode, taskLabelKind: role)
+            )
+        }
+        claudePrompts.append(("knowledge", SystemPromptService.agentModePrompt(agentKind: .claudeCode, sessionProfile: .knowledge)))
+        for (label, prompt) in claudePrompts {
+            // Check the registered catalog independently of the renderer's vocabulary.
+            for toolName in MCPWindowToolGroup.orderedToolNames {
+                XCTAssertFalse(prompt.contains("`\(toolName)`"), "\(label): canonical \(toolName) must be qualified")
+            }
+            XCTAssertFalse(prompt.contains("`RepoPrompt__read_file`"), "\(label): legacy read spelling must be normalized")
+            XCTAssertTrue(prompt.contains("`mcp__\(server)__read_file`"), label)
+            XCTAssertFalse(prompt.contains("__mcp__"), "\(label): no double qualification")
+            XCTAssertEqual(
+                AgentModePrompts.Fragments.qualifiedToolReferences(prompt, agentKind: .claudeCode),
+                prompt,
+                "\(label): qualification is idempotent"
+            )
+        }
+
+        let standard = SystemPromptService.agentModePrompt(agentKind: .claudeCode)
+        for toolName in [
+            MCPWindowToolName.readFile,
+            MCPWindowToolName.search,
+            MCPWindowToolName.getFileTree,
+            MCPWindowToolName.applyEdits,
+            MCPWindowToolName.askUser,
+            MCPWindowToolName.setStatus
+        ] {
+            XCTAssertTrue(standard.contains("`mcp__\(server)__\(toolName)`"), "Claude prompt should qualify \(toolName)")
+        }
+        XCTAssertTrue(standard.contains("`AGENTS.md`"), "unrelated backticked text stays unchanged")
+        let engineer = SystemPromptService.agentModePrompt(agentKind: .claudeCode, taskLabelKind: .engineer)
+        XCTAssertTrue(engineer.contains("native `Read` tool"), "native Claude tool names stay unchanged")
+        XCTAssertTrue(engineer.contains("use MCP `mcp__\(server)__read_file`"))
+
+        let sample = "Use `file_search`, `RepoPrompt__read_file`, `mcp__\(server)__git`, `file_search_extra`, `Read`, and file_search."
+        let expected = "Use `mcp__\(server)__file_search`, `mcp__\(server)__read_file`, `mcp__\(server)__git`, `file_search_extra`, `Read`, and file_search."
+        XCTAssertEqual(AgentModePrompts.Fragments.qualifiedToolReferences(sample, agentKind: .claudeCode), expected)
+        XCTAssertEqual(AgentModePrompts.Fragments.qualifiedToolReferences(sample, agentKind: .codexExec), expected)
+        // Compatible Claude backends deliberately retain prior spelling; qualification there is deferred.
+        let unqualifiedKinds: [AgentProviderKind?] = [nil, .openCode, .cursor, .ohMyPi, .claudeCodeGLM, .kimiCode, .customClaudeCompatible]
+        for agentKind in unqualifiedKinds {
+            let label = agentKind.map(\.rawValue) ?? "nil"
+            XCTAssertEqual(AgentModePrompts.Fragments.qualifiedToolReferences(sample, agentKind: agentKind), sample, label)
+            let prompt = SystemPromptService.agentModePrompt(agentKind: agentKind)
+            XCTAssertTrue(prompt.contains("`RepoPrompt__read_file`"), label)
+            XCTAssertTrue(prompt.contains("`file_search`"), label)
+            XCTAssertFalse(prompt.contains("`mcp__\(server)__"), label)
+        }
+    }
+
+    func testUnifiedDiffCompletionRuleRendersOnceInPatchCapablePromptsOnly() {
+        let rule = AgentModePrompts.Fragments.unifiedDiffCompletionRule
+        let heading = "**Unified diff deliverables**"
+        XCTAssertTrue(rule.contains("only when the user asks you to return a unified diff"))
+        XCTAssertTrue(rule.contains("do not change ordinary editing or analysis"))
+        XCTAssertTrue(rule.contains("exact current file text"))
+        XCTAssertTrue(rule.contains("Never invent context lines or assume that separate regions are adjacent"))
+        XCTAssertTrue(rule.contains("old and new line counts"))
+        XCTAssertTrue(rule.contains("one complete diff block"))
+        XCTAssertTrue(rule.contains("report that blocker instead of returning a patch you know is incomplete"))
+        for toolName in MCPIntegrationHelper.repoPromptToolNames {
+            XCTAssertFalse(rule.contains("`\(toolName)`"), "the rule must not force a specific tool: \(toolName)")
+        }
+
+        let roles: [AgentModelCatalog.TaskLabelKind?] = [nil, .engineer, .pair, .design]
+        let audiences: [ExportDelegationAudience?] = [nil, .some(.none), .both]
+        for agentKind in [AgentProviderKind.claudeCode, .codexExec, .openCode, nil] {
+            let kindLabel = agentKind.map(\.rawValue) ?? "nil"
+            for role in roles {
+                for audience in audiences {
+                    for codeMapsDisabled in [false, true] {
+                        let label = "\(kindLabel)/\(role.map { "\($0)" } ?? "default")/\(String(describing: audience))/\(codeMapsDisabled)"
+                        let prompt = SystemPromptService.agentModePrompt(
+                            agentKind: agentKind,
+                            taskLabelKind: role,
+                            codeMapsDisabled: codeMapsDisabled,
+                            delegationAudience: audience
+                        )
+                        XCTAssertEqual(prompt.components(separatedBy: heading).count - 1, 1, label)
+                        XCTAssertTrue(prompt.contains(rule), label)
+                    }
+                }
+            }
+            XCTAssertFalse(
+                SystemPromptService.agentModePrompt(agentKind: agentKind, taskLabelKind: .explore).contains(heading),
+                "\(kindLabel)/explore"
+            )
+            XCTAssertFalse(
+                SystemPromptService.agentModePrompt(agentKind: agentKind, sessionProfile: .knowledge).contains(heading),
+                "\(kindLabel)/knowledge"
+            )
+        }
+
+        let standard = SystemPromptService.agentModePrompt(agentKind: .claudeCode)
+        XCTAssertTrue(standard.contains("Stop exploring once you know the scope, constraints, affected code, and validation path."))
+        XCTAssertTrue(standard.contains("confirm the requested deliverable exists"))
+    }
+
     func testCodingAgentPromptManifestMatchesRegisteredSchemas() async throws {
         let prompt = SystemPromptService.agentModePrompt()
         XCTAssertTrue(prompt.hasPrefix("# RepoPrompt Coding Agent — System Prompt (vNext-rc2.1)"))

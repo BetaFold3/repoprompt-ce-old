@@ -314,7 +314,7 @@ final class MCPGitSurfaceTests: XCTestCase {
                 let inspection = AgentModePrompts.Fragments.gitInspectionGuidance
                 XCTAssertTrue(
                     prompt.contains(inspection)
-                        || prompt.contains(AgentModePrompts.Fragments.codexQualifiedToolReferences(inspection, agentKind: agentKind)),
+                        || prompt.contains(AgentModePrompts.Fragments.qualifiedToolReferences(inspection, agentKind: agentKind)),
                     label
                 )
             }
@@ -325,7 +325,7 @@ final class MCPGitSurfaceTests: XCTestCase {
             let explore = SystemPromptService.agentModePrompt(agentKind: agentKind, taskLabelKind: .explore)
             XCTAssertFalse(explore.contains("git_review_snapshot"), "\(agentKind) explore")
             XCTAssertTrue(
-                explore.contains(AgentModePrompts.Fragments.codexQualifiedToolReferences(
+                explore.contains(AgentModePrompts.Fragments.qualifiedToolReferences(
                     AgentModePrompts.Fragments.gitInspectionGuidance,
                     agentKind: agentKind
                 )),

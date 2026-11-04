@@ -21,10 +21,13 @@ final class KnowledgeAgentPromptTests: XCTestCase {
             "ask_oracle",
             "oracle_chat_log"
         ] {
-            XCTAssertTrue(prompt.contains("`\(tool)`"), tool)
+            // Claude Code renders RepoPrompt tools with their advertised qualified names.
+            XCTAssertTrue(prompt.contains("`mcp__\(MCPIntegrationHelper.repoPromptMCPServerName)__\(tool)`"), tool)
+            XCTAssertFalse(prompt.contains("`\(tool)`"), tool)
         }
-        for forbidden in ["`git`", "`bash`", "`agent_run`", "`agent_explore`", "`context_builder`"] {
-            XCTAssertFalse(prompt.localizedCaseInsensitiveContains(forbidden), forbidden)
+        for forbidden in ["git", "bash", "agent_run", "agent_explore", "context_builder"] {
+            XCTAssertFalse(prompt.localizedCaseInsensitiveContains("`\(forbidden)`"), forbidden)
+            XCTAssertFalse(prompt.localizedCaseInsensitiveContains("__\(forbidden)`"), forbidden)
         }
         XCTAssertFalse(prompt.contains("packet_context_clean"))
         XCTAssertFalse(prompt.contains("model_preset_id"))

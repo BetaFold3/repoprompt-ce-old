@@ -108,7 +108,7 @@ enum AgentModePrompts {
         - Providing implementation code when asked for analysis — explain and point, don't write code
         - Continuing to explore after you have enough to answer the question
         """
-        return Fragments.codexQualifiedToolReferences(prompt, agentKind: agentKind)
+        return Fragments.qualifiedToolReferences(prompt, agentKind: agentKind)
     }
 
     // MARK: - Engineer
@@ -205,6 +205,8 @@ enum AgentModePrompts {
         4. **After completing a task**:
         \(afterTask)
 
+        \(Fragments.unifiedDiffCompletionRule)
+
         **Important Notes**
         - Always explore before editing unfamiliar code
         - For multi-file changes, work methodically file by file
@@ -212,7 +214,7 @@ enum AgentModePrompts {
         - Do not continue work after the task is complete
         - If something goes wrong, explain what happened and offer to fix it
         """
-        return Fragments.codexQualifiedToolReferences(prompt, agentKind: agentKind)
+        return Fragments.qualifiedToolReferences(prompt, agentKind: agentKind)
     }
 
     // MARK: - Knowledge
@@ -263,7 +265,7 @@ enum AgentModePrompts {
 
         \(delegationGuidance)
         """
-        return Fragments.codexQualifiedToolReferences(prompt, agentKind: agentKind)
+        return Fragments.qualifiedToolReferences(prompt, agentKind: agentKind)
     }
 
     // MARK: - Shared Fragments
@@ -307,6 +309,18 @@ enum AgentModePrompts {
         **Fresh Oracle chats**
         - Every fresh chat (`new_chat:true`) carries an explicit `model` preset. Reuse an exact preset UUID this session already knows, including one listed by an `oracle_model_required` rejection; call `oracle_utils` `op:"models"` only when a preset's identity is missing, ambiguous, or stale. `chat_name` never selects a model.
         - A fresh review that should see only controlled context may pass `selection_mode:"none"` or `selection_mode:"explicit_slices"` with `slices`. Neither packages the automatic review diff, so put diff text in `message` or slice the changed files.
+        """
+
+        /// Conditional completion rule for requests whose deliverable is a unified diff.
+        /// Rendered once in each prompt whose role may produce patches (standard coding,
+        /// engineer, pair, design); explore and Knowledge prompts omit it.
+        static let unifiedDiffCompletionRule = """
+        **Unified diff deliverables**
+        These rules apply only when the user asks you to return a unified diff; they do not change ordinary editing or analysis.
+        - Build every hunk, including its context lines, from the exact current file text you obtained in this session. Never invent context lines or assume that separate regions are adjacent; obtain any missing surrounding lines first.
+        - Check that each hunk header's old and new line counts match the lines in that hunk, and that the diff covers every requested change.
+        - Return the patch as one complete diff block.
+        - If you cannot obtain the context a hunk needs, report that blocker instead of returning a patch you know is incomplete.
         """
 
         // MARK: - Knowledge delegation
@@ -563,11 +577,13 @@ enum AgentModePrompts {
         }
 
         /// Qualify RepoPrompt MCP tool references for providers whose model-visible
-        /// tool names include the server namespace (Codex exposes them as
-        /// `mcp__RepoPrompt__<tool>`). Keep authoring prompts with canonical names
-        /// and qualify the rendered Codex prompt at the boundary.
-        static func codexQualifiedToolReferences(_ prompt: String, agentKind: AgentProviderKind?) -> String {
-            guard agentKind == .codexExec else { return prompt }
+        /// tool names include the server namespace (Codex and Claude Code expose them as
+        /// `mcp__<server>__<tool>`). Keep authoring prompts with canonical names (and the
+        /// legacy `RepoPrompt__read_file` spelling) and qualify the rendered prompt at the
+        /// boundary. Only exact backticked tool names are rewritten, so already-qualified
+        /// references and unrelated backticked text are left unchanged.
+        static func qualifiedToolReferences(_ prompt: String, agentKind: AgentProviderKind?) -> String {
+            guard agentKind == .codexExec || agentKind == .claudeCode else { return prompt }
             var qualified = prompt
             let toolNames = MCPIntegrationHelper.repoPromptToolNames
                 .union(["RepoPrompt__read_file"])

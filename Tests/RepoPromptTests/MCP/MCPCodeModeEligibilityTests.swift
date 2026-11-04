@@ -76,6 +76,50 @@ final class MCPCodeModeEligibilityTests: XCTestCase {
         XCTAssertEqual(Self.eligibility(live: .some(Self.launchSettings(sessionProfile: .knowledge))), .native)
     }
 
+    /// Launch validation accepts strict-grammar dynamic family point releases without a static
+    /// `AgentModel` case; eligibility must read the same authority as the same-family aliases.
+    func testDynamicFamilyPointReleasesShareStaticAliasEligibility() {
+        let staticAliases = ["sonnet", "sonnet:medium", "opus", "opus:medium", "opus[1m]"]
+        let dynamicReleases = [
+            "claude-sonnet-5-1", "claude-sonnet-5-1:medium", "claude-sonnet-5-1-20261015", "claude-sonnet-5-1[1m]",
+            "claude-opus-5-7", "claude-opus-5-7:xhigh", "claude-opus-5-7-20261101", "claude-opus-5-7[1m]:medium"
+        ]
+        for model in dynamicReleases {
+            XCTAssertNil(AgentModel.resolvedModel(forRaw: model, agentKind: .claudeCode), "\(model) must miss the enum")
+        }
+        for model in staticAliases + dynamicReleases {
+            XCTAssertEqual(Self.eligibility(model: model), .directTools, model)
+            XCTAssertEqual(Self.eligibility(model: model, live: .some(Self.launchSettings())), .directTools, model)
+        }
+    }
+
+    func testDynamicPointReleasesKeepEveryOtherGateAndNonFamilyIDsStayNative() {
+        let dynamic = "claude-sonnet-5-1:medium"
+        XCTAssertEqual(Self.eligibility(toolsMode: .native, model: dynamic), .native)
+        for agent in AgentProviderKind.allCases where agent != .claudeCode {
+            XCTAssertEqual(Self.eligibility(agentKind: agent, model: dynamic), .native, agent.rawValue)
+        }
+        XCTAssertEqual(Self.eligibility(sessionProfile: .knowledge, model: dynamic), .native)
+        XCTAssertEqual(Self.eligibility(permissionProfile: .mcpSafeDefaults, model: dynamic), .native)
+        let nativeLive: [LaunchSettings?] = [
+            nil,
+            Self.launchSettings(runtimeVariant: .glm),
+            Self.launchSettings(runtimeVariant: .customCompatible),
+            Self.launchSettings(sessionProfile: .knowledge)
+        ]
+        for live in nativeLive {
+            XCTAssertEqual(Self.eligibility(model: dynamic, live: .some(live)), .native)
+        }
+        // Unknown family, new major, malformed minor/date/qualifier, unparseable effort, custom prefix.
+        for model in [
+            "claude-haiku-5-1", "claude-sonnet-6-1", "claude-opus-6-0:medium", "claude-sonnet-5-x",
+            "claude-sonnet-5-1-2026", "claude-sonnet-5-1-20261015-2", "claude-sonnet-5-1[2m]",
+            "claude-sonnet-5-1:ultra", "acme-claude-sonnet-5-1"
+        ] {
+            XCTAssertEqual(Self.eligibility(model: model), .native, model)
+        }
+    }
+
     func testRepoPromptToolsSettingDefaultsNativeAndUnknownValuesReadNative() throws {
         let suiteName = "MCPCodeModeEligibilityTests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))

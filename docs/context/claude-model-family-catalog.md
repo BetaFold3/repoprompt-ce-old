@@ -42,6 +42,8 @@ Anthropic registry IDs must pass the strict family grammar to enter dynamic Clau
 
 An authoritative refresh withdraws that source's contribution. A model disappears from new picker choices only when neither static entries nor another active discovery source supplies it. Stored raw selections remain unchanged and grammar-valid IDs remain validation-compatible; an unavailable runtime ID must fail loudly at the provider rather than being substituted.
 
+The registry-independent first-party recognition lives in `ClaudeCompatibleModelCatalogAdapter.isSupportedClaudeCodePointRelease(rawModel:)`: no static `AgentModel` resolution, `cliPointRelease` grammar, and a family-supported effort suffix. Launch validation (`isValid`) and Claude `code_mode` eligibility (`ClaudeAgentModeCoordinator.codeModeEligibility`) both read it, so a launch-valid dynamic release such as `claude-sonnet-5-1:medium` gets the same eligibility as its static alias. Eligibility reads the raw selection without rewriting it; every other eligibility gate (tools mode, provider, session/permission profile, live launch settings) is unchanged, and unknown, malformed, or new-major IDs stay native.
+
 ## Claude CLI discovery (subscription-compatible)
 
 The native API list endpoint is authenticated: API-key validation and `GET /v1/models` discovery are separate operations. Claude CLI discovery does not require a separately configured Anthropic API key and never imports that key or extracts subscription credentials.
@@ -146,6 +148,7 @@ Use the smallest coordinated suites for the changed boundary:
 | Native request shape and capability metadata | `AnthropicRequestPlanTests` |
 | Registry-backed Oracle/picker ordering and withdrawal validation | `ModelPickerStringOrderingTests` |
 | Agent Mode overlay and compatible-backend exclusion | `ClaudeCompatiblePluginBridgeTests` |
+| Dynamic point-release `code_mode` eligibility parity | `MCPCodeModeEligibilityTests` |
 | Static catalog consistency across authorities | `ClaudeStaticCatalogConsistencyTests` |
 | Static package catalog behavior | `ClaudeCompatibleRuntimeSupportTests` and `ClaudeCompatiblePluginBridgeTests` |
 | Auto candidacy and launch resolution | `ClaudeAutoPermissionPolicyTests` |

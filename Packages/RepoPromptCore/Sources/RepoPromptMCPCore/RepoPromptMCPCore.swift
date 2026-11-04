@@ -2798,20 +2798,80 @@ func parseCLIMode(version: String) -> CLIMode {
     return .proxy
 }
 
+/// Proxy-mode launch preflight outcome. Both rejection cases print usage and exit 0.
+enum MCPProxyLaunchPreflightOutcome: Equatable {
+    /// Proceed to create `MCPService`.
+    case proceed
+    /// stdin or stdout is a TTY (a human terminal launch).
+    case rejectTTY
+    /// No user args, non-TTY stdin/stdout, and stdin is not a pipe/socket or
+    /// already reports hangup/invalid/error.
+    case rejectNonInteractive
+}
+
+/// Classifies the proxy-mode launch. Keeps the original predicate order and
+/// short-circuiting: both `isatty` reads, then the transport probes only when
+/// neither descriptor is a TTY and there are no user args.
+func classifyProxyLaunchPreflight(
+    stdinFD: Int32,
+    stdoutFD: Int32,
+    hasNoUserArgs: Bool
+) -> MCPProxyLaunchPreflightOutcome {
+    let stdinIsTTY = isatty(stdinFD) != 0
+    let stdoutIsTTY = isatty(stdoutFD) != 0
+    if stdinIsTTY || stdoutIsTTY {
+        return .rejectTTY
+    }
+    if hasNoUserArgs, !stdinLooksLikeMCPTransport(stdinFD) || stdinHasImmediateDisconnect(stdinFD) {
+        return .rejectNonInteractive
+    }
+    return .proceed
+}
+
+#if DEBUG
+    /// DEBUG-only evidence that the proxy preflight rejected a non-interactive
+    /// launch. One synchronous best-effort terminal record; no argv, environment,
+    /// paths, request bytes or errors. A record proves an early rejection; its
+    /// absence proves nothing.
+    enum MCPProxyPreflightRejectionDiagnostics {
+        static let reason = "proxy_preflight_rejected"
+
+        static func makeRecord(localPID: Int) -> MCPTerminalRecord {
+            MCPTerminalRecord(
+                layer: .proxy,
+                initiator: .proxy,
+                reason: reason,
+                sessionToken: nil,
+                localPID: localPID,
+                peerPID: nil,
+                appConnectionID: nil,
+                connectionGeneration: nil,
+                errno: nil,
+                errorDescription: nil
+            )
+        }
+
+        @discardableResult
+        static func writeBestEffort(to directory: URL, localPID: Int) -> URL? {
+            MCPTerminalRecordStore.writeBestEffort(makeRecord(localPID: localPID), to: directory)
+        }
+    }
+#endif
+
 /// Returns true when stdin is suitable for MCP host stdio transport.
 /// MCP hosts should provide a pipe/socket; other descriptor types (e.g. /dev/null)
 /// are treated as non-host invocations.
-private func stdinLooksLikeMCPTransport() -> Bool {
+private func stdinLooksLikeMCPTransport(_ fd: Int32) -> Bool {
     var st = stat()
-    guard fstat(STDIN_FILENO, &st) == 0 else { return false }
+    guard fstat(fd, &st) == 0 else { return false }
     let type = st.st_mode & S_IFMT
     return type == S_IFIFO || type == S_IFSOCK
 }
 
 /// Returns true when stdin already reports hangup/invalid before proxy start.
 /// This indicates no live host is attached.
-private func stdinHasImmediateDisconnect() -> Bool {
-    var pfd = pollfd(fd: STDIN_FILENO, events: Int16(POLLIN), revents: 0)
+private func stdinHasImmediateDisconnect(_ fd: Int32) -> Bool {
+    var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
     let result = poll(&pfd, 1, 0)
     guard result > 0 else { return false }
     let revents = Int32(pfd.revents)
@@ -3536,11 +3596,21 @@ public func runRepoPromptMCP(version: String) async {
         // IMPORTANT: Do not infer "user mode" from a short stdin poll timeout.
         // MCP hosts can legitimately take >200ms before sending initialize, and
         // timing-based detection causes false exits during startup races.
-        let stdinIsTTY = isatty(STDIN_FILENO) != 0
-        let stdoutIsTTY = isatty(STDOUT_FILENO) != 0
-        let hasNoUserArgs = CommandLine.arguments.count <= 1
+        let preflight = classifyProxyLaunchPreflight(
+            stdinFD: STDIN_FILENO,
+            stdoutFD: STDOUT_FILENO,
+            hasNoUserArgs: CommandLine.arguments.count <= 1
+        )
 
-        if stdinIsTTY || stdoutIsTTY || (hasNoUserArgs && (!stdinLooksLikeMCPTransport() || stdinHasImmediateDisconnect())) {
+        if preflight != .proceed {
+            #if DEBUG
+                if preflight == .rejectNonInteractive {
+                    MCPProxyPreflightRejectionDiagnostics.writeBestEffort(
+                        to: MCPFilesystemConstants.eventsDirectoryURL(),
+                        localPID: Int(getpid())
+                    )
+                }
+            #endif
             let usage = """
             RepoPrompt MCP CLI
 

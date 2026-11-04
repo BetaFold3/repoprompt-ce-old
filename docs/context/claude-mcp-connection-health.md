@@ -309,3 +309,26 @@ end. A prior controller setup error also demonstrated automatic deadline stop
 at 180 seconds; it launched no provider. No historical startup failure reproduced,
 so this validates wiring and bounded cleanup, not failure attribution or a
 reliability fix.
+
+## DEBUG helper preflight-rejection record
+
+Proxy mode runs a launch preflight (`classifyProxyLaunchPreflight` in
+`RepoPromptMCPCore.swift`) before it creates `MCPService` or any terminal recorder.
+It prints usage to stderr and exits 0 when stdin or stdout is a TTY
+(`rejectTTY`), or when there are no user args and stdin is not a pipe/socket or
+reports `POLLHUP`/`POLLNVAL`/`POLLERR` on a zero-timeout poll
+(`rejectNonInteractive`). The predicate order and short-circuiting are unchanged:
+both `isatty` reads, then the transport probes only for non-TTY, no-arg launches.
+
+In DEBUG builds only, `rejectNonInteractive` writes one synchronous best-effort
+`MCPTerminalRecord` (`MCPProxyPreflightRejectionDiagnostics`) just before the
+usage/exit: `layer=proxy`, `initiator=proxy`, fixed `reason=proxy_preflight_rejected`,
+timestamp, uptime and `localPID`. Session fingerprint, `peerPID`, connection,
+generation, errno, error text and ledger counts are nil; no argv, environment,
+paths or request bytes. It uses the existing store, events directory, 0700/0600
+permissions and 256-record retention. Write errors are ignored, with no retry.
+TTY launches write nothing, and release builds compile the recording out. A
+record proves an early preflight rejection. Its absence does not prove a crash
+or any other cause. The record does not change timeouts, admission or transport.
+Tests: `MCPProxyTerminalRecordTests` (`testPreflight*`, real pipe, socketpair, pty,
+`/dev/null` and regular-file descriptors).

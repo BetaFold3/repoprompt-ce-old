@@ -3519,7 +3519,8 @@ package final class ClaudeAgentModeCoordinator {
     /// Per-run `code_mode` eligibility for this Claude launch, captured once beside
     /// `runHasNativeShell(for:)` and immutable for the run. Only an official Claude Code
     /// (`.claudeCode`, standard runtime variant) Standard-profile launch whose model resolves
-    /// through the existing Claude model authority, with the RepoPrompt tools setting at
+    /// through the existing Claude model authority (a static alias/default/enum case, or a
+    /// launch-valid dynamic family point release), with the RepoPrompt tools setting at
     /// `direct + code_mode`, is `.directTools`; everything else — compatible backends, Knowledge,
     /// MCP-safe external defaults, unresolved/custom models, unknown live launch settings — is
     /// `.native`.
@@ -3565,6 +3566,7 @@ package final class ClaudeAgentModeCoordinator {
               sessionProfile == .standard,
               permissionProfile != .mcpSafeDefaults,
               AgentModel.resolvedModel(forRaw: selectedModelRaw, agentKind: .claudeCode) != nil
+              || ClaudeCompatibleModelCatalogAdapter.isSupportedClaudeCodePointRelease(rawModel: selectedModelRaw)
         else {
             return .native
         }

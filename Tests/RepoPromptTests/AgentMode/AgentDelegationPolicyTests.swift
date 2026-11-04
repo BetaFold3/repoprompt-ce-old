@@ -1291,7 +1291,7 @@ final class AgentDelegationPolicyTests: XCTestCase {
     }
 
     private func toolReference(_ tool: String, _ agentKind: AgentProviderKind) -> String {
-        agentKind == .codexExec
+        agentKind == .codexExec || agentKind == .claudeCode
             ? "`mcp__\(MCPIntegrationHelper.repoPromptMCPServerName)__\(tool)`"
             : "`\(tool)`"
     }

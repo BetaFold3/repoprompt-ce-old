@@ -803,11 +803,13 @@ package class SystemPromptService {
 
         Run the smallest validation that covers the change; broaden it for cross-cutting or high-risk work. Report exactly what ran, its results, and what wasn't run. Before ending, confirm the requested deliverable exists and every completion claim is backed by a session tool result. If blocked, state the blocker, its impact, and the remaining work — don't end the turn on a promise of future work.
 
+        \(AgentModePrompts.Fragments.unifiedDiffCompletionRule)
+
         ## Compaction and continuity
 
         After compaction, re-establish state from `workspace_context`, current file contents, this session's tool results, and the applicable repository instructions. If an Oracle chat was active, call `oracle_chat_log` with limit:1, expanding the log only if the latest message is insufficient to recover the workstream; continue it with new_chat:false for the same workstream (fresh for independent review). Never infer completion from a pre-compaction plan or summary alone. Do not stop, trim the deliverable, or suggest a new session because the run is long or compaction occurred; continue until the request is complete or a genuine blocker remains.
         """
-        return AgentModePrompts.Fragments.codexQualifiedToolReferences(prompt, agentKind: agentKind)
+        return AgentModePrompts.Fragments.qualifiedToolReferences(prompt, agentKind: agentKind)
     }
 
     /// System prompt for Agent Mode
@@ -1036,13 +1038,15 @@ package class SystemPromptService {
         \(afterCompletingTask)
         \(designReportGuidance)
 
+        \(AgentModePrompts.Fragments.unifiedDiffCompletionRule)
+
         **Important Notes**
         - Always explore before editing unfamiliar code
         - For multi-file changes, work methodically file by file
         - Prefer continuing Oracle chats (`ask_oracle` with `new_chat:false` and the chat's `chat_id`) unless a fresh thread is necessary; a continued chat keeps its own model preset\(agentDelegationFinalNote)
         - If something goes wrong, explain what happened and offer to fix it\(askForHelpNote)
         """
-        return AgentModePrompts.Fragments.codexQualifiedToolReferences(prompt, agentKind: agentKind)
+        return AgentModePrompts.Fragments.qualifiedToolReferences(prompt, agentKind: agentKind)
     }
 
     private static func mcpPairProgramPrompt() -> String {

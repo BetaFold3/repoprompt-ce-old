@@ -202,21 +202,30 @@ package enum ClaudeCompatibleModelCatalogAdapter {
             return false
         }
         guard let known = AgentModel.resolvedModel(forRaw: baseModel, agentKind: agentKind) else {
-            // Grammar-valid same-family point releases stay runnable on the first-party
-            // Claude Code path even when no static AgentModel case exists. Validation is
-            // deliberately registry-independent so stored selections survive withdrawal.
-            guard agentKind == .claudeCode,
-                  let pointRelease = ClaudeModelFamilyCatalog.cliPointRelease(baseModel)
-            else {
-                return false
-            }
-            if let effort = specifier.effortLevel {
-                return pointRelease.family.supportedEfforts.contains(effort)
-            }
-            return true
+            return agentKind == .claudeCode && isSupportedClaudeCodePointRelease(rawModel: normalized)
         }
         guard known.isValidFor(agentKind) else { return false }
         return known.isAvailable
+    }
+
+    /// Grammar-valid same-family point releases stay runnable on the first-party Claude Code
+    /// path even when no static `AgentModel` case exists. Recognition is deliberately
+    /// registry-independent so stored selections survive withdrawal: `true` only when the base
+    /// has no static resolution, parses through `ClaudeModelFamilyCatalog.cliPointRelease`
+    /// (strict family/major/minor/date grammar plus the CLI `[1m]` qualifier), and any effort
+    /// suffix is supported by that family. Shared by `isValid` and Claude `code_mode`
+    /// eligibility so both read one authority.
+    static func isSupportedClaudeCodePointRelease(rawModel: String) -> Bool {
+        let specifier = ClaudeModelSpecifier(raw: rawModel)
+        guard let baseModel = specifier.baseModel,
+              AgentModel.resolvedModel(forRaw: baseModel, agentKind: .claudeCode) == nil,
+              let pointRelease = ClaudeModelFamilyCatalog.cliPointRelease(baseModel)
+        else {
+            return false
+        }
+        guard let effort = specifier.effortLevel else { return true }
+        return claudeEffort(effort, isSupportedForBaseModelRaw: baseModel, agentKind: .claudeCode)
+            && pointRelease.family.supportedEfforts.contains(effort)
     }
 
     static func claudeEffort(
