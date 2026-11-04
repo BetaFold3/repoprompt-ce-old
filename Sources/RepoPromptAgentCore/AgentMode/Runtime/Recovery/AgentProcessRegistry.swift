@@ -63,6 +63,16 @@ package actor AgentProcessRegistry {
     /// Claude runtimes where a pass observed a non-root writer with a readable environment and no
     /// `CLAUDE_CONFIG_DIR`: another refresh can't record a home for them.
     private var homeSettledRuntimeIDs: Set<UUID> = []
+    /// One discovery pass's display facts: the root's liveness (`nil` when unknown) and whether the
+    /// pass was complete (every recorded member observed alive).
+    private struct PassObservation {
+        var rootAlive: Bool?
+        var complete: Bool
+    }
+
+    /// This launch's latest discovery pass of each runtime, kept only while the record reflects that
+    /// pass (display only: ownership never reads it).
+    private var observedPasses: [UUID: PassObservation] = [:]
     static let maxHomeRefreshesPerRuntime = 3
 
     private var changeHandler: (@Sendable (AgentRuntimeRestrictionSnapshot) -> Void)?
@@ -124,7 +134,9 @@ package actor AgentProcessRegistry {
                 for: record,
                 kind: kind,
                 state: unresolved ? .unknown : record.state,
-                isPreviousInstance: record.appInstanceID != store.appInstanceID
+                isPreviousInstance: record.appInstanceID != store.appInstanceID,
+                rootAlive: projectedRootAlive(of: record),
+                discoveryComplete: projectedDiscoveryComplete(of: record)
             ))
         }
         for (runtimeID, bindings) in preserved.sorted(by: { $0.key.uuidString < $1.key.uuidString }) {
@@ -211,11 +223,26 @@ package actor AgentProcessRegistry {
         return .proven
     }
 
+    /// Display only: `false` when the record itself proves the root is gone (its launcher reaped it,
+    /// or only tools remain), else the latest pass's observation, else `nil`.
+    private func projectedRootAlive(of record: AgentRuntimeRecord) -> Bool? {
+        if record.rootReaped || record.state == .toolsRemaining { return false }
+        return observedPasses[record.runtimeID]?.rootAlive
+    }
+
+    /// Display only: the latest pass was complete and its classification is persisted (an
+    /// unpersisted record is shown as `.unknown`, never verified).
+    private func projectedDiscoveryComplete(of record: AgentRuntimeRecord) -> Bool {
+        !unpersisted.contains(record.runtimeID) && observedPasses[record.runtimeID]?.complete == true
+    }
+
     private static func restriction(
         for record: AgentRuntimeRecord,
         kind: AgentRuntimeRestriction.Kind,
         state: AgentRuntimeRecord.State,
-        isPreviousInstance: Bool
+        isPreviousInstance: Bool,
+        rootAlive: Bool?,
+        discoveryComplete: Bool
     ) -> AgentRuntimeRestriction {
         AgentRuntimeRestriction(
             runtimeID: record.runtimeID,
@@ -232,6 +259,9 @@ package actor AgentProcessRegistry {
             associations: record.associations,
             rootPID: record.root?.pid,
             writerPID: record.members.first { $0.role == .writer && $0.identity != record.root }?.identity.pid,
+            rootAlive: rootAlive,
+            discoveryComplete: discoveryComplete,
+            memberPIDs: record.members.map(\.identity.pid),
             memberCount: record.members.count,
             letFinish: record.letFinish,
             revision: record.revision,
@@ -381,6 +411,8 @@ package actor AgentProcessRegistry {
             case .reserved, .live, .unknown, .detachedAtQuit, .toolsRemaining: true
             }
         }
+        let candidateIDs = Set(candidates.map(\.runtimeID))
+        observedPasses = observedPasses.filter { candidateIDs.contains($0.key) }
         guard !candidates.isEmpty else {
             cancelAllWatches(except: [])
             return
@@ -393,6 +425,7 @@ package actor AgentProcessRegistry {
             let family = await discoverFamily(of: record, inventory: inventory)
             guard let current = records[record.runtimeID], current.revision == record.revision else {
                 // Changed while discovering (association, reap, Let finish): the next pass covers it.
+                observedPasses[record.runtimeID] = nil
                 refreshRequestedDuringPass = true
                 continue
             }
@@ -403,6 +436,10 @@ package actor AgentProcessRegistry {
             next.state = classify(current, family: family)
             watchedIdentities[current.runtimeID] = family.aliveIdentities
             persistIfChanged(next, previous: current)
+            // Kept only when the record now shows this pass's members (a failed write keeps the old ones).
+            observedPasses[current.runtimeID] = records[current.runtimeID]?.members == family.members
+                ? PassObservation(rootAlive: family.rootAlive, complete: family.isComplete)
+                : nil
         }
         cancelAllWatches(except: Set(watchedIdentities.keys))
         for (runtimeID, identities) in watchedIdentities {
@@ -810,7 +847,14 @@ package actor AgentProcessRegistry {
         if snapshot.hasGlobalUncertainty { return .ownershipUnknown }
         for record in records.values where record.runtimeID != runtimeID {
             guard record.state.mayHoldWriter || unpersisted.contains(record.runtimeID) else { continue }
-            let restriction = Self.restriction(for: record, kind: .possibleWriter, state: record.state, isPreviousInstance: false)
+            let restriction = Self.restriction(
+                for: record,
+                kind: .possibleWriter,
+                state: record.state,
+                isPreviousInstance: false,
+                rootAlive: projectedRootAlive(of: record),
+                discoveryComplete: projectedDiscoveryComplete(of: record)
+            )
             if restriction.overlapsConversation(keys) || restriction.overlapsSession(keys) {
                 return .ownershipConflict(runtimeID: record.runtimeID)
             }

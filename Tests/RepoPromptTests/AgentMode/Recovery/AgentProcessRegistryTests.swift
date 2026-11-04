@@ -1068,6 +1068,9 @@ final class AgentProcessRegistryTests: XCTestCase {
 
         let record = try XCTUnwrap(Fixtures.record(store, seeded.runtimeID))
         XCTAssertEqual(record.members.map(\.role), [.unknown], "only explicit qualified tool evidence classifies a tool")
+        let before = await registry.restrictionSnapshot().restrictions.first { $0.runtimeID == seeded.runtimeID }
+        XCTAssertEqual(before?.rootAlive, true)
+        XCTAssertEqual(before?.memberPIDs, [1301])
 
         // The root exits: an unknown member keeps the conversation restricted (never tool-only).
         processes.remove(pid: 1300)
@@ -1075,6 +1078,185 @@ final class AgentProcessRegistryTests: XCTestCase {
         let snapshot = await registry.restrictionSnapshot()
         XCTAssertNotEqual(Fixtures.record(store, seeded.runtimeID)?.state, .toolsRemaining)
         XCTAssertTrue(snapshot.blocksSend(AgentRuntimeOwnershipKeys(conversationID: "conv-R2", worktreePath: nil)))
+        // The display projection says the root exited and names the remaining process.
+        let after = snapshot.restrictions.first { $0.runtimeID == seeded.runtimeID }
+        XCTAssertEqual(after?.rootAlive, false)
+        XCTAssertEqual(after?.memberPIDs, [1301])
+    }
+
+    /// The root is gone and the remaining member can't be inspected: the display says the root
+    /// exited, while ownership stays unresolved (`.unknown`) and keeps restricting.
+    func testRootExitWithAnUninspectableMemberIsUnknownWithTheRootGone() async throws {
+        processes.add(processes.observation(pid: 1310, group: 1310))
+        processes.add(processes.observation(pid: 1311, start: 200, parent: 1310, executable: "/opt/fixture/bin/unfamiliar-shim", group: 1310))
+        let seeded = try Fixtures.seed(rootURL: recoveryRoot, root: processes.identity(pid: 1310), rootGroup: 1310, conversationIDs: ["conv-R3"])
+        let store = makeStore()
+        let registry = makeRegistry(store: store)
+        await registry.start()
+        XCTAssertEqual(Fixtures.record(store, seeded.runtimeID)?.members.map(\.identity.pid), [1311])
+
+        processes.remove(pid: 1310)
+        processes.deny(pid: 1311)
+        await registry.refresh()
+        XCTAssertEqual(Fixtures.record(store, seeded.runtimeID)?.state, .unknown, "an uninspectable member is never proof of exit")
+        let snapshot = await registry.restrictionSnapshot()
+        XCTAssertTrue(snapshot.blocksSend(AgentRuntimeOwnershipKeys(conversationID: "conv-R3", worktreePath: nil)))
+        let restriction = try XCTUnwrap(snapshot.restrictions.first { $0.runtimeID == seeded.runtimeID })
+        XCTAssertEqual(restriction.rootAlive, false)
+        XCTAssertEqual(restriction.state, .unknown)
+        XCTAssertEqual(restriction.memberPIDs, [1311])
+        XCTAssertTrue(processes.sentSignals.isEmpty)
+    }
+
+    /// A root seen alive whose lifetime later can't be read is shown as unknown (`nil`), never as
+    /// the earlier pass's `true`.
+    func testRootLifetimeUnknownAfterBeingSeenAliveIsNotStale() async throws {
+        processes.add(processes.observation(pid: 1320, group: 1320))
+        processes.add(processes.observation(pid: 1321, start: 200, parent: 1320, executable: "/opt/fixture/bin/unfamiliar-shim", group: 1320))
+        let seeded = try Fixtures.seed(rootURL: recoveryRoot, root: processes.identity(pid: 1320), rootGroup: 1320, conversationIDs: ["conv-R4"])
+        let store = makeStore()
+        let registry = makeRegistry(store: store)
+        await registry.start()
+        let before = await registry.restrictionSnapshot().restrictions.first { $0.runtimeID == seeded.runtimeID }
+        XCTAssertEqual(before?.rootAlive, true)
+
+        processes.deny(pid: 1320)
+        await registry.refresh()
+        let snapshot = await registry.restrictionSnapshot()
+        let after = try XCTUnwrap(snapshot.restrictions.first { $0.runtimeID == seeded.runtimeID })
+        XCTAssertNil(after.rootAlive, "an unreadable root lifetime is unknown, not the last observation")
+        XCTAssertEqual(after.state, .unknown)
+        XCTAssertTrue(snapshot.blocksSend(AgentRuntimeOwnershipKeys(conversationID: "conv-R4", worktreePath: nil)))
+    }
+
+    /// The root exits while its member stays alive: the record (members, state, revision) is
+    /// unchanged, but the display projection changes, so a new snapshot is published.
+    func testRootOnlyExitPublishesANewSnapshot() async throws {
+        processes.add(processes.observation(pid: 1330, group: 1330))
+        processes.add(processes.observation(pid: 1331, start: 200, parent: 1330, executable: "/opt/fixture/bin/unfamiliar-shim", group: 1330))
+        let seeded = try Fixtures.seed(rootURL: recoveryRoot, root: processes.identity(pid: 1330), rootGroup: 1330, conversationIDs: ["conv-R5"])
+        let store = makeStore()
+        let registry = makeRegistry(store: store)
+        await registry.start()
+        let recordBefore = try XCTUnwrap(Fixtures.record(store, seeded.runtimeID))
+        XCTAssertEqual(recordBefore.state, .live)
+
+        let published = PublishedSnapshots()
+        await registry.setChangeHandler { published.append($0) }
+        XCTAssertEqual(published.rootAlive(seeded.runtimeID), [true], "the handler receives the current snapshot")
+
+        processes.remove(pid: 1330)
+        await registry.refresh()
+        let recordAfter = try XCTUnwrap(Fixtures.record(store, seeded.runtimeID))
+        XCTAssertEqual(recordAfter.state, .live)
+        XCTAssertEqual(recordAfter.members, recordBefore.members)
+        XCTAssertEqual(recordAfter.revision, recordBefore.revision, "the record itself didn't change")
+        XCTAssertEqual(published.rootAlive(seeded.runtimeID), [true, false], "the root's exit republishes the snapshot")
+        XCTAssertTrue(processes.sentSignals.isEmpty)
+    }
+
+    /// The launcher reaped the exact root, and the root's PID can no longer be inspected: no pass
+    /// observes it, but the reap itself shows the root exited.
+    func testReapedRootIsShownExitedWithoutAnObservation() async throws {
+        let store = makeStore()
+        let registry = makeRegistry(store: store)
+        await registry.start()
+        let launch = try newLaunch(registry, conversationID: "conv-R6")
+        let runtimeID = try await launch.prepareSpawn()
+        processes.add(processes.observation(pid: 1340, group: 1340, marker: runtimeID))
+        try await launch.commitSpawn(pid: 1340, processGroupID: 1340)
+
+        processes.deny(pid: 1340)
+        await launch.rootReaped(pid: 1340, confirmed: true)
+        XCTAssertEqual(Fixtures.record(store, runtimeID)?.rootReaped, true)
+        let snapshot = await registry.restrictionSnapshot()
+        let restriction = try XCTUnwrap(snapshot.restrictions.first { $0.runtimeID == runtimeID })
+        XCTAssertEqual(restriction.rootAlive, false, "the confirmed reap proves the root gone")
+        XCTAssertEqual(restriction.state, .unknown, "an uninspectable root still leaves ownership unresolved")
+        XCTAssertFalse(restriction.discoveryComplete)
+        XCTAssertTrue(snapshot.blocksSend(AgentRuntimeOwnershipKeys(conversationID: "conv-R6", worktreePath: nil)))
+        XCTAssertTrue(processes.sentSignals.isEmpty)
+    }
+
+    /// A saved `toolsRemaining` record shows its root exited even when this launch's pass can't
+    /// observe the root and can't save its reclassification; that unsaved row is never verified.
+    func testToolsRemainingRecordShowsTheRootExitedWhenItsPassIsUnsaved() async throws {
+        let tool = processes.identity(pid: 1351, start: 200)
+        processes.add(processes.observation(pid: 1351, start: 200, parent: 1, executable: "/usr/bin/node", group: 1350))
+        let seeded = try Fixtures.seed(
+            rootURL: recoveryRoot,
+            state: .toolsRemaining,
+            root: processes.identity(pid: 1350),
+            rootGroup: 1350,
+            members: [AgentRuntimeMember(identity: tool, processGroupID: 1350, role: .tool)],
+            conversationIDs: ["conv-R7"]
+        )
+        processes.deny(pid: 1350)
+        failures.shouldFailWrites = true
+        let store = makeStore()
+        let registry = makeRegistry(store: store)
+        let snapshot = await registry.start()
+        failures.shouldFailWrites = false
+
+        XCTAssertEqual(Fixtures.record(store, seeded.runtimeID)?.state, .toolsRemaining, "the saved record is unchanged")
+        let restriction = try XCTUnwrap(snapshot.restrictions.first { $0.runtimeID == seeded.runtimeID })
+        XCTAssertEqual(restriction.state, .unknown, "an unsaved classification is unresolved")
+        XCTAssertEqual(restriction.rootAlive, false, "only tools remained, so the root is gone")
+        XCTAssertFalse(restriction.discoveryComplete)
+        XCTAssertTrue(snapshot.blocksSend(AgentRuntimeOwnershipKeys(conversationID: "conv-R7", worktreePath: nil)))
+    }
+
+    /// A pass whose membership change couldn't be saved leaves the runtime unresolved. A later
+    /// root-only exit that matches the saved record keeps the row unverified while the record stays
+    /// unsaved, even though that pass was complete.
+    func testUnsavedPassIsNeverVerifiedAfterTheRootExits() async throws {
+        processes.add(processes.observation(pid: 1360, group: 1360))
+        processes.add(processes.observation(pid: 1361, start: 200, parent: 1360, executable: "/opt/fixture/bin/unfamiliar-shim", group: 1360))
+        let seeded = try Fixtures.seed(rootURL: recoveryRoot, root: processes.identity(pid: 1360), rootGroup: 1360, conversationIDs: ["conv-R8"])
+        let store = makeStore()
+        let registry = makeRegistry(store: store)
+        var snapshot = await registry.start()
+        var restriction = try XCTUnwrap(snapshot.restrictions.first { $0.runtimeID == seeded.runtimeID })
+        XCTAssertEqual(restriction.state, .live)
+        XCTAssertTrue(restriction.discoveryComplete)
+        XCTAssertEqual(restriction.rootAlive, true)
+
+        // A new child appears, but the changed membership can't be saved.
+        failures.shouldFailWrites = true
+        processes.add(processes.observation(pid: 1362, start: 300, parent: 1361, executable: "/opt/fixture/bin/unfamiliar-shim", group: 1360))
+        await registry.refresh()
+        snapshot = await registry.restrictionSnapshot()
+        restriction = try XCTUnwrap(snapshot.restrictions.first { $0.runtimeID == seeded.runtimeID })
+        XCTAssertEqual(restriction.state, .unknown)
+        XCTAssertFalse(restriction.discoveryComplete)
+
+        // The child and the root exit: the pass matches the saved record, which is still unsaved.
+        processes.remove(pid: 1362)
+        processes.remove(pid: 1360)
+        await registry.refresh()
+        failures.shouldFailWrites = false
+        snapshot = await registry.restrictionSnapshot()
+        restriction = try XCTUnwrap(snapshot.restrictions.first { $0.runtimeID == seeded.runtimeID })
+        XCTAssertEqual(restriction.rootAlive, false)
+        XCTAssertEqual(restriction.state, .unknown, "the projection stays unresolved")
+        XCTAssertFalse(restriction.discoveryComplete, "an unsaved runtime is never verified")
+        XCTAssertEqual(restriction.memberPIDs, [1361])
+        XCTAssertTrue(snapshot.blocksSend(AgentRuntimeOwnershipKeys(conversationID: "conv-R8", worktreePath: nil)))
+        XCTAssertTrue(processes.sentSignals.isEmpty)
+    }
+
+    private final class PublishedSnapshots: @unchecked Sendable {
+        private let lock = NSLock()
+        private var snapshots: [AgentRuntimeRestrictionSnapshot] = []
+
+        func append(_ snapshot: AgentRuntimeRestrictionSnapshot) {
+            lock.withLock { snapshots.append(snapshot) }
+        }
+
+        /// Each published snapshot's `rootAlive` for `runtimeID` (`nil` when absent or unknown).
+        func rootAlive(_ runtimeID: UUID) -> [Bool?] {
+            lock.withLock { snapshots.map { $0.restrictions.first { $0.runtimeID == runtimeID }?.rootAlive } }
+        }
     }
 
     func testActiveSameSessionRuntimesExcludeEachOtherBeforeAnyConversationIsKnown() async throws {

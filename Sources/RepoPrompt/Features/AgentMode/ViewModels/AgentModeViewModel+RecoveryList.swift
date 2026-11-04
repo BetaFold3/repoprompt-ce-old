@@ -1145,14 +1145,31 @@ extension AgentModeViewModel {
     }
 
     /// Title and detail of a surviving-runtime row: provider, state, conversation, worktree and
-    /// discovered processes. Stop is not offered (recovered Stop is disabled in production).
+    /// discovered processes. Once the root is seen exited, only the remaining processes are named.
+    /// Stop is not offered (recovered Stop is disabled in production).
     static func recoveryListRuntimeText(_ restriction: AgentRuntimeRestriction) -> (String, String) {
         let provider = restriction.family.map(recoveryListRuntimeFamilyName) ?? "An agent"
+        let rootExited = !restriction.isUnreadable && restriction.rootAlive == false
+        // Only complete discovery saw every recorded member alive: `.live` and `.toolsRemaining` imply
+        // it; `discoveryComplete` also covers a runtime detached at quit. An unresolved (`.unknown`)
+        // projection is never verified.
+        let verified = restriction.state == .live || restriction.state == .toolsRemaining
+            || (restriction.discoveryComplete && restriction.state != .unknown)
+        let remainingPIDs = recoveryListUniquePIDs(restriction.memberPIDs)
         let title: String = switch restriction.kind {
         case .toolsOnly:
             "Tools started by an agent are still running"
         case .possibleWriter where restriction.isUnreadable:
             "Agent process status unknown"
+        case .possibleWriter where rootExited && restriction.writerPID == nil && !remainingPIDs.isEmpty:
+            switch (remainingPIDs.count == 1, verified) {
+            case (true, true): "A process started by an agent is still running"
+            case (true, false): "A process started by an agent may still be running"
+            case (false, true): "Processes started by an agent are still running"
+            case (false, false): "Processes started by an agent may still be running"
+            }
+        case .possibleWriter where rootExited:
+            verified ? "An agent process is still running" : "An agent process may still be running"
         case .possibleWriter:
             restriction.state == .unknown ? "An agent process may still be running" : "An agent process is still running"
         }
@@ -1160,6 +1177,14 @@ extension AgentModeViewModel {
         let origin = restriction.isPreviousInstance ? "from an earlier launch of RepoPrompt" : "started by this launch"
         if restriction.isUnreadable {
             parts.append("Its saved record couldn't be read, so its processes can't be checked.")
+        } else if rootExited {
+            parts.append(contentsOf: recoveryListExitedRootText(
+                restriction,
+                provider: provider,
+                origin: origin,
+                remainingPIDs: remainingPIDs,
+                verified: verified
+            ))
         } else {
             let processes = restriction.memberCount == 1 ? "1 process" : "\(restriction.memberCount) processes"
             // 9-live S5: the root is often a launcher shim; name the agent's own PID when known
@@ -1178,19 +1203,87 @@ extension AgentModeViewModel {
         if let conversation = restriction.conversationIDs.first {
             parts.append("Conversation: \(conversation).")
         }
+        let untilExit = switch (rootExited, remainingPIDs.count) {
+        case (true, 0): "until RepoPrompt confirms they exited"
+        case (true, 2...): "until they exit"
+        default: "until it exits"
+        }
         switch restriction.kind {
         case .toolsOnly:
             parts.append("It no longer writes the conversation, but scheduled work in this worktree stays paused until its tools exit.")
         case .possibleWriter where restriction.conversationIDs.isEmpty:
-            parts.append("Sending in this worktree stays paused until it exits.")
+            parts.append("Sending in this worktree stays paused \(untilExit).")
         case .possibleWriter:
-            parts.append("Sending to that conversation stays paused until it exits.")
+            parts.append("Sending to that conversation stays paused \(untilExit).")
         }
         if restriction.letFinish {
             parts.append("You chose to let it finish; RepoPrompt keeps watching it.")
         }
         parts.append("Nothing is stopped automatically.")
         return (title, parts.joined(separator: " "))
+    }
+
+    /// The detail sentences once the root (often a launcher) is known to have exited. Processes are
+    /// called running only when discovery verified them (`verified`); quit advice appears only then,
+    /// and never while an agent (writer) is recorded.
+    private static func recoveryListExitedRootText(
+        _ restriction: AgentRuntimeRestriction,
+        provider: String,
+        origin: String,
+        remainingPIDs: [Int32],
+        verified: Bool
+    ) -> [String] {
+        /// The verb phrase for one process or several.
+        func running(single: Bool) -> String {
+            guard verified else { return "may still be running" }
+            return single ? "is still running" : "are still running"
+        }
+        if let writer = restriction.writerPID {
+            let launcher = restriction.rootPID.map { "its launcher (PID \($0)) has exited" } ?? "its launcher has exited"
+            var parts = ["\(provider) \(origin) \(running(single: true)) as PID \(writer); \(launcher)."]
+            let others = remainingPIDs.filter { $0 != writer }
+            if !others.isEmpty {
+                let list = recoveryListPIDList(others)
+                let also = switch (verified, others.count == 1) {
+                case (true, _): "Also running: \(list)."
+                case (false, true): "Another process it started may also be running: \(list)."
+                case (false, false): "Other processes it started may also be running: \(list)."
+                }
+                parts.append(also)
+            }
+            return parts
+        }
+        let root = restriction.rootPID.map { " (PID \($0))" } ?? ""
+        guard !remainingPIDs.isEmpty else {
+            return ["\(provider) \(origin)\(root) has exited, but RepoPrompt couldn't confirm that every process it started did."]
+        }
+        let single = remainingPIDs.count == 1
+        let count = single
+            ? "1 process it started \(running(single: true))"
+            : "\(remainingPIDs.count) processes it started \(running(single: false))"
+        var parts = ["\(provider) \(origin)\(root) has exited, but \(count): \(recoveryListPIDList(remainingPIDs))."]
+        if verified {
+            let advice = single
+                ? "If it is stuck, check that PID's command and start time first; then you can quit it yourself. RepoPrompt notices when it exits."
+                : "If they are stuck, check each PID's command and start time first; then you can quit them yourself. RepoPrompt notices when they exit."
+            parts.append(advice)
+        }
+        return parts
+    }
+
+    /// `pids` once each, in order.
+    private static func recoveryListUniquePIDs(_ pids: [Int32]) -> [Int32] {
+        var seen: Set<Int32> = []
+        return pids.filter { seen.insert($0).inserted }
+    }
+
+    private static let recoveryListMaxNamedPIDs = 5
+
+    /// "PID 1, PID 2", naming at most `recoveryListMaxNamedPIDs` followed by "and N more".
+    private static func recoveryListPIDList(_ pids: [Int32]) -> String {
+        let named = pids.prefix(recoveryListMaxNamedPIDs).map { "PID \($0)" }.joined(separator: ", ")
+        let rest = pids.count - recoveryListMaxNamedPIDs
+        return rest > 0 ? "\(named) and \(rest) more" : named
     }
 
     private static func recoveryListRuntimeFamilyName(_ family: AgentRuntimeFamily) -> String {
