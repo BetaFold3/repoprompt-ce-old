@@ -2746,9 +2746,6 @@ struct AgentImageInputAdapter {
     private static let fileURLTokenRegex = try! NSRegularExpression(pattern: #"file://[^\s<>()\[\]{}\"'`]+"#)
     private static let absolutePathTokenRegex = try! NSRegularExpression(pattern: #"(?:^|[\s:=,])((?:~|/)[^\s<>()\[\]{}\"'`]+)"#)
     private static let pathHintTokens = ["file://", "/", "~", ".png", ".jpg", ".jpeg", ".jfif", ".webp", ".avif", ".gif", ".bmp", ".tif", ".tiff", ".heic", ".heif", ".svg"]
-    private static let fallbackImageFileExtensions: Set<String> = [
-        "png", "jpg", "jpeg", "jfif", "jpe", "gif", "bmp", "webp", "avif", "heic", "heif", "tif", "tiff", "svg", "ico"
-    ]
 
     init(fileManager: FileManager = .default, temporaryRoot: URL? = nil) {
         self.fileManager = fileManager
@@ -2759,6 +2756,14 @@ struct AgentImageInputAdapter {
     }
 
     func preparedImages(from pasteboard: NSPasteboard) -> [PreparedImage] {
+        switch ImagePasteboardTypes.filePayload(in: pasteboard, fileManager: fileManager) {
+        case let .imageFiles(urls):
+            return urls.map { PreparedImage(url: $0, isTemporary: false) }
+        case .deferToNative:
+            return []
+        case .none:
+            break
+        }
         let fileURLPrepared = preparedFileURLImages(from: pasteboard, includePlainTextReferences: true)
         if !fileURLPrepared.isEmpty {
             return fileURLPrepared
@@ -2773,6 +2778,14 @@ struct AgentImageInputAdapter {
     }
 
     func shouldConsumePasteAsImageAttachment(from pasteboard: NSPasteboard) -> Bool {
+        switch ImagePasteboardTypes.filePayload(in: pasteboard, fileManager: fileManager) {
+        case .imageFiles:
+            return true
+        case .deferToNative:
+            return false
+        case .none:
+            break
+        }
         if hasExplicitImagePasteboardType(in: pasteboard) {
             return true
         }
@@ -3031,18 +3044,6 @@ struct AgentImageInputAdapter {
         var urls = pasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL] ?? []
 
         for item in pasteboard.pasteboardItems ?? [] {
-            if let fileURLString = item.string(forType: .fileURL),
-               let fileURL = URL(string: fileURLString),
-               fileURL.isFileURL
-            {
-                urls.append(fileURL)
-            } else if let fileURLData = item.data(forType: .fileURL),
-                      let fileURL = URL(dataRepresentation: fileURLData, relativeTo: nil),
-                      fileURL.isFileURL
-            {
-                urls.append(fileURL)
-            }
-
             if includePlainTextReferences, let plainString = item.string(forType: .string) {
                 urls.append(contentsOf: fileURLs(fromPlainText: plainString))
             }
@@ -3396,21 +3397,7 @@ struct AgentImageInputAdapter {
     }
 
     private func isImageFileURL(_ url: URL) -> Bool {
-        if let type = try? url.resourceValues(forKeys: [.contentTypeKey]).contentType {
-            if type.conforms(to: .image) {
-                return true
-            }
-        }
-
-        let rawExtension = url.pathExtension.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !rawExtension.isEmpty else { return false }
-        let normalizedExtension = rawExtension.lowercased()
-        if let type = UTType(filenameExtension: normalizedExtension) {
-            if type.conforms(to: .image) {
-                return true
-            }
-        }
-        return Self.fallbackImageFileExtensions.contains(normalizedExtension)
+        ImagePasteboardTypes.isImageFileURL(url)
     }
 
     private func droppedFileURL(from item: NSSecureCoding?) -> URL? {

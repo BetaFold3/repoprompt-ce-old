@@ -10,6 +10,71 @@ import UniformTypeIdentifiers
 #endif
 
 enum ImagePasteboardTypes {
+    enum FilePayload: Equatable {
+        case none
+        case imageFiles([URL])
+        case deferToNative
+    }
+
+    private static let fallbackImageFileExtensions: Set<String> = [
+        "png", "jpg", "jpeg", "jfif", "jpe", "gif", "bmp", "webp", "avif", "heic", "heif", "tif", "tiff", "svg", "ico"
+    ]
+
+    /// Explicit file payloads outrank their icons/previews. Never partially consume a file selection.
+    static func filePayload(in pasteboard: NSPasteboard, fileManager: FileManager = .default) -> FilePayload {
+        let fileItems = (pasteboard.pasteboardItems ?? []).filter { $0.types.contains(.fileURL) }
+        var references = fileItems.map { item in
+            fileURL(string: item.string(forType: .fileURL), data: item.data(forType: .fileURL))
+        }
+        if references.isEmpty, pasteboard.types?.contains(.fileURL) == true {
+            references.append(fileURL(
+                string: pasteboard.string(forType: .fileURL),
+                data: pasteboard.data(forType: .fileURL)
+            ))
+        }
+        guard !references.isEmpty else { return .none }
+
+        var urls: [URL] = []
+        var seenPaths: Set<String> = []
+        for reference in references {
+            guard let reference, reference.isFileURL else { return .deferToNative }
+            let url = reference.standardizedFileURL
+            var isDirectory: ObjCBool = false
+            guard fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory),
+                  !isDirectory.boolValue,
+                  fileManager.isReadableFile(atPath: url.path),
+                  isImageFileURL(url)
+            else {
+                return .deferToNative
+            }
+            if seenPaths.insert(url.path).inserted {
+                urls.append(url)
+            }
+        }
+        return .imageFiles(urls)
+    }
+
+    private static func fileURL(string: String?, data: Data?) -> URL? {
+        if let string, let url = URL(string: string) {
+            return url
+        }
+        return data.flatMap { URL(dataRepresentation: $0, relativeTo: nil) }
+    }
+
+    static func isImageFileURL(_ url: URL) -> Bool {
+        if let type = try? url.resourceValues(forKeys: [.contentTypeKey]).contentType,
+           type.conforms(to: .image)
+        {
+            return true
+        }
+        let fileExtension = url.pathExtension.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !fileExtension.isEmpty else { return false }
+        if let type = UTType(filenameExtension: fileExtension), type.conforms(to: .image) {
+            return true
+        }
+        return fallbackImageFileExtensions.contains(fileExtension)
+    }
+
     static let legacyApplePNG = NSPasteboard.PasteboardType("Apple PNG pasteboard type")
     static let legacyNeXTTIFF = NSPasteboard.PasteboardType("NeXT TIFF v4.0 pasteboard type")
 
@@ -95,7 +160,10 @@ final class ImageAwareTextView: NSTextView {
 
     override func paste(_ sender: Any?) {
         let pasteboard = sender as? NSPasteboard ?? NSPasteboard.general
-        if enablesImagePasteHandling, imagePasteHandler?(pasteboard) == true {
+        if enablesImagePasteHandling,
+           ImagePasteboardTypes.filePayload(in: pasteboard) != .deferToNative,
+           imagePasteHandler?(pasteboard) == true
+        {
             return
         }
         super.paste(sender)
@@ -104,6 +172,7 @@ final class ImageAwareTextView: NSTextView {
     override func readSelection(from pboard: NSPasteboard, type: NSPasteboard.PasteboardType) -> Bool {
         if enablesImagePasteHandling,
            isImageLikePasteboardType(type),
+           ImagePasteboardTypes.filePayload(in: pboard) != .deferToNative,
            imagePasteHandler?(pboard) == true
         {
             return true
@@ -140,12 +209,22 @@ final class ImageAwareTextView: NSTextView {
         guard canHandleImageDrop(from: pasteboard) else {
             return super.performDragOperation(sender)
         }
-        _ = imagePasteHandler?(pasteboard)
-        // Consume image-like drops so file paths are not inserted into the text body.
+        guard imagePasteHandler?(pasteboard) == true else {
+            return super.performDragOperation(sender)
+        }
+        // Only an accepted image drop suppresses native handling.
         return true
     }
 
-    private func canHandleImageDrop(from pasteboard: NSPasteboard) -> Bool {
+    func canHandleImageDrop(from pasteboard: NSPasteboard) -> Bool {
+        switch ImagePasteboardTypes.filePayload(in: pasteboard) {
+        case .deferToNative:
+            return false
+        case .imageFiles:
+            return true
+        case .none:
+            break
+        }
         if let types = pasteboard.types {
             for type in types where isImageLikePasteboardType(type) {
                 return true
@@ -154,12 +233,7 @@ final class ImageAwareTextView: NSTextView {
 
         if let urlObjects = pasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL] {
             for url in urlObjects where url.isFileURL {
-                if let contentType = try? url.resourceValues(forKeys: [.contentTypeKey]).contentType,
-                   contentType.conforms(to: .image)
-                {
-                    return true
-                }
-                if let extType = UTType(filenameExtension: url.pathExtension), extType.conforms(to: .image) {
+                if ImagePasteboardTypes.isImageFileURL(url) {
                     return true
                 }
             }
