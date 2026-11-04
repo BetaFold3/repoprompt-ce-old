@@ -251,6 +251,13 @@ final class AgentModeViewModel: ObservableObject {
     var contextUsageSnapshot: ContextUsageSnapshot?
     @Published var pendingImageAttachments: [AgentImageAttachment] = []
     @Published var pendingTaggedFileAttachments: [AgentTaggedFileAttachment] = []
+    /// Active session's pending document attachments (mirror of the session; no UI renders it yet).
+    @Published var pendingDocumentAttachments: [AgentDocumentAttachment] = []
+    /// Store that owns managed document originals; preflight resolves every reference through it.
+    var documentAttachmentStore: AgentDocumentAttachmentStore = .production
+    /// The user's Codex shell-tool setting as read for document delivery (injectable so tests
+    /// neither depend on nor mutate real preferences).
+    var codexShellToolPreference: () -> Bool = { CodexAgentToolPreferences.bashToolEnabled() }
     @Published var draftRestorationEvent: DraftRestorationEvent? = nil
     var pendingRemoteStartWindowPicker: RemoteStartWindowPickerState? {
         get { ui.remoteStartPicker.pending }
@@ -782,6 +789,14 @@ final class AgentModeViewModel: ObservableObject {
         /// and before any ownership/staleness validation, so a binding change or an active-stream
         /// update can be interleaved against a held reload.
         var test_persistedLoadPrepareHook: (@MainActor (AgentTabSession) async -> Void)?
+        /// Test seam: awaited at the end of a provider augmentation that carries documents and was
+        /// not blocked (manifest appended, handoff staged), so an original can be removed after
+        /// augmentation and before the route's final document check at its handoff.
+        var test_afterDocumentAugmentationHook: (@MainActor (AgentTabSession?) async -> Void)?
+        /// Test seam: replaces the expected-PID policy armer (which needs a real pending MCP policy in
+        /// the shared server) when the run service is built; set before `test_initializeRunService`,
+        /// as the run-service lifecycle harness injects `expectedPIDPolicyArmer`.
+        var test_expectedPIDPolicyArmerOverride: ((MCPBootstrapLeaseSpec) async -> Bool)?
         /// Test seam: awaited inside `performPersistedSessionLoad` immediately before the payload
         /// is prepared, so an obsolete load can be held while a rebinding and a replacement load
         /// run to (or near) completion. Install it before the load starts: a cold activation's
@@ -3020,22 +3035,28 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     private func makeRunService() -> AgentModeRunService {
+        let productionExpectedPIDPolicyArmer: (MCPBootstrapLeaseSpec) async -> Bool = { spec in
+            guard spec.requiresExpectedAgentPID, let clientName = spec.clientName else {
+                return !spec.requiresExpectedAgentPID
+            }
+            return await ServerNetworkManager.shared.requireExpectedAgentPIDForPendingPolicy(
+                for: clientName,
+                runID: spec.runID,
+                windowID: spec.windowID
+            )
+        }
+        #if DEBUG
+            let expectedPIDPolicyArmer = test_expectedPIDPolicyArmerOverride ?? productionExpectedPIDPolicyArmer
+        #else
+            let expectedPIDPolicyArmer = productionExpectedPIDPolicyArmer
+        #endif
         let baseDependencies = AgentModeRunService.Dependencies(
             windowID: windowID,
             headlessProviderFactory: headlessProviderFactory,
             acpProviderFactory: acpProviderFactory,
             acpControllerFactory: acpControllerFactory,
             connectionPolicyInstaller: connectionPolicyInstaller,
-            expectedPIDPolicyArmer: { spec in
-                guard spec.requiresExpectedAgentPID, let clientName = spec.clientName else {
-                    return !spec.requiresExpectedAgentPID
-                }
-                return await ServerNetworkManager.shared.requireExpectedAgentPIDForPendingPolicy(
-                    for: clientName,
-                    runID: spec.runID,
-                    windowID: spec.windowID
-                )
-            },
+            expectedPIDPolicyArmer: expectedPIDPolicyArmer,
             mcpServerEnabler: mcpServerEnabler,
             workspacePathProvider: { [weak self] session in
                 guard let self else { return nil }
@@ -3256,13 +3277,11 @@ final class AgentModeViewModel: ObservableObject {
                     let outcome = await startAgentRun(
                         tabID: tabID,
                         initialMessage: instruction.text,
+                        documentAttachments: instruction.documentAttachments,
                         inputConstituents: instruction.constituents
                     )
-                    // Durable input that was never handed off stays queued and visible (same intents).
-                    if instruction.isDurable, Self.runStartDidNotHandOff(outcome), let session = sessions[tabID] {
-                        session.pendingInstructions.insert(instruction, at: 0)
-                        session.isDirty = true
-                        scheduleSave(for: tabID)
+                    if Self.runStartDidNotHandOff(outcome), let session = sessions[tabID] {
+                        settleUnsentFollowUpInstruction(instruction, outcome: outcome, session: session)
                     }
                     afterStart?()
                 }
@@ -3270,16 +3289,46 @@ final class AgentModeViewModel: ObservableObject {
             restoreDraftText: { [weak self] tabID, text, message, strategy in
                 self?.restoreComposerDraft(tabID: tabID, text: text, message: message, strategy: strategy)
             },
-            augmentUserMessageForProviderSend: { [weak self] text, attachments, taggedFileAttachments, session, carriers in
+            augmentUserMessageForProviderSend: { [weak self] text, attachments, taggedFileAttachments, documentAttachments, session, carriers in
                 guard let self else { return AgentStagedProviderText(text: text) }
                 return await augmentUserMessageForProviderSend(
                     text,
                     attachments: attachments,
                     taggedFileAttachments: taggedFileAttachments,
+                    documentAttachments: documentAttachments,
                     agent: session?.selectedAgent,
                     session: session,
                     carriers: carriers
                 )
+            },
+            documentAttachmentBlockedMessage: { [weak self] documents, session in
+                // Fails closed without the owning host: no handoff without a document check.
+                guard let self else { return CodexAgentModeCoordinator.codexDocumentHostUnavailableMessage }
+                return documentAttachmentBlockedMessage(documents, session: session)
+            },
+            settleUnsentInput: { [weak self] identities, draftText, images, taggedFiles, documents, session, reason, atProviderBoundary in
+                guard let self else { return }
+                if atProviderBoundary {
+                    settleProviderBoundaryRefusedInput(
+                        identities,
+                        draftText: draftText,
+                        images: images,
+                        taggedFiles: taggedFiles,
+                        documents: documents,
+                        session: session,
+                        reason: reason
+                    )
+                } else {
+                    settleUnsentInput(
+                        identities,
+                        draftText: draftText,
+                        images: images,
+                        taggedFiles: taggedFiles,
+                        documents: documents,
+                        session: session,
+                        reason: reason
+                    )
+                }
             },
             stageResumeRecoveryHandoffIfNeeded: { [weak self] session in
                 await self?.stageResumeRecoveryHandoffIfNeeded(for: session)
@@ -3737,6 +3786,7 @@ final class AgentModeViewModel: ObservableObject {
             workflow: session?.selectedWorkflow,
             imageAttachments: session?.pendingImageAttachments ?? [],
             taggedFileAttachments: session?.pendingTaggedFileAttachments ?? [],
+            documentAttachments: session?.pendingDocumentAttachments ?? [],
             initialStartLocation: session?.pendingInitialStartLocation ?? .local,
             remoteHost: session?.remoteHost
         )
@@ -3747,13 +3797,15 @@ final class AgentModeViewModel: ObservableObject {
             assert(
                 destinationSession.selectedWorkflow == nil
                     && destinationSession.pendingImageAttachments.isEmpty
-                    && destinationSession.pendingTaggedFileAttachments.isEmpty,
+                    && destinationSession.pendingTaggedFileAttachments.isEmpty
+                    && destinationSession.pendingDocumentAttachments.isEmpty,
                 "installPendingUserTurnState should only target a fresh destination session"
             )
         #endif
         destinationSession.selectedWorkflow = pendingState.workflow
         destinationSession.pendingImageAttachments = pendingState.imageAttachments
         destinationSession.pendingTaggedFileAttachments = pendingState.taggedFileAttachments
+        destinationSession.pendingDocumentAttachments = pendingState.documentAttachments
         destinationSession.pendingInitialStartLocation = pendingState.initialStartLocation
         destinationSession.locallyAttributedStartItemID = nil
         destinationSession.remoteHost = pendingState.remoteHost
@@ -3763,6 +3815,7 @@ final class AgentModeViewModel: ObservableObject {
         session?.selectedWorkflow = nil
         session?.pendingImageAttachments.removeAll()
         session?.pendingTaggedFileAttachments.removeAll()
+        session?.pendingDocumentAttachments.removeAll()
         session?.pendingInitialStartLocation = .local
         session?.locallyAttributedStartItemID = nil
         session?.remoteHost = nil
@@ -6307,6 +6360,7 @@ final class AgentModeViewModel: ObservableObject {
         session.pendingInstructions.removeAll()
         session.pendingImageAttachments.removeAll()
         session.pendingTaggedFileAttachments.removeAll()
+        session.pendingDocumentAttachments.removeAll()
         session.pendingTurnRuntimeAnchors.removeAll()
         session.agentMessageRuntimeFootersByItemID.removeAll()
         session.providerSessionID = nil
@@ -11042,6 +11096,9 @@ final class AgentModeViewModel: ObservableObject {
             if pendingTaggedFileAttachments != session.pendingTaggedFileAttachments {
                 pendingTaggedFileAttachments = session.pendingTaggedFileAttachments
             }
+            if pendingDocumentAttachments != session.pendingDocumentAttachments {
+                pendingDocumentAttachments = session.pendingDocumentAttachments
+            }
             if selectedAgent != session.selectedAgent {
                 selectedAgent = session.selectedAgent
             }
@@ -11097,6 +11154,7 @@ final class AgentModeViewModel: ObservableObject {
             contextUsageSnapshot = nil
             pendingImageAttachments = []
             pendingTaggedFileAttachments = []
+            pendingDocumentAttachments = []
             selectedWorkflow = nil
         }
         updateDynamicModelPolling()
@@ -11656,6 +11714,10 @@ final class AgentModeViewModel: ObservableObject {
             }
             if pendingTaggedFileAttachments != session.pendingTaggedFileAttachments {
                 pendingTaggedFileAttachments = session.pendingTaggedFileAttachments
+                invalidation.insert(.composer)
+            }
+            if pendingDocumentAttachments != session.pendingDocumentAttachments {
+                pendingDocumentAttachments = session.pendingDocumentAttachments
                 invalidation.insert(.composer)
             }
             if selectedAgent != session.selectedAgent {
@@ -12842,6 +12904,7 @@ final class AgentModeViewModel: ObservableObject {
               sourceItem.kind == compactedItem.kind,
               sourceItem.attachments == compactedItem.attachments,
               sourceItem.taggedFileAttachments == compactedItem.taggedFileAttachments,
+              sourceItem.documentAttachments == compactedItem.documentAttachments,
               sourceItem.toolName == compactedItem.toolName,
               sourceItem.toolInvocationID == compactedItem.toolInvocationID,
               sourceItem.toolArgsJSON == compactedItem.toolArgsJSON,
@@ -15779,6 +15842,7 @@ final class AgentModeViewModel: ObservableObject {
         let selectedWorkflow: AgentWorkflowDefinition?
         let imageAttachments: [AgentImageAttachment]
         let taggedFileAttachments: [AgentTaggedFileAttachment]
+        let documentAttachments: [AgentDocumentAttachment]
         let initialStartLocation: AgentInitialStartLocation
         let remoteHost: AgentSessionRemoteHostBinding?
 
@@ -15798,6 +15862,7 @@ final class AgentModeViewModel: ObservableObject {
             selectedWorkflow = session?.selectedWorkflow
             imageAttachments = session?.pendingImageAttachments ?? []
             taggedFileAttachments = session?.pendingTaggedFileAttachments ?? []
+            documentAttachments = session?.pendingDocumentAttachments ?? []
             initialStartLocation = session?.pendingInitialStartLocation ?? .local
             remoteHost = session?.remoteHost
         }
@@ -15813,6 +15878,7 @@ final class AgentModeViewModel: ObservableObject {
                 && selectedWorkflow == session.selectedWorkflow
                 && imageAttachments == session.pendingImageAttachments
                 && taggedFileAttachments == session.pendingTaggedFileAttachments
+                && documentAttachments == session.pendingDocumentAttachments
                 && initialStartLocation == session.pendingInitialStartLocation
                 && remoteHost == session.remoteHost
         }
@@ -15834,6 +15900,7 @@ final class AgentModeViewModel: ObservableObject {
             && session.transcript.turns.isEmpty
             && session.pendingImageAttachments.isEmpty
             && session.pendingTaggedFileAttachments.isEmpty
+            && session.pendingDocumentAttachments.isEmpty
             && session.selectedWorkflow == nil
     }
 
@@ -15841,8 +15908,12 @@ final class AgentModeViewModel: ObservableObject {
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let attachments = session.pendingImageAttachments
         let taggedFiles = session.pendingTaggedFileAttachments
-        guard !trimmedText.isEmpty || !attachments.isEmpty || !taggedFiles.isEmpty else {
+        let documents = session.pendingDocumentAttachments
+        guard !trimmedText.isEmpty || !attachments.isEmpty || !taggedFiles.isEmpty || !documents.isEmpty else {
             return .blocked(message: "")
+        }
+        if !documents.isEmpty, let blocked = documentAttachmentBlockedMessage(documents, session: session) {
+            return .blocked(message: blocked)
         }
         if session.profile == .knowledge,
            !KnowledgeSessionPolicy.supportedProviders.contains(session.selectedAgent)
@@ -15863,6 +15934,7 @@ final class AgentModeViewModel: ObservableObject {
                session: session,
                attachments: attachments,
                taggedFiles: taggedFiles,
+               documents: documents,
                activeWorkflow: workflow
            )
         {
@@ -16130,13 +16202,19 @@ final class AgentModeViewModel: ObservableObject {
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let attachmentsToSend = admitted?.attachments ?? (composerInput ? session.pendingImageAttachments : [])
         let taggedFilesToSend = admitted?.taggedFiles ?? (composerInput ? session.pendingTaggedFileAttachments : [])
-        guard !trimmedText.isEmpty || !attachmentsToSend.isEmpty || !taggedFilesToSend.isEmpty else {
+        let documentsToSend = admitted?.documents ?? (composerInput ? session.pendingDocumentAttachments : [])
+        guard !trimmedText.isEmpty || !attachmentsToSend.isEmpty || !taggedFilesToSend.isEmpty || !documentsToSend.isEmpty else {
             return .blocked(message: "")
         }
         if session.remoteHost == nil {
             guard AgentModelCatalog.isAgentAvailable(session.selectedAgent, availability: agentAvailabilityContext) else {
                 return .blocked(message: unavailableAgentMessage(for: session.selectedAgent))
             }
+        }
+        // Documents are preflighted before anything is consumed: an unqualified destination or a
+        // missing original keeps the draft (text, images, documents) exactly as it is.
+        if !documentsToSend.isEmpty, let blocked = documentAttachmentBlockedMessage(documentsToSend, session: session) {
+            return .blocked(message: blocked)
         }
 
         scheduleSkillCatalogRefresh()
@@ -16149,6 +16227,7 @@ final class AgentModeViewModel: ObservableObject {
                 session: session,
                 attachments: attachmentsToSend,
                 taggedFiles: taggedFilesToSend,
+                documents: documentsToSend,
                 activeWorkflow: activeWorkflow
             ) {
                 return validationFailure
@@ -16243,6 +16322,7 @@ final class AgentModeViewModel: ObservableObject {
             selectedWorkflow = nil
             session.pendingImageAttachments.removeAll()
             session.pendingTaggedFileAttachments.removeAll()
+            session.pendingDocumentAttachments.removeAll()
         }
 
         if session.activeAgentSessionID != nil, !session.hasLoadedPersistedState {
@@ -16254,6 +16334,7 @@ final class AgentModeViewModel: ObservableObject {
                     trimmedText: trimmedText,
                     attachmentsToSend: attachmentsToSend,
                     taggedFilesToSend: taggedFilesToSend,
+                    documentsToSend: documentsToSend,
                     activeWorkflow: bubbleWorkflow,
                     nativePreparedTurn: nativePreparedTurn,
                     codexAttemptID: codexAttemptID,
@@ -16270,6 +16351,7 @@ final class AgentModeViewModel: ObservableObject {
             trimmedText: trimmedText,
             attachmentsToSend: attachmentsToSend,
             taggedFilesToSend: taggedFilesToSend,
+            documentsToSend: documentsToSend,
             activeWorkflow: bubbleWorkflow,
             nativePreparedTurn: nativePreparedTurn,
             codexAttemptID: codexAttemptID,
@@ -16288,6 +16370,10 @@ final class AgentModeViewModel: ObservableObject {
         let submittedTaggedFiles = admitted.taggedFiles
         if !submittedTaggedFiles.isEmpty {
             session.pendingTaggedFileAttachments.removeAll { submittedTaggedFiles.contains($0) }
+        }
+        let submittedDocumentIDs = Set(admitted.documents.map(\.id))
+        if !submittedDocumentIDs.isEmpty {
+            session.pendingDocumentAttachments.removeAll { submittedDocumentIDs.contains($0.id) }
         }
         if let submittedWorkflow = admitted.workflow, session.selectedWorkflow == submittedWorkflow {
             session.selectedWorkflow = nil
@@ -16396,8 +16482,14 @@ final class AgentModeViewModel: ObservableObject {
         let capturesComposerInput = consumesComposer && nativePreparedTurn == nil
         let attachments = capturesComposerInput ? session.pendingImageAttachments : []
         let taggedFiles = capturesComposerInput ? session.pendingTaggedFileAttachments : []
-        guard !trimmedText.isEmpty || !attachments.isEmpty || !taggedFiles.isEmpty else {
+        let documents = capturesComposerInput ? session.pendingDocumentAttachments : []
+        guard !trimmedText.isEmpty || !attachments.isEmpty || !taggedFiles.isEmpty || !documents.isEmpty else {
             return .blocked(message: "")
+        }
+        // Before admission (nothing committed or consumed): an unqualified destination or a missing
+        // original keeps the whole draft in the composer.
+        if !documents.isEmpty, let blocked = documentAttachmentBlockedMessage(documents, session: session) {
+            return .blocked(message: blocked)
         }
         if nativePreparedTurn == nil,
            resolvedNativeSlashCommand(in: trimmedText, session: session)?.command.behavior == .controlPlane
@@ -16413,6 +16505,7 @@ final class AgentModeViewModel: ObservableObject {
             text: consumesComposer ? text : trimmedText,
             attachments: attachments,
             taggedFiles: taggedFiles,
+            documents: documents,
             workflow: workflow,
             interviewFirst: interviewFirst,
             consumesComposer: consumesComposer,
@@ -16429,6 +16522,7 @@ final class AgentModeViewModel: ObservableObject {
                 content: content,
                 attachments: admittedAttachments,
                 taggedFiles: taggedFiles,
+                documents: documents,
                 workflow: workflow,
                 interviewFirst: interviewFirst,
                 consumesComposer: consumesComposer
@@ -17012,6 +17106,7 @@ final class AgentModeViewModel: ObservableObject {
         trimmedText: String,
         attachmentsToSend: [AgentImageAttachment],
         taggedFilesToSend: [AgentTaggedFileAttachment],
+        documentsToSend: [AgentDocumentAttachment] = [],
         activeWorkflow: AgentWorkflowDefinition?,
         nativePreparedTurn: NativeSlashPreparedUserTurn?,
         codexAttemptID: UUID?,
@@ -17034,12 +17129,19 @@ final class AgentModeViewModel: ObservableObject {
             trimmedText: trimmedText,
             attachmentsToSend: attachmentsToSend,
             taggedFilesToSend: taggedFilesToSend,
+            documentsToSend: documentsToSend,
             activeWorkflow: activeWorkflow,
             nativePreparedTurn: nativePreparedTurn,
             codexAttemptID: codexAttemptID,
             admitted: admitted,
             composerInput: composerInput
         )
+        // A non-admitted composer send refused after hydration puts its document records back in
+        // the composer (originals are never deleted), so they are not silently lost.
+        if result != .submitted, admitted == nil, composerInput, !documentsToSend.isEmpty {
+            let present = Set(hydratedSession.pendingDocumentAttachments.map(\.id))
+            hydratedSession.pendingDocumentAttachments.append(contentsOf: documentsToSend.filter { !present.contains($0.id) })
+        }
         // The caller already reported `.submitted`; a refusal after hydration releases the admitted
         // intent under R01 (held unless its exact draft is durably back in the composer).
         if result != .submitted, let admitted {
@@ -17096,13 +17198,19 @@ final class AgentModeViewModel: ObservableObject {
         trimmedText: String,
         attachmentsToSend: [AgentImageAttachment],
         taggedFilesToSend: [AgentTaggedFileAttachment],
+        documentsToSend: [AgentDocumentAttachment] = [],
         activeWorkflow: AgentWorkflowDefinition?,
         nativePreparedTurn: NativeSlashPreparedUserTurn?,
         codexAttemptID: UUID?,
         admitted: AdmittedUserTurnInput?,
         composerInput: Bool = true
     ) -> UserTurnSubmissionResult {
-        Self.logCodexDebug("[AgentModeVM] submitUserTurn: tabID=\(tabID), selectedAgent=\(session.selectedAgent), attachments=\(attachmentsToSend.count), taggedFiles=\(taggedFilesToSend.count), workflow=\(activeWorkflow?.displayName ?? "none")")
+        Self.logCodexDebug("[AgentModeVM] submitUserTurn: tabID=\(tabID), selectedAgent=\(session.selectedAgent), attachments=\(attachmentsToSend.count), taggedFiles=\(taggedFilesToSend.count), documents=\(documentsToSend.count), workflow=\(activeWorkflow?.displayName ?? "none")")
+        // Documents are re-checked here, before the bubble or any route (remote hosts included):
+        // an unqualified destination or a missing original refuses the whole turn.
+        if !documentsToSend.isEmpty, let blocked = documentAttachmentBlockedMessage(documentsToSend, session: session) {
+            return .blocked(message: blocked)
+        }
         let admittedIdentity = admitted?.identity
         // F1: every route below needs a durable identity unless admission is inactive. Refuse before
         // the bubble, attachment reservation, interview-first consumption, or any MCP signal.
@@ -17127,6 +17235,7 @@ final class AgentModeViewModel: ObservableObject {
                 trimmedText: trimmedText,
                 attachments: attachmentsToSend,
                 taggedFiles: taggedFilesToSend,
+                documents: documentsToSend,
                 workflow: activeWorkflow
             ) {
             case let .success(item):
@@ -17142,6 +17251,7 @@ final class AgentModeViewModel: ObservableObject {
             trimmedText: trimmedText,
             attachmentsToSend: attachmentsToSend,
             taggedFilesToSend: taggedFilesToSend,
+            documentsToSend: documentsToSend,
             activeWorkflow: activeWorkflow,
             nativePreparedTurn: nativePreparedTurn,
             inputSource: .composer,
@@ -17305,6 +17415,7 @@ final class AgentModeViewModel: ObservableObject {
                 providerText: wrappedText,
                 images: attachmentsToSend,
                 taggedFileAttachments: taggedFilesToSend,
+                documentAttachments: documentsToSend,
                 draftText: trimmedText,
                 identity: identity,
                 origin: codexAttemptID.map(AgentTabSession.CodexFallbackOrigin.mcp) ?? .manual,
@@ -17336,9 +17447,13 @@ final class AgentModeViewModel: ObservableObject {
                     initialMessage: wrappedText,
                     attachments: attachmentsToSend,
                     taggedFileAttachments: taggedFilesToSend,
+                    documentAttachments: documentsToSend,
                     // Codex carries its identity in the fallback context.
                     inputConstituents: nil,
-                    codexFallbackContext: fallbackContext
+                    codexFallbackContext: fallbackContext,
+                    // B N2: composer input refused before the coordinator (its augmentation) is
+                    // settled by the start like any composer start; MCP input settles its own.
+                    unsentInputDraftText: codexAttemptID == nil ? trimmedText : nil
                 )
                 self.noteRecoveryActionStartReturned(identity, outcome: sendOutcome, isCodex: true)
                 if sendOutcome?.didSend != true {
@@ -17409,8 +17524,9 @@ final class AgentModeViewModel: ObservableObject {
                         initialMessage: wrappedText,
                         attachments: attachmentsToSend,
                         taggedFileAttachments: taggedFilesToSend,
+                        documentAttachments: documentsToSend,
                         inputConstituents: [inputIdentity],
-                        holdsPrefixBlockedInput: true
+                        unsentInputDraftText: trimmedText
                     )
                 }
                 return UserTurnSubmissionResult.submitted
@@ -17423,13 +17539,16 @@ final class AgentModeViewModel: ObservableObject {
                         session: session,
                         wrappedText: wrappedText,
                         identity: inputIdentity,
-                        hasAttachments: !attachmentsToSend.isEmpty || !taggedFilesToSend.isEmpty
+                        hasAttachments: !attachmentsToSend.isEmpty || !taggedFilesToSend.isEmpty,
+                        documentAttachments: documentsToSend
                     )
                     return UserTurnSubmissionResult.submitted
                 }
                 let textForContinuation = wrappedText
                 let continuationAttachments = attachmentsToSend
                 let continuationTaggedFiles = taggedFilesToSend
+                let continuationDocuments = documentsToSend
+                let continuationDraftText = trimmedText
                 _ = dequeuePendingNonCodexUserTokens(for: session) ?? userInputTokenEstimate
                 Task { @MainActor [weak self, weak session] in
                     guard let self, let session else { return }
@@ -17437,13 +17556,24 @@ final class AgentModeViewModel: ObservableObject {
                         textForContinuation,
                         attachments: continuationAttachments,
                         taggedFileAttachments: continuationTaggedFiles,
+                        documentAttachments: continuationDocuments,
                         agent: session.selectedAgent,
                         session: session,
                         carriers: [inputIdentity]
                     )
                     if let blockedReason = augmented.blockedReason {
-                        // Its handoff prefix could not be saved with it: never resumed without it.
-                        holdBlockedDurableInput([inputIdentity], session: session, reason: blockedReason)
+                        // Its handoff prefix could not be saved with it, or a document no longer
+                        // passes preflight: never resumed without it. Untracked input returns to
+                        // the composer; durable input is held (never both).
+                        settleUnsentInput(
+                            inputIdentity,
+                            draftText: continuationDraftText,
+                            images: continuationAttachments,
+                            taggedFiles: continuationTaggedFiles,
+                            documents: continuationDocuments,
+                            session: session,
+                            reason: blockedReason
+                        )
                         return
                     }
                     let augmentedText = augmented.text
@@ -17459,8 +17589,17 @@ final class AgentModeViewModel: ObservableObject {
                     }
                     let hasAttachments = !continuationAttachments.isEmpty || !continuationTaggedFiles.isEmpty
                     guard session.instructionContinuation != nil else {
-                        // B R1-1: the wait ended during preparation; the saved input is shown as held.
-                        holdBlockedDurableInput([inputIdentity], session: session, reason: Self.instructionWaitEndedHoldReason)
+                        // B R1-1: the wait ended during preparation; the saved input is shown as held
+                        // (untracked input returns to the composer).
+                        settleUnsentInput(
+                            inputIdentity,
+                            draftText: continuationDraftText,
+                            images: continuationAttachments,
+                            taggedFiles: continuationTaggedFiles,
+                            documents: continuationDocuments,
+                            session: session,
+                            reason: Self.instructionWaitEndedHoldReason
+                        )
                         return
                     }
                     // R05-R1b: a head queued during preparation keeps its priority.
@@ -17469,7 +17608,8 @@ final class AgentModeViewModel: ObservableObject {
                             session: session,
                             wrappedText: textForContinuation,
                             identity: inputIdentity,
-                            hasAttachments: hasAttachments
+                            hasAttachments: hasAttachments,
+                            documentAttachments: continuationDocuments
                         )
                         return
                     }
@@ -17489,7 +17629,31 @@ final class AgentModeViewModel: ObservableObject {
                         print("[AgentModeVM][Recovery] waiting continuation not resumed: \(failure)")
                         // Nothing was handed off (for example the run has no compatible ownership):
                         // the saved input is shown as held, never sent unlinked.
-                        holdBlockedDurableInput([inputIdentity], session: session, reason: failure.dispatchFailureText)
+                        settleUnsentInput(
+                            inputIdentity,
+                            draftText: continuationDraftText,
+                            images: continuationAttachments,
+                            taggedFiles: continuationTaggedFiles,
+                            documents: continuationDocuments,
+                            session: session,
+                            reason: failure.dispatchFailureText
+                        )
+                        return
+                    }
+                    // Final document check after every suspension; the claim below follows with none.
+                    if !continuationDocuments.isEmpty,
+                       let documentBlock = documentAttachmentBlockedMessage(continuationDocuments, session: session)
+                    {
+                        dispatchEvidence.noteNoHandoff(message: documentBlock)
+                        settleUnsentInput(
+                            inputIdentity,
+                            draftText: continuationDraftText,
+                            images: continuationAttachments,
+                            taggedFiles: continuationTaggedFiles,
+                            documents: continuationDocuments,
+                            session: session,
+                            reason: documentBlock
+                        )
                         return
                     }
                     guard claimLiveInstructionWait(
@@ -17508,10 +17672,19 @@ final class AgentModeViewModel: ObservableObject {
                                 session: session,
                                 wrappedText: textForContinuation,
                                 identity: inputIdentity,
-                                hasAttachments: hasAttachments
+                                hasAttachments: hasAttachments,
+                                documentAttachments: continuationDocuments
                             )
                         } else {
-                            holdBlockedDurableInput([inputIdentity], session: session, reason: Self.instructionWaitEndedHoldReason)
+                            settleUnsentInput(
+                                inputIdentity,
+                                draftText: continuationDraftText,
+                                images: continuationAttachments,
+                                taggedFiles: continuationTaggedFiles,
+                                documents: continuationDocuments,
+                                session: session,
+                                reason: Self.instructionWaitEndedHoldReason
+                            )
                         }
                         return
                     }
@@ -17529,8 +17702,9 @@ final class AgentModeViewModel: ObservableObject {
                     initialMessage: wrappedText,
                     attachments: attachmentsToSend,
                     taggedFileAttachments: taggedFilesToSend,
+                    documentAttachments: documentsToSend,
                     inputConstituents: [inputIdentity],
-                    holdsPrefixBlockedInput: true
+                    unsentInputDraftText: trimmedText
                 )
                 noteRecoveryActionStartReturned(inputIdentity, outcome: outcome, isCodex: false)
             }
@@ -17544,6 +17718,7 @@ final class AgentModeViewModel: ObservableObject {
                     wrappedText: wrappedText,
                     attachmentsToSend: attachmentsToSend,
                     taggedFilesToSend: taggedFilesToSend,
+                    documentsToSend: documentsToSend,
                     trimmedText: trimmedText,
                     userItem: userItem,
                     identity: identity,
@@ -17551,7 +17726,12 @@ final class AgentModeViewModel: ObservableObject {
                 )
             } else {
                 // Shared follow-up queue for providers that consume queued instructions at the next turn boundary.
-                session.pendingInstructions.append(AgentPendingInstruction(text: wrappedText, identity: identity))
+                // Document records ride with the entry; their manifest is added at dequeue.
+                session.pendingInstructions.append(AgentPendingInstruction(
+                    text: wrappedText,
+                    identity: identity,
+                    documentAttachments: documentsToSend
+                ))
             }
         }
         return UserTurnSubmissionResult.submitted
@@ -17577,6 +17757,7 @@ final class AgentModeViewModel: ObservableObject {
         trimmedText: String,
         attachmentsToSend: [AgentImageAttachment],
         taggedFilesToSend: [AgentTaggedFileAttachment],
+        documentsToSend: [AgentDocumentAttachment] = [],
         activeWorkflow: AgentWorkflowDefinition?,
         nativePreparedTurn: NativeSlashPreparedUserTurn?,
         inputSource: UserTurnInputSource,
@@ -17589,6 +17770,7 @@ final class AgentModeViewModel: ObservableObject {
             trimmedText: trimmedText,
             attachments: attachmentsToSend,
             taggedFiles: taggedFilesToSend,
+            documents: documentsToSend,
             workflow: activeWorkflow
         )
         if case .composer = inputSource, reusedUserItem == nil,
@@ -17663,6 +17845,7 @@ final class AgentModeViewModel: ObservableObject {
             id: itemID,
             attachments: attachmentsToSend,
             taggedFileAttachments: taggedFilesToSend,
+            documentAttachments: documentsToSend,
             sequenceIndex: session.nextSequenceIndex,
             workflow: activeWorkflow
         )
@@ -17703,6 +17886,7 @@ final class AgentModeViewModel: ObservableObject {
         trimmedText: String,
         attachments: [AgentImageAttachment],
         taggedFiles: [AgentTaggedFileAttachment],
+        documents: [AgentDocumentAttachment] = [],
         workflow: AgentWorkflowDefinition?
     ) -> String {
         if !trimmedText.isEmpty {
@@ -17721,6 +17905,8 @@ final class AgentModeViewModel: ObservableObject {
             return trimmedText
         } else if !attachments.isEmpty {
             return "Sent \(attachments.count) image\(attachments.count == 1 ? "" : "s")"
+        } else if taggedFiles.isEmpty, !documents.isEmpty {
+            return "Attached \(documents.count) document\(documents.count == 1 ? "" : "s")"
         } else {
             return "Included \(taggedFiles.count) file\(taggedFiles.count == 1 ? "" : "s")"
         }
@@ -17813,6 +17999,7 @@ final class AgentModeViewModel: ObservableObject {
         wrappedText: String,
         attachmentsToSend: [AgentImageAttachment],
         taggedFilesToSend: [AgentTaggedFileAttachment],
+        documentsToSend: [AgentDocumentAttachment] = [],
         trimmedText: String,
         userItem: AgentChatItem,
         identity: AgentQueuedInputIdentity,
@@ -17834,6 +18021,7 @@ final class AgentModeViewModel: ObservableObject {
                 interruptedPromptProviderText: interruptedPromptProviderText,
                 attachments: attachmentsToSend,
                 taggedFileAttachments: taggedFilesToSend,
+                documentAttachments: documentsToSend,
                 draftText: trimmedText,
                 identity: identity,
                 createdAt: Date()
@@ -17856,7 +18044,11 @@ final class AgentModeViewModel: ObservableObject {
                 // Attention notifications only: a completion deferred behind this queued steering is
                 // re-evaluated once this handoff settled (after the direct start returned).
                 defer { attentionCompletionProgress(for: session) }
-                let followUp = AgentPendingInstruction(text: queued.providerText, identity: queued.identity)
+                let followUp = AgentPendingInstruction(
+                    text: queued.providerText,
+                    identity: queued.identity,
+                    documentAttachments: queued.documentAttachments
+                )
                 if session.runState.isActive {
                     session.pendingInstructions.insert(followUp, at: 0)
                     // The agent may already be parked in its instruction wait: hand it the head.
@@ -17866,10 +18058,14 @@ final class AgentModeViewModel: ObservableObject {
                     let outcome = await startAgentRun(
                         tabID: session.tabID,
                         initialMessage: queued.providerText,
+                        documentAttachments: queued.documentAttachments,
                         inputConstituents: [queued.identity]
                     )
-                    // Durable input that was never handed off stays queued as a follow-up.
-                    if followUp.isDurable, Self.runStartDidNotHandOff(outcome) {
+                    // Durable (or document-bearing) input that was never handed off stays queued
+                    // as a follow-up with its records.
+                    if followUp.isDurable || !followUp.documentAttachments.isEmpty,
+                       Self.runStartDidNotHandOff(outcome)
+                    {
                         session.pendingInstructions.insert(followUp, at: 0)
                         session.isDirty = true
                         scheduleSave(for: session.tabID)
@@ -17895,6 +18091,7 @@ final class AgentModeViewModel: ObservableObject {
                 providerText: wrappedText,
                 attachments: attachmentsToSend,
                 taggedFileAttachments: taggedFilesToSend,
+                documentAttachments: documentsToSend,
                 draftText: trimmedText,
                 identity: identity,
                 createdAt: Date(),
@@ -18104,6 +18301,7 @@ final class AgentModeViewModel: ObservableObject {
         session: AgentTabSession,
         attachments: [AgentImageAttachment],
         taggedFiles: [AgentTaggedFileAttachment],
+        documents: [AgentDocumentAttachment] = [],
         activeWorkflow: AgentWorkflowDefinition?
     ) -> UserTurnSubmissionResult? {
         let argumentsText = invocation.argumentsText
@@ -18112,7 +18310,7 @@ final class AgentModeViewModel: ObservableObject {
         {
             return .blocked(message: "/\(invocation.command.rawValue) is a Codex native workflow that starts its own provider turn. Clear the selected prompt workflow before using it.")
         }
-        if !attachments.isEmpty || !taggedFiles.isEmpty {
+        if !attachments.isEmpty || !taggedFiles.isEmpty || !documents.isEmpty {
             let suffix = invocation.command == .computerUse ? " yet" : ""
             return .blocked(message: "The /\(invocation.command.rawValue) command cannot be used with attachments or tagged files\(suffix).")
         }
@@ -18746,11 +18944,21 @@ final class AgentModeViewModel: ObservableObject {
         _ text: String,
         attachments: [AgentImageAttachment] = [],
         taggedFileAttachments: [AgentTaggedFileAttachment] = [],
+        documentAttachments: [AgentDocumentAttachment],
         agent: AgentProviderKind? = nil,
         session: AgentTabSession? = nil,
         carriers: [AgentQueuedInputIdentity]
     ) async -> AgentStagedProviderText {
         let effectiveAgent = session?.selectedAgent ?? agent ?? activeSession?.selectedAgent ?? selectedAgent
+        // Attached documents are preflighted before any expansion or handoff staging: a blocked
+        // destination or unavailable original sends nothing and stages nothing.
+        if let blocked = preflightDocumentAttachments(
+            documentAttachments,
+            session: session,
+            agent: effectiveAgent
+        ).blockedMessage {
+            return AgentStagedProviderText(text: text, blockedReason: blocked)
+        }
         let withSkillExpansion = await expandSlashSkillInvocationIfNeeded(text, agentKind: effectiveAgent)
         let lookupContext: WorkspaceLookupContext = if let session {
             await agentWorkspaceLookupContext(tabID: session.tabID, session: session)
@@ -18764,13 +18972,37 @@ final class AgentModeViewModel: ObservableObject {
             taggedFileAttachments: taggedFileAttachments,
             lookupContext: lookupContext
         )
-        let withAttachmentRendering = renderProviderMessage(
+        let withImageRendering = renderProviderMessage(
             text: withTaggedFiles,
             attachments: attachments,
             agent: effectiveAgent
         )
-        guard let session else { return AgentStagedProviderText(text: withAttachmentRendering) }
-        return await stagePendingHandoff(withAttachmentRendering, session: session, carriers: carriers)
+        // Re-checked after the awaits above: an original removed meanwhile still blocks the send.
+        let withAttachmentRendering: String
+        switch appendDocumentManifestForProviderSend(
+            withImageRendering,
+            documents: documentAttachments,
+            session: session,
+            agent: effectiveAgent
+        ) {
+        case let .success(rendered):
+            withAttachmentRendering = rendered
+        case let .failure(blocked):
+            return AgentStagedProviderText(text: text, blockedReason: blocked.message)
+        }
+        let staged: AgentStagedProviderText = if let session {
+            await stagePendingHandoff(withAttachmentRendering, session: session, carriers: carriers)
+        } else {
+            AgentStagedProviderText(text: withAttachmentRendering)
+        }
+        #if DEBUG
+            if !documentAttachments.isEmpty, staged.blockedReason == nil,
+               let hook = test_afterDocumentAugmentationHook
+            {
+                await hook(session)
+            }
+        #endif
+        return staged
     }
 
     /// Text-only form of `stagePendingHandoffIfNeeded` (the stage it creates still awaits an outcome).
@@ -19083,19 +19315,22 @@ final class AgentModeViewModel: ObservableObject {
     /// order. `nil` is the legacy untracked input of inactive recovery admission; when the session
     /// requires durable admission it fails closed (`.stale`, nothing handed off) instead.
     ///
-    /// `holdsPrefixBlockedInput` (B R1-1): for callers that do not re-queue on failure, a start
-    /// refused because its pending-handoff prefix could not be saved shows the carried durable input
-    /// as held. Callers that re-queue a not-handed-off start leave it `false` (never both).
+    /// `unsentInputDraftText` (B R1-1): for composer callers that do not re-queue on failure, a start
+    /// refused before any handoff (its pending-handoff prefix could not be saved, or a document no
+    /// longer passes preflight at augmentation or at the final handoff check) shows carried durable
+    /// input as held, and returns untracked input to the composer with this draft text and its
+    /// documents. Callers that re-queue a not-handed-off start leave it `nil` (never both).
     @discardableResult
     func startAgentRun(
         tabID: UUID,
         initialMessage: String,
         attachments: [AgentImageAttachment] = [],
         taggedFileAttachments: [AgentTaggedFileAttachment] = [],
+        documentAttachments: [AgentDocumentAttachment] = [],
         inputConstituents: [AgentQueuedInputIdentity]?,
         codexFallbackContext: AgentTabSession.CodexFallbackSubmissionContext? = nil,
         providerHandoffAuthorization: (@MainActor () -> Bool)? = nil,
-        holdsPrefixBlockedInput: Bool = false
+        unsentInputDraftText: String? = nil
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome? {
         guard let session = session(for: tabID, createIfNeeded: true) else {
             return .failed(message: Self.composeTabRemovalInProgressMessage)
@@ -19156,17 +19391,33 @@ final class AgentModeViewModel: ObservableObject {
             initialMessage,
             attachments: attachments,
             taggedFileAttachments: taggedFileAttachments,
+            documentAttachments: documentAttachments,
             agent: session.selectedAgent,
             session: session,
             carriers: carriers
         )
+        // Composer-submitted input (`unsentInputDraftText` non-nil) is settled here when it
+        // provably reached no provider: durable input is held (never also restored), untracked
+        // input returns to the composer whole (raw draft text, images, tagged files, documents)
+        // with the reason. Re-queuing and scheduled callers settle their own input (durable input
+        // stays queued with the same intents). Codex input is named by its submission context's
+        // identity (the one that carries its optimistic bubble).
+        let settlementIdentities = codexFallbackContext.map { [$0.identity] } ?? carriers
+        let settleUnsentStartInput = { [weak self] (reason: String) in
+            guard let self, let unsentInputDraftText else { return }
+            settleUnsentInput(
+                settlementIdentities,
+                draftText: unsentInputDraftText,
+                images: attachments,
+                taggedFiles: taggedFileAttachments,
+                documents: documentAttachments,
+                session: session,
+                reason: reason
+            )
+        }
         if let blockedReason = augmented.blockedReason {
-            // Nothing was dispatched or staged: re-queuing callers keep durable input queued (same
-            // intents), exactly as for any other start that provably handed nothing off; the others
-            // show it as held.
-            if holdsPrefixBlockedInput {
-                holdBlockedDurableInput(carriers, session: session, reason: blockedReason)
-            }
+            // Nothing was dispatched or staged.
+            settleUnsentStartInput(blockedReason)
             return .failed(message: blockedReason)
         }
         let augmentedMessage = augmented.text
@@ -19194,6 +19445,7 @@ final class AgentModeViewModel: ObservableObject {
                 providerText: initialMessageForRun,
                 images: context.images,
                 taggedFileAttachments: context.taggedFileAttachments,
+                documentAttachments: context.documentAttachments,
                 draftText: context.draftText,
                 identity: context.identity,
                 origin: context.origin,
@@ -19201,7 +19453,56 @@ final class AgentModeViewModel: ObservableObject {
             )
         }
 
-        let startOutcome = await runService.startRun(
+        // Final document check (non-Codex routes; Codex re-checks at its own dispatch): composed
+        // into the run service's final handoff authorization, which runs synchronously after every
+        // asynchronous preparation above and before any runner is invoked. An original removed
+        // meanwhile refuses the start with its own message, nothing handed off.
+        let documentHandoffGate = documentAttachments.isEmpty || session.selectedAgent == .codexExec
+            ? nil
+            : AgentDocumentHandoffGate()
+        let handoffAuthorization: (@MainActor () -> Bool)? = if let documentHandoffGate {
+            { [weak self, weak session] in
+                guard let self, let session else { return false }
+                if let blocked = documentAttachmentBlockedMessage(documentAttachments, session: session) {
+                    documentHandoffGate.blockedMessage = blocked
+                    return false
+                }
+                return providerHandoffAuthorization?() ?? true
+            }
+        } else {
+            providerHandoffAuthorization
+        }
+        // The same check again at the runner's provider send seam (DOC-02), after provider startup
+        // and with no suspension before the write, when the runner already owns this input. Durable
+        // input is held there; a scheduled attempt's input stays with its schedule; other untracked
+        // input returns to the composer whole (the caller's raw draft text, or a re-queuing caller's
+        // own run text), without its bubble. Images the runner reserved come back through that
+        // reservation.
+        let boundaryDraftText = unsentInputDraftText ?? initialMessage
+        let documentBoundaryAuthority: AgentDocumentBoundaryAuthority? = if documentHandoffGate != nil {
+            AgentDocumentBoundaryAuthority(
+                refusal: { [weak self, weak session] in
+                    guard let self, let session else { return CodexAgentModeCoordinator.codexDocumentHostUnavailableMessage }
+                    return documentAttachmentBlockedMessage(documentAttachments, session: session)
+                },
+                settleRefused: { [weak self, weak session] reason in
+                    guard let self, let session else { return }
+                    settleProviderBoundaryRefusedInput(
+                        carriers,
+                        draftText: boundaryDraftText,
+                        images: attachments,
+                        taggedFiles: taggedFileAttachments,
+                        documents: documentAttachments,
+                        session: session,
+                        reason: reason
+                    )
+                }
+            )
+        } else {
+            nil
+        }
+
+        var startOutcome = await runService.startRun(
             tabID: tabID,
             session: session,
             // The notice-free text keeps the runners' "run text differs" token re-estimate honest.
@@ -19210,10 +19511,16 @@ final class AgentModeViewModel: ObservableObject {
             attachments: attachments,
             inputConstituents: constituents,
             codexFallbackContext: preparedCodexFallbackContext,
-            providerHandoffAuthorization: providerHandoffAuthorization,
+            providerHandoffAuthorization: handoffAuthorization,
+            documentBoundaryAuthority: documentBoundaryAuthority,
             delegatedQuestionStageID: delegatedQuestionStageID,
             pendingHandoffStage: pendingHandoffStage
         )
+        if let documentBlock = documentHandoffGate?.blockedMessage {
+            // The run service released every stage and noted no handoff for the constituents.
+            startOutcome = .failed(message: documentBlock)
+            settleUnsentStartInput(documentBlock)
+        }
         // Start-tail settlement of stages the provider outcome did not already resolve: a start that
         // provably handed nothing off releases them; uncertainty holds them; an admitted runner
         // still owes its outcome (an inactive run alone is not proof of non-handoff).
@@ -21171,13 +21478,17 @@ final class AgentModeViewModel: ObservableObject {
         // Queued instructions drain first, in FIFO order. A durable head goes through the
         // before-handoff dispatch commit under the existing run (R05/F4); it is never skipped, so no
         // later input can overtake it through the wait installed below.
-        if let head = session.pendingInstructions.first, head.isDurable {
-            return try await deliverDurableQueuedInstructionHead(head, session: session, waitOwnerID: waitOwnerID)
+        // An untracked head carrying documents takes the same guarded path (DOC-03): its documents
+        // are preflighted while it is still queued and re-checked at the handoff.
+        if let head = session.pendingInstructions.first, head.isDurable || !head.documentAttachments.isEmpty {
+            return try await deliverGuardedQueuedInstructionHead(head, session: session, waitOwnerID: waitOwnerID)
         }
         if let head = session.pendingInstructions.first, !head.isDurable {
             let queuedText = session.pendingInstructions.removeFirst().text
             let augmented = await augmentUserMessageForProviderSend(
                 queuedText,
+                // A head carrying documents took the guarded branch above.
+                documentAttachments: [],
                 agent: session.selectedAgent,
                 session: session,
                 carriers: []
@@ -21245,13 +21556,15 @@ final class AgentModeViewModel: ObservableObject {
         }
     }
 
-    /// R05/F4: drains the durable queue head into this instruction wait under the existing run.
-    /// Provider text is prepared first; then the dispatch commit, then exact revalidation of the
-    /// wait owner, run attempt, head, and lane with no suspension before the head is removed and its
-    /// text returned. Returning the text is only a local handoff to the waiting tool, not proof the
+    /// R05/F4: drains a durable queue head, or an untracked head carrying documents (DOC-03), into
+    /// this instruction wait under the existing run. Provider text is prepared first; then (durable
+    /// only) the dispatch commit, then exact revalidation of the wait owner, run attempt, head, and
+    /// lane, and a final document check, with no suspension before the head is removed and its text
+    /// returned. Returning the text is only a local handoff to the waiting tool, not proof the
     /// provider received its result (R05-R1a): the dispatch is recorded `deliveryUnknown`, never
-    /// `providerAccepted`. Any failure before the handoff keeps the head in place (FIFO preserved).
-    private func deliverDurableQueuedInstructionHead(
+    /// `providerAccepted`. Any other failure before the handoff keeps the head in place (FIFO
+    /// preserved); a head refused by its own documents leaves the queue instead (F1).
+    private func deliverGuardedQueuedInstructionHead(
         _ head: AgentPendingInstruction,
         session: AgentTabSession,
         waitOwnerID: UUID
@@ -21269,12 +21582,15 @@ final class AgentModeViewModel: ObservableObject {
         }
         let augmented = await augmentUserMessageForProviderSend(
             head.text,
+            documentAttachments: head.documentAttachments,
             agent: session.selectedAgent,
             session: session,
             carriers: head.constituents
         )
         if let blockedReason = augmented.blockedReason {
-            // Its handoff prefix could not be saved with it: the head stays queued (FIFO preserved).
+            // Its handoff prefix could not be saved with it (the head stays queued, FIFO preserved),
+            // or its documents failed preflight (the head leaves the queue, F1).
+            settleDocumentRefusedQueueHead(head, session: session, reason: blockedReason)
             throw QueuedInstructionDeliveryError(message: blockedReason)
         }
         var stageDelivered = false
@@ -21286,27 +21602,66 @@ final class AgentModeViewModel: ObservableObject {
             )
         }
         guard ownsHead() else { throw CancellationError() }
-        let evidence: AgentRecoveryDispatchEvidence
-        switch await AgentRecoveryDispatchEvidence.beginUnderActiveRun(
-            session: session,
-            constituents: head.constituents
-        ) {
-        case let .success(begun):
-            evidence = begun
-        case let .failure(failure):
-            print("[AgentModeVM][Recovery] queued instruction head not delivered: \(failure)")
-            throw QueuedInstructionDeliveryError(message: failure.dispatchFailureText)
+        var evidence: AgentRecoveryDispatchEvidence?
+        if head.isDurable {
+            switch await AgentRecoveryDispatchEvidence.beginUnderActiveRun(
+                session: session,
+                constituents: head.constituents
+            ) {
+            case let .success(begun):
+                evidence = begun
+            case let .failure(failure):
+                print("[AgentModeVM][Recovery] queued instruction head not delivered: \(failure)")
+                throw QueuedInstructionDeliveryError(message: failure.dispatchFailureText)
+            }
+            guard ownsHead(), evidence?.isValidForHandoff(in: session) == true else {
+                evidence?.noteNoHandoff(message: AgentModeRunService.recoveryDispatchTargetChangedReason)
+                throw CancellationError()
+            }
         }
-        guard ownsHead(), evidence.isValidForHandoff(in: session) else {
-            evidence.noteNoHandoff(message: AgentModeRunService.recoveryDispatchTargetChangedReason)
-            throw CancellationError()
+        // Final document check after every suspension, with none before the handoff: an original
+        // removed meanwhile refuses it (DOC-02).
+        if !head.documentAttachments.isEmpty,
+           let documentBlock = documentAttachmentBlockedMessage(head.documentAttachments, session: session)
+        {
+            evidence?.noteNoHandoff(message: documentBlock)
+            settleDocumentRefusedQueueHead(head, session: session, reason: documentBlock)
+            throw QueuedInstructionDeliveryError(message: documentBlock)
         }
         session.pendingInstructions.removeFirst()
         let text = deliverDelegatedQuestionNoticesWithImmediateInput(augmented.text, session: session)
         stageDelivered = true
         // Local handoff only: no downstream evidence proves the provider consumed the tool result.
-        evidence.noteDeliveryUnknown()
+        evidence?.noteDeliveryUnknown()
         return UserInstructionResponse(text: text, timedOut: false, elapsedSeconds: 0)
+    }
+
+    /// F1: a queue head refused by its own documents would be refused again at every later turn
+    /// boundary or wait, wedging every input queued behind it. While it is still the head, it leaves
+    /// the queue: durable input is held for explicit recovery (its intent keeps text and documents);
+    /// untracked input returns to the composer. A head blocked for any other reason stays queued.
+    private func settleDocumentRefusedQueueHead(
+        _ head: AgentPendingInstruction,
+        session: AgentTabSession,
+        reason: String
+    ) {
+        guard !head.documentAttachments.isEmpty,
+              documentAttachmentBlockedMessage(head.documentAttachments, session: session) != nil,
+              session.pendingInstructions.first == head
+        else { return }
+        session.pendingInstructions.removeFirst()
+        // A queued head carries no images or tagged files (only text and documents).
+        settleUnsentInput(
+            head.constituents,
+            draftText: head.text,
+            images: [],
+            taggedFiles: [],
+            documents: head.documentAttachments,
+            session: session,
+            reason: reason
+        )
+        session.isDirty = true
+        scheduleSave(for: session.tabID)
     }
 
     /// Atomically hands `text` to the live instruction wait `expectedWaitID` (same run attempt) under
@@ -21364,18 +21719,24 @@ final class AgentModeViewModel: ObservableObject {
 
     /// R05-R1b: input arriving while an older queue head owns the live instruction wait is queued
     /// behind that head (FIFO), never handed to the wait ahead of it. Input with attachments is shown
-    /// as held instead, since a queued follow-up carries text only.
+    /// as held instead, since a queued follow-up carries text only. Document records are not
+    /// attachments here: they queue as structured records and are preflighted at dequeue.
     private func queueBehindOlderInstructionHead(
         session: AgentTabSession,
         wrappedText: String,
         identity: AgentQueuedInputIdentity,
-        hasAttachments: Bool
+        hasAttachments: Bool,
+        documentAttachments: [AgentDocumentAttachment]
     ) {
         if hasAttachments, identity.isDurable {
             holdBlockedDurableInput([identity], session: session, reason: Self.queuedBehindOlderInputHoldReason)
             return
         }
-        session.pendingInstructions.append(AgentPendingInstruction(text: wrappedText, identity: identity))
+        session.pendingInstructions.append(AgentPendingInstruction(
+            text: wrappedText,
+            identity: identity,
+            documentAttachments: documentAttachments
+        ))
         session.isDirty = true
         updateBindingsFromSession(session)
         scheduleSave(for: session.tabID)
@@ -21405,6 +21766,7 @@ final class AgentModeViewModel: ObservableObject {
             }
             let augmented = await augmentUserMessageForProviderSend(
                 head.text,
+                documentAttachments: head.documentAttachments,
                 agent: session.selectedAgent,
                 session: session,
                 carriers: head.constituents
@@ -21417,8 +21779,13 @@ final class AgentModeViewModel: ObservableObject {
                     disposition: stageDelivered ? .sent : .notSent
                 )
             }
-            // A blocked prefix keeps the head queued (visible in the queue, never sent without it).
-            guard augmented.blockedReason == nil, stillOwnsHead() else { return }
+            // A blocked prefix keeps the head queued (visible in the queue, never sent without it); a
+            // head refused by its own documents leaves the queue instead (F1).
+            if let blockedReason = augmented.blockedReason {
+                settleDocumentRefusedQueueHead(head, session: session, reason: blockedReason)
+                return
+            }
+            guard stillOwnsHead() else { return }
             let evidence: AgentRecoveryDispatchEvidence
             switch await AgentRecoveryDispatchEvidence.beginUnderActiveRun(
                 session: session,
@@ -21428,6 +21795,14 @@ final class AgentModeViewModel: ObservableObject {
                 evidence = begun
             case let .failure(failure):
                 print("[AgentModeVM][Recovery] re-queued head not delivered to the live wait: \(failure)")
+                return
+            }
+            // Final document check after every suspension; the claim below follows with none.
+            if !head.documentAttachments.isEmpty,
+               let documentBlock = documentAttachmentBlockedMessage(head.documentAttachments, session: session)
+            {
+                evidence.noteNoHandoff(message: documentBlock)
+                settleDocumentRefusedQueueHead(head, session: session, reason: documentBlock)
                 return
             }
             guard claimLiveInstructionWait(
@@ -22481,10 +22856,12 @@ final class AgentModeViewModel: ObservableObject {
             session.withRecoveryComposerObservationSuppressed {
                 session.pendingImageAttachments.removeAll()
                 session.pendingTaggedFileAttachments.removeAll()
+                session.pendingDocumentAttachments.removeAll()
             }
         } else {
             session.pendingImageAttachments.removeAll()
             session.pendingTaggedFileAttachments.removeAll()
+            session.pendingDocumentAttachments.removeAll()
         }
         session.attachmentsPendingProviderConsumptionCleanup.removeAll()
         session.nextSequenceIndex = 0
@@ -22934,7 +23311,9 @@ final class AgentModeViewModel: ObservableObject {
 
         let hasTranscript = !session.transcript.turns.isEmpty || !session.items.isEmpty
         let hasDraft = !session.draftText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        let hasPendingAttachments = !session.pendingImageAttachments.isEmpty || !session.pendingTaggedFileAttachments.isEmpty
+        let hasPendingAttachments = !session.pendingImageAttachments.isEmpty
+            || !session.pendingTaggedFileAttachments.isEmpty
+            || !session.pendingDocumentAttachments.isEmpty
         let hasPendingInteraction = session.runState == .waitingForUser
             || session.hasPendingQuestionUI
             || session.pendingApproval != nil

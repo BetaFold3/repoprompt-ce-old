@@ -154,6 +154,55 @@ package struct AgentRecoveryTaggedFileReference: Equatable {
     }
 }
 
+/// Durable reference to an attached document. The original lives in the global managed document
+/// store (`AgentDocumentAttachmentStore`), addressed only by `id` and `kind`; recovery never stores a
+/// path, never copies or deletes the original, and validates its existence separately from the
+/// per-session managed image files.
+package struct AgentRecoveryDocumentReference: Equatable {
+    package let id: UUID
+    package let kind: AgentDocumentKind
+    package let originalFilename: String
+    package let byteCount: Int64
+    package let createdAt: AgentRecoveryTimestamp
+    package var extras: AgentRecoveryExtras
+
+    package init(
+        id: UUID,
+        kind: AgentDocumentKind,
+        originalFilename: String,
+        byteCount: Int64,
+        createdAt: AgentRecoveryTimestamp,
+        extras: AgentRecoveryExtras = [:]
+    ) {
+        self.id = id
+        self.kind = kind
+        self.originalFilename = originalFilename
+        self.byteCount = byteCount
+        self.createdAt = createdAt
+        self.extras = extras
+    }
+
+    package init(_ attachment: AgentDocumentAttachment) {
+        self.init(
+            id: attachment.id,
+            kind: attachment.kind,
+            originalFilename: attachment.originalFilename,
+            byteCount: attachment.byteCount,
+            createdAt: AgentRecoveryTimestamp(attachment.createdAt)
+        )
+    }
+
+    package var attachment: AgentDocumentAttachment {
+        AgentDocumentAttachment(
+            id: id,
+            kind: kind,
+            originalFilename: originalFilename,
+            byteCount: byteCount,
+            createdAt: createdAt.date
+        )
+    }
+}
+
 /// Full workflow snapshot, including the resolved template body. `AgentWorkflowDefinition`'s own
 /// Codable form deliberately omits custom templates, so recovery does not reuse it.
 package struct AgentRecoveryWorkflowSnapshot: Equatable {
@@ -227,11 +276,14 @@ package struct AgentRecoveryWorkflowSnapshot: Equatable {
     }
 }
 
-/// Immutable composer or intent payload: text, images, tagged files, workflow, interview choice.
+/// Immutable composer or intent payload: text, images, tagged files, documents, workflow, interview
+/// choice.
 package struct AgentRecoveryInputContent: Equatable {
     package let text: String
     package let images: [AgentRecoveryImageReference]
     package let taggedFiles: [AgentRecoveryTaggedFileReference]
+    /// Attached documents (global managed IDs). Stored under `documents` only when non-empty.
+    package let documents: [AgentRecoveryDocumentReference]
     package let workflow: AgentRecoveryWorkflowSnapshot?
     package let interviewFirst: Bool
     package var extras: AgentRecoveryExtras
@@ -240,6 +292,7 @@ package struct AgentRecoveryInputContent: Equatable {
         text: String,
         images: [AgentRecoveryImageReference] = [],
         taggedFiles: [AgentRecoveryTaggedFileReference] = [],
+        documents: [AgentRecoveryDocumentReference] = [],
         workflow: AgentRecoveryWorkflowSnapshot? = nil,
         interviewFirst: Bool = false,
         extras: AgentRecoveryExtras = [:]
@@ -247,6 +300,7 @@ package struct AgentRecoveryInputContent: Equatable {
         self.text = text
         self.images = images
         self.taggedFiles = taggedFiles
+        self.documents = documents
         self.workflow = workflow
         self.interviewFirst = interviewFirst
         self.extras = extras
@@ -254,7 +308,7 @@ package struct AgentRecoveryInputContent: Equatable {
 
     /// No user-visible content; an empty composer is stored as an absent composer.
     package var isEmpty: Bool {
-        text.isEmpty && images.isEmpty && taggedFiles.isEmpty && workflow == nil && !interviewFirst
+        text.isEmpty && images.isEmpty && taggedFiles.isEmpty && documents.isEmpty && workflow == nil && !interviewFirst
     }
 
     var managedImageFileNames: Set<String> {

@@ -505,6 +505,7 @@ package enum AgentTranscriptIncrementalImportResult: Equatable {
                 "reasoningHash=\(hashedText(item.reasoning))",
                 "attachments=\(item.attachments.count)",
                 "tagged=\(item.taggedFileAttachments.count)",
+                "documents=\(item.documentAttachments.map(\.id.uuidString).joined(separator: ","))",
                 "workflow=\(item.workflow?.id ?? "nil")"
             ].joined(separator: "|")
         }
@@ -4485,7 +4486,7 @@ package enum AgentTranscriptIO {
                 defer { flatIndex += 1 }
                 switch row.kind {
                 case .user:
-                    forkItems.append(ForkItem(pos: pos, payload: .tagged(tag: "user", text: row.text), dropPriority: .essential, turnID: tid, hostRowID: row.id, timestamp: row.timestamp))
+                    forkItems.append(ForkItem(pos: pos, payload: .tagged(tag: "user", text: Self.forkUserText(row)), dropPriority: .essential, turnID: tid, hostRowID: row.id, timestamp: row.timestamp))
                     pos += 1
                 case .assistant, .assistantInline:
                     guard row.hasDisplayableAssistantBody else { continue }
@@ -6051,6 +6052,17 @@ package enum AgentTranscriptIO {
     private static func conclusionActivity(in turn: AgentTranscriptTurn) -> AgentTranscriptActivity? {
         guard let conclusionActivityID = turn.conclusionActivityID else { return nil }
         return turn.allActivities.first(where: { $0.id == conclusionActivityID })
+    }
+
+    /// A forked/handed-off user row names its attached documents (filename and type only; never a
+    /// path or document content), so the destination knows the turn referred to them.
+    static func forkUserText(_ row: AgentChatItem) -> String {
+        guard !row.documentAttachments.isEmpty else { return row.text }
+        let names = row.documentAttachments
+            .map { "\($0.originalFilename) (\($0.kind.displayName))" }
+            .joined(separator: ", ")
+        let note = "[Attached documents: \(names)]"
+        return row.text.isEmpty ? note : "\(row.text)\n\(note)"
     }
 
     private static func truncateArgs(_ rawArgs: String?, max limit: Int) -> String {

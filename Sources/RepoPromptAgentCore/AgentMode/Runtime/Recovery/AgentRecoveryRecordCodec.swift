@@ -718,6 +718,8 @@ enum AgentRecoveryRecordCodec {
             text: reader.string("text"),
             images: reader.array("images").enumerated().map { try image($1, path: "\(path).images[\($0)]") },
             taggedFiles: reader.array("taggedFiles").enumerated().map { try taggedFile($1, path: "\(path).taggedFiles[\($0)]") },
+            // Absent in records written before documents existed; never written empty.
+            documents: optionalArray(reader.optional("documents"), path: "\(path).documents", element: document),
             workflow: reader.optional("workflow").map { try workflow($0, path: "\(path).workflow") },
             interviewFirst: reader.bool("interviewFirst"),
             extras: reader.extras
@@ -729,6 +731,9 @@ enum AgentRecoveryRecordCodec {
         object["text"] = .string(content.text)
         object["images"] = .array(content.images.map(imageJSON))
         object["taggedFiles"] = .array(content.taggedFiles.map(taggedFileJSON))
+        if !content.documents.isEmpty {
+            object["documents"] = .array(content.documents.map(documentJSON))
+        }
         if let workflow = content.workflow {
             object["workflow"] = workflowJSON(workflow)
         }
@@ -793,6 +798,40 @@ enum AgentRecoveryRecordCodec {
         object["relativePath"] = .string(file.relativePath)
         object["displayName"] = .string(file.displayName)
         object["createdAt"] = timestampJSON(file.createdAt)
+        return .object(object)
+    }
+
+    private static func document(_ json: AgentRecoveryJSONValue, path: String) throws -> AgentRecoveryDocumentReference {
+        var reader = try Reader(json, path: path)
+        let id = try reader.uuid("id")
+        let kindRaw = try reader.string("kind")
+        // An unknown kind (a newer build's document type) makes the record unreadable, so the store
+        // preserves its bytes instead of silently dropping the attachment.
+        guard let kind = AgentDocumentKind(rawValue: kindRaw) else {
+            throw AgentRecoveryDecodingError(reason: .unknownVariant("\(path).kind=\(kindRaw)"))
+        }
+        let originalFilename = try reader.string("originalFilename")
+        let byteCount = try Reader.int64(reader.required("byteCount"), path: "\(path).byteCount")
+        guard byteCount >= 0 else {
+            throw AgentRecoveryDecodingError(reason: .malformed("\(path).byteCount is negative"))
+        }
+        return try AgentRecoveryDocumentReference(
+            id: id,
+            kind: kind,
+            originalFilename: originalFilename,
+            byteCount: byteCount,
+            createdAt: reader.timestamp("createdAt"),
+            extras: reader.extras
+        )
+    }
+
+    private static func documentJSON(_ document: AgentRecoveryDocumentReference) -> AgentRecoveryJSONValue {
+        var object = document.extras
+        object["id"] = .string(document.id.uuidString)
+        object["kind"] = .string(document.kind.rawValue)
+        object["originalFilename"] = .string(document.originalFilename)
+        object["byteCount"] = .number(Decimal(document.byteCount))
+        object["createdAt"] = timestampJSON(document.createdAt)
         return .object(object)
     }
 

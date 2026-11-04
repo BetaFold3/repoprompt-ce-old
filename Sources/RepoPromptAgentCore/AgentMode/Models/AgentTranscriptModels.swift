@@ -87,6 +87,9 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
     public var text: String
     public var attachments: [AgentImageAttachment]
     public var taggedFileAttachments: [AgentTaggedFileAttachment]
+    /// Attached PDF/HTML documents; `nil` when there are none, so older transcripts decode and
+    /// re-encode unchanged.
+    public var documentAttachments: [AgentDocumentAttachment]?
     public var workflow: AgentWorkflowDefinition?
     public var codexGoalMode: AgentCodexGoalModeMetadata?
     public var scheduledSend: AgentScheduledSendProvenance?
@@ -109,6 +112,7 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
         text: String,
         attachments: [AgentImageAttachment] = [],
         taggedFileAttachments: [AgentTaggedFileAttachment] = [],
+        documentAttachments: [AgentDocumentAttachment] = [],
         workflow: AgentWorkflowDefinition? = nil,
         codexGoalMode: AgentCodexGoalModeMetadata? = nil,
         scheduledSend: AgentScheduledSendProvenance? = nil,
@@ -129,6 +133,7 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
         self.text = text
         self.attachments = attachments
         self.taggedFileAttachments = taggedFileAttachments
+        self.documentAttachments = documentAttachments.isEmpty ? nil : documentAttachments
         self.workflow = workflow
         self.codexGoalMode = codexGoalMode
         self.scheduledSend = scheduledSend
@@ -151,6 +156,7 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
         text = item.text
         attachments = item.attachments
         taggedFileAttachments = item.taggedFileAttachments
+        documentAttachments = item.documentAttachments.isEmpty ? nil : item.documentAttachments
         workflow = item.workflow
         codexGoalMode = item.codexGoalMode
         scheduledSend = item.scheduledSend
@@ -172,6 +178,7 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
             text: overrideText ?? text,
             attachments: attachments,
             taggedFileAttachments: taggedFileAttachments,
+            documentAttachments: documentAttachments ?? [],
             toolName: toolExecution?.toolName,
             toolInvocationID: toolExecution?.invocationID,
             toolArgsJSON: toolExecution?.argsJSON,
@@ -210,7 +217,9 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
         guard item.kind == .assistant || item.kind == .assistantInline else { return false }
         guard AgentDisplayableText.hasDisplayableBody(item.text) else { return false }
         let trimmed = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !item.attachments.isEmpty || !item.taggedFileAttachments.isEmpty || item.workflow != nil {
+        if !item.attachments.isEmpty || !item.taggedFileAttachments.isEmpty || !item.documentAttachments.isEmpty
+            || item.workflow != nil
+        {
             return true
         }
         if trimmed.contains("\n") || trimmed.count >= 80 || trimmed.contains("```") {
@@ -247,6 +256,8 @@ public struct AgentTranscriptRequestAnchor: Codable, Identifiable, Sendable, Equ
     public var text: String
     public var attachments: [AgentImageAttachment]
     public var taggedFileAttachments: [AgentTaggedFileAttachment]
+    /// Attached PDF/HTML documents; `nil` when there are none (older transcripts are unchanged).
+    public var documentAttachments: [AgentDocumentAttachment]?
     public var workflow: AgentWorkflowDefinition?
     public var codexGoalMode: AgentCodexGoalModeMetadata?
     public var scheduledSend: AgentScheduledSendProvenance?
@@ -262,6 +273,7 @@ public struct AgentTranscriptRequestAnchor: Codable, Identifiable, Sendable, Equ
         text = item.text
         attachments = item.attachments
         taggedFileAttachments = item.taggedFileAttachments
+        documentAttachments = item.documentAttachments.isEmpty ? nil : item.documentAttachments
         workflow = item.workflow
         codexGoalMode = item.codexGoalMode
         scheduledSend = item.scheduledSend
@@ -278,6 +290,7 @@ public struct AgentTranscriptRequestAnchor: Codable, Identifiable, Sendable, Equ
             text: text,
             attachments: attachments,
             taggedFileAttachments: taggedFileAttachments,
+            documentAttachments: documentAttachments ?? [],
             sequenceIndex: sequenceIndex,
             workflow: workflow,
             codexGoalMode: codexGoalMode,

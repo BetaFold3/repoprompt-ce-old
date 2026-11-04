@@ -691,6 +691,7 @@ extension AgentModeViewModel {
 
         let attachments = session.pendingImageAttachments
         let taggedFiles = session.pendingTaggedFileAttachments
+        let documents = session.pendingDocumentAttachments
         let selectedWorkflowSnapshot = session.selectedWorkflow
         let bubbleWorkflow: AgentWorkflowDefinition? = if let selectedWorkflowSnapshot {
             selectedWorkflowSnapshot
@@ -709,6 +710,7 @@ extension AgentModeViewModel {
             rawText: trimmedText,
             attachments: attachments,
             taggedFileAttachments: taggedFiles,
+            documentAttachments: documents,
             workflow: bubbleWorkflow,
             interviewFirst: consumesInterviewFirst,
             isNewSessionStart: isNewSessionStart,
@@ -721,6 +723,7 @@ extension AgentModeViewModel {
         // Move (never copy) the pending composer state into the record.
         session.pendingImageAttachments.removeAll()
         session.pendingTaggedFileAttachments.removeAll()
+        session.pendingDocumentAttachments.removeAll()
         session.selectedWorkflow = nil
         if tabID == currentTabID {
             selectedWorkflow = nil
@@ -748,6 +751,7 @@ extension AgentModeViewModel {
             }
             session.pendingImageAttachments = attachments
             session.pendingTaggedFileAttachments = taggedFiles
+            session.pendingDocumentAttachments = documents
             session.selectedWorkflow = selectedWorkflowSnapshot
             if tabID == currentTabID {
                 selectedWorkflow = selectedWorkflowSnapshot
@@ -784,7 +788,8 @@ extension AgentModeViewModel {
         notBefore: Date,
         runAlongsideOtherSessions: Bool,
         removingImageAttachmentIDs: Set<UUID> = [],
-        removingTaggedFileAttachmentIDs: Set<UUID> = []
+        removingTaggedFileAttachmentIDs: Set<UUID> = [],
+        removingDocumentAttachmentIDs: Set<UUID> = []
     ) async -> String? {
         guard let session = sessions[tabID] else { return Self.scheduledSendMissingMessage }
         let token = session.activeAgentSessionID.flatMap { sessionID in
@@ -805,7 +810,13 @@ extension AgentModeViewModel {
             let retainedTaggedFiles = record.taggedFileAttachments.filter {
                 !removingTaggedFileAttachmentIDs.contains($0.id)
             }
-            guard !trimmedText.isEmpty || !retainedAttachments.isEmpty || !retainedTaggedFiles.isEmpty else {
+            // Removing a document from a schedule drops only its record; the managed original stays.
+            let retainedDocuments = record.documents.filter {
+                !removingDocumentAttachmentIDs.contains($0.id)
+            }
+            guard !trimmedText.isEmpty || !retainedAttachments.isEmpty || !retainedTaggedFiles.isEmpty
+                || !retainedDocuments.isEmpty
+            else {
                 return "Type a message or keep an attachment before saving the scheduled message."
             }
             if let timingMessage = AgentScheduledSendTiming.validationMessage(for: notBefore) {
@@ -821,6 +832,7 @@ extension AgentModeViewModel {
             updated.rawText = trimmedText
             updated.attachments = retainedAttachments
             updated.taggedFileAttachments = retainedTaggedFiles
+            updated.documents = retainedDocuments
             updated.notBefore = notBefore
             updated.runAlongsideOtherSessions = runAlongsideOtherSessions
             updated.state = .scheduled
@@ -2165,6 +2177,10 @@ extension AgentModeViewModel {
                 return "An attached image is no longer available."
             }
         }
+        // Documents: the destination must qualify and every managed original must still resolve.
+        if !record.documents.isEmpty, let blocked = documentAttachmentBlockedMessage(record.documents, session: session) {
+            return blocked
+        }
         return nil
     }
 
@@ -2247,6 +2263,7 @@ extension AgentModeViewModel {
             trimmedText: trimmedText,
             attachmentsToSend: record.attachments,
             taggedFilesToSend: record.taggedFileAttachments,
+            documentsToSend: record.documents,
             activeWorkflow: record.workflow,
             nativePreparedTurn: nil,
             inputSource: .scheduled(record: record, attempt: attempt),
@@ -2256,6 +2273,26 @@ extension AgentModeViewModel {
         let wrappedText = prepared.wrappedText
 
         if let scheduledDispatchRunStarter {
+            // Injected provider starts get the same final document step as provider augmentation
+            // (`augmentUserMessageForProviderSend`): re-preflight the record's documents at dispatch
+            // and hand over the escaped manifest (the records ride on the prepared user item); a
+            // block sends nothing.
+            let providerText: String
+            switch appendDocumentManifestForProviderSend(
+                wrappedText,
+                documents: record.documents,
+                session: session,
+                agent: session.selectedAgent
+            ) {
+            case let .success(rendered):
+                providerText = rendered
+            case let .failure(blocked):
+                return ScheduledSubmitResult(
+                    outcome: .failed(message: blocked.message),
+                    userItem: prepared.userItem,
+                    runnerOwnsInputOnNil: false
+                )
+            }
             // Mirror the run service's final guarded boundary for injected provider starts.
             guard providerHandoffAuthorization() else {
                 return ScheduledSubmitResult(
@@ -2266,7 +2303,7 @@ extension AgentModeViewModel {
             }
             let runnerOwnsInputOnNil = session.selectedAgent != .codexExec
             noteScheduledRunStartAwaited(recoveryIdentity, in: session, runnerOwnsInputOnNil: runnerOwnsInputOnNil)
-            let outcome = await scheduledDispatchRunStarter(tabID, wrappedText, record.attachments, record.taggedFileAttachments)
+            let outcome = await scheduledDispatchRunStarter(tabID, providerText, record.attachments, record.taggedFileAttachments)
             return ScheduledSubmitResult(outcome: outcome, userItem: prepared.userItem, runnerOwnsInputOnNil: runnerOwnsInputOnNil)
         }
         if session.selectedAgent == .codexExec {
@@ -2287,6 +2324,7 @@ extension AgentModeViewModel {
                 providerText: wrappedText,
                 images: record.attachments,
                 taggedFileAttachments: record.taggedFileAttachments,
+                documentAttachments: record.documents,
                 draftText: trimmedText,
                 identity: identity,
                 origin: .manual,
@@ -2297,6 +2335,7 @@ extension AgentModeViewModel {
                 initialMessage: wrappedText,
                 attachments: record.attachments,
                 taggedFileAttachments: record.taggedFileAttachments,
+                documentAttachments: record.documents,
                 // Codex carries its identity in the fallback context.
                 inputConstituents: nil,
                 codexFallbackContext: fallbackContext,
@@ -2326,6 +2365,7 @@ extension AgentModeViewModel {
             initialMessage: wrappedText,
             attachments: record.attachments,
             taggedFileAttachments: record.taggedFileAttachments,
+            documentAttachments: record.documents,
             inputConstituents: [identity],
             providerHandoffAuthorization: providerHandoffAuthorization
         )
@@ -3150,11 +3190,13 @@ extension AgentModeViewModel: AgentScheduledSendCoordinatorHost {
                     trimmedText: dispatching.rawText.trimmingCharacters(in: .whitespacesAndNewlines),
                     attachments: dispatching.attachments,
                     taggedFiles: dispatching.taggedFileAttachments,
+                    documents: dispatching.documents,
                     workflow: dispatching.workflow
                 ),
                 id: attempt.itemID,
                 attachments: dispatching.attachments,
                 taggedFileAttachments: dispatching.taggedFileAttachments,
+                documentAttachments: dispatching.documents,
                 workflow: dispatching.workflow
             )
         acceptedItem.scheduledSend = receipt
@@ -3255,6 +3297,7 @@ extension AgentModeViewModel: AgentScheduledSendCoordinatorHost {
             text: record.rawText,
             images: images,
             taggedFiles: record.taggedFileAttachments.map(AgentRecoveryTaggedFileReference.init),
+            documents: record.documents.map(AgentRecoveryDocumentReference.init),
             workflow: record.workflow.map(AgentRecoveryWorkflowSnapshot.init),
             interviewFirst: record.interviewFirst
         )

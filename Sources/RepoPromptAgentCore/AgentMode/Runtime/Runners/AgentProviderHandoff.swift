@@ -418,6 +418,45 @@ final class AgentProviderHandoff {
     private weak var heldLane: AgentRecoverySessionLane?
     private var heldForUser = false
 
+    // MARK: Document boundary authority (DOC-02)
+
+    /// Final document authority of input carrying document references; `nil` for input without any.
+    private var documentAuthority: AgentDocumentBoundaryAuthority?
+    /// The reason this handoff was refused at its provider boundary for its documents (settled).
+    private(set) var documentRefusalReason: String?
+
+    /// Installs the document authority the provider's send seam consults at its final boundary.
+    func installDocumentAuthority(_ authority: AgentDocumentBoundaryAuthority?) {
+        documentAuthority = authority
+    }
+
+    /// The final document check at the provider's send boundary (DOC-02). Call synchronously at the
+    /// boundary, after every provider startup/preparation await and with none before the write: just
+    /// before `enterProviderBoundary`, and again inside a transport's pre-byte write admission.
+    /// Returns the refusal when a referenced original no longer passes preflight: nothing is handed
+    /// off (proven not written once the boundary was entered), carried staged input is released,
+    /// durable input is held with the reason, and the route's settlement runs exactly once (it
+    /// returns untracked input to the composer). `nil` admits the handoff. A refusal is sticky: a
+    /// repeated check (a transport re-entering write admission) returns the same reason and never
+    /// admits or settles the already-settled input again.
+    func documentRefusalAtProviderBoundary() -> String? {
+        if let documentRefusalReason { return documentRefusalReason }
+        guard let authority = documentAuthority, let reason = authority.refusal() else { return nil }
+        documentAuthority = nil
+        documentRefusalReason = reason
+        if handoffStarted {
+            noteProvenNotWritten(message: reason)
+        } else {
+            noteNoHandoff(message: reason)
+        }
+        reportStagedInput(stagedInputDisposition(sent: false))
+        if isDurable {
+            holdForUser(reason: reason)
+        }
+        authority.settleRefused(reason)
+        return reason
+    }
+
     /// A dispatch commit (or the pending-handoff staging before it) failed: nothing was handed off,
     /// the carried staged input is released, and the durable input is presented as held with the
     /// failure's explanation. Its intents stay saved (`queued` before a commit).
@@ -558,6 +597,24 @@ final class AgentProviderHandoff {
     }
 }
 
+/// Final document authority carried by a provider handoff (DOC-02): `refusal` re-runs the
+/// document preflight for the input's references (nil when they all still pass); `settleRefused`
+/// is the route's settlement of refused input (untracked input back to the composer with its
+/// documents and the reason; durable input is already held by the handoff).
+@MainActor
+package struct AgentDocumentBoundaryAuthority {
+    package let refusal: @MainActor () -> String?
+    package let settleRefused: @MainActor (_ reason: String) -> Void
+
+    package init(
+        refusal: @escaping @MainActor () -> String?,
+        settleRefused: @escaping @MainActor (_ reason: String) -> Void
+    ) {
+        self.refusal = refusal
+        self.settleRefused = settleRefused
+    }
+}
+
 /// What a send attempt means for staged next-turn input that rode on one handoff (the tab's staged
 /// pending-handoff payload and delegated child-question notices). These are stage-delivery boundary
 /// semantics, not provider acceptance: an intent's durable delivery state advances only on
@@ -626,12 +683,16 @@ package enum AgentPendingHandoffDispatchStaging {
 package struct AgentStagedProviderText: Equatable {
     package let text: String
     package let pendingHandoffStage: AgentPendingHandoffStage?
-    /// Set when this durable send must not proceed: its pending-handoff prefix could not be made
-    /// part of its intent before dispatch (adopted plan §5). The input stays saved; nothing staged.
+    /// Set when this send must not proceed: its pending-handoff prefix could not be made part of its
+    /// intent before dispatch (adopted plan §5), or an attached document failed preflight. The input
+    /// stays saved; nothing staged.
     package let blockedReason: String?
 
+    /// A blocked result carries no sendable text (empty), so a caller that missed `blockedReason`
+    /// still cannot deliver the input without its handoff prefix or document manifest. Drafts are
+    /// restored from each carrier's own draft text, never from this value.
     package init(text: String, pendingHandoffStage: AgentPendingHandoffStage? = nil, blockedReason: String? = nil) {
-        self.text = text
+        self.text = blockedReason == nil ? text : ""
         self.pendingHandoffStage = pendingHandoffStage
         self.blockedReason = blockedReason
     }

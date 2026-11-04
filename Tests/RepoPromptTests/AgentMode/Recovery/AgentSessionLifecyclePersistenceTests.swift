@@ -124,6 +124,57 @@ final class AgentSessionLifecyclePersistenceTests: XCTestCase {
         }
     }
 
+    /// A supported envelope whose transcript carries a malformed document record (unknown kind) is
+    /// decoded strictly: every load lane fails and the bytes are never rewritten (no lenient default
+    /// drops the record).
+    func testMalformedDocumentRecordFailsClosedWithoutRewrite() async throws {
+        let env = makeEnvironment()
+        defer { env.cleanup() }
+
+        let sessionID = UUID()
+        var session = AgentSession(id: sessionID, workspaceID: env.workspace.id, name: "Documents")
+        session.lifecycle = .v1(AgentSessionLifecycle(incarnationID: UUID()))
+        let document = AgentDocumentAttachment(
+            id: UUID(),
+            kind: .pdf,
+            originalFilename: "report.pdf",
+            byteCount: 42,
+            createdAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+        session.items = [AgentChatItemPersist(from: .user("see attached", documentAttachments: [document], sequenceIndex: 1))]
+        let valid = try XCTUnwrap(String(data: JSONEncoder().encode(session), encoding: .utf8))
+        let malformed = valid.replacingOccurrences(of: #""kind":"pdf""#, with: #""kind":"docx""#)
+        XCTAssertNotEqual(malformed, valid, "The fixture changes the document kind")
+        XCTAssertNoThrow(try AgentSessionDataCodec.decodeSession(from: Data(valid.utf8)), "Only the document record is malformed")
+
+        let fileURL = try await installRawSession(Data(malformed.utf8), id: sessionID, env: env)
+        let bytes = try Data(contentsOf: fileURL)
+        let service = env.makeService()
+
+        do {
+            _ = try await service.loadAgentSessionForEditing(id: sessionID, for: env.workspace)
+            XCTFail("Editing load must fail closed")
+        } catch {}
+        do {
+            _ = try await service.loadAgentSession(from: fileURL)
+            XCTFail("Load must fail closed")
+        } catch {}
+        for sequential in [false, true] {
+            do {
+                _ = try await AgentSessionDataService.$forcesSequentialHydrationPreparation.withValue(sequential) {
+                    try await service.preparePersistedHydration(hydrationRequest(sessionID: sessionID, env: env))
+                }
+                XCTFail("Hydration must fail closed (sequential=\(sequential))")
+            } catch {}
+        }
+        _ = try? await service.loadAgentSessionStub(
+            from: fileURL,
+            recoverMissingMetadata: true,
+            persistRecoveredMetadata: true
+        )
+        XCTAssertEqual(try Data(contentsOf: fileURL), bytes, "The malformed document record is preserved byte for byte")
+    }
+
     // MARK: - Migration
 
     func testLegacyLoadMigratesIdentityOnceUnderTheGate() async throws {

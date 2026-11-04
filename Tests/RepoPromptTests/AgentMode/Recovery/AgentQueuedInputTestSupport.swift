@@ -105,14 +105,17 @@ final class RecoveryLaneFixture {
         return load.persistenceState
     }
 
+    /// `documentStore` resolves the document references intents carry (the store their originals
+    /// were imported into); the default is the production store.
     static func make(
         _ name: String,
-        fileOperations: AgentRecoveryStore.FileOperations = .live
+        fileOperations: AgentRecoveryStore.FileOperations = .live,
+        documentStore: AgentDocumentAttachmentStore = .production
     ) async throws -> RecoveryLaneFixture {
         let root = try RecoveryTestSupport.makeTemporaryRoot(name)
         let recoveryRoot = root.appendingPathComponent("AgentRecovery/v1", isDirectory: true)
         let workspace = Workspace(customStoragePath: root.appendingPathComponent("workspace", isDirectory: true))
-        let store = AgentRecoveryStore(rootURL: recoveryRoot, fileOperations: fileOperations)
+        let store = AgentRecoveryStore(rootURL: recoveryRoot, fileOperations: fileOperations, documentStore: documentStore)
         let service = AgentSessionDataService(
             tombstoneRoot: recoveryRoot.appendingPathComponent("tombstones", isDirectory: true),
             recoveryStore: store
@@ -184,13 +187,17 @@ final class RecoveryLaneFixture {
     }
 
     /// Commits a real `queued` intent through the lane and returns its durable identity.
-    func queuedIdentity(_ text: String, userItemID: UUID = UUID()) async throws -> AgentQueuedInputIdentity {
+    func queuedIdentity(
+        _ text: String,
+        userItemID: UUID = UUID(),
+        documents: [AgentDocumentAttachment] = []
+    ) async throws -> AgentQueuedInputIdentity {
         let admitted = try await lane.admitQueued(AgentRecoveryAdmission(
             binding: lane.binding,
             userItemID: userItemID,
             origin: .mcp,
             target: .session,
-            original: RecoveryTestSupport.content(text)
+            original: AgentRecoveryInputContent(text: text, documents: documents.map { AgentRecoveryDocumentReference($0) })
         )).get()
         return AgentQueuedInputIdentity(receipt: admitted.receipt)
     }

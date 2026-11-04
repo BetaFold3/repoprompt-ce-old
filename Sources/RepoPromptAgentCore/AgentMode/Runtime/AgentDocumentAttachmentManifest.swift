@@ -17,6 +17,63 @@ package enum AgentDocumentDeliveryCapability: Equatable {
     case localFileAccess(readableKinds: Set<AgentDocumentKind>)
 }
 
+/// Which destinations are qualified to read attached documents, from verified local tool access
+/// (docs/reviews/2026-11-04-finder-file-paste/evidence/document-access). Only configuration that
+/// already exists is consulted: no permission, sandbox, or directory scope is widened, and an
+/// approval mode is not a reason to block (the provider's own approval flow governs each read).
+package enum AgentDocumentDeliveryPolicy {
+    package static let remoteHostReason =
+        "Attached documents can't be sent to a remote host. Remove them or send from a local session. Nothing was sent."
+    package static let knowledgeReason =
+        "Knowledge sessions can't read attached documents yet. Remove them or use a standard session. Nothing was sent."
+    package static let codexShellDisabledReason =
+        "Codex needs its shell tool enabled to read attached documents. Enable it in settings or remove the documents. Nothing was sent."
+
+    package static func unsupportedProviderReason(_ agent: AgentProviderKind) -> String {
+        "\(agent.displayName) can't read attached documents yet. Use Claude Code or Codex, or remove the documents. Nothing was sent."
+    }
+
+    /// - Claude Code (local, standard profile): its native `Read` tool is enabled in standard Agent
+    ///   Mode and reads PDF and HTML originals.
+    /// - Codex (local, standard profile) with its shell tool enabled: shell readers render PDFs and
+    ///   read HTML as text.
+    /// Everything else (remote hosts, Knowledge sessions, Claude-compatible backends, ACP agents,
+    /// Codex without a shell) is not qualified.
+    package static func capability(
+        agent: AgentProviderKind,
+        profile: AgentSessionProfile,
+        isRemoteHost: Bool,
+        codexShellToolEnabled: Bool
+    ) -> AgentDocumentDeliveryCapability {
+        if isRemoteHost {
+            return .unavailable(reason: remoteHostReason)
+        }
+        if profile == .knowledge {
+            return .unavailable(reason: knowledgeReason)
+        }
+        switch agent {
+        case .claudeCode:
+            return .localFileAccess(readableKinds: [.pdf, .html])
+        case .codexExec:
+            return codexShellToolEnabled
+                ? .localFileAccess(readableKinds: [.pdf, .html])
+                : .unavailable(reason: codexShellDisabledReason)
+        case .openCode, .cursor, .ohMyPi, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
+            return .unavailable(reason: unsupportedProviderReason(agent))
+        }
+    }
+}
+
+package extension AgentDocumentPreflightResult {
+    /// One user-visible message for a blocked result (every issue, in order); `nil` when ready.
+    var blockedMessage: String? {
+        guard case let .blocked(issues) = self else { return nil }
+        var seen = Set<String>()
+        let messages = issues.map(\.message).filter { seen.insert($0).inserted }
+        return messages.joined(separator: " ")
+    }
+}
+
 package enum AgentDocumentPreflightIssue: Equatable {
     case deliveryUnavailable(reason: String)
     case unsupportedKind(AgentDocumentAttachment)

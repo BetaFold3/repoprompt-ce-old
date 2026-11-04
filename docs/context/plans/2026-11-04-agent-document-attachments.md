@@ -14,7 +14,7 @@ Implement the owner-approved proposal: verify actual agent access; add durable d
 The reviewable execution units, assumptions, validation, and review findings live in the local evidence directory: `docs/reviews/2026-11-04-finder-file-paste/evidence/`. The implementation sequence groups the approved proposal by dependency so no visible attachment can ship before its lifecycle and delivery are wired.
 
 Step 1 — done | rounds 0/2 | open: none | downgraded: none | assumed: local managed originals; exact composer access remains Step 3 | deferred: crash-left staging cleanup and fault-injection coverage (evidence/step1-review-disposition.md)
-Step 2 — todo | rounds 0/2 | open: none | downgraded: none | assumed: additive decoding defaults | deferred: none
+Step 2 — done | rounds 2/2 | open: none | downgraded: none | assumed: additive decoding; standard local Claude/Codex only | deferred: nonblocking limits in step2-final-disposition.md
 Step 3 — todo | rounds 0/2 | open: none | downgraded: none | assumed: preserve image-only paths | deferred: none
 
 ## Decisions

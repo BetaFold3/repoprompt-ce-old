@@ -686,6 +686,7 @@ extension AgentModeViewModel {
         let workflow: AgentWorkflowDefinition?
         let imageAttachments: [AgentImageAttachment]
         let taggedFileAttachments: [AgentTaggedFileAttachment]
+        let documentAttachments: [AgentDocumentAttachment]
         let initialStartLocation: AgentInitialStartLocation
         let remoteHost: AgentSessionRemoteHostBinding?
 
@@ -693,6 +694,7 @@ extension AgentModeViewModel {
             workflow == nil
                 && imageAttachments.isEmpty
                 && taggedFileAttachments.isEmpty
+                && documentAttachments.isEmpty
                 && initialStartLocation == .local
                 && remoteHost == nil
         }

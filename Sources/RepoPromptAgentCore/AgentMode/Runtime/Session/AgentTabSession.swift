@@ -375,6 +375,7 @@ package final class AgentTabSession: ObservableObject {
         let providerText: String
         let attachments: [AgentImageAttachment]
         let taggedFileAttachments: [AgentTaggedFileAttachment]
+        package let documentAttachments: [AgentDocumentAttachment]
         /// The original user-typed text to restore into the composer on failure/cancel.
         let draftText: String
         /// The queued user input this steering delivers (its user item is the optimistic bubble).
@@ -390,6 +391,7 @@ package final class AgentTabSession: ObservableObject {
             providerText: String,
             attachments: [AgentImageAttachment],
             taggedFileAttachments: [AgentTaggedFileAttachment],
+            documentAttachments: [AgentDocumentAttachment] = [],
             draftText: String,
             identity: AgentQueuedInputIdentity,
             createdAt: Date,
@@ -401,6 +403,7 @@ package final class AgentTabSession: ObservableObject {
             self.providerText = providerText
             self.attachments = attachments
             self.taggedFileAttachments = taggedFileAttachments
+            self.documentAttachments = documentAttachments
             self.draftText = draftText
             self.identity = identity
             self.createdAt = createdAt
@@ -434,6 +437,7 @@ package final class AgentTabSession: ObservableObject {
         let interruptedPromptProviderText: String?
         let attachments: [AgentImageAttachment]
         let taggedFileAttachments: [AgentTaggedFileAttachment]
+        package let documentAttachments: [AgentDocumentAttachment]
         /// The original user-typed text to restore into the composer on failure/cancel.
         let draftText: String
         /// The queued user input this steering delivers (its user item is the optimistic bubble).
@@ -448,6 +452,7 @@ package final class AgentTabSession: ObservableObject {
             interruptedPromptProviderText: String?,
             attachments: [AgentImageAttachment],
             taggedFileAttachments: [AgentTaggedFileAttachment],
+            documentAttachments: [AgentDocumentAttachment] = [],
             draftText: String,
             identity: AgentQueuedInputIdentity,
             createdAt: Date
@@ -459,6 +464,7 @@ package final class AgentTabSession: ObservableObject {
             self.interruptedPromptProviderText = interruptedPromptProviderText
             self.attachments = attachments
             self.taggedFileAttachments = taggedFileAttachments
+            self.documentAttachments = documentAttachments
             self.draftText = draftText
             self.identity = identity
             self.createdAt = createdAt
@@ -641,6 +647,9 @@ package final class AgentTabSession: ObservableObject {
         let providerText: String
         package let images: [AgentImageAttachment]
         package let taggedFileAttachments: [AgentTaggedFileAttachment]
+        /// Documents this submission delivers. Their manifest is already part of `providerText`
+        /// once prepared; the records restore the composer when the submission is returned.
+        package let documentAttachments: [AgentDocumentAttachment]
         package let draftText: String
         /// The user input this submission delivers. A durable identity's intent ID is the queue ID.
         package let identity: AgentQueuedInputIdentity
@@ -652,6 +661,7 @@ package final class AgentTabSession: ObservableObject {
             providerText: String,
             images: [AgentImageAttachment],
             taggedFileAttachments: [AgentTaggedFileAttachment],
+            documentAttachments: [AgentDocumentAttachment] = [],
             draftText: String,
             identity: AgentQueuedInputIdentity,
             origin: CodexFallbackOrigin,
@@ -665,6 +675,7 @@ package final class AgentTabSession: ObservableObject {
             self.providerText = providerText
             self.images = images
             self.taggedFileAttachments = taggedFileAttachments
+            self.documentAttachments = documentAttachments
             self.draftText = draftText
             self.identity = identity
             self.origin = origin
@@ -705,6 +716,7 @@ package final class AgentTabSession: ObservableObject {
         package var providerText: String
         let images: [AgentImageAttachment]
         let taggedFileAttachments: [AgentTaggedFileAttachment]
+        package var documentAttachments: [AgentDocumentAttachment] = []
         let model: String?
         let reasoningEffort: String?
         let serviceTier: String?
@@ -907,6 +919,15 @@ package final class AgentTabSession: ObservableObject {
     @Published package var pendingTaggedFileAttachments: [AgentTaggedFileAttachment] = [] {
         didSet {
             guard pendingTaggedFileAttachments != oldValue else { return }
+            notifyRecoveryComposerMutation()
+        }
+    }
+
+    /// Pending PDF/HTML document attachments for the next user turn (managed originals; a channel
+    /// separate from images and tagged files, never pruned against mention tokens).
+    @Published package var pendingDocumentAttachments: [AgentDocumentAttachment] = [] {
+        didSet {
+            guard pendingDocumentAttachments != oldValue else { return }
             notifyRecoveryComposerMutation()
         }
     }
@@ -1703,6 +1724,16 @@ package final class AgentTabSession: ObservableObject {
 
     package var pendingScheduledSendRecord: AgentScheduledSendPersist? {
         scheduledSend?.persistedValue
+    }
+
+    /// Whether `identity` is a scheduled attempt's input (its deterministic bubble): the in-flight
+    /// attempt, one accepted and awaiting finalization, or a bubble stamped with its schedule
+    /// receipt. The schedule owns that payload, so a refusal never also returns it to the composer.
+    package func isScheduledAttemptInput(_ identity: AgentQueuedInputIdentity) -> Bool {
+        guard let itemID = identity.userItemID else { return false }
+        if pendingScheduledSendRecord?.attempt?.itemID == itemID { return true }
+        if scheduledSendPendingFinalization?.attempt.itemID == itemID { return true }
+        return items.contains { $0.id == itemID && $0.scheduledSend != nil }
     }
 
     /// True while this session owns provider work for a scheduled attempt (dispatch in

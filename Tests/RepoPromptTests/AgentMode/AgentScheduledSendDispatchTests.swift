@@ -596,6 +596,232 @@ final class AgentScheduledSendDispatchTests: XCTestCase {
         XCTAssertEqual(persistedRequest.text, "Run the tests")
     }
 
+    // MARK: - Attached documents
+
+    private func importScheduledPDF(_ harness: Harness) async throws -> (AgentDocumentAttachment, AgentDocumentAttachmentStore) {
+        let store = AgentDocumentAttachmentStore(rootURL: harness.storageURL.appendingPathComponent("Documents", isDirectory: true))
+        harness.viewModel.documentAttachmentStore = store
+        let source = harness.storageURL.appendingPathComponent("Plan.pdf")
+        try Data("%PDF-1.4 SCHEDULED-SECRET-BODY".utf8).write(to: source)
+        let imported = try await store.importDocuments(from: [source])
+        return try (XCTUnwrap(imported.first), store)
+    }
+
+    func testScheduledDocumentSnapshotDispatchesRecordsAndManifest() async throws {
+        let harness = try await makeHarness(windowID: 4391)
+        let clock = DispatchFakeClock(now: Date())
+        harness.viewModel.attachScheduledSendCoordinator(AgentScheduledSendCoordinator(clock: clock.clock))
+        let (doc, store) = try await importScheduledPDF(harness)
+        harness.session.pendingDocumentAttachments = [doc]
+        let notBefore = clock.now.addingTimeInterval(60)
+        _ = try await harness.viewModel.installScheduledSend(
+            text: "Review the plan",
+            on: harness.session,
+            notBefore: notBefore,
+            runAlongsideOtherSessions: false,
+            isNewSessionStart: false
+        ).get()
+
+        // The snapshot moved the records out of the composer into the durable record.
+        XCTAssertTrue(harness.session.pendingDocumentAttachments.isEmpty)
+        XCTAssertEqual(harness.session.pendingScheduledSendRecord?.documents, [doc])
+        let persisted = try await harness.persistedSession()
+        XCTAssertEqual(persisted.scheduledSend?.persistedValue?.documents, [doc])
+
+        let probe = DispatchProbe()
+        harness.viewModel.scheduledDispatchRunStarter = { [harness, probe] _, providerText, _, _ in
+            probe.providerText = providerText
+            // The records ride on the prepared user item handed to this start.
+            probe.documents = harness.session.items.last { $0.kind == .user }?.documentAttachments ?? []
+            return .sent
+        }
+        clock.advance(to: notBefore.addingTimeInterval(1))
+        try await waitUntil("provider acceptance recorded") {
+            harness.session.lastScheduledDispatch != nil && harness.session.scheduledSendPendingFinalization == nil
+        }
+
+        XCTAssertEqual(probe.documents, [doc], "The provider start receives the record's document records")
+        let providerText = try XCTUnwrap(probe.providerText)
+        XCTAssertTrue(providerText.hasPrefix("Review the plan\n\n<attached_documents>"), providerText)
+        XCTAssertTrue(providerText.contains(store.managedFileURL(for: doc).path), "The manifest names the managed original")
+        XCTAssertFalse(providerText.contains("SCHEDULED-SECRET-BODY"), "Document content is never inlined")
+        let accepted = try XCTUnwrap(harness.session.items.first { $0.kind == .user })
+        XCTAssertEqual(accepted.documentAttachments, [doc])
+        XCTAssertEqual(accepted.text, "Review the plan", "The bubble keeps the typed text, not the manifest")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: store.managedFileURL(for: doc).path), "Acceptance never deletes the original")
+    }
+
+    func testScheduledDocumentMissingAtDispatchSendsNothingAndKeepsRecords() async throws {
+        let harness = try await makeHarness(windowID: 4392)
+        let clock = DispatchFakeClock(now: Date())
+        harness.viewModel.attachScheduledSendCoordinator(AgentScheduledSendCoordinator(clock: clock.clock))
+        let (doc, store) = try await importScheduledPDF(harness)
+        harness.session.pendingDocumentAttachments = [doc]
+        let notBefore = clock.now.addingTimeInterval(60)
+        _ = try await harness.viewModel.installScheduledSend(
+            text: "Review the plan",
+            on: harness.session,
+            notBefore: notBefore,
+            runAlongsideOtherSessions: false,
+            isNewSessionStart: false
+        ).get()
+        try FileManager.default.removeItem(at: store.managedFileURL(for: doc))
+
+        let probe = DispatchProbe()
+        harness.viewModel.scheduledDispatchRunStarter = { [probe] _, _, _, _ in
+            probe.startCount += 1
+            return .sent
+        }
+        clock.advance(to: notBefore.addingTimeInterval(1))
+        try await waitUntil("failed state recorded") {
+            harness.session.pendingScheduledSendRecord?.state == .failed
+        }
+
+        XCTAssertEqual(probe.startCount, 0, "Nothing reaches the provider")
+        let failed = try XCTUnwrap(harness.session.pendingScheduledSendRecord)
+        XCTAssertEqual(failed.documents, [doc], "The record keeps its documents for an explicit retry")
+        XCTAssertNotNil(failed.lastFailureMessage)
+        XCTAssertNil(harness.session.lastScheduledDispatch)
+        XCTAssertFalse(harness.session.items.contains { $0.kind == .user })
+    }
+
+    /// F13: production scheduled dispatch (no injected run starter) re-preflights the record's
+    /// documents and delivers the manifest through the Claude runner to the native runtime.
+    func testScheduledDocumentDispatchDeliversManifestThroughClaudeRunner() async throws {
+        let controller = LifecycleFakeNativeController(recorder: LifecycleRecorder())
+        addTeardownBlock { await controller.shutdown() }
+        let harness = try await makeHarness(windowID: 4393, claudeController: controller)
+        harness.session.selectedAgent = .claudeCode
+        let clock = DispatchFakeClock(now: Date())
+        harness.viewModel.attachScheduledSendCoordinator(AgentScheduledSendCoordinator(clock: clock.clock))
+        let (doc, store) = try await importScheduledPDF(harness)
+        harness.session.pendingDocumentAttachments = [doc]
+        let notBefore = clock.now.addingTimeInterval(60)
+        _ = try await harness.viewModel.installScheduledSend(
+            text: "Review the plan",
+            on: harness.session,
+            notBefore: notBefore,
+            runAlongsideOtherSessions: false,
+            isNewSessionStart: false
+        ).get()
+        XCTAssertNil(harness.viewModel.scheduledDispatchRunStarter, "Production dispatch, no injected starter")
+
+        clock.advance(to: notBefore.addingTimeInterval(1))
+        let deadline = Date().addingTimeInterval(5)
+        var sent = await controller.recordedSentMessages()
+        while sent.isEmpty, Date() < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+            sent = await controller.recordedSentMessages()
+        }
+
+        XCTAssertEqual(sent.count, 1, "The native runtime received exactly the scheduled turn")
+        let providerText = try XCTUnwrap(sent.first)
+        XCTAssertTrue(providerText.contains("Review the plan"), providerText)
+        XCTAssertTrue(providerText.contains("<attached_documents>"), providerText)
+        XCTAssertTrue(providerText.contains(store.managedFileURL(for: doc).path), "The manifest names the managed original")
+        XCTAssertFalse(providerText.contains("SCHEDULED-SECRET-BODY"), "Document content is never inlined")
+        let accepted = try XCTUnwrap(harness.session.items.first { $0.kind == .user })
+        XCTAssertEqual(accepted.documentAttachments, [doc])
+        XCTAssertEqual(accepted.text, "Review the plan", "The bubble keeps the typed text, not the manifest")
+        await harness.viewModel.cancelAgentRun(tabID: harness.tabID, cause: .ordinary)
+    }
+
+    /// B N3: production scheduled Claude dispatch whose original disappears during provider
+    /// startup is refused at the send seam's final boundary: nothing is written, and the schedule
+    /// keeps the one copy of its input. Nothing is also restored into the composer. (Recovery
+    /// inactive: the legacy launched-run heuristic already adopted the attempt, so its stamped
+    /// bubble keeps the document records and the refusal is shown next to it.)
+    func testScheduledClaudeDocumentRefusedDuringStartupStaysWithScheduleOnly() async throws {
+        let recorder = LifecycleRecorder()
+        let startGate = LifecycleAsyncGate()
+        let controller = LifecycleFakeNativeController(recorder: recorder, startGate: startGate)
+        addTeardownBlock { await controller.shutdown() }
+        let harness = try await makeHarness(windowID: 4394, claudeController: controller)
+        harness.session.selectedAgent = .claudeCode
+        let clock = DispatchFakeClock(now: Date())
+        harness.viewModel.attachScheduledSendCoordinator(AgentScheduledSendCoordinator(clock: clock.clock))
+        let (doc, store) = try await importScheduledPDF(harness)
+        harness.session.pendingDocumentAttachments = [doc]
+        let notBefore = clock.now.addingTimeInterval(60)
+        _ = try await harness.viewModel.installScheduledSend(
+            text: "Review the plan",
+            on: harness.session,
+            notBefore: notBefore,
+            runAlongsideOtherSessions: false,
+            isNewSessionStart: false
+        ).get()
+        harness.session.draftText = ""
+
+        clock.advance(to: notBefore.addingTimeInterval(1))
+        try await waitUntil("provider startup suspended") { recorder.events.contains("claude:start") }
+        try FileManager.default.removeItem(at: store.managedFileURL(for: doc))
+        let refusal = try XCTUnwrap(harness.viewModel.documentAttachmentBlockedMessage([doc], session: harness.session))
+        await startGate.release()
+        try await waitUntil("run ended") { !harness.session.runState.isActive }
+        await harness.session.agentTask?.value
+
+        let sent = await controller.recordedSentMessages()
+        XCTAssertTrue(sent.isEmpty, "Nothing reached the provider: \(sent)")
+        XCTAssertTrue(harness.session.pendingDocumentAttachments.isEmpty, "Never also restored into the composer")
+        XCTAssertTrue(harness.session.pendingImageAttachments.isEmpty)
+        XCTAssertEqual(harness.session.draftText, "", "No composer draft copy")
+        let scheduledCopies = harness.session.items.filter { $0.kind == .user && $0.scheduledSend != nil }
+        XCTAssertEqual(scheduledCopies.count, 1, "The schedule's one copy remains")
+        XCTAssertEqual(scheduledCopies.first?.documentAttachments, [doc], "It keeps the document records")
+        XCTAssertEqual(
+            harness.session.items.count { $0.kind == .error && $0.text == refusal },
+            1,
+            "The refusal is shown once"
+        )
+    }
+
+    /// B N3: production scheduled Codex dispatch refused for its documents after augmentation sends
+    /// nothing; the failed schedule keeps its document records for an explicit retry, and nothing
+    /// is also restored into the composer.
+    func testScheduledCodexDocumentRefusedAtHandoffStaysWithScheduleOnly() async throws {
+        let codex = DispatchNoopCodexController()
+        let harness = try await makeHarness(windowID: 4395, codexController: codex)
+        harness.session.selectedAgent = .codexExec
+        harness.session.permissionProfile = .userConfigured
+        harness.viewModel.codexShellToolPreference = { true }
+        let clock = DispatchFakeClock(now: Date())
+        harness.viewModel.attachScheduledSendCoordinator(AgentScheduledSendCoordinator(clock: clock.clock))
+        let (doc, store) = try await importScheduledPDF(harness)
+        harness.session.pendingDocumentAttachments = [doc]
+        let notBefore = clock.now.addingTimeInterval(60)
+        _ = try await harness.viewModel.installScheduledSend(
+            text: "Review the plan",
+            on: harness.session,
+            notBefore: notBefore,
+            runAlongsideOtherSessions: false,
+            isNewSessionStart: false
+        ).get()
+        harness.session.draftText = ""
+        // The original disappears after the dispatch's augmentation, before its handoff.
+        let url = store.managedFileURL(for: doc)
+        var removed = false
+        harness.viewModel.test_afterDocumentAugmentationHook = { _ in
+            guard !removed else { return }
+            removed = true
+            try? FileManager.default.removeItem(at: url)
+        }
+
+        clock.advance(to: notBefore.addingTimeInterval(1))
+        try await waitUntil("failed state recorded") {
+            harness.session.pendingScheduledSendRecord?.state == .failed
+        }
+
+        XCTAssertTrue(removed, "The dispatch augmented the record's documents")
+        XCTAssertTrue(codex.startTexts.isEmpty, "No turn/start for a missing original")
+        let failed = try XCTUnwrap(harness.session.pendingScheduledSendRecord)
+        XCTAssertEqual(failed.documents, [doc], "The schedule keeps its document records for an explicit retry")
+        XCTAssertNil(harness.session.lastScheduledDispatch)
+        XCTAssertTrue(harness.session.pendingDocumentAttachments.isEmpty, "Never also restored into the composer")
+        XCTAssertTrue(harness.session.pendingImageAttachments.isEmpty)
+        XCTAssertEqual(harness.session.draftText, "", "No composer draft copy")
+        XCTAssertFalse(harness.session.items.contains { $0.kind == .user }, "The unsent attempt's bubble is removed")
+    }
+
     func testFailedOutcomeKeepsItemIDWithoutSentMarkerAndSendNowRedrivesSameItem() async throws {
         let harness = try await makeHarness(windowID: 4303)
         let clock = DispatchFakeClock(now: Date())
@@ -3143,8 +3369,11 @@ final class AgentScheduledSendDispatchTests: XCTestCase {
     private func makeHarness(
         windowID: Int,
         workspace existingWorkspace: WorkspaceModel? = nil,
-        storageURL existingStorageURL: URL? = nil
+        storageURL existingStorageURL: URL? = nil,
+        claudeController: LifecycleFakeNativeController? = nil,
+        codexController: DispatchNoopCodexController? = nil
     ) async throws -> Harness {
+        let usesProductionRunService = claudeController != nil || codexController != nil
         let storageURL: URL
         if let existingStorageURL {
             storageURL = existingStorageURL
@@ -3162,12 +3391,37 @@ final class AgentScheduledSendDispatchTests: XCTestCase {
             repoPaths: [storageURL.path],
             customStoragePath: storageURL
         )
-        let viewModel = AgentModeViewModel(
-            testWindowID: windowID,
-            testWorkspacePath: storageURL.path,
-            testWorkspaceDirectory: storageURL,
-            codexControllerFactory: { _, _, _, _, _, _ in DispatchNoopCodexController() }
-        )
+        let viewModel = if usesProductionRunService {
+            // The production run service with only recording fake runtimes (no process) and inert
+            // MCP policy/routing hooks, as the run-service lifecycle harness composes it.
+            AgentModeViewModel(
+                testWindowID: windowID,
+                testWorkspacePath: storageURL.path,
+                testWorkspaceDirectory: storageURL,
+                codexControllerFactory: { _, _, _, _, _, _ in codexController ?? DispatchNoopCodexController() },
+                claudeControllerFactory: { _, _, _, _ in
+                    claudeController ?? LifecycleFakeNativeController(recorder: LifecycleRecorder())
+                },
+                connectionPolicyInstaller: { _, _, _, _, _, _, _, runID, _, _, _, _, _, _, _ in
+                    if let runID {
+                        await MCPRoutingWaiter.notifyRouted(runID: runID)
+                    }
+                },
+                mcpRunRoutingCleaner: { _, _, _ in }
+            )
+        } else {
+            AgentModeViewModel(
+                testWindowID: windowID,
+                testWorkspacePath: storageURL.path,
+                testWorkspaceDirectory: storageURL,
+                codexControllerFactory: { _, _, _, _, _, _ in DispatchNoopCodexController() }
+            )
+        }
+        if usesProductionRunService {
+            viewModel.test_expectedPIDPolicyArmerOverride = { _ in true }
+            viewModel.test_setAvailableAgents([.claudeCode, .codexExec])
+            viewModel.test_initializeRunService()
+        }
         viewModel.test_persistenceWorkspaceOverride = workspace
         // The view model uses the shared data service; never leak an injector across tests.
         addTeardownBlock {
@@ -3308,6 +3562,7 @@ private final class DispatchProbe {
     var userItemsAtHandoff: [AgentChatItem] = []
     var startCount = 0
     var createdTabIDs: [UUID] = []
+    var documents: [AgentDocumentAttachment] = []
 }
 
 /// Holds a dispatch inside the provider handoff until the test releases it.
@@ -3420,8 +3675,12 @@ private final class DispatchNoopCodexController: CodexSessionControlling {
         CodexNativeSessionController.ThreadSnapshot(conversationID: "noop", rolloutPath: nil, model: nil, reasoningEffort: nil, runtimeStatus: .idle, currentTurnID: nil, activeTurnIDs: [], latestTurnStatus: nil)
     }
 
-    func startUserTurn(text _: String, images _: [AgentImageAttachment], model _: String?, reasoningEffort _: String?, serviceTier _: String?) async throws -> CodexTurnStartReceipt {
-        CodexTurnStartReceipt(provisionalSubmissionID: "noop")
+    /// `turn/start` texts this controller received (scheduled Codex document tests).
+    private(set) var startTexts: [String] = []
+
+    func startUserTurn(text: String, images _: [AgentImageAttachment], model _: String?, reasoningEffort _: String?, serviceTier _: String?) async throws -> CodexTurnStartReceipt {
+        startTexts.append(text)
+        return CodexTurnStartReceipt(provisionalSubmissionID: "noop")
     }
 
     func steerUserTurn(text _: String, images _: [AgentImageAttachment], expectedTurnID: String) async throws -> CodexTurnSteerReceipt {

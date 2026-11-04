@@ -131,6 +131,8 @@ package enum AgentRecoveryStoreError: Error, Equatable {
     case heldComposerUnresolved(revision: AgentRecoveryComposerRevision, transcriptResetGeneration: UInt64)
     case unreadableRecord(UUID, AgentRecoveryUnreadableReason)
     case attachmentUnavailable(imageID: UUID)
+    /// An attached document's managed original (global document store) is missing or unreadable.
+    case documentUnavailable(documentID: UUID)
     case attachmentImportFailed(String)
     /// A storage operation failed: the raw description (logs only, never user-facing text) and its
     /// typed cause, classified at the store boundary (`AgentRecoveryStorageFailureCause`).
@@ -184,7 +186,7 @@ package enum AgentRecoveryStoreError: Error, Equatable {
             .revisionConflict
         case .unreadableRecord:
             .unreadable
-        case .attachmentUnavailable, .attachmentImportFailed:
+        case .attachmentUnavailable, .documentUnavailable, .attachmentImportFailed:
             .attachment
         case .storageFailure:
             .storage
@@ -374,15 +376,21 @@ package actor AgentRecoveryStore {
     /// written. `nil` until a mark is read or written.
     private(set) var ordinaryExitSettlementLaunchCutoff: AgentRecoveryTimestamp?
 
+    /// Global managed document originals referenced by stored content. Recovery only checks that
+    /// they exist; it never copies, moves, or deletes them.
+    nonisolated let documentStore: AgentDocumentAttachmentStore
+
     package init(
         rootURL: URL,
         appInstanceID: UUID = AgentRecoveryLaunchInstance.currentID,
         fileOperations: FileOperations = .live,
+        documentStore: AgentDocumentAttachmentStore = .production,
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.rootURL = rootURL.standardizedFileURL
         self.appInstanceID = appInstanceID
         self.fileOperations = fileOperations
+        self.documentStore = documentStore
         self.now = now
     }
 
@@ -550,7 +558,9 @@ package actor AgentRecoveryStore {
         if intent.staleTargetMarkedAt != nil || intent.transcriptResetGeneration != currentGeneration {
             reasons.insert(.staleTarget)
         }
-        if missingManagedImageID(in: intent.payload, sessionID: sessionID) != nil {
+        if missingManagedImageID(in: intent.payload, sessionID: sessionID) != nil
+            || missingManagedDocumentID(in: intent.payload) != nil
+        {
             reasons.insert(.missingAttachment)
         }
         return reasons
@@ -1969,6 +1979,13 @@ package actor AgentRecoveryStore {
             }
             return file
         }
+        let documents = new.documents.map { document in
+            var document = document
+            if let previous = old.documents.first(where: { $0.id == document.id }) {
+                document.extras = mergedExtras(previous.extras, document.extras)
+            }
+            return document
+        }
         var workflow = new.workflow
         if var updated = workflow, let previous = old.workflow, previous.source == updated.source {
             updated.extras = mergedExtras(previous.extras, updated.extras)
@@ -1978,6 +1995,7 @@ package actor AgentRecoveryStore {
             text: new.text,
             images: images,
             taggedFiles: taggedFiles,
+            documents: documents,
             workflow: workflow,
             interviewFirst: new.interviewFirst,
             extras: mergedExtras(old.extras, new.extras)
@@ -2049,6 +2067,9 @@ package actor AgentRecoveryStore {
         }
         if let missing = missingManagedImageID(in: submission.payload, sessionID: binding.sessionID) {
             throw AgentRecoveryStoreError.attachmentUnavailable(imageID: missing)
+        }
+        if let missing = missingManagedDocumentID(in: submission.payload) {
+            throw AgentRecoveryStoreError.documentUnavailable(documentID: missing)
         }
         let timestamp = AgentRecoveryTimestamp(now())
         var attempts = current?.attempts ?? []
@@ -2199,6 +2220,17 @@ package actor AgentRecoveryStore {
                   FileManager.default.fileExists(atPath: url.path)
             else {
                 return image.id
+            }
+        }
+        return nil
+    }
+
+    /// Document references are validated against the global managed store by ID and kind, never
+    /// against the per-session image file schema.
+    private func missingManagedDocumentID(in content: AgentRecoveryInputContent) -> UUID? {
+        for document in content.documents {
+            guard case .success = documentStore.resolveManagedFile(for: document.attachment) else {
+                return document.id
             }
         }
         return nil

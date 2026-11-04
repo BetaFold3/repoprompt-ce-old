@@ -165,6 +165,7 @@ package struct AgentColdRestoreInterruptionContext: Equatable {
         package let text: String
         package let attachments: [AgentImageAttachment]
         package let taggedFiles: [AgentTaggedFileAttachment]
+        package let documents: [AgentDocumentAttachment]
         package let workflow: AgentWorkflowDefinition?
 
         package init(
@@ -174,6 +175,7 @@ package struct AgentColdRestoreInterruptionContext: Equatable {
             text: String,
             attachments: [AgentImageAttachment],
             taggedFiles: [AgentTaggedFileAttachment],
+            documents: [AgentDocumentAttachment] = [],
             workflow: AgentWorkflowDefinition?
         ) {
             self.userItemID = userItemID
@@ -182,6 +184,7 @@ package struct AgentColdRestoreInterruptionContext: Equatable {
             self.text = text
             self.attachments = attachments
             self.taggedFiles = taggedFiles
+            self.documents = documents
             self.workflow = workflow
         }
     }
@@ -354,6 +357,7 @@ package struct AgentColdRestoreInterruptionContext: Equatable {
                 id: $0.userItemID,
                 attachments: $0.attachments,
                 taggedFileAttachments: $0.taggedFiles,
+                documentAttachments: $0.documents,
                 workflow: $0.workflow
             )
         }

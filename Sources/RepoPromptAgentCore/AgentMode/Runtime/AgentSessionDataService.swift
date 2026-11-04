@@ -3548,6 +3548,7 @@ package actor AgentSessionDataService {
                 text: intent.payload.text,
                 attachments: intent.payload.images.compactMap { recoveryStore.attachment(for: $0, sessionID: sessionID) },
                 taggedFiles: intent.payload.taggedFiles.map(\.attachment),
+                documents: intent.payload.documents.map(\.attachment),
                 workflow: intent.payload.workflow?.definition
             )
         }
