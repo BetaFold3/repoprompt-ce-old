@@ -82,6 +82,16 @@ Legacy models retain suffix-driven `-thinking` / `-thinking-max` behavior and re
 
 RepoPrompt owns its app default independently of the Claude Code CLI's internal default behavior. `ClaudeAgentToolPreferences` defaults to `.high`, prefers high, then medium, then the first available supported choice, and launches Claude Code with `CLAUDE_CODE_EFFORT_LEVEL`. The native Anthropic adaptive path likewise uses `.high` when no effort is requested. Do not change the app default to mirror a CLI-side xhigh default; direct CLI behavior and RepoPrompt-launched behavior are deliberately distinct.
 
+## MCP selector presentation
+
+`list_agents` text preserves exact Claude colon-effort targets such as
+`claudeCode:claude-opus-5-5:medium`. Entries whose trailing `:<effort>` matches
+their effort metadata bypass Codex's hyphen-family shorthand in
+`ToolOutputFormatter`; the catalog and selector resolver remain authoritative
+and unchanged. `ToolOutputFormatterAgentManageTests` covers the displayed IDs,
+local resolver acceptance, malformed-ID rejection, and unchanged Codex shorthand.
+This is formatting validation, not evidence of provider startup reliability.
+
 ## Claude Code Auto permission invariants
 
 `ClaudeAgentToolPreferences` is the sole local authority for Auto candidacy and launch resolution. Auto is a candidate only on the official `.claudeCode` backend for the `opus`, `opus[1m]`, and `sonnet` aliases; the exact legacy IDs `claude-opus-4-6`, `claude-opus-4-7`, and `claude-sonnet-4-6`; and strict major-5 Fable, Opus, and Sonnet family IDs accepted by `ClaudeModelFamilyCatalog`. Compatible backends, nil/default/unknown selections, and known unsupported families block Auto. Local candidacy only permits an attempt; the Claude Code acknowledgement remains the acceptance authority.

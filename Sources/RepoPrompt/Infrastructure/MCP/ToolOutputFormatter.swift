@@ -6332,7 +6332,14 @@ extension ToolOutputFormatter {
                     // Extract base: everything after "agentRaw:" minus an explicit or supported effort suffix.
                     let afterColon = modelID.contains(":") ? String(modelID[modelID.index(after: modelID.firstIndex(of: ":")!)...]) : modelID
                     let agentPrefix = modelID.contains(":") ? String(modelID[...modelID.firstIndex(of: ":")!]) : ""
-                    let groupingEffort = agentListGroupingEffort(modelID: afterColon, reasoningEffort: effort)
+                    var groupingEffort = agentListGroupingEffort(modelID: afterColon, reasoningEffort: effort)
+                    // Colon-qualified targets (Claude `base:effort`) are already exact
+                    // selectors; list them verbatim instead of inventing `-{effort}`.
+                    if let candidate = groupingEffort,
+                       afterColon.lowercased().hasSuffix(":\(candidate.lowercased())")
+                    {
+                        groupingEffort = nil
+                    }
                     let base = agentListFamilyBase(modelID: afterColon, groupingEffort: groupingEffort)
                     let familyKey = agentPrefix + base
 
