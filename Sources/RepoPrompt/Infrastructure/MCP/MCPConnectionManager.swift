@@ -17960,8 +17960,34 @@ actor ServerNetworkManager {
         )
     }
 
+    /// Bounded startup grace for admission eviction. A viable, never-called connection admitted
+    /// within this window ranks behind every other eligible candidate, so admission pressure takes
+    /// an older or used idle connection before a client that is still starting up. When only
+    /// startup-grace candidates exist, eviction still falls back to them.
+    private static let admissionEvictionStartupGraceSeconds: TimeInterval = 60
+
+    /// One cutoff per eviction invocation keeps the startup tier stable while candidates are sorted.
+    private static func admissionEvictionStartupGraceCutoff() -> Date {
+        Date().addingTimeInterval(-admissionEvictionStartupGraceSeconds)
+    }
+
+    /// Non-viable candidates (infinite idle) and candidates without stats (`distantPast`) never qualify.
+    private func isWithinAdmissionStartupGrace(
+        _ candidate: EvictionCandidate,
+        cutoff: Date
+    ) -> Bool {
+        !candidate.everCalled && candidate.idleSeconds.isFinite && candidate.createdAt > cutoff
+    }
+
     /// Sort ascending by value (least valuable first)
-    private func isLessValuable(_ a: EvictionCandidate, than b: EvictionCandidate) -> Bool {
+    private func isLessValuable(
+        _ a: EvictionCandidate,
+        than b: EvictionCandidate,
+        startupGraceCutoff: Date
+    ) -> Bool {
+        let aInStartupGrace = isWithinAdmissionStartupGrace(a, cutoff: startupGraceCutoff)
+        let bInStartupGrace = isWithinAdmissionStartupGrace(b, cutoff: startupGraceCutoff)
+        if aInStartupGrace != bInStartupGrace { return bInStartupGrace }
         if a.everCalled != b.everCalled { return a.everCalled == false }
         if a.idleSeconds != b.idleSeconds { return a.idleSeconds > b.idleSeconds }
         if a.totalCalls != b.totalCalls { return a.totalCalls < b.totalCalls }
@@ -18003,7 +18029,11 @@ actor ServerNetworkManager {
             }
         }
 
-        for victim in candidates.sorted(by: isLessValuable) {
+        let startupGraceCutoff = Self.admissionEvictionStartupGraceCutoff()
+        let orderedCandidates = candidates.sorted {
+            isLessValuable($0, than: $1, startupGraceCutoff: startupGraceCutoff)
+        }
+        for victim in orderedCandidates {
             #if DEBUG
                 if let debugBeforeAdmissionEvictionCloseForTesting {
                     await debugBeforeAdmissionEvictionCloseForTesting(victim.id)
@@ -18182,7 +18212,11 @@ actor ServerNetworkManager {
             sourceListener: sourceListener,
             lifecycleGeneration: lifecycleGeneration
         ) else { return .admissionContextInvalidated }
-        for victim in candidates.sorted(by: isLessValuable) {
+        let startupGraceCutoff = Self.admissionEvictionStartupGraceCutoff()
+        let orderedCandidates = candidates.sorted {
+            isLessValuable($0, than: $1, startupGraceCutoff: startupGraceCutoff)
+        }
+        for victim in orderedCandidates {
             guard isCurrentBootstrapAdmissionContext(
                 sourceListener: sourceListener,
                 lifecycleGeneration: lifecycleGeneration

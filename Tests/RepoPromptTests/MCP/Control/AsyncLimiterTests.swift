@@ -1726,6 +1726,42 @@ import XCTest
             await assertAdmissionEvictionFallsBackToNextCandidate(scope: .global)
         }
 
+        func testPerClientAdmissionEvictionPrefersUsedIdleCandidateOverStartupGraceConnection() async {
+            await assertAdmissionEvictionStartupGraceRanking(
+                scope: .perClient,
+                startupGraceVersusOlderUsed: true
+            )
+        }
+
+        func testGlobalAdmissionEvictionPrefersUsedIdleCandidateOverStartupGraceConnection() async {
+            await assertAdmissionEvictionStartupGraceRanking(
+                scope: .global,
+                startupGraceVersusOlderUsed: true
+            )
+        }
+
+        func testPerClientAdmissionEvictionFallsBackToStartupGraceCandidatesWhenNoOtherExists() async {
+            await assertAdmissionEvictionStartupGraceFallback(scope: .perClient)
+        }
+
+        func testGlobalAdmissionEvictionFallsBackToStartupGraceCandidatesWhenNoOtherExists() async {
+            await assertAdmissionEvictionStartupGraceFallback(scope: .global)
+        }
+
+        func testPerClientAdmissionEvictionKeepsNeverUsedPreferenceAfterStartupGrace() async {
+            await assertAdmissionEvictionStartupGraceRanking(
+                scope: .perClient,
+                startupGraceVersusOlderUsed: false
+            )
+        }
+
+        func testGlobalAdmissionEvictionKeepsNeverUsedPreferenceAfterStartupGrace() async {
+            await assertAdmissionEvictionStartupGraceRanking(
+                scope: .global,
+                startupGraceVersusOlderUsed: false
+            )
+        }
+
         func testGlobalAdmissionEvictionIgnoresRemovingSiblingBeforeClosingProtectedVictim() async {
             let manager = ServerNetworkManager()
             let firstClientID = "admission-eviction-first-\(UUID().uuidString)"
@@ -4358,6 +4394,125 @@ import XCTest
             await busyGate.release()
             await manager.debugRemoveConnection(firstCandidateID)
             await manager.debugRemoveConnection(secondCandidateID)
+        }
+
+        private struct AdmissionEvictionRankingCandidate {
+            let id = UUID()
+            let idleSeconds: TimeInterval
+            let totalToolCalls: Int
+            let createdAt: Date
+        }
+
+        /// Never-used `first` (inside or beyond the startup grace) versus an older used idle `second`.
+        private func assertAdmissionEvictionStartupGraceRanking(
+            scope: AdmissionEvictionScope,
+            startupGraceVersusOlderUsed: Bool,
+            file: StaticString = #filePath,
+            line: UInt = #line
+        ) async {
+            let neverUsed = AdmissionEvictionRankingCandidate(
+                idleSeconds: 1,
+                totalToolCalls: 0,
+                createdAt: startupGraceVersusOlderUsed ? Date() : Date(timeIntervalSinceNow: -120)
+            )
+            let olderUsed = AdmissionEvictionRankingCandidate(
+                idleSeconds: 60,
+                totalToolCalls: 1,
+                createdAt: .distantPast
+            )
+            await assertAdmissionEvictionSelectsVictim(
+                scope: scope,
+                candidates: [neverUsed, olderUsed],
+                expectedVictimID: startupGraceVersusOlderUsed ? olderUsed.id : neverUsed.id,
+                file: file,
+                line: line
+            )
+        }
+
+        /// Only startup-grace candidates: eviction still proceeds, ordered by the existing idle rule.
+        private func assertAdmissionEvictionStartupGraceFallback(
+            scope: AdmissionEvictionScope,
+            file: StaticString = #filePath,
+            line: UInt = #line
+        ) async {
+            let fresher = AdmissionEvictionRankingCandidate(
+                idleSeconds: 1,
+                totalToolCalls: 0,
+                createdAt: Date()
+            )
+            let idler = AdmissionEvictionRankingCandidate(
+                idleSeconds: 5,
+                totalToolCalls: 0,
+                createdAt: Date()
+            )
+            await assertAdmissionEvictionSelectsVictim(
+                scope: scope,
+                candidates: [fresher, idler],
+                expectedVictimID: idler.id,
+                file: file,
+                line: line
+            )
+        }
+
+        /// Per-client scope runs direct admission at cap 2; global scope runs the global eviction routine.
+        private func assertAdmissionEvictionSelectsVictim(
+            scope: AdmissionEvictionScope,
+            candidates: [AdmissionEvictionRankingCandidate],
+            expectedVictimID: UUID,
+            file: StaticString,
+            line: UInt
+        ) async {
+            let manager = ServerNetworkManager()
+            let clientID = "admission-eviction-startup-grace-\(UUID().uuidString)"
+            let incomingConnectionID = UUID()
+            if scope == .perClient {
+                await manager.debugConfigurePerClientAdmissionForTesting(maxConnectionsPerClient: 2)
+                await manager.debugInstallDirectAdmissionConnectionForTesting(
+                    connectionID: incomingConnectionID,
+                    connection: AdmissionEvictionTestConnection(idleSeconds: 0)
+                )
+            }
+            for candidate in candidates {
+                await manager.debugInstallAdmissionEvictionCandidateForTesting(
+                    connectionID: candidate.id,
+                    connection: AdmissionEvictionTestConnection(idleSeconds: candidate.idleSeconds),
+                    clientID: clientID,
+                    totalToolCalls: candidate.totalToolCalls,
+                    createdAt: candidate.createdAt
+                )
+            }
+
+            let didProceed: Bool = switch scope {
+            case .perClient:
+                await manager.tryReserveConnectionSlot(
+                    connectionID: incomingConnectionID,
+                    clientID: clientID
+                )
+            case .global:
+                await manager.debugEvictLeastValuableGlobalForAdmissionForTesting(
+                    preserveOnePerClient: false
+                )
+            }
+
+            XCTAssertTrue(didProceed, "Admission eviction must not refuse when a candidate is eligible", file: file, line: line)
+            for candidate in candidates {
+                let retained = await manager.debugContainsConnection(candidate.id)
+                XCTAssertEqual(
+                    retained,
+                    candidate.id != expectedVictimID,
+                    "Unexpected eviction outcome for candidate with \(candidate.totalToolCalls) calls, idle \(candidate.idleSeconds)s",
+                    file: file,
+                    line: line
+                )
+            }
+
+            for candidate in candidates {
+                await manager.debugRemoveConnection(candidate.id)
+            }
+            if scope == .perClient {
+                await manager.debugRemoveConnection(incomingConnectionID)
+                await manager.debugConfigurePerClientAdmissionForTesting(maxConnectionsPerClient: nil)
+            }
         }
 
         private func waitForAdmissionRetryWaiterCount(
