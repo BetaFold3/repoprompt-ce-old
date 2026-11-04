@@ -1,8 +1,9 @@
 """Grader for E-family (edit) tasks.
 
-grade_edit(tid, text) -> {"correct", "score", "parse", "applied", "apply_strict", "failed_checks"}
+grade_edit(tid, text) -> {"correct", "score", "parse", "applied", "apply_strict", "failed_checks", "diff_block_count"}
 
-Pipeline: take the last ```diff block -> collect touched paths -> reject paths outside the
+Pipeline: require exactly one ```diff block (the prompts demand it; none -> no_diff_block, more than one ->
+multiple_diff_blocks, both before any fixture, git or swiftc work) -> collect touched paths -> reject paths outside the
 task's allowed set -> materialize allowed files from `git show <TRUTH_COMMIT>:<path>` into a temp dir ->
 `git apply --check` (strict; fallback `--recount` for wrong hunk-header counts, recorded as
 apply_strict=False) -> apply -> task checks (regexes, bounded line churn, swiftc typecheck/run).
@@ -191,10 +192,12 @@ def _with_git_headers(diff):
 
 def grade_edit(tid, text):
     blocks = re.findall(r"```diff[^\n]*\n(.*?)```", text or "", re.S)
-    fail = {"correct": False, "score": 0.0, "applied": False, "apply_strict": False}
+    fail = {"correct": False, "score": 0.0, "applied": False, "apply_strict": False, "diff_block_count": len(blocks)}
     if not blocks:
         return {**fail, "parse": False, "failed_checks": ["no_diff_block"]}
-    diff = blocks[-1]
+    if len(blocks) > 1:
+        return {**fail, "parse": False, "failed_checks": ["multiple_diff_blocks"]}
+    diff = blocks[0]
     if not diff.endswith("\n"): diff += "\n"
     spec = EDIT_TASKS[tid]
     touched = _touched(diff)
@@ -230,4 +233,5 @@ def grade_edit(tid, text):
             except Exception as e: ok, name = False, f"{name}:{type(e).__name__}"
             if not ok: failed.append(name)
     score = round((len(checks) - len(failed)) / len(checks), 3)
-    return {"correct": not failed, "score": score, "parse": True, "applied": True, "apply_strict": strict, "failed_checks": failed}
+    return {"correct": not failed, "score": score, "parse": True, "applied": True, "apply_strict": strict, "failed_checks": failed,
+            "diff_block_count": 1}

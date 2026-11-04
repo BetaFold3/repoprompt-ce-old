@@ -29,6 +29,7 @@ sys.path.insert(0, str(LAB))
 import analyze  # noqa: E402
 import lab_config as C  # noqa: E402
 import runner  # noqa: E402
+import edit_grade  # noqa: E402
 import tasks  # noqa: E402
 from edit_grade import grade_edit  # noqa: E402
 
@@ -40,6 +41,12 @@ def has_truth_commit() -> bool:
 
 def answer(obj) -> str:
     return "Done.\n```json\n" + json.dumps(obj) + "\n```"
+
+
+# Applies strictly to E3's humanizer at the truth commit (a comment line; not a semantic answer).
+E3_APPLYING_DIFF = ("--- a/Sources/RepoPrompt/Infrastructure/VCS/GitWorktreeDisplayLabelHumanizer.swift\n"
+                    "+++ b/Sources/RepoPrompt/Infrastructure/VCS/GitWorktreeDisplayLabelHumanizer.swift\n"
+                    "@@ -1,3 +1,4 @@\n import Foundation\n+// lab\n \n enum GitWorktreeDisplayLabelHumanizer {\n")
 
 
 class GradingTests(unittest.TestCase):
@@ -72,16 +79,45 @@ class GradingTests(unittest.TestCase):
         self.assertFalse(g["correct"]); self.assertEqual(g["failed_checks"], ["c_total_characters"])
 
     def test_edit_grader_rejects_missing_diff_and_unintended_files_before_applying(self):
-        self.assertEqual(grade_edit("E3_label_cap", "nothing")["failed_checks"], ["no_diff_block"])
+        g = grade_edit("E3_label_cap", "nothing")
+        self.assertEqual((g["failed_checks"], g["diff_block_count"]), (["no_diff_block"], 0))
         diff = "```diff\n--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-a\n+b\n```"
-        self.assertEqual(grade_edit("E3_label_cap", diff)["failed_checks"], ["unintended_files:README.md"])
+        g = grade_edit("E3_label_cap", diff)
+        self.assertEqual((g["failed_checks"], g["diff_block_count"]), (["unintended_files:README.md"], 1))
+
+    def test_edit_grader_rejects_more_than_one_diff_block_before_any_fixture_or_git_work(self):
+        good = f"```diff\n{E3_APPLYING_DIFF}```"
+        corrupt = "```diff\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-not in any file\n```"
+        cases = {"corrupt then applying": [corrupt, good], "applying then corrupt": [good, corrupt],
+                 "applying twice": [good, good], "three blocks": [corrupt, corrupt, good]}
+        boom = mock.Mock(side_effect=AssertionError("grader touched fixture, git or swiftc"))
+        with mock.patch.object(edit_grade, "head", boom), mock.patch.object(edit_grade.subprocess, "run", boom):
+            for label, blocks in cases.items():
+                g = grade_edit("E3_label_cap", "Answer.\n" + "\nAnd also:\n".join(blocks))
+                self.assertEqual(g, {"correct": False, "score": 0.0, "parse": False, "applied": False, "apply_strict": False,
+                                     "failed_checks": ["multiple_diff_blocks"], "diff_block_count": len(blocks)}, label)
+        boom.assert_not_called()
+
+    @unittest.skipUnless(has_truth_commit(), "truth commit not in local history (shallow clone?)")
+    def test_edit_grader_does_not_pass_on_a_last_block_that_would_pass_alone(self):
+        # Regression: the grader used the last block, so a passing final block hid earlier extra blocks.
+        # Checks are stubbed to pass so "would pass" depends only on strict application at the truth commit.
+        spec = {**edit_grade.EDIT_TASKS["E3_label_cap"], "checks": lambda: [("stub", lambda f, tmp: True)]}
+        good = f"```diff\n{E3_APPLYING_DIFF}```"
+        corrupt = "```diff\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-not in any file\n```"
+        with mock.patch.dict(edit_grade.EDIT_TASKS, {"E3_label_cap": spec}):
+            alone = grade_edit("E3_label_cap", good)
+            self.assertEqual((alone["correct"], alone["apply_strict"], alone["diff_block_count"]), (True, True, 1))
+            g = grade_edit("E3_label_cap", f"{corrupt}\n{good}")
+        self.assertEqual((g["correct"], g["applied"], g["failed_checks"], g["diff_block_count"]),
+                         (False, False, ["multiple_diff_blocks"], 2))
 
     @unittest.skipUnless(has_truth_commit(), "truth commit not in local history (shallow clone?)")
     def test_edit_grader_reports_a_diff_that_does_not_apply_at_the_truth_commit(self):
         p = "Sources/RepoPrompt/Infrastructure/VCS/GitWorktreeDisplayLabelHumanizer.swift"
         diff = f"```diff\n--- a/{p}\n+++ b/{p}\n@@ -1,1 +1,1 @@\n-this line is not in the file\n+x\n```"
         g = grade_edit("E3_label_cap", diff)
-        self.assertEqual((g["applied"], g["failed_checks"]), (False, ["apply_failed"]))
+        self.assertEqual((g["applied"], g["failed_checks"], g["diff_block_count"]), (False, ["apply_failed"], 1))
 
 
 class TruthPinTests(unittest.TestCase):

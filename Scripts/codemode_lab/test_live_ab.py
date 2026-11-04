@@ -388,6 +388,17 @@ class Grading(Fixture):
         self.assertTrue(r["correct"]); self.assertTrue(r["graded"])
         self.assertTrue(any("differs from the transcript" in w for w in r["warnings"]))
 
+    def test_multiple_diff_blocks_graded_incorrect_and_carried_into_row(self):
+        d = self.session(CC_NATIVE)
+        d["transcript"]["turns"][0]["request"]["text"] = live_ab.worker_prompt("E1_rename_subtract", FIXTURE_ROOT)
+        self.save_session(CC_NATIVE, d)
+        block = "```diff\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n```"
+        self.set_claude_answer(f"{block}\n{block}")
+        r = self.collect(CC_NATIVE, "app_cc_base", task="E1_rename_subtract")
+        self.assertEqual((r["rc"], r["graded"], r["answer_correct"], r["correct"]), (0, True, False, False), r["collect_errors"])
+        self.assertEqual((r["failed_checks"], r["diff_block_count"]), (["multiple_diff_blocks"], 2))
+        self.assertFalse(analyze.correct(r))
+
     def test_non_completed_status_is_incorrect_and_ungraded(self):
         self.set_claude_answer(T1_ANSWER)
         for status in ("timeout", "failed"):
