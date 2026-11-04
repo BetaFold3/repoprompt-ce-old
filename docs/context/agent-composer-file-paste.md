@@ -13,6 +13,10 @@ Last-verified: 2026-11-04
 - `ImageAwareTextView` vetoes deferred file payloads at paste, image-type `readSelection`, and image-drop admission. Preparing originals rather than previews remains the adapter's responsibility. A source-wide caller search found `AgentInputBar` is the only production `onImagePaste` caller; the other references are forwarding/wiring inside `ResizableTextField`. Rejected image callbacks in `performDragOperation` delegate to AppKit rather than reporting success unconditionally.
 - Do not blacklist ICNS: an actual ICNS file or a standalone copied icon can still be an image. PDF renderability through `NSImage` does not make a PDF an image file.
 
+## Document attachment implementation
+
+The [PDF/HTML attachment plan](plans/2026-11-04-agent-document-attachments.md) tracks the follow-up implementation. The containment behavior below is not successful document attachment: filename or path insertion does not meet the owner's requirement. Document admission is not yet enabled.
+
 ## Limits
 
 Native fallback is not a new document attachment or absolute-path insertion feature. A private-pasteboard AppKit characterization with a PDF URL, ICNS preview, and filename text inserted only the basename. Do not claim a usable original-file reference is restored without live evidence and an explicit insertion contract.
