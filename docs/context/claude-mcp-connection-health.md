@@ -220,7 +220,9 @@ Status/end require `capture_id` and the same accepted caller connection that
 began the capture. Use one persistent CLI helper; reconnects do not transfer
 ownership. Begin returns `ready` only after exclusive file creation and header
 persistence. A competing begin returns `busy`; end is idempotent for the retained
-capture. No caller-supplied output path or identity is accepted.
+capture. No caller-supplied output path or identity is accepted. Startup operations return
+`code`, not the generic `ok` field used by ping: check `code == "ready"` before
+starting a workload, retain `capture_id`, and require `drained` on end.
 
 The app-only recorder is disabled by default. Its autoclosure event producers do
 no additional process/ancestry reads or disk I/O when disabled. Once armed it
@@ -297,3 +299,13 @@ A successful live read validates diagnostic wiring, not historical causation
 or closure of the code-mode Step 6 gate. Installing changed code still requires
 immediate owner approval before visible lifecycle action; runtime capture
 activation changes no global logging setting, admission cap, retry or timeout.
+
+Successful-path live validation passed on 2026-11-04 against the signed
+optimized-incremental build of `ca73d78c`: one native Opus 5.5/medium run completed
+Git snapshot and patch-read calls. Process-start ancestry joined the app,
+launcher, provider and helper; handshake and connection IDs joined bootstrap
+acceptance to initialize approval. Eight records (3,130 bytes) drained on explicit
+end. A prior controller setup error also demonstrated automatic deadline stop
+at 180 seconds; it launched no provider. No historical startup failure reproduced,
+so this validates wiring and bounded cleanup, not failure attribution or a
+reliability fix.
