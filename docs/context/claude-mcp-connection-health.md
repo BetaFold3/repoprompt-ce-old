@@ -1,6 +1,6 @@
 # Claude MCP connection health, watchdog loss recovery, and helper crash guard
 
-Scope: read when the task touches the MCP tool-execution watchdog's forced disconnect, run connection-loss events (`AgentMCPRunConnectionLoss`, `AgentMCPRunLaunchIdentity`), the helper-exit watch or helper process identity (`MCPHelperProcessLiveness`, `MCPHelperPeerProcessSnapshot`), Claude native RepoPrompt MCP health (`currentRepoPromptMCPHealth`, `awaitRepoPromptMCPConnectedEvidence`), turn-boundary MCP recovery in `ClaudeAgentModeCoordinator`, or `Task.sleep` use in the `repoprompt-mcp` helper.
+Scope: read when the task touches the MCP tool-execution watchdog's forced disconnect, run connection-loss events (`AgentMCPRunConnectionLoss`, `AgentMCPRunLaunchIdentity`), the helper-exit watch or helper process identity (`MCPHelperProcessLiveness`, `MCPHelperPeerProcessSnapshot`), Claude native RepoPrompt MCP health (`currentRepoPromptMCPHealth`, `awaitRepoPromptMCPConnectedEvidence`), turn-boundary MCP recovery in `ClaudeAgentModeCoordinator`, `Task.sleep` use in the `repoprompt-mcp` helper, or opt-in DEBUG MCP startup capture (`MCPStartupDiagnostics`).
 Authority: Authoritative
 Last-verified: 2026-10-27
 
@@ -210,3 +210,90 @@ Live acceptance passed on 2026-10-26 against the Dev app (`debug-optimized-incre
 - **idle-kill** and **midturn-kill**: "the RepoPrompt MCP helper process exited". The mid-turn loss was non-terminal and turn 1 completed.
 
 For each of watchdog, idle-kill and midturn-kill, a new Claude process resumed the same conversation (`--resume <id>`) on the next turn, the old one exited, a RepoPrompt tool succeeded, and turn 1's prompt occurred exactly once in Claude's transcript (not replayed). `route_not_restored` was not exercised live; it is covered by unit tests. Live acceptance of `laterturn-kill` (later-turn route retention, including the early lease release) passed on 2026-10-27 against the Dev app (`--optimized-incremental` build), a real Claude CLI and `claudeCode:sonnet:medium`: turn 2 reused the turn-1 helper on the same Claude process, recorded `policy_released_for_proven_route` and `route_wait_skipped_proven_route` (no 10 s wait), kept the route past 15 s, and ran a RepoPrompt tool. The helper SIGKILL then produced the helper-exit notice, and turn 3 resumed the same conversation on a new Claude process (`--resume`) with a successful RepoPrompt tool and no replay of turns 1 or 2. `soft-disconnect` and `baseline` passed again on the same build. The first live runs found the early release never fired: `ClaudeCompatibleNativeSessionAdapter`, through which Agent Mode reaches the Claude controller, did not forward `repoPromptMCPLaunchAgentPID`, so the protocol default `nil` applied. It now forwards it, pinned by `testHealthAndEvidenceReachTheControllerThroughTheRuntimeProtocolAndAdapter`. Any new `NativeAgentRuntimeControlling` member the Claude path needs must be forwarded by that adapter as well.
+
+
+## Opt-in DEBUG startup capture
+
+The hidden `__repoprompt_debug_diagnostics` dispatcher supports
+`startup_capture_begin`, `startup_capture_status` and `startup_capture_end`.
+Status/end require `capture_id` and the same accepted caller connection that
+began the capture. Use one persistent CLI helper; reconnects do not transfer
+ownership. Begin returns `ready` only after exclusive file creation and header
+persistence. A competing begin returns `busy`; end is idempotent for the retained
+capture. No caller-supplied output path or identity is accepted.
+
+The app-only recorder is disabled by default. Its autoclosure event producers do
+no additional process/ancestry reads or disk I/O when disabled. Once armed it
+records early kernel peer identity before handshake reading, bootstrap outcome,
+run/launch identity, initialize start/accept/refusal, exact slot-refusal site, and the first
+accepted-socket terminal reason. The extra early peer snapshot is diagnostic
+only: authorization still reads peer PID at its original site. Unknown identity
+and unrecognized reason strings remain `unknown`; no raw errors, client names,
+tokens/prefixes, argv, environment, paths or message payloads enter the capture.
+Session and launch correlation use the existing salted terminal fingerprints.
+The launch token and helper session token are different identities: their
+fingerprints must not be compared for equality. Join through process-start
+identity/ancestry and connection mapping instead. Inactive handshake exits use
+`handshake_inactive`, not a guessed generation-change cause; the initial active
+guard precedes any extra diagnostic peer-FD lookup.
+
+The header event carries `schema: 1`. Every record's `utc` is Unix epoch
+milliseconds (including fractional precision); `uptimeOffset` is seconds from
+capture creation, which also anchors the automatic 180-second deadline.
+
+| Event | Field meaning |
+|---|---|
+| `peerObserved` | `generation` is the listener counter; `peerPID`/`peer` identify the kernel socket peer and process-start instance. |
+| `connectionLinked` | `generation` is the admission lifecycle counter; `peerPID` is the authoritative observed socket peer when available. |
+| `terminal` | `generation` is the connection lifecycle counter; `peerPID` is the recorded helper peer. |
+| `launchObserved` | `peerPID`/`peer` identify the registered provider-launch process, not the socket helper; `launchFingerprint` hashes its launch token. |
+| `approvalStarted` / `approvalAccepted` | The initialize callback passed its initial identity guard / is returning true, including a successfully attached companion. Neither proves response delivery. |
+
+Listener and lifecycle counter values must not be equated across event kinds.
+
+A single serial writer receives bounded immutable records without awaiting disk
+on admission paths. Limits include header/stop records: 180 seconds, 1,024
+records, 1 MiB. Space for the final stop record is reserved. Overflow stops rather
+than rotating evidence. End drains the writer before acknowledgment. Deadline,
+overflow and write failure are explicit status codes; write failure disables
+capture without affecting admission. Counts describe reserved encoded output;
+after a write failure they are not proof of bytes persisted. Abrupt app death
+can lose queued events; this is not crash-durable logging.
+
+Files are exclusive UUID-named JSONL under the MCP events directory's
+`startup-diagnostics/` subdirectory (directory 0700, files 0600). Four retained
+files are allowed; a fifth begin refuses rather than deleting/overwriting prior
+evidence. Owner-controlled cleanup is separate. Ordinary terminal-file rotation
+does not prune this subdirectory. Tests inject temporary directories.
+
+### Slot-refusal sites
+
+At this diagnostic contract's source revision, `slotRefused` always carries
+`reason=slot_refused` and one compile-time `site` in
+`ServerNetworkManager.tryReserveConnectionSlot`. These identify predicates,
+not speculative diagnoses:
+
+| Site | Existing rejecting predicate |
+|---|---|
+| `initialFence` | No live, non-removing connection with the current lifecycle identity. |
+| `clientCooldown` | Client is in user-kill cooldown. |
+| `afterPendingPublished` | Direct admission identity invalid after the DEBUG suspension seam. |
+| `afterGlobalPrune` | Direct admission identity invalid after global hygiene. |
+| `afterGlobalEviction` | Direct admission identity invalid after global eviction attempt. |
+| `globalNoProgress` | Global load remains full and eviction returned no progress or invalidated context. |
+| `afterClientPrune` | Direct admission identity invalid after per-client hygiene. |
+| `afterClientEviction` | Direct admission identity invalid after per-client eviction attempt. |
+| `clientNoProgress` | Per-client membership remains full and eviction made no progress. |
+| `beforeCommit` | Direct admission identity invalid before final capacity stabilization. |
+
+Bootstrap refusal precedes registration; slot refusal is a later initialized-
+connection admission boundary and must not be mislabeled as pre-registration.
+Eviction terminal events identify the victim connection, not necessarily the
+incoming connection. Exact helper/run ownership requires matching process-start
+identity and ancestry, not equality of wrapper and initialized provider PIDs.
+Unmatched peers remain unowned; export only established target records and
+aggregate unrelated counts. No app receipt does not prove helper death.
+A successful live read validates diagnostic wiring, not historical causation
+or closure of the code-mode Step 6 gate. Installing changed code still requires
+immediate owner approval before visible lifecycle action; runtime capture
+activation changes no global logging setting, admission cap, retry or timeout.

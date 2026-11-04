@@ -1044,6 +1044,18 @@ actor ServerNetworkManager {
     }
 
     #if DEBUG
+        var startupDiagnostics = MCPStartupDiagnostics.shared
+
+        func debugSetStartupDiagnostics(_ recorder: MCPStartupDiagnostics) {
+            startupDiagnostics = recorder
+        }
+
+        /// Install a test-owned listener without starting app services or production persistence.
+        func debugSetStartupListenerForTesting(_ listener: BootstrapSocketServer?) {
+            bootstrapSocketServer = listener
+            bootstrapSocketServerLifecycleGeneration = listener == nil ? nil : lifecycleGeneration
+        }
+
         enum DebugBootstrapSocketURLOverrideError: Error, Equatable {
             case managerNotFullyStopped
             case overrideAlreadyInstalled
@@ -4921,6 +4933,14 @@ actor ServerNetworkManager {
         case .absent, .unreadable:
             nil
         }
+        #if DEBUG
+            startupDiagnostics.record(.init(
+                kind: .launchObserved, runID: runID, peerPID: launch.agentProcessID,
+                identityState: agentIdentity == nil ? .unknown : .observed,
+                peer: agentIdentity.map(MCPStartupDiagnostics.ProcessInstance.init),
+                launchFingerprint: MCPTerminalFingerprint.session(launch.token.uuidString)
+            ))
+        #endif
         if agentIdentity == nil {
             connectionLog("Run connection-loss observer for run=\(runID) launch=\(launch.token): agent pid=\(launch.agentProcessID) identity unreadable; watchdog proof falls back to PID only and the helper-exit watch will not address this launch")
         }
@@ -6464,6 +6484,14 @@ actor ServerNetworkManager {
         observedPeerPID: Int? = nil
     ) async -> BootstrapSocketServer.Admission {
         let connectionID = UUID()
+        #if DEBUG
+            startupDiagnostics.record(.init(
+                kind: .connectionLinked, handshakeID: MCPStartupDiagnostics.handshakeID,
+                connectionID: connectionID, generation: admissionLifecycleGeneration,
+                peerPID: observedPeerPID.map { pid_t($0) },
+                sessionFingerprint: MCPTerminalFingerprint.session(sessionToken)
+            ))
+        #endif
         connectionLog("Bootstrap socket connection: \(connectionID) from '\(clientName ?? "unknown")' (pid=\(clientPid), session=\(sessionToken.prefix(8))...)")
         mcpACPLog("[MCP-ACP] bootstrap connection connection=\(connectionID) bootstrapClientName=\(clientName ?? "unknown") pid=\(clientPid)")
 
@@ -7374,7 +7402,15 @@ actor ServerNetworkManager {
                 connectionLog("Starting MCP server for bootstrap connection \(connectionID)")
                 mcpACPLog("[MCP-ACP] starting MCP server connection=\(connectionID)")
                 try await manager.start { clientInfo in
-                    guard self.isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else { return false }
+                    guard self.isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else {
+                        #if DEBUG
+                            self.startupDiagnostics.record(.init(kind: .approvalRefused, reason: .stale_generation, connectionID: connectionID))
+                        #endif
+                        return false
+                    }
+                    #if DEBUG
+                        self.startupDiagnostics.record(.init(kind: .approvalStarted, connectionID: connectionID))
+                    #endif
                     connectionLog("MCP handshake callback for \(connectionID): clientName='\(clientInfo.name)'")
                     mcpACPLog("[MCP-ACP] handshake connection=\(connectionID) clientName=\(clientInfo.name)")
 
@@ -7395,27 +7431,51 @@ actor ServerNetworkManager {
                     let trimmedName = clientInfo.name.trimmingCharacters(in: .whitespacesAndNewlines)
                     if trimmedName.isEmpty {
                         await self.recordIdentityFailure(for: connectionID, source: .filesystem, reason: "Bootstrap handshake provided empty client name")
+                        #if DEBUG
+                            self.startupDiagnostics.record(.init(kind: .approvalRefused, reason: .empty_client_identity, connectionID: connectionID))
+                        #endif
                         return false
                     }
 
                     // Check cooldown
                     if self.isSessionBlocked(sessionToken) {
                         log.warning("Rejecting bootstrap connection \(connectionID) - session in cooldown")
+                        #if DEBUG
+                            self.startupDiagnostics.record(.init(kind: .approvalRefused, reason: .session_blocked, connectionID: connectionID))
+                        #endif
                         return false
                     }
 
                     connectionLog("Calling approval handler for \(connectionID) client='\(clientInfo.name)'")
                     let approved = await approvalHandler(connectionID, clientInfo)
-                    guard self.isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else { return false }
+                    guard self.isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else {
+                        #if DEBUG
+                            self.startupDiagnostics.record(.init(kind: .approvalRefused, reason: .stale_generation, connectionID: connectionID))
+                        #endif
+                        return false
+                    }
                     connectionLog("Approval handler returned \(approved) for \(connectionID)")
                     if approved, self.companionRoleByConnectionID[connectionID] != nil {
                         // Read-only companion: no policy wait, pending-policy consumption,
                         // run route, live affinity or connection-waiter notification.
                         let attached = await self.attachCompanionAtInitialize(connectionID: connectionID)
-                        guard self.isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else { return false }
+                        guard self.isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else {
+                            #if DEBUG
+                                self.startupDiagnostics.record(.init(kind: .approvalRefused, reason: .stale_generation, connectionID: connectionID))
+                            #endif
+                            return false
+                        }
                         if !attached {
+                            #if DEBUG
+                                self.startupDiagnostics.record(.init(kind: .approvalRefused, reason: .companion_attach_failed, connectionID: connectionID))
+                            #endif
                             self.pendingConnections.removeValue(forKey: connectionID)
                         }
+                        #if DEBUG
+                            if attached {
+                                self.startupDiagnostics.record(.init(kind: .approvalAccepted, connectionID: connectionID))
+                            }
+                        #endif
                         return attached
                     }
                     if approved {
@@ -7469,8 +7529,16 @@ actor ServerNetworkManager {
                             sessionKey: sessionToken,
                             clientPid: clientPid
                         )
-                        guard self.isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else { return false }
+                        guard self.isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else {
+                            #if DEBUG
+                                self.startupDiagnostics.record(.init(kind: .approvalRefused, reason: .stale_generation, connectionID: connectionID))
+                            #endif
+                            return false
+                        }
                         if readiness == .timedOut {
+                            #if DEBUG
+                                self.startupDiagnostics.record(.init(kind: .approvalRefused, reason: .policy_wait_timeout, connectionID: connectionID))
+                            #endif
                             self.pendingConnections.removeValue(forKey: connectionID)
                             return false
                         }
@@ -7482,8 +7550,16 @@ actor ServerNetworkManager {
                             bootstrapClientName: bootstrapClientName,
                             expectedLifecycleGeneration: expectedLifecycleGeneration
                         )
-                        guard self.isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else { return false }
+                        guard self.isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else {
+                            #if DEBUG
+                                self.startupDiagnostics.record(.init(kind: .approvalRefused, reason: .stale_generation, connectionID: connectionID))
+                            #endif
+                            return false
+                        }
                         if case let .rejected(runID, reason) = policyOutcome {
+                            #if DEBUG
+                                self.startupDiagnostics.record(.init(kind: .approvalRefused, reason: MCPStartupDiagnostics.Reason(rawValue: reason) ?? .unknown, connectionID: connectionID, runID: runID))
+                            #endif
                             mcpPolicyLog(
                                 "rejected MCP initialize after pid-gated policy wait client=\(clientInfo.name) connection=\(connectionID) runID=\(runID?.uuidString ?? "nil") reason=\(reason)"
                             )
@@ -7516,8 +7592,16 @@ actor ServerNetworkManager {
                             }
                         }
                     } else {
+                        #if DEBUG
+                            self.startupDiagnostics.record(.init(kind: .approvalRefused, reason: .approval_rejected, connectionID: connectionID))
+                        #endif
                         self.pendingConnections.removeValue(forKey: connectionID)
                     }
+                    #if DEBUG
+                        if approved {
+                            self.startupDiagnostics.record(.init(kind: .approvalAccepted, connectionID: connectionID))
+                        }
+                    #endif
                     return approved
                 }
 
@@ -8143,6 +8227,14 @@ actor ServerNetworkManager {
         guard let record = claim.claim(candidate) else { return }
         terminalRecordClaimsByConnectionID[connectionID] = claim
         if isFirstTerminalCommit {
+            #if DEBUG
+                startupDiagnostics.record(.init(
+                    kind: .terminal, reason: MCPStartupDiagnostics.Reason(rawValue: record.reason) ?? .unknown,
+                    connectionID: connectionID, runID: runIDByConnectionID[connectionID],
+                    generation: connectionLifecycleGenerationByID[connectionID],
+                    peerPID: pid_t(peerPID), sessionFingerprint: record.sessionFingerprint
+                ))
+            #endif
             // Every terminal path commits here first, synchronously and while the run route is
             // intact, so the first terminal reason decides whether the helper is watched.
             openHelperExitObservationIfEligible(connectionID: connectionID, closeReason: record.reason)
@@ -16920,6 +17012,9 @@ actor ServerNetworkManager {
 
     func tryReserveConnectionSlot(connectionID: UUID, clientID: String) async -> Bool {
         guard let admissionFence = captureDirectAdmissionFence(connectionID: connectionID) else {
+            #if DEBUG
+                startupDiagnostics.record(.init(kind: .slotRefused, reason: .slot_refused, site: .initialFence, connectionID: connectionID))
+            #endif
             return false
         }
 
@@ -16927,6 +17022,9 @@ actor ServerNetworkManager {
         if isClientInUserKillCooldown(clientID) {
             let remainingTTL = remainingUserKillCooldown(clientID) ?? 0
             log.notice("Rejecting connection \(connectionID) from '\(clientID)' - in user-kill cooldown (remaining: \(String(format: "%.1f", remainingTTL))s of \(Int(userKilledClientCooldown))s)")
+            #if DEBUG
+                startupDiagnostics.record(.init(kind: .slotRefused, reason: .slot_refused, site: .clientCooldown, connectionID: connectionID))
+            #endif
             return false
         }
 
@@ -16937,6 +17035,9 @@ actor ServerNetworkManager {
         #if DEBUG
             await debugAfterDirectAdmissionPendingPublishedForTesting?(connectionID)
             guard isCurrentDirectAdmission(connectionID: connectionID, fence: admissionFence) else {
+                #if DEBUG
+                    startupDiagnostics.record(.init(kind: .slotRefused, reason: .slot_refused, site: .afterPendingPublished, connectionID: connectionID))
+                #endif
                 return false
             }
         #endif
@@ -16950,6 +17051,9 @@ actor ServerNetworkManager {
             if effectiveGlobalAdmissionLoad() >= maxGlobalConnections {
                 await pruneNonViableConnections()
                 guard isCurrentDirectAdmission(connectionID: connectionID, fence: admissionFence) else {
+                    #if DEBUG
+                        startupDiagnostics.record(.init(kind: .slotRefused, reason: .slot_refused, site: .afterGlobalPrune, connectionID: connectionID))
+                    #endif
                     return false
                 }
             }
@@ -16959,6 +17063,9 @@ actor ServerNetworkManager {
                     capacityPredicate: .direct
                 )
                 guard isCurrentDirectAdmission(connectionID: connectionID, fence: admissionFence) else {
+                    #if DEBUG
+                        startupDiagnostics.record(.init(kind: .slotRefused, reason: .slot_refused, site: .afterGlobalEviction, connectionID: connectionID))
+                    #endif
                     return false
                 }
                 if effectiveGlobalAdmissionLoad() < maxGlobalConnections {
@@ -16974,6 +17081,9 @@ actor ServerNetworkManager {
                         fence: admissionFence
                     )
                     log.notice("Rejecting connection \(connectionID) from '\(clientID)' - global capacity full (effective=\(effectiveGlobalAdmissionLoad()), cap=\(maxGlobalConnections))")
+                    #if DEBUG
+                        startupDiagnostics.record(.init(kind: .slotRefused, reason: .slot_refused, site: .globalNoProgress, connectionID: connectionID))
+                    #endif
                     return false
                 }
             }
@@ -16983,6 +17093,9 @@ actor ServerNetworkManager {
             while effectiveSet.count >= maxConnectionsPerClient {
                 await pruneNonViableConnections()
                 guard isCurrentDirectAdmission(connectionID: connectionID, fence: admissionFence) else {
+                    #if DEBUG
+                        startupDiagnostics.record(.init(kind: .slotRefused, reason: .slot_refused, site: .afterClientPrune, connectionID: connectionID))
+                    #endif
                     return false
                 }
                 pruneDeadSlots(for: clientID)
@@ -16994,6 +17107,9 @@ actor ServerNetworkManager {
                     capacityLimit: maxConnectionsPerClient
                 )
                 guard isCurrentDirectAdmission(connectionID: connectionID, fence: admissionFence) else {
+                    #if DEBUG
+                        startupDiagnostics.record(.init(kind: .slotRefused, reason: .slot_refused, site: .afterClientEviction, connectionID: connectionID))
+                    #endif
                     return false
                 }
                 effectiveSet = effectiveActiveConnectionIDs(for: clientID)
@@ -17009,11 +17125,17 @@ actor ServerNetworkManager {
                         fence: admissionFence
                     )
                     log.notice("Rejecting connection \(connectionID) from '\(clientID)' - per-client capacity full (active=\(effectiveSet.count), cap=\(maxConnectionsPerClient))")
+                    #if DEBUG
+                        startupDiagnostics.record(.init(kind: .slotRefused, reason: .slot_refused, site: .clientNoProgress, connectionID: connectionID))
+                    #endif
                     return false
                 }
             }
 
             guard isCurrentDirectAdmission(connectionID: connectionID, fence: admissionFence) else {
+                #if DEBUG
+                    startupDiagnostics.record(.init(kind: .slotRefused, reason: .slot_refused, site: .beforeCommit, connectionID: connectionID))
+                #endif
                 return false
             }
             if effectiveGlobalAdmissionLoad() < maxGlobalConnections {

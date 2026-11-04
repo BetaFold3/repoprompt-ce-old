@@ -10,6 +10,411 @@ import XCTest
 
 #if DEBUG
     final class AsyncLimiterTests: XCTestCase {
+        func testStartupCaptureOwnershipPrivacyAndRetention() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let recorder = MCPStartupDiagnostics(directory: directory, write: { file, data in
+                XCTAssertNotEqual(fcntl(file.fileDescriptor, F_GETFD) & FD_CLOEXEC, 0)
+                try file.write(contentsOf: data)
+            })
+            let owner = UUID()
+            let earliestUTC = Date().timeIntervalSince1970 * 1000
+            let started = await recorder.begin(owner: owner)
+            let id = try XCTUnwrap(started.captureID)
+            XCTAssertEqual(started.code, .ready)
+            let busy = await recorder.begin(owner: owner)
+            XCTAssertEqual(busy.code, .busy)
+            let denied = await recorder.status(owner: UUID(), captureID: id, end: true)
+            XCTAssertEqual(denied.code, .forbidden)
+            let missing = await recorder.status(owner: owner, captureID: UUID())
+            XCTAssertEqual(missing.code, .notFound)
+            let secret = "startup-token-payload-sentinel"
+            recorder.record(.init(
+                kind: .bootstrapRejected, reason: MCPStartupDiagnostics.Reason(rawValue: secret) ?? .unknown,
+                sessionFingerprint: MCPTerminalFingerprint.session(secret)
+            ))
+            let ended = await recorder.status(owner: owner, captureID: id, end: true)
+            XCTAssertEqual(ended.code, .ended)
+            XCTAssertTrue(ended.drained)
+            let repeated = await recorder.status(owner: owner, captureID: id, end: true)
+            XCTAssertEqual(repeated.records, ended.records)
+            let url = directory.appendingPathComponent(id.uuidString + ".jsonl")
+            let data = try Data(contentsOf: url)
+            XCTAssertEqual(data.count, ended.bytes)
+            let header = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(data.split(separator: 0x0A)[0])) as? [String: Any])
+            let utc = try XCTUnwrap(header["utc"] as? Double)
+            XCTAssertGreaterThanOrEqual(utc, earliestUTC)
+            XCTAssertLessThanOrEqual(utc, Date().timeIntervalSince1970 * 1000)
+            XCTAssertEqual((header["event"] as? [String: Any])?["schema"] as? Int, 1)
+            XCTAssertFalse(String(decoding: data, as: UTF8.self).contains(secret))
+            XCTAssertEqual(try startupCaptureEvents(at: url).map { $0["kind"] as? String }, ["header", "bootstrapRejected", "stopped"])
+            let permissions = try FileManager.default.attributesOfItem(atPath: url.path)
+            XCTAssertEqual((permissions[.posixPermissions] as? NSNumber)?.intValue, 0o600)
+            let dirPermissions = try FileManager.default.attributesOfItem(atPath: directory.path)
+            XCTAssertEqual((dirPermissions[.posixPermissions] as? NSNumber)?.intValue, 0o700)
+            for _ in 0 ..< 3 {
+                let next = await recorder.begin(owner: owner)
+                _ = try await recorder.status(owner: owner, captureID: XCTUnwrap(next.captureID), end: true)
+            }
+            let full = await recorder.begin(owner: owner)
+            XCTAssertEqual(full.code, .retentionFull)
+            XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path).count, 4)
+            XCTAssertEqual(try Data(contentsOf: url), data, "A later capture cannot overwrite retained evidence")
+        }
+
+        func testStartupCaptureDispatcherUsesCallerNotSpoofedArguments() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let manager = ServerNetworkManager()
+            let recorder = MCPStartupDiagnostics(directory: directory)
+            await manager.debugSetStartupDiagnostics(recorder)
+            let owner = UUID()
+            let other = UUID()
+            func invoke(_ caller: UUID, _ arguments: [String: Value]) async throws -> [String: Any] {
+                let result = await manager.handleDebugDiagnosticsTool(connectionID: caller, arguments: arguments)
+                let text = result.content.compactMap { item -> String? in
+                    if case let .text(text, _, _) = item { return text }
+                    return nil
+                }.joined()
+                return try XCTUnwrap(JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
+            }
+            let started = try await invoke(owner, ["op": .string("startup_capture_begin")])
+            XCTAssertEqual(started["code"] as? String, "ready")
+            let id = try XCTUnwrap(started["capture_id"] as? String)
+            let denied = try await invoke(other, [
+                "op": .string("startup_capture_end"), "capture_id": .string(id),
+                "owner": .string(owner.uuidString), "connection_id": .string(owner.uuidString)
+            ])
+            XCTAssertEqual(denied["code"] as? String, "forbidden")
+            let missing = try await invoke(owner, ["op": .string("startup_capture_end")])
+            XCTAssertEqual(missing["code"] as? String, "invalid_params")
+            let ended = try await invoke(owner, ["op": .string("startup_capture_end"), "capture_id": .string(id)])
+            XCTAssertEqual(ended["code"] as? String, "ended")
+            XCTAssertEqual(ended["drained"] as? Bool, true)
+        }
+
+        func testStartupCaptureRetainsFirstTerminalAndKnownReasons() async throws {
+            let terminationReasons: [TerminationReason] = [
+                .userBootFromDashboard, .runCompleted, .runCancelled, .serverShutdown,
+                .idleTimeout, .approvalDenied, .connectionReplaced, .toolExecutionWatchdog
+            ]
+            let bootstrapReasons: [MCPBootstrapErrorCode] = [
+                .approvalDenied, .protocolVersionMismatch, .serverNotReady, .serverUnavailable,
+                .connectionLimitReached, .capacityExceeded, .sessionBlocked, .clientCooldown
+            ]
+            let transportReasons: [MCPTransportTerminalCause] = [
+                .peerEOF, .incompleteEOF, .readError, .writeFailure, .writeStall, .writeHangup,
+                .receiveBufferOverflow, .localDisconnect, .connectFailure, .connectCancelled
+            ]
+            let reasons = terminationReasons.map(\.rawValue) + bootstrapReasons.map(\.rawValue) + transportReasons.map(\.rawValue)
+                + ["connection_bound_to_other_run", "session_token_bound_to_other_run", "stale_connection"]
+            for reason in reasons {
+                XCTAssertNotNil(MCPStartupDiagnostics.Reason(rawValue: reason), reason)
+            }
+            XCTAssertNil(MCPStartupDiagnostics.Reason(rawValue: "untrusted-future-reason"))
+
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let recorder = MCPStartupDiagnostics(directory: directory.appendingPathComponent("capture"))
+            let manager = ServerNetworkManager()
+            await manager.debugSetStartupDiagnostics(recorder)
+            await manager.debugSetTerminalRecordsDirectoryOverride(directory.appendingPathComponent("terminal"))
+            let owner = UUID()
+            let started = await recorder.begin(owner: owner)
+            let id = try XCTUnwrap(started.captureID)
+            let connectionID = UUID()
+            await manager.debugInstallDirectAdmissionConnectionForTesting(
+                connectionID: connectionID, connection: AdmissionEvictionTestConnection(idleSeconds: 0)
+            )
+            await manager.debugSetBootstrapPeerPID(connectionID: connectionID, pid: getpid())
+            let runID = UUID()
+            let launch = AgentMCPRunLaunchIdentity(token: UUID(), agentProcessID: getpid())
+            let observer = await manager.registerRunConnectionLossObserver(for: runID, launch: launch) { _ in }
+            await manager.debugCommitTerminalRecordForTesting(connectionID: connectionID, reason: TerminationReason.toolExecutionWatchdog.rawValue)
+            await manager.debugCommitTerminalRecordForTesting(connectionID: connectionID, reason: "peer_eof")
+            _ = await recorder.status(owner: owner, captureID: id, end: true)
+            await manager.unregisterRunConnectionLossObserver(for: runID, token: observer)
+            await manager.debugRemoveConnection(connectionID)
+            let events = try startupCaptureEvents(at: directory.appendingPathComponent("capture").appendingPathComponent(id.uuidString + ".jsonl"))
+            let terminals = events.filter { $0["kind"] as? String == "terminal" }
+            XCTAssertEqual(terminals.count, 1)
+            XCTAssertEqual(terminals.first?["connectionID"] as? String, connectionID.uuidString)
+            XCTAssertEqual(terminals.first?["reason"] as? String, "tool_execution_watchdog")
+            let observedLaunch = try XCTUnwrap(events.first { $0["kind"] as? String == "launchObserved" })
+            XCTAssertEqual(observedLaunch["runID"] as? String, runID.uuidString)
+            XCTAssertEqual(observedLaunch["peerPID"] as? Int32, getpid())
+            XCTAssertEqual(observedLaunch["launchFingerprint"] as? String, MCPTerminalFingerprint.session(launch.token.uuidString)?.description)
+        }
+
+        func testStartupCaptureConcurrentProducersEndAndCompetingBegin() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let writerEntered = expectation(description: "writer holds the first event")
+            let releaseWriter = DispatchSemaphore(value: 0)
+            defer { releaseWriter.signal() }
+            let blockedConnection = UUID()
+            let recorder = MCPStartupDiagnostics(directory: directory, recordLimit: 8, write: { file, data in
+                if String(decoding: data, as: UTF8.self).contains(blockedConnection.uuidString) {
+                    writerEntered.fulfill()
+                    guard releaseWriter.wait(timeout: .now() + 5) == .success else { throw CocoaError(.fileWriteUnknown) }
+                }
+                try file.write(contentsOf: data)
+            })
+            let owner = UUID()
+            let started = await recorder.begin(owner: owner)
+            let id = try XCTUnwrap(started.captureID)
+            recorder.record(.init(kind: .peerObserved, connectionID: blockedConnection))
+            await fulfillment(of: [writerEntered], timeout: 2)
+
+            let endStarted = expectation(description: "end requested while writer is blocked")
+            let endCompleted = LimiterLockedFlag()
+            let ending = Task {
+                endStarted.fulfill()
+                let result = await recorder.status(owner: owner, captureID: id, end: true)
+                endCompleted.mark()
+                return result
+            }
+            let producers = Task {
+                await withTaskGroup(of: Void.self) { group in
+                    for _ in 0 ..< 4 {
+                        group.addTask {
+                            for _ in 0 ..< 8 {
+                                recorder.record(.init(kind: .peerObserved))
+                            }
+                        }
+                    }
+                }
+            }
+            await fulfillment(of: [endStarted], timeout: 2)
+            await producers.value
+            let competing = await recorder.begin(owner: UUID())
+            XCTAssertEqual(competing.code, .busy)
+            XCTAssertNil(competing.captureID)
+            XCTAssertFalse(endCompleted.isMarked(), "End cannot acknowledge before the queued writer drains")
+            releaseWriter.signal()
+            let ended = await ending.value
+            XCTAssertTrue(ended.code == .ended || ended.code == .overflow)
+            XCTAssertEqual(ended.captureID, id)
+            XCTAssertTrue(ended.drained)
+            XCTAssertLessThanOrEqual(ended.records, 8)
+            XCTAssertLessThanOrEqual(ended.bytes, 1024 * 1024)
+
+            let data = try Data(contentsOf: directory.appendingPathComponent(id.uuidString + ".jsonl"))
+            let records = try data.split(separator: 0x0A).map {
+                try XCTUnwrap(JSONSerialization.jsonObject(with: Data($0)) as? [String: Any])
+            }
+            XCTAssertEqual(records.count, ended.records)
+            XCTAssertEqual(data.count, ended.bytes)
+            XCTAssertEqual(records.compactMap { $0["sequence"] as? Int }, Array(0 ..< records.count))
+            XCTAssertTrue(records.allSatisfy { $0["captureID"] as? String == id.uuidString })
+            let events = records.compactMap { $0["event"] as? [String: Any] }
+            XCTAssertEqual(events.count(where: { $0["kind"] as? String == "stopped" }), 1)
+            XCTAssertEqual(events.last?["kind"] as? String, "stopped")
+            XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path), [id.uuidString + ".jsonl"])
+        }
+
+        func testStartupCaptureBoundsDeadlineDisabledAndWriteFailure() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let clock = StartupCaptureClock()
+            let recorder = MCPStartupDiagnostics(directory: directory, now: { clock.read() })
+            var evaluated = false
+            func event() -> MCPStartupDiagnostics.Event {
+                evaluated = true
+                return .init(kind: .peerObserved)
+            }
+            recorder.record(event())
+            XCTAssertFalse(evaluated)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+            let owner = UUID()
+            let first = await recorder.begin(owner: owner)
+            let firstID = try XCTUnwrap(first.captureID)
+            clock.advance()
+            recorder.record(event())
+            XCTAssertFalse(evaluated, "Expired captures must not read process ancestry")
+            let expired = await recorder.status(owner: owner, captureID: firstID, end: true)
+            XCTAssertEqual(expired.code, .deadline)
+            XCTAssertTrue(expired.drained)
+            XCTAssertEqual(expired.records, 2)
+
+            // Initialization consumes the entire budget. Automatic shutdown must use the
+            // original start, without a record/status call being needed to notice expiry.
+            let initializationClock = StartupCaptureClock()
+            let automaticStop = expectation(description: "automatic deadline after slow header")
+            let slowHeader = MCPStartupDiagnostics(
+                directory: directory.appendingPathComponent("slow-header"),
+                now: { initializationClock.read() },
+                write: { file, data in
+                    try file.write(contentsOf: data)
+                    let text = String(decoding: data, as: UTF8.self)
+                    if text.contains("\"header\"") { initializationClock.advance() }
+                    if text.contains("\"stopped\"") { automaticStop.fulfill() }
+                }
+            )
+            let slowStart = await slowHeader.begin(owner: owner)
+            let slowID = try XCTUnwrap(slowStart.captureID)
+            await fulfillment(of: [automaticStop], timeout: 2)
+            let automaticallyEnded = await slowHeader.status(owner: owner, captureID: slowID)
+            XCTAssertEqual(automaticallyEnded.code, .deadline)
+            XCTAssertTrue(automaticallyEnded.drained)
+            XCTAssertEqual(automaticallyEnded.records, 2)
+
+            for (label, byteLimit) in [("records", 1024 * 1024), ("bytes", 4096)] {
+                let bounded = MCPStartupDiagnostics(directory: directory.appendingPathComponent(label), byteLimit: byteLimit)
+                let start = await bounded.begin(owner: owner)
+                let id = try XCTUnwrap(start.captureID)
+                for _ in 0 ..< 1100 {
+                    bounded.record(.init(kind: .peerObserved, handshakeID: UUID()))
+                }
+                let stopped = await bounded.status(owner: owner, captureID: id, end: true)
+                XCTAssertEqual(stopped.code, .overflow, label)
+                XCTAssertTrue(stopped.drained)
+                XCTAssertLessThanOrEqual(stopped.records, 1024)
+                XCTAssertLessThanOrEqual(stopped.bytes, byteLimit)
+                if label == "records" { XCTAssertEqual(stopped.records, 1024) }
+                let url = directory.appendingPathComponent(label).appendingPathComponent(id.uuidString + ".jsonl")
+                XCTAssertEqual(try Data(contentsOf: url).count, stopped.bytes)
+                XCTAssertEqual(try startupCaptureEvents(at: url).last?["kind"] as? String, "stopped")
+            }
+
+            let failing = MCPStartupDiagnostics(directory: directory.appendingPathComponent("failure"), write: { file, data in
+                if String(decoding: data, as: UTF8.self).contains("peerObserved") { throw CocoaError(.fileWriteUnknown) }
+                try file.write(contentsOf: data)
+            })
+            let failedStart = await failing.begin(owner: owner)
+            let failedID = try XCTUnwrap(failedStart.captureID)
+            failing.record(.init(kind: .peerObserved))
+            let failure = await failing.status(owner: owner, captureID: failedID, end: true)
+            XCTAssertEqual(failure.code, .writeFailure)
+            XCTAssertTrue(failure.drained)
+            evaluated = false
+            failing.record(event())
+            XCTAssertFalse(evaluated)
+        }
+
+        func testStartupCaptureRealBootstrapRefusalBeforeRegistration() async throws {
+            let directory = URL(fileURLWithPath: "/tmp/rpce-startup-\(UUID().uuidString.prefix(8))")
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let recorder = MCPStartupDiagnostics(directory: directory.appendingPathComponent("capture"))
+            let manager = ServerNetworkManager()
+            let existing = UUID()
+            await manager.debugSetStartupDiagnostics(recorder)
+            await manager.debugSetTerminalRecordsDirectoryOverride(directory.appendingPathComponent("terminal"))
+            await manager.debugConfigureGlobalAdmissionForTesting(maxGlobalConnections: 1, preserveOnePerClient: true)
+            await manager.debugInstallAdmissionEvictionCandidateForTesting(
+                connectionID: existing, connection: AdmissionEvictionTestConnection(idleSeconds: 0),
+                clientID: "existing", totalToolCalls: 0, createdAt: .distantPast
+            )
+            let gate = LimiterTestGate()
+            let busy = Task {
+                try? await manager.withConnectionCallPermitForTesting(connectionID: existing, lane: .ordinary) {
+                    await gate.markStartedAndWaitForRelease()
+                }
+            }
+            await gate.waitUntilStarted()
+            let server = BootstrapSocketServer(socketURL: directory.appendingPathComponent("s.sock"))
+            await server.debugSetStartupDiagnostics(recorder)
+            await manager.debugSetStartupListenerForTesting(server)
+            let owner = UUID()
+            var captureID: UUID?
+            func cleanup() async {
+                if let captureID { _ = await recorder.status(owner: owner, captureID: captureID, end: true) }
+                await server.stop()
+                await manager.debugSetStartupListenerForTesting(nil)
+                await gate.release()
+                await busy.value
+                await manager.debugRemoveConnection(existing)
+            }
+            do {
+                try await server.start { fd, token, pid, name, credentials in
+                    await manager.debugHandleBootstrapAdmissionThroughCurrentListenerForTesting(
+                        clientFD: fd, sessionToken: token, clientPid: pid, clientName: name,
+                        companionCredential: nil, observedPeerPID: credentials.observedPeerPID
+                    ) ?? .reject()
+                }
+                let started = await recorder.begin(owner: owner)
+                captureID = started.captureID
+                let id = try XCTUnwrap(captureID)
+                var fds = [Int32](repeating: -1, count: 2)
+                guard socketpair(AF_UNIX, SOCK_STREAM, 0, &fds) == 0 else { throw POSIXError(.EIO) }
+                defer {
+                    for fd in fds where fd >= 0 {
+                        close(fd)
+                    }
+                }
+                var request = try JSONEncoder().encode(MCPBootstrapRequest(
+                    sessionToken: "private-startup-sentinel", clientPid: Int(getpid()), clientName: "capture-test"
+                ))
+                request.append(0x0A)
+                let written = request.withUnsafeBytes { Darwin.write(fds[1], $0.baseAddress!, $0.count) }
+                XCTAssertEqual(written, request.count)
+                let serverFD = fds[0]
+                fds[0] = -1 // Ownership transfers to the ordinary handshake cleanup.
+                await server.debugHandleStartupSocketForTesting(serverFD)
+                var readable = pollfd(fd: fds[1], events: Int16(POLLIN | POLLHUP), revents: 0)
+                guard poll(&readable, 1, 2000) > 0 else { throw POSIXError(.ETIMEDOUT) }
+                var response = [UInt8](repeating: 0, count: 2048)
+                let count = Darwin.read(fds[1], &response, response.count)
+                guard count > 0 else { throw POSIXError(.EIO) }
+                let reply = try JSONDecoder().decode(MCPBootstrapResponse.self, from: Data(response.prefix(max(0, count))))
+                XCTAssertEqual(reply.type, "rejected")
+                XCTAssertEqual(reply.errorCode, "capacity_exceeded")
+                let retained = await manager.debugContainsConnection(existing)
+                XCTAssertTrue(retained)
+                let reserved = await manager.debugBootstrapReservationCount()
+                XCTAssertEqual(reserved, 0)
+                await server.stop()
+                // An inactive handshake must not query a stale/reused FD for peer identity.
+                await server.debugHandleStartupSocketForTesting(-1)
+                let ended = await recorder.status(owner: owner, captureID: id, end: true)
+                XCTAssertTrue(ended.drained)
+                let capturedEvents = try startupCaptureEvents(at: directory.appendingPathComponent("capture").appendingPathComponent(id.uuidString + ".jsonl"))
+                let events = try XCTUnwrap(capturedEvents.count == 6 ? capturedEvents : nil)
+                XCTAssertEqual(events.map { $0["kind"] as? String }, ["header", "peerObserved", "connectionLinked", "bootstrapRejected", "bootstrapRejected", "stopped"])
+                XCTAssertEqual(events[4]["reason"] as? String, "handshake_inactive")
+                XCTAssertEqual(events[4]["identityState"] as? String, "unknown")
+                XCTAssertNil(events[4]["peerPID"])
+                let peer = events[1]
+                XCTAssertEqual((peer["peerPID"] as? NSNumber)?.int32Value, getpid())
+                XCTAssertNotNil(peer["peer"])
+                XCTAssertEqual(peer["handshakeID"] as? String, events[2]["handshakeID"] as? String)
+                XCTAssertEqual(peer["handshakeID"] as? String, events[3]["handshakeID"] as? String)
+                XCTAssertEqual(events[3]["reason"] as? String, "capacity_exceeded")
+                let incoming = try XCTUnwrap((events[2]["connectionID"] as? String).flatMap(UUID.init(uuidString:)))
+                let registered = await manager.debugContainsConnection(incoming)
+                XCTAssertFalse(registered)
+                XCTAssertFalse(String(describing: events).contains("private-startup-sentinel"))
+            } catch {
+                await cleanup()
+                throw error
+            }
+            await cleanup()
+        }
+
+        private func startupCaptureEvents(at url: URL) throws -> [[String: Any]] {
+            try Data(contentsOf: url).split(separator: 0x0A).map { line in
+                let record = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(line)) as? [String: Any])
+                return try XCTUnwrap(record["event"] as? [String: Any])
+            }
+        }
+
+        private final class StartupCaptureClock: @unchecked Sendable {
+            private let lock = NSLock()
+            private var value: TimeInterval = 0
+            func read() -> TimeInterval {
+                lock.lock()
+                defer { lock.unlock() }
+                return value
+            }
+
+            func advance() {
+                lock.lock()
+                value = 180
+                lock.unlock()
+            }
+        }
+
         func testCancelledMiddleWaiterDetachesPromptlyAndLiveWaitersRemainFIFO() async throws {
             let limiter = AsyncLimiter(limit: 1)
             let holderGate = LimiterTestGate()
@@ -3803,7 +4208,14 @@ import XCTest
             file: StaticString = #filePath,
             line: UInt = #line
         ) async {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let recorder = MCPStartupDiagnostics(directory: directory)
+            let owner = UUID()
+            let capture = await recorder.begin(owner: owner)
+            XCTAssertEqual(capture.code, .ready)
             let manager = ServerNetworkManager()
+            await manager.debugSetStartupDiagnostics(recorder)
             let existingConnectionID = UUID()
             let incomingConnectionID = UUID()
             let busyGate = LimiterTestGate()
@@ -3855,6 +4267,17 @@ import XCTest
             XCTAssertEqual(effectiveCount, path == .direct ? 2 : 1, file: file, line: line)
             let retainedExisting = await manager.debugContainsConnection(existingConnectionID)
             XCTAssertTrue(retainedExisting, file: file, line: line)
+
+            if let id = capture.captureID {
+                _ = await recorder.status(owner: owner, captureID: id, end: true)
+                if path == .direct {
+                    let events = try? startupCaptureEvents(at: directory.appendingPathComponent(id.uuidString + ".jsonl"))
+                    let refused = events?.first { $0["kind"] as? String == "slotRefused" }
+                    XCTAssertEqual(refused?["reason"] as? String, "slot_refused")
+                    XCTAssertEqual(refused?["site"] as? String, "globalNoProgress")
+                    XCTAssertEqual(refused?["connectionID"] as? String, incomingConnectionID.uuidString)
+                }
+            }
 
             await busyGate.release()
             await assertCompletion(busyTask, description: "busy connection task")

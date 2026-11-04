@@ -160,6 +160,26 @@ private final class BootstrapHandshakeSocket: @unchecked Sendable {
 /// Actor that manages the single bootstrap UNIX socket.
 /// Accepts CLI connections and hands them off to ServerNetworkManager.
 actor BootstrapSocketServer {
+    #if DEBUG
+        private var startupDiagnostics = MCPStartupDiagnostics.shared
+
+        func debugSetStartupDiagnostics(_ recorder: MCPStartupDiagnostics) {
+            startupDiagnostics = recorder
+        }
+
+        /// Exercise the real handshake and admission callback with a test-owned socketpair.
+        /// The caller transfers ownership of fd; the ordinary handshake cleanup closes it.
+        func debugHandleStartupSocketForTesting(_ fd: Int32) async {
+            let id = UUID()
+            let socket = BootstrapHandshakeSocket(fd: fd)
+            inFlightHandshakeSockets[id] = socket
+            await handleNewConnectionWithBackpressure(
+                handshakeID: id, handshakeSocket: socket,
+                generation: listenerGeneration, lifecycleCorrelation: nil
+            )
+        }
+    #endif
+
     private let socketURL: URL
     private let logger: Logger
     private let handshakeIOQueue = DispatchQueue(
@@ -769,7 +789,19 @@ actor BootstrapSocketServer {
     ) async {
         let clientFD = handshakeSocket.fd
         bootstrapSocketServerLog("BootstrapSocketServer: new connection on fd \(clientFD)")
-        guard isActiveHandshake(handshakeSocket, generation: generation) else { return }
+        guard isActiveHandshake(handshakeSocket, generation: generation) else {
+            #if DEBUG
+                startupDiagnostics.record(.init(kind: .bootstrapRejected, reason: .handshake_inactive, handshakeID: handshakeID, identityState: .unknown))
+            #endif
+            return
+        }
+        #if DEBUG
+            startupDiagnostics.record(startupDiagnostics.peerEvent(
+                handshakeID: handshakeID,
+                peerPID: Self.peerPID(for: clientFD).map { pid_t($0) },
+                generation: generation
+            ))
+        #endif
 
         // Set blocking mode for simpler handshake I/O
         let flags = fcntl(clientFD, F_GETFL)
@@ -786,11 +818,23 @@ actor BootstrapSocketServer {
         ) else {
             if isActiveHandshake(handshakeSocket, generation: generation) {
                 logger.warning("BootstrapSocketServer: failed to read handshake from fd \(clientFD)")
+                #if DEBUG
+                    startupDiagnostics.record(.init(kind: .handshakeReadFailed, handshakeID: handshakeID))
+                #endif
+            } else {
+                #if DEBUG
+                    startupDiagnostics.record(.init(kind: .bootstrapRejected, reason: .handshake_inactive, handshakeID: handshakeID))
+                #endif
             }
             return
         }
 
-        guard isActiveHandshake(handshakeSocket, generation: generation) else { return }
+        guard isActiveHandshake(handshakeSocket, generation: generation) else {
+            #if DEBUG
+                startupDiagnostics.record(.init(kind: .bootstrapRejected, reason: .handshake_inactive, handshakeID: handshakeID))
+            #endif
+            return
+        }
 
         let peerPid = Self.peerPID(for: clientFD)
         let effectivePid = peerPid ?? request.clientPid
@@ -803,6 +847,9 @@ actor BootstrapSocketServer {
         // Validate protocol version
         guard request.protocolVersion == MCPBootstrapProtocol.currentVersion else {
             logger.warning("BootstrapSocketServer: protocol version mismatch (got \(request.protocolVersion), expected \(MCPBootstrapProtocol.currentVersion))")
+            #if DEBUG
+                startupDiagnostics.record(.init(kind: .bootstrapRejected, reason: .protocol_version_mismatch, handshakeID: handshakeID))
+            #endif
             _ = await sendResponseAsync(.rejected(reason: "Protocol version mismatch", errorCode: "protocol_version_mismatch"), to: handshakeSocket)
             return
         }
@@ -810,6 +857,9 @@ actor BootstrapSocketServer {
         // Invoke callback to let ServerNetworkManager decide
         guard let handler = onNewConnection else {
             logger.error("BootstrapSocketServer: no connection handler registered")
+            #if DEBUG
+                startupDiagnostics.record(.init(kind: .bootstrapRejected, reason: .server_not_ready, handshakeID: handshakeID))
+            #endif
             _ = await sendResponseAsync(.rejected(reason: "Server not ready", errorCode: "server_not_ready"), to: handshakeSocket)
             return
         }
@@ -824,17 +874,23 @@ actor BootstrapSocketServer {
             EditFlowPerf.Stage.Bootstrap.admission,
             EditFlowPerf.Dimensions(activeCount: inFlightHandshakeSockets.count)
         )
-        let admission = await handler(
-            clientFD,
-            request.sessionToken,
-            effectivePid,
-            request.clientName,
-            HandshakeCredentials(
-                gatewayCredential: request.gatewayCredential,
-                companionCredential: request.companionCredential,
-                observedPeerPID: peerPid
-            )
+        let credentials = HandshakeCredentials(
+            gatewayCredential: request.gatewayCredential,
+            companionCredential: request.companionCredential,
+            observedPeerPID: peerPid
         )
+        #if DEBUG
+            let admission = await MCPStartupDiagnostics.$handshakeID.withValue(handshakeID) {
+                await handler(clientFD, request.sessionToken, effectivePid, request.clientName, credentials)
+            }
+            startupDiagnostics.record(.init(
+                kind: admission.accepted ? .bootstrapAccepted : .bootstrapRejected,
+                reason: admission.accepted ? nil : MCPStartupDiagnostics.Reason(rawValue: admission.rejection?.errorCode ?? "") ?? .unknown,
+                handshakeID: handshakeID
+            ))
+        #else
+            let admission = await handler(clientFD, request.sessionToken, effectivePid, request.clientName, credentials)
+        #endif
         EditFlowPerf.end(
             EditFlowPerf.Stage.Bootstrap.admission,
             admissionState,
@@ -853,6 +909,9 @@ actor BootstrapSocketServer {
         )
         bootstrapSocketServerLog("BootstrapSocketServer: handler returned accepted=\(admission.accepted) for '\(request.clientName ?? "unknown")'")
         guard isActiveHandshake(handshakeSocket, generation: generation) else {
+            #if DEBUG
+                startupDiagnostics.record(.init(kind: .bootstrapRejected, reason: .handshake_inactive, handshakeID: handshakeID))
+            #endif
             await abortAcceptedAdmissionIfNeeded(admission)
             return
         }
@@ -861,6 +920,9 @@ actor BootstrapSocketServer {
             guard let publishTransferredFD = admission.publishTransferredFD,
                   let postAccept = admission.postAccept
             else {
+                #if DEBUG
+                    startupDiagnostics.record(.init(kind: .bootstrapRejected, reason: .ownership_hooks_missing, handshakeID: handshakeID))
+                #endif
                 logger.error("BootstrapSocketServer: accepted admission missing ownership-transfer hooks for fd \(clientFD)")
                 await abortAcceptedAdmissionIfNeeded(admission)
                 return
@@ -871,6 +933,9 @@ actor BootstrapSocketServer {
             let writeOk = await sendResponseAsync(.accepted(), to: handshakeSocket)
             guard writeOk, isActiveHandshake(handshakeSocket, generation: generation) else {
                 logger.error("BootstrapSocketServer: failed or aborted accepted response for fd \(clientFD)")
+                #if DEBUG
+                    startupDiagnostics.record(.init(kind: .acceptedResponseFailed, handshakeID: handshakeID))
+                #endif
                 await abortAcceptedAdmissionIfNeeded(admission)
                 return
             }
@@ -887,6 +952,9 @@ actor BootstrapSocketServer {
             guard handshakeSocket.transferOwnershipIfOpen(
                 publishTransferredFD: publishTransferredFD
             ) else {
+                #if DEBUG
+                    startupDiagnostics.record(.init(kind: .bootstrapRejected, reason: .ownership_transfer_failed, handshakeID: handshakeID))
+                #endif
                 await abortAcceptedAdmissionIfNeeded(admission)
                 return
             }

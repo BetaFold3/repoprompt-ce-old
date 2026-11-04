@@ -25,6 +25,21 @@ import MCP
             }
 
             switch op {
+            case "startup_capture_begin", "startup_capture_status", "startup_capture_end":
+                let status: MCPStartupDiagnostics.Status
+                if op == "startup_capture_begin" {
+                    status = await startupDiagnostics.begin(owner: connectionID)
+                } else {
+                    guard let value = debugString(arguments, "capture_id"), let captureID = UUID(uuidString: value) else {
+                        return debugDiagnosticsError(op: op, code: "invalid_params", message: "A capture UUID is required.")
+                    }
+                    status = await startupDiagnostics.status(owner: connectionID, captureID: captureID, end: op == "startup_capture_end")
+                }
+                return debugDiagnosticsResult([
+                    "op": op, "code": status.code.rawValue,
+                    "capture_id": Self.debugOptionalValue(status.captureID?.uuidString),
+                    "records": status.records, "bytes": status.bytes, "drained": status.drained
+                ])
             case "ping":
                 return await debugDiagnosticsResult(debugPingPayload(connectionID: connectionID, op: op, arguments: arguments))
             case "connection_snapshot":
