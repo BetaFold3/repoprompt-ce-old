@@ -23,7 +23,7 @@ package enum AgentSessionFileCreationPolicy {
 /// Immutable, process-local ownership of one durable session incarnation. Callers capture this
 /// once when they create or hydrate an editable session and never refresh it after deletion.
 package struct AgentSessionPersistenceStamp: Hashable {
-    let sessionID: UUID
+    package let sessionID: UUID
     package let workspaceID: UUID
     let deletionGeneration: UInt64
     /// Durable lifecycle incarnation. Always present for editable authority; `nil` only for a
@@ -4629,7 +4629,10 @@ package actor AgentSessionDataService {
     /// inaccessible residue that is reported diagnostically; repeated deletion retries cleanup
     /// without publishing the logical deletion again (one generation bump and notification per
     /// tombstone commit).
-    private func deleteAgentSessionFileLocked(_ fileURL: URL, sessionID: UUID) async throws {
+    private func deleteAgentSessionFileLocked(
+        _ fileURL: URL, sessionID: UUID, holdingRichFilesystemFence: Bool = false,
+        currentWorkspaceRoot: URL? = nil
+    ) async throws {
         let folder = fileURL.deletingLastPathComponent()
         let filename = fileURL.lastPathComponent
         let fileKey = canonicalSessionFileKey(fileURL)
@@ -4659,6 +4662,32 @@ package actor AgentSessionDataService {
                 print("[AgentSessionDataService] deletion committed for \(sessionID); session file cleanup failed and residue remains inaccessible: \(error)")
             }
         }
+        // Rich tree beside AgentSessions: the root of the session-file location this deletion used
+        // and, when the caller resolved it, the workspace's current root (a stamp URL captured
+        // before a completed move or rename is stale). The tombstone above already committed this
+        // session's deletion, so either location holds only this session's residue. Each root is
+        // resolved once (the store refuses a symlinked root). Fence after the session gate (global
+        // lock order).
+        var richRoots: [URL] = []
+        for candidate in [folder.deletingLastPathComponent(), currentWorkspaceRoot].compactMap(\.self) {
+            let resolved = candidate.standardizedFileURL.resolvingSymlinksInPath()
+            if !richRoots.contains(resolved) { richRoots.append(resolved) }
+        }
+        let richFence = AgentRichArtifactFilesystemFence.shared
+        if !holdingRichFilesystemFence { await richFence.acquire() }
+        for root in richRoots {
+            do {
+                #if DEBUG
+                    if let injected = test_richArtifactDeletionFailure?(sessionID) { throw injected }
+                #endif
+                try await AgentRichArtifactStore.offMain {
+                    try AgentRichArtifactStore.removeSession(root: root, sessionID: sessionID)
+                }
+            } catch {
+                print("[AgentSessionDataService] deletion committed for \(sessionID); rich cleanup failed and residue remains inaccessible: \(error)")
+            }
+        }
+        if !holdingRichFilesystemFence { richFence.release() }
         if let recoveryStore {
             // Still under the session gate: no recovery transaction can interleave. Failure never
             // reverses the deletion; tombstone filtering hides any residue and a repeated
@@ -4764,18 +4793,19 @@ package actor AgentSessionDataService {
             workspaceID: workspace.id
         )
         let fileURL = state.stamp.fileURL
+        let currentRoot = workspaceFolderURL(for: workspace)
         switch try tombstoneState(for: sessionID) {
         case .absent:
             break
         case .committed:
             // Already logically deleted: retry cleanup of any residue.
-            try await deleteAgentSessionFileLocked(fileURL, sessionID: sessionID)
+            try await deleteAgentSessionFileLocked(fileURL, sessionID: sessionID, currentWorkspaceRoot: currentRoot)
             return .alreadyAbsent
         case .unreadable:
             throw AgentScheduledSendMutationError.unreadableTombstone(sessionID)
         }
         guard FileManager.default.fileExists(atPath: fileURL.path) else {
-            try await deleteAgentSessionFileLocked(fileURL, sessionID: sessionID)
+            try await deleteAgentSessionFileLocked(fileURL, sessionID: sessionID, currentWorkspaceRoot: currentRoot)
             return .alreadyAbsent
         }
         guard
@@ -4791,7 +4821,7 @@ package actor AgentSessionDataService {
         else {
             return .ownershipChanged
         }
-        try await deleteAgentSessionFileLocked(fileURL, sessionID: sessionID)
+        try await deleteAgentSessionFileLocked(fileURL, sessionID: sessionID, currentWorkspaceRoot: currentRoot)
         return .deleted
     }
 
@@ -4870,6 +4900,242 @@ package actor AgentSessionDataService {
         return stamp.fileURL.deletingLastPathComponent()
     }
 
+    // MARK: - Rich artifacts (the existing session gates are the only lifetime authority)
+
+    #if DEBUG
+        private var test_richArtifactPhase: (@Sendable (String, UUID) async throws -> Void)?
+        private var test_richArtifactDeletionFailure: (@Sendable (UUID) -> Error?)?
+        package func test_setRichArtifactPhase(_ hook: (@Sendable (String, UUID) async throws -> Void)?) {
+            test_richArtifactPhase = hook
+        }
+
+        package func test_setRichArtifactDeletionFailure(_ hook: (@Sendable (UUID) -> Error?)?) {
+            test_richArtifactDeletionFailure = hook
+        }
+
+        package func test_richSessionWaiterCount(_ sessionID: UUID) -> Int {
+            sessionPersistenceWaiters[sessionID]?.count ?? 0
+        }
+    #endif
+
+    /// Rich authority for a session under `root` (a root its caller validated as the workspace's
+    /// current storage). Stamps are never refreshed, so the stamp's absolute path can predate a
+    /// completed rename or storage move; identity is therefore this session's own file under
+    /// `root` plus the stamp's durable incarnation there (with the stamp's service, deletion
+    /// generation and the authoritative tombstone), not the stamp's absolute directory.
+    private func validateRichAuthority(
+        _ state: AgentSessionPersistenceState, root: URL
+    ) throws {
+        let stamp = state.stamp
+        try validatePersistenceStamp(stamp, sessionID: stamp.sessionID, workspaceID: stamp.workspaceID)
+        try requireNoTombstone(for: stamp.sessionID)
+        let fileURL = agentSessionFileURL(
+            id: stamp.sessionID, in: root.appendingPathComponent(Self.agentSessionsFolderName)
+        )
+        guard FileManager.default.fileExists(atPath: fileURL.path) else { throw AgentRichArtifactError.storageMoved }
+        guard case let .v1(current) = try currentDurableLifecycle(fileURL: fileURL, sessionID: stamp.sessionID),
+              let expected = stamp.incarnationID, current.incarnationID == expected
+        else { throw AgentScheduledSendMutationError.staleIncarnation(expected: stamp.incarnationID, actual: nil) }
+    }
+
+    package func captureRichArtifactRoot(
+        state: AgentSessionPersistenceState, workspace: some AgentWorkspaceStorageReference,
+        resolvedRoot: URL
+    ) async throws -> URL {
+        await acquireSessionPersistence(for: state.stamp.sessionID)
+        defer { releaseSessionPersistence(for: state.stamp.sessionID) }
+        guard workspace.id == state.stamp.workspaceID,
+              workspaceFolderURL(for: workspace).standardizedFileURL.resolvingSymlinksInPath() == resolvedRoot.standardizedFileURL.resolvingSymlinksInPath()
+        else { throw AgentRichArtifactError.storageMoved }
+        try validateRichAuthority(state, root: resolvedRoot)
+        return resolvedRoot
+    }
+
+    package func publishRichArtifact(
+        state: AgentSessionPersistenceState, root: URL,
+        manifest: AgentRichArtifactManifest, assets: [UUID: Data],
+        commitCheck: @escaping @MainActor () throws -> Void
+    ) async throws {
+        let sessionID = state.stamp.sessionID
+        await acquireSessionPersistence(for: sessionID)
+        defer { releaseSessionPersistence(for: sessionID) }
+        let fence = AgentRichArtifactFilesystemFence.shared
+        await fence.acquire()
+        defer { fence.release() }
+        try Task.checkCancellation()
+        try validateRichAuthority(state, root: root)
+        guard manifest.provenance.sessionID == sessionID else { throw AgentRichArtifactError.invalidManifest }
+        #if DEBUG
+            try await test_richArtifactPhase?("beforeStage", sessionID)
+        #endif
+        let stage = try await AgentRichArtifactStore.cancellable { cancellation in
+            try AgentRichArtifactStore.stage(root: root, sessionID: sessionID, manifest: manifest, assets: assets, cancellation: cancellation)
+        }
+        do {
+            #if DEBUG
+                try await test_richArtifactPhase?("afterStage", sessionID)
+            #endif
+            try Task.checkCancellation()
+            try validateRichAuthority(state, root: root)
+            // The final exact-attempt/root check and the single rename cannot interleave with a
+            // root mutation request. Bulk bytes have already been written off-main.
+            try await MainActor.run {
+                try commitCheck()
+                try AgentRichArtifactStore.install(stage)
+            }
+        } catch {
+            _ = try? await AgentRichArtifactStore.offMain { AgentRichArtifactStore.discard(stage) }
+            throw error
+        }
+        // Rename committed: no post-commit cancellation error or automatic retry.
+    }
+
+    package func readRichArtifact(
+        state: AgentSessionPersistenceState, root: URL, reference: RichPresentationReference
+    ) async throws -> AgentRichArtifactManifest {
+        await acquireSessionPersistence(for: state.stamp.sessionID)
+        defer { releaseSessionPersistence(for: state.stamp.sessionID) }
+        let fence = AgentRichArtifactFilesystemFence.shared
+        await fence.acquire()
+        defer { fence.release() }
+        try validateRichAuthority(state, root: root)
+        return try await AgentRichArtifactStore.offMain {
+            try AgentRichArtifactStore.read(root: root, sessionID: state.stamp.sessionID, reference: reference)
+        }
+    }
+
+    /// Private handoff commit. The destination session gate (and, when artifacts must be copied,
+    /// the source gate in UUID order), then the rich filesystem fence, stay held through copying,
+    /// the exclusive initial save, the final main-actor check and exposure, or rollback. Every
+    /// handoff, with or without references, protects destination storage identity: `root` must be
+    /// this service's root for `workspace` (`workspaceStorageRoot(for:)`). That internal check only
+    /// compares two values derived from the caller's `workspace` snapshot; the caller's
+    /// `commitCheck` is the ONLY check against the current workspace and its storage (revision and
+    /// root), so a caller that passes a no-op check gets no current-root protection. Root mutations wait for
+    /// the fence before moving anything, so no physical move can interleave between the checks
+    /// and the save or exposure, and a stale root never recreates an old directory. With no
+    /// references no source authority is needed and nothing is copied.
+    /// Rollback never exposes the destination: private records are discarded, a committed
+    /// destination file goes through the existing tombstone-first deletion, and destination rich
+    /// residue is removed. The source is never mutated.
+    package func commitPrivateHandoff(
+        sourceState: AgentSessionPersistenceState?, initialSession: AgentSession,
+        workspace: some AgentWorkspaceStorageReference, root: URL,
+        references: [RichPresentationReference],
+        persistPrivateRecords: @escaping @MainActor () async throws -> Void = {},
+        discardPrivateRecords: @escaping @MainActor () async -> Void = {},
+        commitCheck: @escaping @MainActor () throws -> Void,
+        expose: @escaping @MainActor (AgentSessionEditableLoad) throws -> Void
+    ) async throws {
+        // `commitCheck` runs before the first copy, before each copy, before the initial save and
+        // in the main-actor exposure section, all under the session gates and the fence.
+        let destinationID = initialSession.id
+        guard initialSession.lifecycle == nil, initialSession.workspaceID == workspace.id,
+              !(initialSession.isListStub && initialSession.effectiveItemCount > 0)
+        else { throw AgentScheduledSendMutationError.invalidInitialSession(destinationID) }
+        var unique = Set<UUID>()
+        let copies = references.filter { unique.insert($0.artifactID).inserted }
+        var copy: (source: AgentSessionPersistenceState, root: URL)?
+        if !copies.isEmpty {
+            guard let sourceState, sourceState.stamp.sessionID != destinationID,
+                  sourceState.stamp.workspaceID == workspace.id
+            else { throw AgentRichArtifactError.sourceUnavailable }
+            copy = (sourceState, root)
+        }
+        let ids = ([destinationID] + (copy.map { [$0.source.stamp.sessionID] } ?? []))
+            .sorted { $0.uuidString < $1.uuidString }
+        for id in ids {
+            await acquireSessionPersistence(for: id)
+        }
+        defer { for id in ids.reversed() {
+            releaseSessionPersistence(for: id)
+        } }
+        let fence = AgentRichArtifactFilesystemFence.shared
+        await fence.acquire()
+        defer { fence.release() }
+
+        try Task.checkCancellation()
+        guard workspaceFolderURL(for: workspace).standardizedFileURL.resolvingSymlinksInPath()
+            == root.standardizedFileURL.resolvingSymlinksInPath()
+        else { throw AgentRichArtifactError.storageMoved }
+        if let copy {
+            try validateRichAuthority(copy.source, root: copy.root)
+        }
+        try requireNoTombstone(for: destinationID)
+        let fileURL = agentSessionFileURL(id: destinationID, in: agentSessionsFolderURL(for: workspace))
+        guard !FileManager.default.fileExists(atPath: fileURL.path) else {
+            throw AgentScheduledSendMutationError.sessionAlreadyExists(destinationID)
+        }
+        do {
+            try await commitCheck()
+            if let copy {
+                let sourceID = copy.source.stamp.sessionID
+                for reference in copies {
+                    try Task.checkCancellation()
+                    try await commitCheck()
+                    #if DEBUG
+                        try await test_richArtifactPhase?("beforeCopy", reference.artifactID)
+                    #endif
+                    try await AgentRichArtifactStore.cancellable { cancellation in
+                        try AgentRichArtifactStore.copy(
+                            root: copy.root, source: sourceID, destination: destinationID,
+                            reference: reference, cancellation: cancellation
+                        )
+                    }
+                }
+                try Task.checkCancellation()
+                // The source gate is still held: no deletion or new incarnation can have committed.
+                try validateRichAuthority(copy.source, root: copy.root)
+            }
+            #if DEBUG
+                try await test_richArtifactPhase?("afterCopy", destinationID)
+            #endif
+            try await persistPrivateRecords()
+            try Task.checkCancellation()
+            try await commitCheck()
+            let commit = try await saveAgentSessionLocked(
+                initialSession, for: workspace, preparation: .alreadyCanonicalTranscript,
+                trustedCanonicalItemCount: nil, intentionallyRemovingFinalizedScheduledSendItems: [],
+                committingTranscriptReset: nil, fileCreationPolicy: .createIfMissing,
+                authority: .compatibility, countsAsFullSave: false
+            )
+            guard let session = commit.committedSession else {
+                throw AgentScheduledSendMutationError.sessionAlreadyExists(destinationID)
+            }
+            #if DEBUG
+                try await test_richArtifactPhase?("afterSave", destinationID)
+            #endif
+            try Task.checkCancellation()
+            // Final placement/authority check and exposure in one non-suspending main-actor section.
+            try await MainActor.run {
+                try commitCheck()
+                try expose(AgentSessionEditableLoad(session: session, persistenceState: commit.persistenceState))
+            }
+        } catch {
+            await discardPrivateRecords()
+            if FileManager.default.fileExists(atPath: fileURL.path) {
+                // Existing tombstone-first deletion (caches, notification, recovery, metadata and
+                // the destination rich tree); this call already owns the fence.
+                do {
+                    try await deleteAgentSessionFileLocked(
+                        fileURL, sessionID: destinationID, holdingRichFilesystemFence: true
+                    )
+                } catch {
+                    print("[AgentSessionDataService] private handoff destination rollback failed; residue stays unexposed: \(error)")
+                }
+            } else if let copy {
+                do {
+                    try await AgentRichArtifactStore.offMain {
+                        try AgentRichArtifactStore.removeSession(root: copy.root, sessionID: destinationID)
+                    }
+                } catch {
+                    print("[AgentSessionDataService] private handoff rich cleanup failed; residue stays unexposed: \(error)")
+                }
+            }
+            throw error
+        }
+    }
+
     // MARK: - Folder Helpers
 
     // Readers resolve with `agentSessionsFolderURL` or `agentSessionsFolderIfExists` and never create
@@ -4896,13 +5162,24 @@ package actor AgentSessionDataService {
         return folder
     }
 
+    private static let agentSessionsFolderName = "AgentSessions"
+
     /// The "AgentSessions" subfolder location. Computes only; never touches the filesystem.
     private func agentSessionsFolderURL(for workspace: some AgentWorkspaceStorageReference) -> URL {
-        workspaceFolderURL(for: workspace).appendingPathComponent("AgentSessions")
+        workspaceFolderURL(for: workspace).appendingPathComponent(Self.agentSessionsFolderName)
+    }
+
+    /// The storage root this service persists the workspace's sessions under, and therefore the
+    /// only root its rich artifact trees live beside (`agent_rich_artifacts` next to
+    /// `AgentSessions`). Rich publication and handoff capture and revalidate exactly this root, so
+    /// it always agrees with session persistence (including when a global custom location is set,
+    /// which session persistence does not consult). Computes only.
+    package nonisolated func workspaceStorageRoot(for workspace: some AgentWorkspaceStorageReference) -> URL {
+        workspaceFolderURL(for: workspace)
     }
 
     /// The workspace's main folder (custom storage path or the default root). Computes only.
-    private func workspaceFolderURL(for workspace: some AgentWorkspaceStorageReference) -> URL {
+    private nonisolated func workspaceFolderURL(for workspace: some AgentWorkspaceStorageReference) -> URL {
         if let customURL = workspace.customStoragePath {
             return customURL
         }

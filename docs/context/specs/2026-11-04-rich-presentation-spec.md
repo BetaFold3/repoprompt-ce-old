@@ -19,6 +19,7 @@ Follow the [review policy](../review-policy.md) and [validation workflow](../wor
 - The owner requires independent copied/branched conversations to retain artifacts after source deletion.
 - The owner includes all trusted local Agent Mode runs, including workers, Explore and Knowledge; general external MCP clients are excluded.
 - The owner requested a technical spec, not implementation.
+- On 2026-11-05, the owner chose bounded storage support: refuse rich creation and artifact-bearing handoffs when resolved workspace and session storage disagree, accept the resulting global-custom-storage limitation, and leave existing session persistence unchanged (D2).
 
 ## Non-goals
 No scraping/scheduling, arbitrary HTML/JavaScript, WebKit changes, MCP Apps hosting, general structured-result migration, new branch UI, or native Codex conversation-branching implementation. No background image refresh, redirects, authenticated downloads, automatic retries, animation/SVG, advanced chart types, embedded briefing charts, new export formats, or cross-session shared assets.
@@ -94,12 +95,12 @@ Step 2 — done | rounds 1/2 | open: none | downgraded: none | assumed: A4,A5; s
 - Change: Core artifact service/store at `AgentSessionDataService` storage/deletion gate; trusted MCP owner resolver; App handoff and root-change seams. No dependency on concurrently changing document-attachment work.
 - Validation: proposed `RichPresentationLifecycleTests` covers partial writes, deletion/cancellation/storage move during fetch, worker-session reload, compacted-cutoff copy then source deletion, copy failure, and custom-storage movement.
 - Done when: bytes precede references, copies survive source deletion, no late task recreates deleted/stale storage, and D1's copy-failure behavior is settled.
-Step 3 — blocked | rounds 2/2 | open: D1 copy-failure disposition | downgraded: none | assumed: A4; abort incomplete handoff recommended | deferred: native branching implementation
+Step 3 — done | rounds 2/2 | open: none | downgraded: none | assumed: A4 | deferred: D2 storage limitation, native branching, advisory findings and Step 4 gates in step3-final.md
 ### Step 4 — Tool and complete inline history
 - Change: `present_rich` provider via `MCPWindowToolRuntime` with freshness none; canonical names/group/catalog, capabilities/grants, admission/execution contracts and recognition; Core turn model/sanitizer/compactor; App outer block renderer. Advertise only once storage and full-inline retention are integrated.
 - Validation: `AgentToolResultPersistencePolicyTests`, `AgentTranscriptGroupInspectionTests`, catalog/admission tests and one end-to-end fixture: publish → sanitize twice including ACP → save → all retention tiers → reload → render exactly once, with missing assets and creation disabled.
 - Done when: complete content stays outer-inline with stable ordering and no historical network traffic or duplicate success body.
-Step 4 — todo | rounds 2/2 | open: none | downgraded: none | assumed: A1,A2,A6 | deferred: none
+Step 4 — todo | rounds 0/2 | open: activation and inline retention | downgraded: none | assumed: A1,A2,A6 | deferred: activation gates in step3-final.md
 ### Step 5 — Acceptance and durable guidance
 - Change: fix only observed integration defects and update this owning spec's status/contract; keep raw evidence outside it.
 - Validation: affected `make dev-test FILTER=<Suite>`, `make dev-lint`, product build and `make guardrails`; context checker plus its negative suite. With immediate owner approval, exercise Claude/Codex/OMP tool refresh, worker/Knowledge output, long history, resizing, selection, restart, handoff and image denial in the Dev app.

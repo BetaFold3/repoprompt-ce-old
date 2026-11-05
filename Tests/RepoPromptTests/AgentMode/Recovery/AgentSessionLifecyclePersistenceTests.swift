@@ -827,6 +827,49 @@ final class AgentSessionLifecyclePersistenceTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: unproven.fileURL.path))
     }
 
+    // MARK: - Rich artifact deletion
+
+    func testDeletionRemovesRichTreeAfterTombstoneAndRepeatedDeletionRetriesFailedCleanup() async throws {
+        let env = makeEnvironment()
+        defer { env.cleanup() }
+        let service = env.makeService()
+        let created = try await create(service, name: "Rich", env: env)
+        let sessionID = created.load.session.id
+        let root = try XCTUnwrap(env.workspace.customStoragePath)
+        let artifactID = UUID()
+        let input = RichPresentationInput(title: "Local data", content: .chart(RichPresentationChart(
+            chartType: .bar, xLabel: "Item", unit: "count", x: ["A"], series: [.init(name: "Measured", y: [2])],
+            sources: [.init(label: "Local fixture")]
+        )))
+        let manifest = try AgentRichArtifactManifest(
+            artifactID: artifactID, input: input, outcomes: [],
+            provenance: .init(runID: UUID(), attemptID: UUID(), sessionID: sessionID, toolInvocationID: UUID())
+        )
+        let reference = RichPresentationReference(artifactID: artifactID, kind: .chart, title: input.title, fallbackText: "Summary")
+        try await service.publishRichArtifact(
+            state: created.load.persistenceState, root: root, manifest: manifest, assets: [:], commitCheck: {}
+        )
+        let richDirectory = root.appendingPathComponent("agent_rich_artifacts").appendingPathComponent(sessionID.uuidString)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: richDirectory.path))
+
+        // Rich cleanup failure never reverses or fails the committed deletion.
+        await service.test_setRichArtifactDeletionFailure { _ in InjectedFailure() }
+        try await service.deleteAgentSession(id: sessionID, for: env.workspace)
+        await service.test_setRichArtifactDeletionFailure(nil)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: env.tombstoneURL(for: sessionID).path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: created.fileURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: richDirectory.path), "Residue remains")
+        do {
+            _ = try await service.readRichArtifact(state: created.load.persistenceState, root: root, reference: reference)
+            XCTFail("Tombstoned residue is inaccessible")
+        } catch {}
+
+        // A repeated deletion retries the cleanup.
+        try await service.deleteAgentSession(id: sessionID, for: env.workspace)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: richDirectory.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("agent_rich_artifacts").path))
+    }
+
     // MARK: - Fixtures
 
     private struct InjectedFailure: Error {}
