@@ -1501,6 +1501,11 @@ extension MCPServerViewModel {
         /// (`ServerNetworkManager.gatewayRemoteDeviceID(for:)`). Nil for every other caller; the
         /// client-asserted `clientName` alone never sets it.
         let gatewayRemoteDeviceID: String?
+        /// The run attempt ownership applied to the connection with its run policy, from the same
+        /// actor read as `runPurpose` and `actorRoutedRunTab` (`requestRoutingContext`). Captured
+        /// once and never refreshed by later rehydration: rich-presentation authority belongs to
+        /// the attempt the request was admitted under (`RichPresentationMCPAuthorityResolver`).
+        let appliedRunOwnership: ServerNetworkManager.AppliedRunOwnership?
 
         init(
             connectionID: UUID?,
@@ -1511,7 +1516,8 @@ extension MCPServerViewModel {
             explicitWindowRoutingHint: MCPExplicitWindowRoutingHint? = nil,
             toolInvocationID: UUID? = nil,
             actorRoutedRunTab: ServerNetworkManager.RunPolicyTab?,
-            gatewayRemoteDeviceID: String? = nil
+            gatewayRemoteDeviceID: String? = nil,
+            appliedRunOwnership: ServerNetworkManager.AppliedRunOwnership? = nil
         ) {
             self.connectionID = connectionID
             self.clientName = clientName
@@ -1522,6 +1528,7 @@ extension MCPServerViewModel {
             self.toolInvocationID = toolInvocationID
             self.actorRoutedRunTab = actorRoutedRunTab
             self.gatewayRemoteDeviceID = gatewayRemoteDeviceID
+            self.appliedRunOwnership = appliedRunOwnership
         }
 
         func withActorRoutedRunTab(_ runTab: ServerNetworkManager.RunPolicyTab?) -> RequestMetadata {
@@ -1594,7 +1601,8 @@ extension MCPServerViewModel {
             explicitWindowRoutingHint: service.currentRequestExplicitWindowRoutingHint(),
             toolInvocationID: ServerNetworkManager.currentToolInvocationID,
             actorRoutedRunTab: actorRoutedRunTab,
-            gatewayRemoteDeviceID: routing.gatewayRemoteDeviceID
+            gatewayRemoteDeviceID: routing.gatewayRemoteDeviceID,
+            appliedRunOwnership: routing.appliedRunOwnership
         )
     }
 

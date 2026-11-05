@@ -124,6 +124,57 @@ final class AgentSessionLifecyclePersistenceTests: XCTestCase {
         }
     }
 
+    /// A supported envelope whose transcript carries a malformed document record (unknown kind) is
+    /// decoded strictly: every load lane fails and the bytes are never rewritten (no lenient default
+    /// drops the record).
+    func testMalformedDocumentRecordFailsClosedWithoutRewrite() async throws {
+        let env = makeEnvironment()
+        defer { env.cleanup() }
+
+        let sessionID = UUID()
+        var session = AgentSession(id: sessionID, workspaceID: env.workspace.id, name: "Documents")
+        session.lifecycle = .v1(AgentSessionLifecycle(incarnationID: UUID()))
+        let document = AgentDocumentAttachment(
+            id: UUID(),
+            kind: .pdf,
+            originalFilename: "report.pdf",
+            byteCount: 42,
+            createdAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+        session.items = [AgentChatItemPersist(from: .user("see attached", documentAttachments: [document], sequenceIndex: 1))]
+        let valid = try XCTUnwrap(String(data: JSONEncoder().encode(session), encoding: .utf8))
+        let malformed = valid.replacingOccurrences(of: #""kind":"pdf""#, with: #""kind":"docx""#)
+        XCTAssertNotEqual(malformed, valid, "The fixture changes the document kind")
+        XCTAssertNoThrow(try AgentSessionDataCodec.decodeSession(from: Data(valid.utf8)), "Only the document record is malformed")
+
+        let fileURL = try await installRawSession(Data(malformed.utf8), id: sessionID, env: env)
+        let bytes = try Data(contentsOf: fileURL)
+        let service = env.makeService()
+
+        do {
+            _ = try await service.loadAgentSessionForEditing(id: sessionID, for: env.workspace)
+            XCTFail("Editing load must fail closed")
+        } catch {}
+        do {
+            _ = try await service.loadAgentSession(from: fileURL)
+            XCTFail("Load must fail closed")
+        } catch {}
+        for sequential in [false, true] {
+            do {
+                _ = try await AgentSessionDataService.$forcesSequentialHydrationPreparation.withValue(sequential) {
+                    try await service.preparePersistedHydration(hydrationRequest(sessionID: sessionID, env: env))
+                }
+                XCTFail("Hydration must fail closed (sequential=\(sequential))")
+            } catch {}
+        }
+        _ = try? await service.loadAgentSessionStub(
+            from: fileURL,
+            recoverMissingMetadata: true,
+            persistRecoveredMetadata: true
+        )
+        XCTAssertEqual(try Data(contentsOf: fileURL), bytes, "The malformed document record is preserved byte for byte")
+    }
+
     // MARK: - Migration
 
     func testLegacyLoadMigratesIdentityOnceUnderTheGate() async throws {
@@ -774,6 +825,49 @@ final class AgentSessionLifecyclePersistenceTests: XCTestCase {
             XCTAssertEqual(error as? AgentScheduledSendRecoveryError, .lifecycleAuthorityUnavailable)
         }
         XCTAssertFalse(FileManager.default.fileExists(atPath: unproven.fileURL.path))
+    }
+
+    // MARK: - Rich artifact deletion
+
+    func testDeletionRemovesRichTreeAfterTombstoneAndRepeatedDeletionRetriesFailedCleanup() async throws {
+        let env = makeEnvironment()
+        defer { env.cleanup() }
+        let service = env.makeService()
+        let created = try await create(service, name: "Rich", env: env)
+        let sessionID = created.load.session.id
+        let root = try XCTUnwrap(env.workspace.customStoragePath)
+        let artifactID = UUID()
+        let input = RichPresentationInput(title: "Local data", content: .chart(RichPresentationChart(
+            chartType: .bar, xLabel: "Item", unit: "count", x: ["A"], series: [.init(name: "Measured", y: [2])],
+            sources: [.init(label: "Local fixture")]
+        )))
+        let manifest = try AgentRichArtifactManifest(
+            artifactID: artifactID, input: input, outcomes: [],
+            provenance: .init(runID: UUID(), attemptID: UUID(), sessionID: sessionID, toolInvocationID: UUID())
+        )
+        let reference = RichPresentationReference(artifactID: artifactID, kind: .chart, title: input.title, fallbackText: "Summary")
+        try await service.publishRichArtifact(
+            state: created.load.persistenceState, root: root, manifest: manifest, assets: [:], commitCheck: {}
+        )
+        let richDirectory = root.appendingPathComponent("agent_rich_artifacts").appendingPathComponent(sessionID.uuidString)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: richDirectory.path))
+
+        // Rich cleanup failure never reverses or fails the committed deletion.
+        await service.test_setRichArtifactDeletionFailure { _ in InjectedFailure() }
+        try await service.deleteAgentSession(id: sessionID, for: env.workspace)
+        await service.test_setRichArtifactDeletionFailure(nil)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: env.tombstoneURL(for: sessionID).path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: created.fileURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: richDirectory.path), "Residue remains")
+        do {
+            _ = try await service.readRichArtifact(state: created.load.persistenceState, root: root, reference: reference)
+            XCTFail("Tombstoned residue is inaccessible")
+        } catch {}
+
+        // A repeated deletion retries the cleanup.
+        try await service.deleteAgentSession(id: sessionID, for: env.workspace)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: richDirectory.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("agent_rich_artifacts").path))
     }
 
     // MARK: - Fixtures

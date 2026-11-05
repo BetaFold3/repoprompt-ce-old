@@ -72,10 +72,9 @@ struct ManageWorkspacesView: View {
                                 panel.canChooseFiles = false
                                 panel.allowsMultipleSelection = false
                                 if panel.runModal() == .OK, let chosenURL = panel.urls.first {
-                                    do {
-                                        try workspaceManager.updateGlobalStoragePath(chosenURL)
-                                    } catch {
-                                        print("Failed to update global storage location: \(error)")
+                                    Task {
+                                        do { try await workspaceManager.updateGlobalStoragePath(chosenURL) }
+                                        catch { print("Failed to update global storage location: \(error)") }
                                     }
                                 }
                             } label: {
@@ -85,10 +84,9 @@ struct ManageWorkspacesView: View {
 
                             if workspaceManager.globalCustomStorageURL != nil {
                                 Button {
-                                    do {
-                                        try workspaceManager.resetGlobalStorageToDefault()
-                                    } catch {
-                                        print("Failed to reset global storage: \(error)")
+                                    Task {
+                                        do { try await workspaceManager.resetGlobalStorageToDefault() }
+                                        catch { print("Failed to reset global storage: \(error)") }
                                     }
                                 } label: {
                                     Text("Reset to Default")
@@ -609,11 +607,13 @@ struct ManageWorkspacesView: View {
                 Button("Save") {
                     let finalName = renameField.trimmingCharacters(in: .whitespaces)
                     guard !finalName.isEmpty else { return }
-                    workspaceManager.renameWorkspace(workspace, newName: finalName)
-                    workspaceManager.setWorkspaceDefaultRemoteHost(
-                        workspace,
-                        hostID: renameRemoteHostID
-                    )
+                    let hostID = renameRemoteHostID
+                    // Keep the previous order: the folder rename precedes the host save, so that
+                    // save targets the renamed folder rather than recreating the old one.
+                    Task {
+                        await workspaceManager.renameWorkspace(workspace, newName: finalName)
+                        workspaceManager.setWorkspaceDefaultRemoteHost(workspace, hostID: hostID)
+                    }
                     workspaceBeingRenamed = nil
                 }
                 .disabled(renameField.trimmingCharacters(in: .whitespaces).isEmpty)

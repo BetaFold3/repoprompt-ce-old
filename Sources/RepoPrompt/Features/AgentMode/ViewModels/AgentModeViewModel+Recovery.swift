@@ -335,6 +335,8 @@ extension AgentModeViewModel {
         let content: AgentRecoveryInputContent
         let attachments: [AgentImageAttachment]
         let taggedFiles: [AgentTaggedFileAttachment]
+        /// Attached document records (global managed IDs) captured with this snapshot.
+        var documents: [AgentDocumentAttachment] = []
         let workflow: AgentWorkflowDefinition?
         let interviewFirst: Bool
         /// A composer submission: exactly the submitted items leave the live composer.
@@ -372,6 +374,7 @@ extension AgentModeViewModel {
         text: String,
         attachments: [AgentImageAttachment],
         taggedFiles: [AgentTaggedFileAttachment],
+        documents: [AgentDocumentAttachment] = [],
         workflow: AgentWorkflowDefinition?,
         interviewFirst: Bool,
         consumesComposer: Bool,
@@ -431,6 +434,7 @@ extension AgentModeViewModel {
             text: text,
             images: images,
             taggedFiles: taggedFiles.map(AgentRecoveryTaggedFileReference.init),
+            documents: documents.map(AgentRecoveryDocumentReference.init),
             workflow: workflow.map(AgentRecoveryWorkflowSnapshot.init),
             interviewFirst: interviewFirst
         )
@@ -817,6 +821,7 @@ extension AgentModeViewModel {
             text: session.draftText,
             images: images,
             taggedFiles: session.pendingTaggedFileAttachments.map(AgentRecoveryTaggedFileReference.init),
+            documents: session.pendingDocumentAttachments.map(AgentRecoveryDocumentReference.init),
             workflow: session.selectedWorkflow.map(AgentRecoveryWorkflowSnapshot.init),
             interviewFirst: effectiveInterviewFirst(for: session)
         )
@@ -1121,6 +1126,8 @@ extension AgentModeViewModel {
             }
             session.pendingImageAttachments = images
             session.pendingTaggedFileAttachments = content.taggedFiles.map(\.attachment)
+            // Document references are kept even when an original is missing; send preflight blocks.
+            session.pendingDocumentAttachments = content.documents.map(\.attachment)
             session.selectedWorkflow = content.workflow?.definition
             session.interviewFirst = content.interviewFirst
             if session === activeSession {

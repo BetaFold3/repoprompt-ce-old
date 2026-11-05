@@ -230,17 +230,40 @@ package final class AgentModeRunService {
         let startFollowUpRun: (_ tabID: UUID, _ instruction: AgentPendingInstruction, _ afterStart: FollowUpStartObservation?) -> Void
         /// Restore queued steering draft text back to the composer.
         let restoreDraftText: (_ tabID: UUID, _ text: String, _ message: String, _ strategy: DraftRestorationStrategy) -> Void
-        /// Augment queued steering text with skill context, tagged files, and attachment rendering before
-        /// submit; reports the exact pending-handoff stage the assembly created. For durable `carriers`
-        /// a new stage rides on the text only once its snapshot is attached to the carrier intent,
-        /// before the dispatch commit (R03).
+        /// Augment queued steering text with skill context, tagged files, attachment rendering, and the
+        /// attached-document manifest before submit; reports the exact pending-handoff stage the
+        /// assembly created. A document preflight failure is reported as `blockedReason` (nothing
+        /// staged). For durable `carriers` a new stage rides on the text only once its snapshot is
+        /// attached to the carrier intent, before the dispatch commit (R03).
         let augmentUserMessageForProviderSend: (
             _ text: String,
             _ attachments: [AgentImageAttachment],
             _ taggedFileAttachments: [AgentTaggedFileAttachment],
+            _ documentAttachments: [AgentDocumentAttachment],
             _ session: AgentTabSession?,
             _ carriers: [AgentQueuedInputIdentity]
         ) async -> AgentStagedProviderText
+        /// Synchronous document re-preflight through the host's document store and the session's
+        /// current destination, run with no suspension before a provider handoff that carries
+        /// `documents`; `nil` when nothing blocks.
+        let documentAttachmentBlockedMessage: (
+            _ documents: [AgentDocumentAttachment],
+            _ session: AgentTabSession
+        ) -> String?
+        /// The host's shared settlement of input that provably reached no provider: durable input is
+        /// held (`atProviderBoundary`: the handoff already held it, so only the reason is shown);
+        /// untracked input returns to the composer whole (raw draft text, images, tagged files,
+        /// documents) with the reason, its optimistic bubble removed.
+        let settleUnsentInput: (
+            _ identities: [AgentQueuedInputIdentity],
+            _ draftText: String,
+            _ images: [AgentImageAttachment],
+            _ taggedFiles: [AgentTaggedFileAttachment],
+            _ documents: [AgentDocumentAttachment],
+            _ session: AgentTabSession,
+            _ reason: String,
+            _ atProviderBoundary: Bool
+        ) -> Void
         /// Stages a transcript handoff for fresh-session resume recovery.
         let stageResumeRecoveryHandoffIfNeeded: (_ session: AgentTabSession) async -> Void
         /// Prepends a staged handoff payload to provider-facing text, reporting the stage it created.
@@ -365,9 +388,24 @@ package final class AgentModeRunService {
                 _ text: String,
                 _ attachments: [AgentImageAttachment],
                 _ taggedFileAttachments: [AgentTaggedFileAttachment],
+                _ documentAttachments: [AgentDocumentAttachment],
                 _ session: AgentTabSession?,
                 _ carriers: [AgentQueuedInputIdentity]
             ) async -> AgentStagedProviderText,
+            documentAttachmentBlockedMessage: @escaping (
+                _ documents: [AgentDocumentAttachment],
+                _ session: AgentTabSession
+            ) -> String?,
+            settleUnsentInput: @escaping (
+                _ identities: [AgentQueuedInputIdentity],
+                _ draftText: String,
+                _ images: [AgentImageAttachment],
+                _ taggedFiles: [AgentTaggedFileAttachment],
+                _ documents: [AgentDocumentAttachment],
+                _ session: AgentTabSession,
+                _ reason: String,
+                _ atProviderBoundary: Bool
+            ) -> Void,
             stageResumeRecoveryHandoffIfNeeded: @escaping (_ session: AgentTabSession) async -> Void,
             prependPendingHandoffIfNeeded: @escaping (_ text: String, _ session: AgentTabSession) -> AgentStagedProviderText,
             stagePendingHandoffForDurableDispatch: @escaping (_ text: String, _ session: AgentTabSession) async
@@ -442,6 +480,8 @@ package final class AgentModeRunService {
             self.startFollowUpRun = startFollowUpRun
             self.restoreDraftText = restoreDraftText
             self.augmentUserMessageForProviderSend = augmentUserMessageForProviderSend
+            self.documentAttachmentBlockedMessage = documentAttachmentBlockedMessage
+            self.settleUnsentInput = settleUnsentInput
             self.stageResumeRecoveryHandoffIfNeeded = stageResumeRecoveryHandoffIfNeeded
             self.prependPendingHandoffIfNeeded = prependPendingHandoffIfNeeded
             self.stagePendingHandoffForDurableDispatch = stagePendingHandoffForDurableDispatch
@@ -572,6 +612,7 @@ package final class AgentModeRunService {
         inputConstituents: [AgentQueuedInputIdentity],
         codexFallbackContext: AgentTabSession.CodexFallbackSubmissionContext? = nil,
         providerHandoffAuthorization: (@MainActor () -> Bool)? = nil,
+        documentBoundaryAuthority: AgentDocumentBoundaryAuthority? = nil,
         delegatedQuestionStageID: UUID? = nil,
         pendingHandoffStage: AgentPendingHandoffStage? = nil
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome? {
@@ -692,6 +733,9 @@ package final class AgentModeRunService {
             case let .success(prepared):
                 handoff = prepared
                 hooks.carryStagedInput(stagedInput, on: prepared, session: session)
+                // Input carrying documents: the runner's provider send seam re-checks them at its
+                // final boundary, after provider startup (DOC-02).
+                prepared.installDocumentAuthority(documentBoundaryAuthority)
             }
             // Revalidate: the same session target, nothing started or replaced meanwhile.
             guard session.selectedAgent == selectedAgent,
@@ -763,7 +807,9 @@ package final class AgentModeRunService {
         )
         let codeModeEligibility = resolveCodeModeEligibility(selectedAgent: selectedAgent, session: session)
         let runCoordinator = runCoordinator
-        let makeLease: (_ runID: UUID) -> MCPBootstrapLease = { runID in
+        // Every runner admits its run attempt first and passes that exact ownership: the lease's
+        // rich-presentation grant derives only from it (never from live Settings).
+        let makeLease: (_ runID: UUID, _ ownership: AgentRunOwnership) -> MCPBootstrapLease = { runID, ownership in
             self.dependencies.bindPendingOracleReviewContext(tabID, runID)
             let leaseSpec = MCPBootstrapLeaseSpec.agentMode(
                 tabID: tabID,
@@ -776,7 +822,8 @@ package final class AgentModeRunService {
                 allowsAgentExternalControlTools: delegationPolicy.allowsAgentExternalControlTools,
                 additionalRestrictedTools: delegationPolicy.additionalRestrictedTools,
                 runHasNativeShell: runHasNativeShell,
-                codeModeEligibility: codeModeEligibility
+                codeModeEligibility: codeModeEligibility,
+                runOwnership: ownership
             )
             #if DEBUG
                 let provenRoutePolicyReleaser = self.dependencies.testProvenRoutePolicyReleaser
@@ -1142,6 +1189,7 @@ package final class AgentModeRunService {
                     providerTextForSend,
                     steeringBatch.flatMap(\.attachments),
                     steeringBatch.flatMap(\.taggedFileAttachments),
+                    steeringBatch.flatMap(\.documentAttachments),
                     session,
                     steeringBatch.map(\.identity)
                 )
@@ -1215,6 +1263,18 @@ package final class AgentModeRunService {
                         session: session,
                         reason: "stale ACP steering attempt after dispatch commit"
                     )
+                    return
+                }
+                // Final document check after every asynchronous preparation, with no suspension
+                // before the send: an original removed meanwhile refuses the handoff, exactly like a
+                // blocked augmentation (the batch returns to the follow-up queue unsent).
+                let batchDocuments = steeringBatch.flatMap(\.documentAttachments)
+                if !batchDocuments.isEmpty,
+                   let documentBlock = hooks.documentAttachmentBlockedMessage(batchDocuments, session)
+                {
+                    handoff.noteNoHandoff(message: documentBlock)
+                    restoreUnsentBatch()
+                    requeueAllQueuedACPSteeringAsFollowUp(tabID: tabID, session: session, reason: documentBlock)
                     return
                 }
                 let sent = await submitActiveACPPromptIfSupported(
@@ -1413,11 +1473,15 @@ package final class AgentModeRunService {
     ) {
         let providerText = coalescedACPProviderText(for: instructions)
             .trimmingCharacters(in: .whitespacesAndNewlines)
+        // Structured records survive the requeue; augmentation preflights them at dequeue.
+        let documentAttachments = instructions.flatMap(\.documentAttachments)
         // One follow-up delivers every source input, in order (separate bubbles already exist).
-        guard !providerText.isEmpty,
+        // A document-only input has content even without text.
+        guard !providerText.isEmpty || !documentAttachments.isEmpty,
               let followUp = AgentPendingInstruction(
                   coalescedText: providerText,
-                  constituents: instructions.map(\.identity)
+                  constituents: instructions.map(\.identity),
+                  documentAttachments: documentAttachments
               )
         else { return }
         if session.runState == .completed, session.acpController != nil {
@@ -1641,6 +1705,7 @@ package final class AgentModeRunService {
                     steering.providerText,
                     steering.attachments,
                     steering.taggedFileAttachments,
+                    steering.documentAttachments,
                     session,
                     [steering.identity]
                 )
@@ -1662,10 +1727,32 @@ package final class AgentModeRunService {
                         session.pendingNonCodexUserInputTokenQueue.insert(dequeuedUserInputTokens, at: 0)
                     }
                 }
-                if augmentedSteering.blockedReason != nil {
-                    // Its handoff prefix could not be saved with it: never sent without it. Handled
-                    // like a refused dispatch commit (nothing dispatched; the input stays saved).
-                    restoreUnsentSteering()
+                // Input that provably reached no provider because of `reason`, settled by the host's
+                // shared settlement (B N8): durable input is held with that reason (its intent keeps
+                // the text and attachments); untracked input returns to the composer whole, its
+                // bubble removed and the reason shown once. It never re-enters this queue, so the
+                // queued-draft restore below never returns it a second time.
+                let steeringHooks = hooks
+                let settleBlockedSteering = { [weak self] (reason: String, atProviderBoundary: Bool) in
+                    // Idempotent; released for every refused steering, as the queued-draft restore
+                    // does (B N15).
+                    self?.releaseUnconsumedClaudeSupersedingProtection(for: [steering], session: session)
+                    steeringHooks.settleUnsentInput(
+                        [steering.identity],
+                        steering.draftText,
+                        steering.attachments,
+                        steering.taggedFileAttachments,
+                        steering.documentAttachments,
+                        session,
+                        reason,
+                        atProviderBoundary
+                    )
+                }
+                if let blockedReason = augmentedSteering.blockedReason {
+                    // Its handoff prefix could not be saved with it, or a document no longer passes
+                    // preflight: never sent without it. Handled like a refused dispatch commit
+                    // (nothing dispatched; the input stays saved).
+                    settleBlockedSteering(blockedReason, false)
                     restoreAllQueuedClaudeSteeringDrafts(tabID: tabID, session: session, strategy: .prependAlways)
                     await cancelClaudeRunStrandedBySteeringFailureIfNeeded(
                         tabID: tabID,
@@ -1713,6 +1800,19 @@ package final class AgentModeRunService {
                     hooks.carryStagedInput(steeringStagedInput, on: begun, session: session)
                     steeringHandoff = begun
                 }
+                // Re-checked again at the send seam's final boundary, after its readiness and
+                // interrupt awaits (DOC-02): durable input is then held by the handoff (the shared
+                // settlement only shows the reason); untracked input returns to the composer whole.
+                var refusedAtProviderBoundary = false
+                if !steering.documentAttachments.isEmpty {
+                    handoff.installDocumentAuthority(AgentDocumentBoundaryAuthority(
+                        refusal: { steeringHooks.documentAttachmentBlockedMessage(steering.documentAttachments, session) },
+                        settleRefused: { reason in
+                            refusedAtProviderBoundary = true
+                            settleBlockedSteering(reason, true)
+                        }
+                    ))
+                }
                 guard isCurrentClaudeSteeringAttempt(session: session, runID: runID, runAttemptID: runAttemptID) else {
                     handoff.noteNoHandoff()
                     restoreUnsentSteering()
@@ -1721,6 +1821,22 @@ package final class AgentModeRunService {
                         session: session,
                         strategy: .prependAlways,
                         matching: { $0.targetRunID == runID && $0.targetRunAttemptID == runAttemptID }
+                    )
+                    return
+                }
+                // Final document check after every asynchronous preparation, with no suspension
+                // before the send: an original removed meanwhile refuses the handoff.
+                if !steering.documentAttachments.isEmpty,
+                   let documentBlock = hooks.documentAttachmentBlockedMessage(steering.documentAttachments, session)
+                {
+                    handoff.noteNoHandoff(message: documentBlock)
+                    settleBlockedSteering(documentBlock, false)
+                    restoreAllQueuedClaudeSteeringDrafts(tabID: tabID, session: session, strategy: .prependAlways)
+                    await cancelClaudeRunStrandedBySteeringFailureIfNeeded(
+                        tabID: tabID,
+                        session: session,
+                        runID: runID,
+                        runAttemptID: runAttemptID
                     )
                     return
                 }
@@ -1734,6 +1850,17 @@ package final class AgentModeRunService {
                 steeringDebugLog("[AgentRunSteeringWake] Claude flush send completed id=\(steering.id) tab=\(tabID) runID=\(runID) attempt=\(runAttemptID) sent=\(sent)")
                 // An uncertain durable delivery neither replays nor consumes staged input.
                 hooks.recordStagedInputSendOutcome(handoff: handoff, sent: sent)
+                if refusedAtProviderBoundary {
+                    // Already settled at the boundary (held, or returned to the composer).
+                    restoreAllQueuedClaudeSteeringDrafts(tabID: tabID, session: session, strategy: .prependAlways)
+                    await cancelClaudeRunStrandedBySteeringFailureIfNeeded(
+                        tabID: tabID,
+                        session: session,
+                        runID: runID,
+                        runAttemptID: runAttemptID
+                    )
+                    return
+                }
                 if sent {
                     await hooks.signalMCPInstructionDelivered(session)
                 }
@@ -1861,6 +1988,11 @@ package final class AgentModeRunService {
             .filter { !$0.isEmpty }
         releaseUnconsumedClaudeSupersedingProtection(for: instructions, session: session)
         session.pendingClaudeSteeringInstructions.removeAll(where: shouldRestore)
+        restoreUntrackedDocumentsToComposer(
+            instructions.filter { !$0.identity.isDurable }.flatMap(\.documentAttachments),
+            session: session,
+            draftRestored: !drafts.isEmpty
+        )
         restoreClaudeSteeringDrafts(drafts, tabID: tabID, strategy: strategy)
     }
 
@@ -1881,8 +2013,41 @@ package final class AgentModeRunService {
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
         releaseUnconsumedClaudeSupersedingProtection(for: instructions, session: session)
+        restoreUntrackedDocumentsToComposer(
+            instructions.filter { !$0.identity.isDurable }.flatMap(\.documentAttachments),
+            session: session,
+            draftRestored: !drafts.isEmpty
+        )
         restoreClaudeSteeringDrafts(drafts, tabID: tabID, strategy: strategy)
     }
+
+    /// Untracked (non-durable) input whose draft text returns to the composer also returns its
+    /// document records, so they are never silently dropped; durable input keeps them in its intent.
+    /// The composer is refreshed; when no draft text came back with them (a document-only restore,
+    /// or a removal that returns no text), a notice says where they went.
+    private func restoreUntrackedDocumentsToComposer(
+        _ documents: [AgentDocumentAttachment],
+        session: AgentTabSession,
+        draftRestored: Bool
+    ) {
+        guard !documents.isEmpty else { return }
+        var knownIDs = Set(session.pendingDocumentAttachments.map(\.id))
+        let restored = documents.filter { knownIDs.insert($0.id).inserted }
+        guard !restored.isEmpty else { return }
+        session.pendingDocumentAttachments.append(contentsOf: restored)
+        if !draftRestored {
+            session.appendItem(AgentChatItem.error(
+                Self.unsentDocumentsReturnedNotice,
+                sequenceIndex: session.nextSequenceIndex
+            ))
+            hooks.scheduleSave(session.tabID)
+        }
+        hooks.requestUIRefresh(session.tabID, true)
+    }
+
+    /// Shown when queued documents return to the composer without any draft text.
+    static let unsentDocumentsReturnedNotice =
+        "Attached documents from a message that was not sent were returned to the composer."
 
     /// Held-input reasons for durable queued input whose queue entry was removed (F5).
     static let steeringTargetEndedHoldReason = "The run it was queued for ended before it was sent, so it is no longer queued."
@@ -1924,6 +2089,13 @@ package final class AgentModeRunService {
         )
         .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
         .filter { !$0.isEmpty }
+        restoreUntrackedDocumentsToComposer(
+            session.pendingClaudeSteeringInstructions.filter { !$0.identity.isDurable }.flatMap(\.documentAttachments)
+                + session.pendingACPSteeringInstructions.filter { !$0.identity.isDurable }.flatMap(\.documentAttachments)
+                + session.pendingInstructions.filter { !$0.isDurable }.flatMap(\.documentAttachments),
+            session: session,
+            draftRestored: !drafts.isEmpty
+        )
         guard !drafts.isEmpty else { return }
         hooks.restoreDraftText(tabID, drafts.joined(separator: "\n"), "Restored queued messages after changing execution location", strategy)
     }
@@ -1981,6 +2153,14 @@ package final class AgentModeRunService {
         switch intent {
         case .userStop:
             restoreAllQueuedClaudeSteeringDrafts(tabID: tabID, session: session, strategy: .prependAlways)
+            // Ordinary stop still drops queued follow-up and ACP steering text, but untracked
+            // document records have no other copy: they return to the composer, never discarded.
+            restoreUntrackedDocumentsToComposer(
+                session.pendingACPSteeringInstructions.filter { !$0.identity.isDurable }.flatMap(\.documentAttachments)
+                    + session.pendingInstructions.filter { !$0.isDurable }.flatMap(\.documentAttachments),
+                session: session,
+                draftRestored: false
+            )
         case .executionLocationChange:
             restoreAllQueuedDraftsForExecutionLocationChange(tabID: tabID, session: session, strategy: .prependAlways)
         }

@@ -19,6 +19,20 @@ package protocol AgentMCPHosting: Sendable {
     /// bootstrap lease after it released the global gate and before the turn's message is sent.
     func refreshRetainedRunPolicyForTurnStart(for clientName: String, runID: UUID) async
 
+    /// Turn-start delivery of a newly admitted run attempt's ownership to the run's live routed
+    /// connections for `clientName`, for every provider (Claude, Codex, ACP), without restarting a
+    /// controller or re-binding a tab. Updates only the rich-presentation part of the run's cached
+    /// policy and of each connection: the applied attempt ownership and whether the dedicated
+    /// rich-presentation tool is granted. Every other policy field (delegation restrictions,
+    /// profile, role) keeps its existing lifetime. Refuses an ownership for a different tab than the
+    /// run's policy, or an older attempt than the one already installed. Sends `tools/list_changed`
+    /// only to a connection whose granted tools changed.
+    func refreshRunAttemptRichPresentation(
+        for clientName: String,
+        runID: UUID,
+        runOwnership: AgentRunOwnership
+    ) async
+
     /// For a later turn whose launch keeps its helper: when the run already has a live route whose
     /// helper is proven (as `hasAuthoritativeLiveRunRoute` with `requiredAgentPID`) to belong to
     /// `agentPID`'s launch and no application of the run's policy is in flight, first clears the
@@ -65,7 +79,8 @@ package protocol AgentMCPHosting: Sendable {
         purpose: MCPRunPurpose,
         taskLabelKind: AgentModelCatalog.TaskLabelKind?,
         allowsAgentExternalControlTools: Bool,
-        requiresExpectedAgentPID: Bool
+        requiresExpectedAgentPID: Bool,
+        runOwnership: AgentRunOwnership?
     ) async
 
     func clearClientConnectionPolicy(for clientName: String, windowID: Int?, runID: UUID?) async

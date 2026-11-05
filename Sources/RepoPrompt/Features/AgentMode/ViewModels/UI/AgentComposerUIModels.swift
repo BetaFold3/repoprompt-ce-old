@@ -247,7 +247,8 @@ struct AgentScheduledSendProps: Equatable, Identifiable {
         attachments = AgentAttachmentStripSnapshot(
             scopeTabID: tabID,
             imageAttachments: scheduledSend.attachments,
-            taggedFileAttachments: scheduledSend.taggedFileAttachments
+            taggedFileAttachments: scheduledSend.taggedFileAttachments,
+            documentAttachments: scheduledSend.documents
         )
         isNewSessionStart = scheduledSend.isNewSessionStart
         runAlongsideOtherSessions = scheduledSend.runAlongsideOtherSessions
@@ -370,7 +371,8 @@ struct AgentScheduledSendProps: Equatable, Identifiable {
         attachments = AgentAttachmentStripSnapshot(
             scopeTabID: tabID,
             imageAttachments: [],
-            taggedFileAttachments: []
+            taggedFileAttachments: [],
+            documentAttachments: []
         )
         isNewSessionStart = false
         runAlongsideOtherSessions = false
@@ -404,7 +406,8 @@ struct AgentScheduledSendActions {
         _ notBefore: Date,
         _ runAlongsideOtherSessions: Bool,
         _ removingImageAttachmentIDs: Set<UUID>,
-        _ removingTaggedFileAttachmentIDs: Set<UUID>
+        _ removingTaggedFileAttachmentIDs: Set<UUID>,
+        _ removingDocumentAttachmentIDs: Set<UUID>
     ) async -> String?
     let cancel: (_ tabID: UUID, _ scheduleID: UUID) async -> String?
     let sendNow: (
@@ -684,13 +687,16 @@ struct AgentComposerProps: Equatable {
     var recoveryList: AgentRecoveryListProps?
     /// R4 edit freeze of this window (quit or window close preserving it): the composer is disabled.
     var isShutdownFrozen = false
+    /// This tab's in-flight document imports and last document failure (`nil` when neither).
+    var documentImport: AgentComposerDocumentImportProps?
 
     static let empty = AgentComposerProps(
         currentTabID: nil,
         submitTarget: nil,
         attachments: AgentAttachmentStripSnapshot(
             imageAttachments: [],
-            taggedFileAttachments: []
+            taggedFileAttachments: [],
+            documentAttachments: []
         ),
         scheduledSend: nil,
         staleResetRecovery: nil,

@@ -20,7 +20,9 @@ final class AgentSessionProfilePersistenceTests: XCTestCase {
                 "ask_oracle",
                 "oracle_chat_log",
                 "agent_run",
-                "workspace_steer"
+                "workspace_steer",
+                // Ceiling membership only; the attempt's captured rich-presentation grant decides.
+                "present_rich"
             ]
         )
         XCTAssertEqual(

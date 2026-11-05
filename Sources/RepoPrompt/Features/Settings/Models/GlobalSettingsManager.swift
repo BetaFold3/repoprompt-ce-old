@@ -360,6 +360,9 @@ class GlobalSettingsStore: ObservableObject {
     @Published private(set) var copySettings: [UUID: CopyGlobalSettings] = [:]
     @Published private(set) var chatSettings: [UUID: ChatGlobalSettings] = [:]
     @Published private(set) var agentModelsSettingsByWorkspaceID: [UUID: WorkspaceAgentModelsSettings] = [:]
+    /// Committed (successfully persisted or adopted from disk) workspace rich presentation
+    /// permissions. Changed only by `setRichPresentationSettings`, load, and on-disk adoption.
+    @Published private(set) var richPresentationSettingsByWorkspaceID: [UUID: WorkspaceRichPresentationSettings] = [:]
     @Published private(set) var codeMapsGloballyDisabled: Bool = false
     /// Non-nil when the on-disk settings file is blocked (unreadable or a newer schema).
     /// UI surfaces this so the user can recover; RepoPrompt never auto-recovers.
@@ -1741,6 +1744,116 @@ class GlobalSettingsStore: ObservableObject {
         return false
     }
 
+    // MARK: - Workspace rich presentation
+
+    /// Committed rich presentation permissions for one workspace as this store last adopted them,
+    /// for display; disabled with no approved hosts when none are stored. Run admission reads the
+    /// file instead (`persistedRichPresentationSettings(for:)`).
+    func richPresentationSettings(for workspaceID: UUID) -> WorkspaceRichPresentationSettings {
+        richPresentationSettingsByWorkspaceID[workspaceID] ?? .disabled
+    }
+
+    /// The workspace's permissions committed on disk now, for run-attempt admission: another
+    /// running build sharing the file may have changed them since this store last adopted it, as
+    /// steering-grant checks also assume. Disabled when the file or the entry is missing; nil (no
+    /// authority, so the attempt fails closed) when the file is unreadable or a preserved
+    /// future/foreign schema. Side-effect free: memory is never changed here.
+    func persistedRichPresentationSettings(for workspaceID: UUID) -> WorkspaceRichPresentationSettings? {
+        switch GlobalSettingsFileStore.readRichPresentationSettings(at: fileStore.fileURL) {
+        case .missingFile: .disabled
+        case let .settings(settings): settings[workspaceID] ?? .disabled
+        case .preservedSchema, .unreadable: nil
+        }
+    }
+
+    /// Adopts the on-disk rich presentation map for display, without writing, so the Settings
+    /// section shows what new runs will admit after another build changed it. Memory is left alone
+    /// (false) when the file is unreadable or a preserved future/foreign schema.
+    @discardableResult
+    func refreshRichPresentationSettingsFromDisk() -> Bool {
+        adoptPersistedRichPresentationSettings() == .adopted
+    }
+
+    enum RichPresentationSettingsSaveOutcome: Equatable {
+        case saved
+        /// The committed entry no longer equals the one the edit started from; nothing was written.
+        case conflict
+        case failed
+    }
+
+    /// Validates and persists one complete workspace entry under the cross-process settings lock,
+    /// replacing only that workspace in the on-disk map. The in-memory committed value changes only
+    /// after a successful write, so a failed enable or host addition never becomes observable to
+    /// newly admitted runs. Returns false, without writing, for an entry with an invalid host, when
+    /// the lock is unavailable, or when the on-disk settings can't be read.
+    @discardableResult
+    func setRichPresentationSettings(_ settings: WorkspaceRichPresentationSettings, for workspaceID: UUID) -> Bool {
+        saveRichPresentationSettings(settings, for: workspaceID, replacing: nil) == .saved
+    }
+
+    /// `setRichPresentationSettings` as a compare-and-set: with `expected`, the entry is replaced
+    /// only when the workspace's committed entry, after adopting the on-disk map under the lock,
+    /// still equals `expected` (the value an editor's draft started from). Otherwise `.conflict`,
+    /// and nothing is written, so a stale draft never overwrites a newer choice made in another
+    /// view or build.
+    func saveRichPresentationSettings(
+        _ settings: WorkspaceRichPresentationSettings,
+        for workspaceID: UUID,
+        replacing expected: WorkspaceRichPresentationSettings?
+    ) -> RichPresentationSettingsSaveOutcome {
+        guard let candidate = settings.validatedForStorage() else { return .failed }
+        let locked = GlobalSettingsFileLock.withExclusiveLock(for: fileStore.fileURL) { () -> RichPresentationSettingsSaveOutcome? in
+            guard adoptPersistedWorkspaceSteeringGrants() == .adopted,
+                  adoptPersistedRichPresentationSettings() == .adopted
+            else { return nil }
+            if let expected, richPresentationSettings(for: workspaceID) != expected {
+                return .conflict
+            }
+            var updated = richPresentationSettingsByWorkspaceID
+            updated[workspaceID] = candidate.grantsAnything ? candidate : nil
+            guard updated != richPresentationSettingsByWorkspaceID else { return .saved }
+            guard writeDocument(makeDocument(richPresentationSettings: updated)) else { return .failed }
+            objectWillChange.send()
+            richPresentationSettingsByWorkspaceID = updated
+            return .saved
+        }
+        guard let locked, let result = locked else {
+            noteSaveFailedWithoutWriting()
+            return .failed
+        }
+        return result
+    }
+
+    private func installRichPresentationSettings(_ settings: [UUID: WorkspaceRichPresentationSettings]) {
+        let invalidWorkspaceIDs = settings.compactMap { $0.value.storedEntryWasInvalid ? $0.key : nil }
+        if !invalidWorkspaceIDs.isEmpty {
+            let ids = invalidWorkspaceIDs.map(\.uuidString).sorted().joined(separator: ", ")
+            print("⚠️ Ignoring malformed rich presentation settings for workspace(s) \(ids); they grant nothing.")
+        }
+        if richPresentationSettingsByWorkspaceID != settings {
+            objectWillChange.send()
+            richPresentationSettingsByWorkspaceID = settings
+        }
+    }
+
+    /// Replaces the in-memory rich presentation map with the on-disk map (none when the file is
+    /// missing) so a whole-document save never resurrects a permission another build removed (or
+    /// drops one it added). Memory is left alone when the file can't be read; callers must not
+    /// write then.
+    private func adoptPersistedRichPresentationSettings() -> WorkspaceSteeringGrantAdoption {
+        switch GlobalSettingsFileStore.readRichPresentationSettings(at: fileStore.fileURL) {
+        case .missingFile:
+            installRichPresentationSettings([:])
+        case let .settings(settings):
+            installRichPresentationSettings(settings)
+        case .preservedSchema:
+            return .preservedSchema
+        case .unreadable:
+            return .unreadable
+        }
+        return .adopted
+    }
+
     // MARK: - Workspace steering grants
 
     /// In-memory copy for display. Another running build sharing the file may have changed the
@@ -1767,13 +1880,15 @@ class GlobalSettingsStore: ObservableObject {
     /// settings lock. `saved` is true when the save succeeded or nothing changed; on failure the
     /// previous preferences are restored (the Telegram setter contract), so grants change only
     /// on a successful save. Returns nil without running `mutation` or writing when the lock is
-    /// unavailable or the on-disk grants can't be read. Callers validate through
-    /// `WorkspaceSteeringGrantStore`.
+    /// unavailable or the on-disk grants or rich presentation settings can't be read. Callers
+    /// validate through `WorkspaceSteeringGrantStore`.
     func updateWorkspaceSteeringGrantsAndSave<Outcome>(
         _ mutation: (inout [WorkspaceSteeringGrant]) -> Outcome
     ) -> (outcome: Outcome, saved: Bool)? {
         let locked = GlobalSettingsFileLock.withExclusiveLock(for: fileStore.fileURL) { () -> (Outcome, Bool)? in
-            guard adoptPersistedWorkspaceSteeringGrants() == .adopted else { return nil }
+            guard adoptPersistedWorkspaceSteeringGrants() == .adopted,
+                  adoptPersistedRichPresentationSettings() == .adopted
+            else { return nil }
             let before = scalarPreferences
             var grants = before.workspaceSteeringGrants ?? []
             let outcome = mutation(&grants)
@@ -2569,6 +2684,7 @@ class GlobalSettingsStore: ObservableObject {
         )
         chatSettings = migratedContextBuilderState.chatSettings
         agentModelsSettingsByWorkspaceID = document.agentModelsSettings
+        installRichPresentationSettings(document.richPresentationSettings)
         globalDefaults = migratedContextBuilderState.globalDefaults
         scalarPreferences = document.scalarPreferences ?? GlobalScalarPreferences()
         if !existingFileWasCorrupt {
@@ -2638,6 +2754,7 @@ class GlobalSettingsStore: ObservableObject {
             )
             chatSettings = migratedContextBuilderState.chatSettings
             agentModelsSettingsByWorkspaceID = document.agentModelsSettings
+            installRichPresentationSettings(document.richPresentationSettings)
             globalDefaults = migratedContextBuilderState.globalDefaults
             scalarPreferences = document.scalarPreferences ?? GlobalScalarPreferences()
             syncTelemetryMirrorFromLoadedSettings(scalarPreferences)
@@ -2824,27 +2941,32 @@ class GlobalSettingsStore: ObservableObject {
         #endif
     }
 
-    private func makeDocument() -> GlobalSettingsDocument {
+    /// Pass `richPresentationSettings` to write a staged candidate map without publishing it.
+    private func makeDocument(
+        richPresentationSettings: [UUID: WorkspaceRichPresentationSettings]? = nil
+    ) -> GlobalSettingsDocument {
         GlobalSettingsDocument(
             copySettings: copySettings,
             chatSettings: chatSettings,
             agentModelsSettings: agentModelsSettingsByWorkspaceID,
             globalDefaults: globalDefaults,
-            scalarPreferences: scalarPreferences
+            scalarPreferences: scalarPreferences,
+            richPresentationSettings: richPresentationSettings ?? richPresentationSettingsByWorkspaceID
         )
     }
 
-    /// Saves under the cross-process settings lock after adopting the on-disk grants. Writes
-    /// nothing, and reports `.saveFailed` unless another block reason is set, when the lock is
-    /// unavailable or the on-disk grants can't be read. A preserved (future/foreign) file is left
-    /// to the file store, which refuses the write with its own reason.
+    /// Saves under the cross-process settings lock after adopting the on-disk grants and rich
+    /// presentation permissions. Writes nothing, and reports `.saveFailed` unless another block
+    /// reason is set, when the lock is unavailable or either on-disk permission set can't be read.
+    /// A preserved (future/foreign) file is left to the file store, which refuses the write with
+    /// its own reason.
     @discardableResult
     private func save() -> Bool {
         let locked = GlobalSettingsFileLock.withExclusiveLock(for: fileStore.fileURL) { () -> Bool? in
-            switch adoptPersistedWorkspaceSteeringGrants() {
-            case .adopted, .preservedSchema: writeDocument()
-            case .unreadable: nil
-            }
+            let grants = adoptPersistedWorkspaceSteeringGrants()
+            let richPresentation = adoptPersistedRichPresentationSettings()
+            guard grants != .unreadable, richPresentation != .unreadable else { return nil }
+            return writeDocument()
         }
         guard let locked, let written = locked else {
             noteSaveFailedWithoutWriting()
@@ -2854,8 +2976,12 @@ class GlobalSettingsStore: ObservableObject {
     }
 
     private func writeDocument() -> Bool {
+        writeDocument(makeDocument())
+    }
+
+    private func writeDocument(_ document: GlobalSettingsDocument) -> Bool {
         do {
-            try fileStore.save(makeDocument())
+            try fileStore.save(document)
             if persistenceBlockReason != fileStore.blockReason {
                 persistenceBlockReason = fileStore.blockReason
             }

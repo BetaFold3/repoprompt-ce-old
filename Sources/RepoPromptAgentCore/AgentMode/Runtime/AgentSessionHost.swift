@@ -43,6 +43,10 @@ package protocol CodexAgentModeCoordinatorHost: AgentSessionHost {
     func publishMCPStateChange(for session: AgentTabSession)
     func signalCodexInstructionDelivered(for session: AgentTabSession) async
     func restoreCodexFallbackDraft(tabID: UUID, text: String, message: String)
+    /// Re-preflights attached documents for `session`'s destination through the host's owning
+    /// document store (synchronous, so callable with no suspension before a handoff); `nil` when
+    /// nothing blocks.
+    func documentAttachmentBlockedMessage(_ documents: [AgentDocumentAttachment], session: AgentTabSession) -> String?
     func recordMCPInteractionResolution(
         for session: AgentTabSession,
         interactionID: UUID,

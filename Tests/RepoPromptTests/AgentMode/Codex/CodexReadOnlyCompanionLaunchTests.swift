@@ -394,7 +394,7 @@ final class CodexReadOnlyCompanionLaunchTests: XCTestCase {
                         created.append(controller)
                         return controller
                     },
-                    connectionPolicyInstaller: { clientName, windowID, restrictedTools, oneShot, reason, ttl, tabID, runID, additionalTools, allowedToolsOverride, sessionProfile, purpose, taskLabelKind, allowsAgentExternalControlTools, requiresExpectedAgentPID, codeModeEligibility in
+                    connectionPolicyInstaller: { clientName, windowID, restrictedTools, oneShot, reason, ttl, tabID, runID, additionalTools, allowedToolsOverride, sessionProfile, purpose, taskLabelKind, allowsAgentExternalControlTools, requiresExpectedAgentPID, codeModeEligibility, runOwnership in
                         // The production install (so the lease's expected-PID armer finds its pending
                         // policy), then a stand-in primary initializing routes the run.
                         await ServerNetworkManager.shared.installClientConnectionPolicy(
@@ -413,7 +413,8 @@ final class CodexReadOnlyCompanionLaunchTests: XCTestCase {
                             taskLabelKind: taskLabelKind,
                             allowsAgentExternalControlTools: allowsAgentExternalControlTools,
                             requiresExpectedAgentPID: requiresExpectedAgentPID,
-                            codeModeEligibility: codeModeEligibility
+                            codeModeEligibility: codeModeEligibility,
+                            runOwnership: runOwnership
                         )
                         await policies.install(
                             clientName: clientName,

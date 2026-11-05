@@ -91,6 +91,9 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
     public var text: String
     public var attachments: [AgentImageAttachment]
     public var taggedFileAttachments: [AgentTaggedFileAttachment]
+    /// Attached PDF/HTML documents; `nil` when there are none, so older transcripts decode and
+    /// re-encode unchanged.
+    public var documentAttachments: [AgentDocumentAttachment]?
     public var workflow: AgentWorkflowDefinition?
     public var codexGoalMode: AgentCodexGoalModeMetadata?
     public var scheduledSend: AgentScheduledSendProvenance?
@@ -113,6 +116,7 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
         text: String,
         attachments: [AgentImageAttachment] = [],
         taggedFileAttachments: [AgentTaggedFileAttachment] = [],
+        documentAttachments: [AgentDocumentAttachment] = [],
         workflow: AgentWorkflowDefinition? = nil,
         codexGoalMode: AgentCodexGoalModeMetadata? = nil,
         scheduledSend: AgentScheduledSendProvenance? = nil,
@@ -133,6 +137,7 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
         self.text = text
         self.attachments = attachments
         self.taggedFileAttachments = taggedFileAttachments
+        self.documentAttachments = documentAttachments.isEmpty ? nil : documentAttachments
         self.workflow = workflow
         self.codexGoalMode = codexGoalMode
         self.scheduledSend = scheduledSend
@@ -155,6 +160,7 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
         text = item.text
         attachments = item.attachments
         taggedFileAttachments = item.taggedFileAttachments
+        documentAttachments = item.documentAttachments.isEmpty ? nil : item.documentAttachments
         workflow = item.workflow
         codexGoalMode = item.codexGoalMode
         scheduledSend = item.scheduledSend
@@ -176,6 +182,7 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
             text: overrideText ?? text,
             attachments: attachments,
             taggedFileAttachments: taggedFileAttachments,
+            documentAttachments: documentAttachments ?? [],
             toolName: toolExecution?.toolName,
             toolInvocationID: toolExecution?.invocationID,
             toolArgsJSON: toolExecution?.argsJSON,
@@ -215,7 +222,9 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
         guard item.kind == .assistant || item.kind == .assistantInline else { return false }
         guard AgentDisplayableText.hasDisplayableBody(item.text) else { return false }
         let trimmed = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !item.attachments.isEmpty || !item.taggedFileAttachments.isEmpty || item.workflow != nil {
+        if !item.attachments.isEmpty || !item.taggedFileAttachments.isEmpty || !item.documentAttachments.isEmpty
+            || item.workflow != nil
+        {
             return true
         }
         if trimmed.contains("\n") || trimmed.count >= 80 || trimmed.contains("```") {
@@ -252,6 +261,8 @@ public struct AgentTranscriptRequestAnchor: Codable, Identifiable, Sendable, Equ
     public var text: String
     public var attachments: [AgentImageAttachment]
     public var taggedFileAttachments: [AgentTaggedFileAttachment]
+    /// Attached PDF/HTML documents; `nil` when there are none (older transcripts are unchanged).
+    public var documentAttachments: [AgentDocumentAttachment]?
     public var workflow: AgentWorkflowDefinition?
     public var codexGoalMode: AgentCodexGoalModeMetadata?
     public var scheduledSend: AgentScheduledSendProvenance?
@@ -267,6 +278,7 @@ public struct AgentTranscriptRequestAnchor: Codable, Identifiable, Sendable, Equ
         text = item.text
         attachments = item.attachments
         taggedFileAttachments = item.taggedFileAttachments
+        documentAttachments = item.documentAttachments.isEmpty ? nil : item.documentAttachments
         workflow = item.workflow
         codexGoalMode = item.codexGoalMode
         scheduledSend = item.scheduledSend
@@ -283,6 +295,7 @@ public struct AgentTranscriptRequestAnchor: Codable, Identifiable, Sendable, Equ
             text: text,
             attachments: attachments,
             taggedFileAttachments: taggedFileAttachments,
+            documentAttachments: documentAttachments ?? [],
             sequenceIndex: sequenceIndex,
             workflow: workflow,
             codexGoalMode: codexGoalMode,
@@ -552,6 +565,12 @@ public struct AgentTranscriptTurn: Codable, Identifiable, Sendable, Equatable {
     /// Set when cold restore closed this open turn as its recorded ordinary outcome (never together
     /// with an interruption).
     public var recoveredOutcome: AgentTranscriptTurnRecoveredOutcome?
+    /// Durable ordered references, independent of destructively retained tool activities.
+    package var richPresentations: [AgentTranscriptRichPresentation] = []
+    /// The persisted `richPresentations` value when this build cannot decode it (a newer format or
+    /// corruption). Kept verbatim and re-encoded unchanged so the session, its text history and the
+    /// unread references stay intact; handoff refuses while it is present (never a silent drop).
+    package var unreadableRichPresentations: AgentScheduledSendJSONValue?
 
     public init(
         id: UUID = UUID(),
@@ -597,6 +616,7 @@ public struct AgentTranscriptTurn: Codable, Identifiable, Sendable, Equatable {
         case frozenDetailedToolTailLimit
         case interruption
         case recoveredOutcome
+        case richPresentations
     }
 
     public init(from decoder: Decoder) throws {
@@ -615,6 +635,15 @@ public struct AgentTranscriptTurn: Codable, Identifiable, Sendable, Equatable {
         // Additive member: an unreadable record never fails the session.
         interruption = try? container.decodeIfPresent(AgentTranscriptTurnInterruption.self, forKey: .interruption)
         recoveredOutcome = try? container.decodeIfPresent(AgentTranscriptTurnRecoveredOutcome.self, forKey: .recoveredOutcome)
+        // Missing is legacy. An undecodable present value never fails the session (or its text
+        // history) and is never discarded: it is preserved raw for verbatim re-encoding.
+        if container.contains(.richPresentations) {
+            if let decoded = try? container.decode([AgentTranscriptRichPresentation].self, forKey: .richPresentations) {
+                richPresentations = decoded
+            } else {
+                unreadableRichPresentations = try container.decode(AgentScheduledSendJSONValue.self, forKey: .richPresentations)
+            }
+        }
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -632,6 +661,24 @@ public struct AgentTranscriptTurn: Codable, Identifiable, Sendable, Equatable {
         try container.encodeIfPresent(frozenDetailedToolTailLimit, forKey: .frozenDetailedToolTailLimit)
         try container.encodeIfPresent(interruption, forKey: .interruption)
         try container.encodeIfPresent(recoveredOutcome, forKey: .recoveredOutcome)
+        // Omitted when empty so legacy session bytes are unchanged; an unreadable value round-trips.
+        // One representation per turn: both together would silently drop the readable list.
+        assert(
+            richPresentations.isEmpty || unreadableRichPresentations == nil,
+            "A turn holds both readable and unreadable rich presentations"
+        )
+        if let unreadableRichPresentations {
+            try container.encode(unreadableRichPresentations, forKey: .richPresentations)
+        } else if !richPresentations.isEmpty {
+            try container.encode(richPresentations, forKey: .richPresentations)
+        }
+    }
+
+    /// Rebuilds derive turns from rows; turn-owned references (readable or preserved raw) are
+    /// carried from the turn being replaced instead.
+    package mutating func carryRichPresentations(from turn: AgentTranscriptTurn) {
+        richPresentations = turn.richPresentations
+        unreadableRichPresentations = turn.unreadableRichPresentations
     }
 
     public var isCompleted: Bool {

@@ -61,6 +61,9 @@ package struct AgentScheduledSendPersist: Codable, Equatable {
     package var rawText: String
     package var attachments: [AgentImageAttachment]
     package var taggedFileAttachments: [AgentTaggedFileAttachment]
+    /// Stored only when non-empty, so records without documents encode exactly as before (the
+    /// member decoder requires a byte-equal typed re-encode). Use `documents`.
+    private(set) var documentAttachments: [AgentDocumentAttachment]?
     package var workflow: AgentWorkflowDefinition?
     package var interviewFirst: Bool
     package var isNewSessionStart: Bool
@@ -79,6 +82,7 @@ package struct AgentScheduledSendPersist: Codable, Equatable {
         rawText: String,
         attachments: [AgentImageAttachment],
         taggedFileAttachments: [AgentTaggedFileAttachment],
+        documentAttachments: [AgentDocumentAttachment] = [],
         workflow: AgentWorkflowDefinition? = nil,
         interviewFirst: Bool,
         isNewSessionStart: Bool,
@@ -96,6 +100,7 @@ package struct AgentScheduledSendPersist: Codable, Equatable {
         self.rawText = rawText
         self.attachments = attachments
         self.taggedFileAttachments = taggedFileAttachments
+        self.documentAttachments = documentAttachments.isEmpty ? nil : documentAttachments
         self.workflow = workflow
         self.interviewFirst = interviewFirst
         self.isNewSessionStart = isNewSessionStart
@@ -103,6 +108,12 @@ package struct AgentScheduledSendPersist: Codable, Equatable {
         self.firstEligibleAt = firstEligibleAt
         self.attempt = attempt
         self.lastFailureMessage = lastFailureMessage
+    }
+
+    /// Attached document records (global managed IDs); empty when none.
+    package var documents: [AgentDocumentAttachment] {
+        get { documentAttachments ?? [] }
+        set { documentAttachments = newValue.isEmpty ? nil : newValue }
     }
 }
 

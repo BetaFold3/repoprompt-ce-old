@@ -513,6 +513,7 @@ extension AgentModeViewModel {
         trimmedText: String,
         attachments: [AgentImageAttachment],
         taggedFiles: [AgentTaggedFileAttachment],
+        documents: [AgentDocumentAttachment] = [],
         workflow: AgentWorkflowDefinition?
     ) -> Bool {
         item.kind == .user
@@ -520,10 +521,12 @@ extension AgentModeViewModel {
                 trimmedText: trimmedText,
                 attachments: attachments,
                 taggedFiles: taggedFiles,
+                documents: documents,
                 workflow: workflow
             )
             && item.attachments.map(\.id) == attachments.map(\.id)
             && item.taggedFileAttachments.map(\.id) == taggedFiles.map(\.id)
+            && item.documentAttachments.map(\.id) == documents.map(\.id)
             && item.workflow?.id == workflow?.id
     }
 
@@ -571,6 +574,7 @@ extension AgentModeViewModel {
         payloadText: String,
         images: [AgentImageAttachment],
         taggedFiles: [AgentTaggedFileAttachment],
+        documents: [AgentDocumentAttachment] = [],
         workflow: AgentWorkflowDefinition?,
         referencedTurnIDs: Set<UUID>,
         session: AgentTabSession,
@@ -579,10 +583,17 @@ extension AgentModeViewModel {
         synchronizeDerivedTranscriptForRecoverySavedInput(session)
         let trimmedText = payloadText.trimmingCharacters(in: .whitespacesAndNewlines)
         var savedItem = AgentChatItem.user(
-            Self.userBubbleText(trimmedText: trimmedText, attachments: images, taggedFiles: taggedFiles, workflow: workflow),
+            Self.userBubbleText(
+                trimmedText: trimmedText,
+                attachments: images,
+                taggedFiles: taggedFiles,
+                documents: documents,
+                workflow: workflow
+            ),
             id: userItemID,
             attachments: images,
             taggedFileAttachments: taggedFiles,
+            documentAttachments: documents,
             workflow: workflow
         )
         if let createdAt {
@@ -598,6 +609,7 @@ extension AgentModeViewModel {
                     trimmedText: trimmedText,
                     attachments: images,
                     taggedFiles: taggedFiles,
+                    documents: documents,
                     workflow: workflow
                 )
             },
@@ -626,6 +638,7 @@ extension AgentModeViewModel {
             payloadText: intent.payload.text,
             images: images,
             taggedFiles: intent.payload.taggedFiles.map(\.attachment),
+            documents: intent.payload.documents.map(\.attachment),
             workflow: intent.payload.workflow?.definition,
             referencedTurnIDs: referencedTurnIDs,
             session: session,
@@ -656,6 +669,7 @@ extension AgentModeViewModel {
             payloadText: intent.payload.text,
             images: images,
             taggedFiles: intent.payload.taggedFiles.map(\.attachment),
+            documents: intent.payload.documents.map(\.attachment),
             workflow: intent.payload.workflow?.definition,
             referencedTurnIDs: referencedTurnIDs,
             session: session,
@@ -674,6 +688,7 @@ extension AgentModeViewModel {
         trimmedText: String,
         attachments: [AgentImageAttachment],
         taggedFiles: [AgentTaggedFileAttachment],
+        documents: [AgentDocumentAttachment] = [],
         workflow: AgentWorkflowDefinition?
     ) -> Result<AgentChatItem, RecoverySavedRefusal> {
         guard let preparation = admitted.savedPreparation,
@@ -690,6 +705,7 @@ extension AgentModeViewModel {
             payloadText: trimmedText,
             images: attachments,
             taggedFiles: taggedFiles,
+            documents: documents,
             workflow: workflow,
             referencedTurnIDs: [],
             session: session,
@@ -841,6 +857,7 @@ extension AgentModeViewModel {
             content: intent.payload,
             attachments: images,
             taggedFiles: intent.payload.taggedFiles.map(\.attachment),
+            documents: intent.payload.documents.map(\.attachment),
             workflow: intent.payload.workflow?.definition,
             interviewFirst: intent.payload.interviewFirst,
             consumesComposer: false,

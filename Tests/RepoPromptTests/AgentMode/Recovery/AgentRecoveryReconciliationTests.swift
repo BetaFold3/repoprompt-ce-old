@@ -1835,7 +1835,7 @@ final class AgentRecoveryReconciliationTests: XCTestCase {
                 codexControllerFactory: { _, _, _, _, _, _ in LifecycleNoopCodexController(recorder: LifecycleRecorder()) },
                 codexControllerFactoryWithComputerUse: codexFactory,
                 claudeControllerFactory: { _, _, _, _ in claudeController },
-                connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+                connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _ in },
                 mcpRunRoutingCleaner: { _, _, _ in }
             )
         } else {

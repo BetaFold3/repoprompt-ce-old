@@ -13,7 +13,10 @@ extension MCPBootstrapLeaseSpec {
         allowsAgentExternalControlTools: Bool = false,
         additionalRestrictedTools: Set<String> = [],
         runHasNativeShell: Bool = false,
-        codeModeEligibility: MCPCodeModeEligibility = .native
+        codeModeEligibility: MCPCodeModeEligibility = .native,
+        // The admitted attempt this lease serves. Production run paths always pass it; `nil`
+        // (direct policy tests) grants no rich presentation.
+        runOwnership: AgentRunOwnership? = nil
     ) -> MCPBootstrapLeaseSpec {
         MCPBootstrapLeaseSpec(
             runID: runID,
@@ -30,7 +33,8 @@ extension MCPBootstrapLeaseSpec {
                 .union(runHasNativeShell ? AgentModeMCPToolPolicy.nativeShellRestrictedTools : []),
             additionalTools: AgentModeMCPPolicyInstaller.additionalTools(
                 for: agent,
-                sessionProfile: sessionProfile
+                sessionProfile: sessionProfile,
+                runOwnership: runOwnership
             ),
             allowedToolsOverride: sessionProfile == .knowledge
                 ? AgentModeMCPToolPolicy.knowledgeAllowedTools
@@ -43,7 +47,8 @@ extension MCPBootstrapLeaseSpec {
             taskLabelKind: taskLabelKind,
             allowsAgentExternalControlTools: allowsAgentExternalControlTools,
             requiresExpectedAgentPID: agent.requiresExpectedPIDOwnedAgentModeMCPRouting,
-            codeModeEligibility: codeModeEligibility
+            codeModeEligibility: codeModeEligibility,
+            runOwnership: runOwnership
         )
     }
 }
@@ -70,7 +75,8 @@ extension MCPBootstrapLease {
                 leaseSpec.taskLabelKind,
                 leaseSpec.allowsAgentExternalControlTools,
                 leaseSpec.requiresExpectedAgentPID,
-                leaseSpec.codeModeEligibility
+                leaseSpec.codeModeEligibility,
+                leaseSpec.runOwnership
             )
         }
     }

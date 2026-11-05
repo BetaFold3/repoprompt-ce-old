@@ -26,7 +26,11 @@ package enum KnowledgeSessionPolicy {
         MCPWindowToolName.agentRun,
         // Knowledge sessions in an Assistant workspace may list and steer granted workspaces
         // (docs/context/specs/2026-11-01-assistant-workspace-steering-spec.md).
-        MCPWindowToolName.workspaceSteer
+        MCPWindowToolName.workspaceSteer,
+        // Knowledge runs may present rich charts/briefings when their attempt's captured workspace
+        // policy grants it; this ceiling entry alone grants nothing
+        // (docs/context/specs/2026-11-04-rich-presentation-spec.md).
+        AgentRichPresentationToolPolicy.toolName
     ]
 
     /// Closed per-operation allowlist for `agent_run` calls from a Knowledge caller. An

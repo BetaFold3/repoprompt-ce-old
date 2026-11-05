@@ -952,6 +952,8 @@ final class CodemapStoreFixture: @unchecked Sendable {
         resolutionGate: CodemapResolutionGate? = nil,
         syntheticGraphArtifacts: Bool = false,
         bindingEnginePolicy: WorkspaceCodemapBindingEnginePolicy = .default,
+        capabilityHooks: WorkspaceCodemapGitCapabilityServiceHooks = .none,
+        capabilityGitService: GitService? = nil,
         manifestStoreFaultAction: @escaping @Sendable (
             CodeMapRootManifestStoreFaultPoint
         ) -> CodeMapRootManifestStoreFaultAction = { _ in .proceed }
@@ -996,6 +998,7 @@ final class CodemapStoreFixture: @unchecked Sendable {
                     return WorkspaceCodemapBindingEngine(
                         runtime: runtime,
                         capabilityService: WorkspaceCodemapGitCapabilityService(
+                            gitService: capabilityGitService ?? GitService(),
                             namespaceSalt: Data(
                                 repeating: 0x6C,
                                 count: GitBlobRepositoryNamespace.saltByteCount
@@ -1003,7 +1006,12 @@ final class CodemapStoreFixture: @unchecked Sendable {
                             hooks: WorkspaceCodemapGitCapabilityServiceHooks(
                                 beforeResolution: {
                                     await resolutionGate?.enterAndWait()
-                                }
+                                    await capabilityHooks.beforeResolution()
+                                },
+                                afterFirstAuthorityCapture: capabilityHooks.afterFirstAuthorityCapture,
+                                afterSourcePathFingerprintCapture: capabilityHooks.afterSourcePathFingerprintCapture,
+                                afterAuthorityEvidenceComponentStat: capabilityHooks.afterAuthorityEvidenceComponentStat,
+                                afterAuthorityEvidenceOpen: capabilityHooks.afterAuthorityEvidenceOpen
                             )
                         ),
                         sourceReader: registry.makeValidatedSourceReaderClient(),

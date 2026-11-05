@@ -519,11 +519,12 @@ final class AgentRecoveryStartupCompositionTests: XCTestCase {
         XCTAssertEqual(starts.count, 1, "Exactly one dispatch")
     }
 
-    /// Step 9-activation-b (review A P2-02, B A7): the same already-authorized new-session Send now
-    /// stays undispatched while Check confirms the crash hold from process records (the hold's run
-    /// was registered at run start and its only earlier-launch record exited), and dispatches
-    /// exactly once after the acknowledgement commits. The held session is never opened.
-    func testCrashHoldBlocksNewSessionSendNowUntilCheckConfirmsItThenDispatchesOnce() async throws {
+    /// Step 9-activation-b (review A P2-02, B A7), automatic since 2026-10-31: the same
+    /// already-authorized new-session Send now stays undispatched while the app confirms the crash
+    /// hold from process records on its own at startup (the hold's run was registered at run start
+    /// and its only earlier-launch record exited), and dispatches exactly once after the
+    /// acknowledgement commits. The held session is never opened and nobody clicks anything.
+    func testCrashHoldBlocksNewSessionSendNowUntilItIsConfirmedAutomaticallyThenDispatchesOnce() async throws {
         let fixture = try makeFixture()
         let processes = ScriptedProcessSystem()
 
@@ -578,14 +579,51 @@ final class AgentRecoveryStartupCompositionTests: XCTestCase {
             activation: .claudeAndCodex,
             loadInventory: { AgentRecoveryWorkspaceInventory(workspaces: destinations) }
         )
+        // The automatic confirmation starts once startup is ready; it is held just before its
+        // acknowledgement write until the send below is authorized.
+        @MainActor
+        final class CommitGate {
+            private(set) var reached = false
+            private var isOpen = false
+            private var waiters: [CheckedContinuation<Void, Never>] = []
+
+            func wait() async {
+                reached = true
+                guard !isOpen else { return }
+                await withCheckedContinuation { waiters.append($0) }
+            }
+
+            func open() {
+                isOpen = true
+                waiters.forEach { $0.resume() }
+                waiters = []
+            }
+        }
+        final class Starts {
+            var count = 0
+        }
+        final class Paused {
+            var startsBeforeCommit: Int?
+        }
+        let commitGate = CommitGate()
+        let starts = Starts()
+        let paused = Paused()
+        let coordinator = try XCTUnwrap(composition.coordinator)
+        coordinator.test_automaticCrashHoldAtCommit = { [scheduler, starts, paused, commitGate] in
+            await commitGate.wait()
+            scheduler.recordDidChange()
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            paused.startsBeforeCommit = starts.count
+        }
         let viewModel = makeViewModel(windowID: 4813, fixture: fixture)
         viewModel.test_initializeRunService()
         composition.install(into: viewModel)
         viewModel.attachScheduledSendCoordinator(scheduler)
         await composition.startupCompletion?.value
-        let coordinator = try XCTUnwrap(composition.coordinator)
         XCTAssertTrue(scheduler.isStartupAdmissionOpen)
         viewModel.test_establishPersistenceWorkspace(fixture.workspace)
+        let reached = await Support.eventually { commitGate.reached }
+        XCTAssertTrue(reached, "the automatic confirmation reached its write")
         XCTAssertNotNil(coordinator.blockingCrashHold(for: heldBinding))
 
         // Another tab in the same workspace schedules a new-session start and sends it now.
@@ -595,10 +633,6 @@ final class AgentRecoveryStartupCompositionTests: XCTestCase {
         scheduledTab.appendItem(.user("Earlier turn"))
         let saved = await viewModel.flushSave(for: scheduledTabID)
         XCTAssertTrue(saved)
-        final class Starts {
-            var count = 0
-        }
-        let starts = Starts()
         viewModel.scheduledDispatchRunStarter = { [starts] _, _, _, _ in
             starts.count += 1
             return .stale(reason: "test starter")
@@ -622,23 +656,13 @@ final class AgentRecoveryStartupCompositionTests: XCTestCase {
         XCTAssertTrue(blocked, "\(scheduler.disposition(scheduleID: scheduleID))")
         XCTAssertEqual(starts.count, 0)
 
-        // Check confirms the hold; just before its acknowledgement write, nothing has been sent.
-        final class Paused {
-            var startsBeforeCommit: Int?
-        }
-        let paused = Paused()
-        coordinator.test_crashHoldProofAtCommit = { [scheduler, starts, paused] in
-            scheduler.recordDidChange()
-            try? await Task.sleep(nanoseconds: 100_000_000)
-            paused.startsBeforeCommit = starts.count
-        }
-        let crash = try XCTUnwrap(coordinator.catalog.items.first { $0.sessionID == held.session.id && $0.kind == .crashHold })
-        let status = await coordinator.checkCatalogItems([crash], checksActive: true) { _ in
-            XCTFail("a crash hold is never reconciled")
-            return .notAttempted("no reconcile")
+        // The automatic confirmation writes the acknowledgement; just before it, nothing was sent.
+        commitGate.open()
+        while let automatic = coordinator.automaticCrashHoldTask {
+            await automatic.value
         }
         XCTAssertEqual(paused.startsBeforeCommit, 0, "the authorized send waits for the acknowledgement commit")
-        XCTAssertEqual(status?.entries.first?.outcome, .resolved(AgentRecoveryCrashHoldCheckText.confirmed))
+        XCTAssertNil(coordinator.blockingCrashHold(for: heldBinding), "confirmed without a click")
         let acknowledgement = await now.store.read(sessionID: held.session.id).record?.crashHoldAcknowledgement
         XCTAssertNotNil(acknowledgement)
         XCTAssertNil(coordinator.lane(for: held.session.id), "the held session was never opened")
@@ -735,6 +759,241 @@ final class AgentRecoveryStartupCompositionTests: XCTestCase {
         XCTAssertTrue(direct.hasPrefix("Claude from an earlier launch of RepoPrompt (1 process found, started as PID 7048)."), direct)
         XCTAssertFalse(direct.contains("agent PID"))
         XCTAssertTrue(direct.contains("You chose to let it finish; RepoPrompt keeps watching it."), direct)
+    }
+
+    /// A survivor whose root was seen exited names the processes that remain (here an orphaned helper
+    /// shell), never the dead root as if it were running. A recorded agent (writer) is still running
+    /// and only its launcher exited: no quit advice then.
+    func testSurvivingRuntimeTextNamesRemainingProcessesAfterTheRootExited() {
+        func restriction(
+            writerPID: Int32?,
+            memberPIDs: [Int32],
+            state: AgentRuntimeRecord.State = .live
+        ) -> AgentRuntimeRestriction {
+            AgentRuntimeRestriction(
+                runtimeID: UUID(), kind: .possibleWriter, family: .claudeNative, provider: nil, state: state,
+                isPreviousInstance: true, isUnreadable: false, providerHome: nil,
+                conversationIDs: ["conv-root-exited"], worktreePaths: ["/tmp/wt-root-exited"], sessionIDs: [], associations: [],
+                rootPID: 65135, writerPID: writerPID, rootAlive: false, memberPIDs: memberPIDs,
+                memberCount: memberPIDs.count, letFinish: true, revision: .make(), createdAt: nil
+            )
+        }
+        let helper = AgentModeViewModel.recoveryListRuntimeText(restriction(writerPID: nil, memberPIDs: [25175])).1
+        XCTAssertTrue(
+            helper.hasPrefix(
+                "Claude from an earlier launch of RepoPrompt (PID 65135) has exited, but 1 process it started is still running: PID 25175."
+                    + " If it is stuck, check that PID's command and start time first; then you can quit it yourself."
+                    + " RepoPrompt notices when it exits."
+            ),
+            helper
+        )
+        XCTAssertFalse(helper.contains("started as PID"), helper)
+        XCTAssertTrue(helper.contains("Sending to that conversation stays paused until it exits."), helper)
+        XCTAssertTrue(helper.contains("You chose to let it finish; RepoPrompt keeps watching it."), helper)
+
+        let writer = AgentModeViewModel.recoveryListRuntimeText(restriction(writerPID: 25200, memberPIDs: [25175, 25200])).1
+        XCTAssertTrue(
+            writer.hasPrefix(
+                "Claude from an earlier launch of RepoPrompt is still running as PID 25200; its launcher (PID 65135) has exited."
+                    + " Also running: PID 25175."
+            ),
+            writer
+        )
+        XCTAssertFalse(writer.contains("has exited, but"), writer)
+        XCTAssertFalse(writer.contains("quit"), writer)
+        XCTAssertTrue(writer.contains("Sending to that conversation stays paused until they exit."), writer)
+
+        let writerAlone = AgentModeViewModel.recoveryListRuntimeText(restriction(writerPID: 25200, memberPIDs: [25200])).1
+        XCTAssertTrue(
+            writerAlone.hasPrefix(
+                "Claude from an earlier launch of RepoPrompt is still running as PID 25200; its launcher (PID 65135) has exited."
+                    + " Worktree:"
+            ),
+            writerAlone
+        )
+        XCTAssertFalse(writerAlone.contains("quit"), writerAlone)
+
+        let unconfirmed = AgentModeViewModel.recoveryListRuntimeText(restriction(writerPID: nil, memberPIDs: [], state: .unknown)).1
+        XCTAssertTrue(
+            unconfirmed.hasPrefix(
+                "Claude from an earlier launch of RepoPrompt (PID 65135) has exited, but RepoPrompt couldn't confirm that every process it started did."
+            ),
+            unconfirmed
+        )
+        XCTAssertFalse(unconfirmed.contains("quit it yourself"), unconfirmed)
+        XCTAssertTrue(unconfirmed.contains("Sending to that conversation stays paused until RepoPrompt confirms they exited."), unconfirmed)
+        XCTAssertFalse(unconfirmed.contains("until it exits"), unconfirmed)
+    }
+
+    /// Discovery that couldn't verify every member (`.unknown`, `.detachedAtQuit`, `.reserved`) says
+    /// the remaining processes may still be running and gives no quit advice. A runtime detached at
+    /// quit whose latest pass was complete is verified; an unresolved (`.unknown`) one never is.
+    func testSurvivingRuntimeTextAfterTheRootExitedHedgesUnverifiedProcesses() {
+        func restriction(
+            writerPID: Int32?,
+            memberPIDs: [Int32],
+            state: AgentRuntimeRecord.State,
+            discoveryComplete: Bool = false
+        ) -> AgentRuntimeRestriction {
+            AgentRuntimeRestriction(
+                runtimeID: UUID(), kind: .possibleWriter, family: .claudeNative, provider: nil, state: state,
+                isPreviousInstance: true, isUnreadable: false, providerHome: nil,
+                conversationIDs: [], worktreePaths: ["/tmp/wt-root-exited"], sessionIDs: [], associations: [],
+                rootPID: 65135, writerPID: writerPID, rootAlive: false, discoveryComplete: discoveryComplete,
+                memberPIDs: memberPIDs, memberCount: memberPIDs.count, letFinish: false, revision: .make(), createdAt: nil
+            )
+        }
+        let detached = restriction(writerPID: nil, memberPIDs: [25175], state: .detachedAtQuit, discoveryComplete: true)
+        let (detachedTitle, detachedText) = AgentModeViewModel.recoveryListRuntimeText(detached)
+        XCTAssertEqual(detachedTitle, "A process started by an agent is still running")
+        XCTAssertTrue(
+            detachedText.hasPrefix(
+                "Claude from an earlier launch of RepoPrompt (PID 65135) has exited, but 1 process it started is still running: PID 25175."
+                    + " If it is stuck, check that PID's command and start time first; then you can quit it yourself."
+                    + " RepoPrompt notices when it exits."
+            ),
+            detachedText
+        )
+        let unresolved = restriction(writerPID: nil, memberPIDs: [25175], state: .unknown, discoveryComplete: true)
+        let unresolvedText = AgentModeViewModel.recoveryListRuntimeText(unresolved).1
+        XCTAssertTrue(unresolvedText.contains("may still be running"), unresolvedText)
+        XCTAssertFalse(unresolvedText.contains("quit"), unresolvedText)
+        for state in [AgentRuntimeRecord.State.unknown, .detachedAtQuit, .reserved] {
+            let one = AgentModeViewModel.recoveryListRuntimeText(restriction(writerPID: nil, memberPIDs: [25175], state: state)).1
+            XCTAssertTrue(
+                one.hasPrefix(
+                    "Claude from an earlier launch of RepoPrompt (PID 65135) has exited, but 1 process it started may still be running: PID 25175."
+                        + " Worktree:"
+                ),
+                "\(state): \(one)"
+            )
+            XCTAssertFalse(one.contains("is still running"), one)
+            XCTAssertFalse(one.contains("quit"), one)
+            XCTAssertTrue(one.contains("Sending in this worktree stays paused until it exits."), one)
+
+            let two = AgentModeViewModel.recoveryListRuntimeText(restriction(writerPID: nil, memberPIDs: [25175, 25180], state: state)).1
+            XCTAssertTrue(
+                two.contains("but 2 processes it started may still be running: PID 25175, PID 25180."),
+                "\(state): \(two)"
+            )
+            XCTAssertFalse(two.contains("quit"), two)
+            XCTAssertTrue(two.contains("Sending in this worktree stays paused until they exit."), two)
+
+            let writer = AgentModeViewModel.recoveryListRuntimeText(restriction(writerPID: 25200, memberPIDs: [25175, 25200], state: state)).1
+            XCTAssertTrue(
+                writer.hasPrefix(
+                    "Claude from an earlier launch of RepoPrompt may still be running as PID 25200; its launcher (PID 65135) has exited."
+                        + " Another process it started may also be running: PID 25175."
+                ),
+                "\(state): \(writer)"
+            )
+            XCTAssertFalse(writer.contains("quit"), writer)
+        }
+    }
+
+    /// Several verified remaining processes get plural advice; repeated PIDs are named once and at
+    /// most five PIDs are listed; a missing root PID is omitted rather than shown.
+    func testSurvivingRuntimeTextAfterTheRootExitedPluralizesCapsAndOmitsAMissingRoot() {
+        func restriction(rootPID: Int32?, writerPID: Int32? = nil, memberPIDs: [Int32]) -> AgentRuntimeRestriction {
+            AgentRuntimeRestriction(
+                runtimeID: UUID(), kind: .possibleWriter, family: .codexAppServer, provider: nil, state: .live,
+                isPreviousInstance: false, isUnreadable: false, providerHome: nil,
+                conversationIDs: [], worktreePaths: [], sessionIDs: [], associations: [],
+                rootPID: rootPID, writerPID: writerPID, rootAlive: false, memberPIDs: memberPIDs,
+                memberCount: memberPIDs.count, letFinish: false, revision: .make(), createdAt: nil
+            )
+        }
+        let plural = AgentModeViewModel.recoveryListRuntimeText(restriction(rootPID: 900, memberPIDs: [901, 902, 901])).1
+        XCTAssertTrue(
+            plural.hasPrefix(
+                "Codex started by this launch (PID 900) has exited, but 2 processes it started are still running: PID 901, PID 902."
+                    + " If they are stuck, check each PID's command and start time first; then you can quit them yourself."
+                    + " RepoPrompt notices when they exit."
+                    + " Sending in this worktree stays paused until they exit."
+            ),
+            plural
+        )
+
+        let many = AgentModeViewModel.recoveryListRuntimeText(restriction(rootPID: 900, memberPIDs: Array(901 ... 908))).1
+        XCTAssertTrue(
+            many.contains("but 8 processes it started are still running: PID 901, PID 902, PID 903, PID 904, PID 905 and 3 more."),
+            many
+        )
+        XCTAssertFalse(many.contains("PID 906"), many)
+
+        let exactlyFive = AgentModeViewModel.recoveryListRuntimeText(restriction(rootPID: 900, memberPIDs: Array(901 ... 905))).1
+        XCTAssertTrue(exactlyFive.contains(": PID 901, PID 902, PID 903, PID 904, PID 905. "), exactlyFive)
+        XCTAssertFalse(exactlyFive.contains("more"), exactlyFive)
+
+        let rootless = AgentModeViewModel.recoveryListRuntimeText(restriction(rootPID: nil, memberPIDs: [901])).1
+        XCTAssertTrue(
+            rootless.hasPrefix("Codex started by this launch has exited, but 1 process it started is still running: PID 901."),
+            rootless
+        )
+        XCTAssertFalse(rootless.contains("(PID"), rootless)
+
+        let rootlessWriter = AgentModeViewModel.recoveryListRuntimeText(restriction(rootPID: nil, writerPID: 910, memberPIDs: [910])).1
+        XCTAssertTrue(
+            rootlessWriter.hasPrefix("Codex started by this launch is still running as PID 910; its launcher has exited."),
+            rootlessWriter
+        )
+    }
+
+    /// Once the root exited, a row with only non-writer processes is titled after those processes;
+    /// a recorded agent, tools-only and unreadable rows keep their titles.
+    func testSurvivingRuntimeTitleAfterTheRootExited() {
+        func title(
+            kind: AgentRuntimeRestriction.Kind = .possibleWriter,
+            state: AgentRuntimeRecord.State,
+            writerPID: Int32? = nil,
+            memberPIDs: [Int32],
+            rootAlive: Bool? = false,
+            isUnreadable: Bool = false
+        ) -> String {
+            AgentModeViewModel.recoveryListRuntimeText(AgentRuntimeRestriction(
+                runtimeID: UUID(), kind: kind, family: .claudeNative, provider: nil, state: state,
+                isPreviousInstance: true, isUnreadable: isUnreadable, providerHome: nil,
+                conversationIDs: [], worktreePaths: [], sessionIDs: [], associations: [],
+                rootPID: 65135, writerPID: writerPID, rootAlive: rootAlive, memberPIDs: memberPIDs,
+                memberCount: memberPIDs.count, letFinish: false, revision: .make(), createdAt: nil
+            )).0
+        }
+        XCTAssertEqual(title(state: .live, memberPIDs: [25175]), "A process started by an agent is still running")
+        XCTAssertEqual(title(state: .unknown, memberPIDs: [25175]), "A process started by an agent may still be running")
+        XCTAssertEqual(title(state: .live, memberPIDs: [25175, 25180]), "Processes started by an agent are still running")
+        XCTAssertEqual(title(state: .detachedAtQuit, memberPIDs: [25175, 25180]), "Processes started by an agent may still be running")
+        XCTAssertEqual(title(state: .live, writerPID: 25200, memberPIDs: [25200]), "An agent process is still running")
+        XCTAssertEqual(title(state: .detachedAtQuit, writerPID: 25200, memberPIDs: [25200]), "An agent process may still be running")
+        XCTAssertEqual(title(state: .unknown, memberPIDs: []), "An agent process may still be running")
+        XCTAssertEqual(title(state: .live, memberPIDs: [25175], rootAlive: nil), "An agent process is still running")
+        XCTAssertEqual(
+            title(kind: .toolsOnly, state: .toolsRemaining, memberPIDs: [25175]),
+            "Tools started by an agent are still running"
+        )
+        XCTAssertEqual(title(state: .unknown, memberPIDs: [25175], isUnreadable: true), "Agent process status unknown")
+    }
+
+    /// A tools-only row (its root is gone by definition) names the exited root and the remaining
+    /// tool, then the tools sentence; its title is unchanged.
+    func testToolsOnlyRuntimeTextAfterTheRootExited() {
+        let restriction = AgentRuntimeRestriction(
+            runtimeID: UUID(), kind: .toolsOnly, family: .codexAppServer, provider: nil, state: .toolsRemaining,
+            isPreviousInstance: true, isUnreadable: false, providerHome: nil,
+            conversationIDs: [], worktreePaths: ["/tmp/wt-tools"], sessionIDs: [], associations: [],
+            rootPID: 800, writerPID: nil, rootAlive: false, memberPIDs: [801],
+            memberCount: 1, letFinish: false, revision: .make(), createdAt: nil
+        )
+        let (title, detail) = AgentModeViewModel.recoveryListRuntimeText(restriction)
+        XCTAssertEqual(title, "Tools started by an agent are still running")
+        XCTAssertEqual(
+            detail,
+            "Codex from an earlier launch of RepoPrompt (PID 800) has exited, but 1 process it started is still running: PID 801."
+                + " If it is stuck, check that PID's command and start time first; then you can quit it yourself."
+                + " RepoPrompt notices when it exits."
+                + " Worktree: /tmp/wt-tools."
+                + " It no longer writes the conversation, but scheduled work in this worktree stays paused until its tools exit."
+                + " Nothing is stopped automatically."
+        )
     }
 
     /// R04: Edit keeps a carrier's exact pending-handoff association. An absent session payload is

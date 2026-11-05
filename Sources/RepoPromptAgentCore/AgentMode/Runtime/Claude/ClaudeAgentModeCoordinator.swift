@@ -2569,6 +2569,11 @@ package final class ClaudeAgentModeCoordinator {
             // Untracked input commits too (nothing is written for it) and keeps legacy staging at the
             // write below.
             if !handoff.isCommitted {
+                // DOC-02: the recovery store refuses to commit a durable intent whose document
+                // original is gone (with only a generic delivery-not-recorded reason), so the
+                // sticky document authority decides first: refused with its own reason and settled
+                // by the route, exactly like the boundary check below (which stays authoritative).
+                guard handoff.documentRefusalAtProviderBoundary() == nil else { return false }
                 var durableText = text
                 if handoff.isDurable {
                     // Without a host nothing can stage a prefix (`.none`); the late-payload check
@@ -2646,6 +2651,10 @@ package final class ClaudeAgentModeCoordinator {
                 }
                 let instructions = agentModeInstructionInjection(for: session)
                 let providerBoundText = providerBoundUserMessage(outboundText, instructions: instructions)
+                // DOC-02 final document authority: after every startup, readiness, effort, and commit
+                // await above, with no suspension before the boundary. A referenced original removed
+                // meanwhile refuses the send (settled by the handoff and its route); nothing written.
+                guard handoff.documentRefusalAtProviderBoundary() == nil else { return false }
                 guard handoff.enterProviderBoundary(in: session) else { return false }
                 // R6 owner capture: the dispatch reservation (verified current above) owns this
                 // user turn; its scope is captured now and never re-read at write time.
@@ -2686,6 +2695,9 @@ package final class ClaudeAgentModeCoordinator {
                     guard dispatchReservationIsCurrent(dispatchReservation, for: session),
                           sessionOwnsClaudeController(controller, for: session)
                     else { return .denied }
+                    // DOC-02: the transport's own pre-byte step re-checks the documents after its
+                    // registry awaits; a refusal writes zero bytes.
+                    guard handoff.documentRefusalAtProviderBoundary() == nil else { return .denied }
                     return admission
                 }
                 let turnID = try await AgentRuntimeOperationOwner.$session.withValue(runtimeOwner) {
@@ -2693,6 +2705,8 @@ package final class ClaudeAgentModeCoordinator {
                         try await controller.sendUserMessage(providerBoundText)
                     }
                 }
+                // Written: its documents were admitted; release the route's authority closures.
+                handoff.installDocumentAuthority(nil)
                 // Written: track until the turn's own completion proves acceptance.
                 dispatchHandoffsByTurnID[turnID] = WrittenDispatchHandoff(
                     tabID: session.tabID,
@@ -2715,6 +2729,14 @@ package final class ClaudeAgentModeCoordinator {
                 // through the session-owned seam; nothing is registered from here.
                 return true
             } catch {
+                if handoff.documentRefusalReason != nil {
+                    // Refused for its documents at the transport's write admission: the handoff and
+                    // its route already settled the input (nothing written). Exactly like the
+                    // pre-boundary refusal, the route owns what happens to its run (a start's
+                    // runner fails its run; a steering flush ends only a run it stranded), so an
+                    // otherwise active run is never ended here and no send-failure row is added.
+                    return false
+                }
                 if !handoff.handoffStarted {
                     handoff.noteNoHandoff(message: error.localizedDescription)
                 } else if Self.sendErrorProvesNoWrite(error) {

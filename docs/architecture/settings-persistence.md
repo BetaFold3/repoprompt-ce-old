@@ -46,6 +46,9 @@ representing its content. Schema-requiring features have fixed introduction cons
   preservation block is latched for that file-store instance: removing the final grant does
   not automatically unblock an already-running older build. Relaunch that build after the
   file returns to a schema it supports; use a grant-capable build for live steering checks.
+- `workspaceRichPresentationSchemaVersion = 7` (any `richPresentationSettingsByWorkspaceID`
+  entry that is enabled or approves an image host). Disabled, host-free entries are not
+  written, so disabling every workspace returns the file to the schema its other content needs.
 
 `requiredSchemaVersion` returns the maximum fixed feature version required by the
 document. It must never use `currentSchemaVersion` as the version of an existing feature:
@@ -125,6 +128,21 @@ future/foreign file is still refused by the file store with its own reason.
 `WorkspaceSteeringGrantStore.isGranted` reads the file on every call and fails closed.
 Limits: user-initiated recovery and compatible import write without the lock, and builds
 without grant support do not take it (schema v6 keeps them from writing while grants exist).
+
+Workspace rich presentation permissions follow the same rule: every save and grant write also
+adopts the on-disk `richPresentationSettingsByWorkspaceID` map (entries `{enabled,
+approved_image_hosts}`), and an unreadable map blocks the write.
+`setRichPresentationSettings` validates hosts with the shared exact-host validator, replaces
+only its workspace entry under the lock, and publishes the new value only after the write
+succeeds. A malformed stored entry (wrong field types or any rejected host) grants nothing;
+its `enabled` flag is never salvaged, and the next save drops it. Run-attempt admission reads the
+file on every attempt (`persistedRichPresentationSettings`), never the in-memory copy: missing
+file or entry is disabled, and an unreadable or preserved future/foreign file gives no authority.
+The Settings editor saves as a compare-and-set against the entry its draft started from
+(`saveRichPresentationSettings(_:for:replacing:)`), so a stale draft reports a conflict and
+writes nothing. A draft rebases onto the committed entry whenever no unsaved edit would be lost
+(clean, including an undone edit, or equal to the committed entry), and the section adopts the
+on-disk map without writing when it appears (`refreshRichPresentationSettingsFromDisk`).
 
 Blocked-persistence warnings may be dismissed in workspace windows for the current app
 session. The store owns dismissal across workspace windows and clears it when the reason

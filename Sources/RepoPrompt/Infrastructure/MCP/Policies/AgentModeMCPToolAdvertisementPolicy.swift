@@ -29,6 +29,9 @@ enum AgentModeMCPToolAdvertisementPolicy {
         // App settings are safe allowlisted preferences and should be visible to agent-mode subagents;
         // discovery/context-builder runs remain restricted by DiscoverMCPToolPolicy itself.
         capabilities.remove(.appSettings)
+        // Explore sessions may present rich content when their attempt was granted it; the grant
+        // itself (not this advertisement filter) is the authorization.
+        capabilities.remove(.richPresentation)
         // Add conversation log hiding — explore agents don't need oracle_chat_log
         capabilities.insert(.conversationLog)
         // Hide context mutation tools (manage_selection, prompt) and context render (workspace_context)

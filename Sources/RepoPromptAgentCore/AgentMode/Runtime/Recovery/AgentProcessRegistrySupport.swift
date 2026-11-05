@@ -223,6 +223,16 @@ package struct AgentRuntimeRestriction: Equatable, Identifiable {
     /// 9-live S5: the first recorded writer member that isn't the root (the CLI under a launcher
     /// shim), so the item can name the agent's own PID; `nil` when unknown or equal to the root.
     package let writerPID: Int32?
+    /// Whether the root is alive: this launch's latest discovery pass, else `false` when the record
+    /// proves it gone (reaped, or only tools remain); `nil` when unknown. Display only: ownership,
+    /// admission and crash-hold proof never read it, but a change republishes the snapshot.
+    package let rootAlive: Bool?
+    /// Whether this launch's latest discovery pass was complete (every recorded member observed
+    /// alive) and its classification is persisted; `false` when not observed. Display only:
+    /// ownership, admission and crash-hold proof never read it, but a change republishes the snapshot.
+    package let discoveryComplete: Bool
+    /// PIDs of the recorded non-root members, sorted by PID (the processes `memberCount` counts).
+    package let memberPIDs: [Int32]
     package let memberCount: Int
     package let letFinish: Bool
     package let revision: AgentRecoveryRecordRevision?
@@ -247,6 +257,9 @@ package struct AgentRuntimeRestriction: Equatable, Identifiable {
         associations: [AgentRuntimeAssociation],
         rootPID: Int32?,
         writerPID: Int32? = nil,
+        rootAlive: Bool? = nil,
+        discoveryComplete: Bool = false,
+        memberPIDs: [Int32] = [],
         memberCount: Int,
         letFinish: Bool,
         revision: AgentRecoveryRecordRevision?,
@@ -266,6 +279,9 @@ package struct AgentRuntimeRestriction: Equatable, Identifiable {
         self.associations = associations
         self.rootPID = rootPID
         self.writerPID = writerPID == rootPID ? nil : writerPID
+        self.rootAlive = rootAlive
+        self.discoveryComplete = discoveryComplete
+        self.memberPIDs = memberPIDs
         self.memberCount = memberCount
         self.letFinish = letFinish
         self.revision = revision

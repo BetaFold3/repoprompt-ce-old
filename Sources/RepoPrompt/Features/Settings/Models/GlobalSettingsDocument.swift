@@ -7,7 +7,8 @@ import RepoPromptAgentCore
 /// Schema v1 contains copy settings, chat settings, and cross-workspace global
 /// defaults. Schema v2 adds optional scalar preference groups. Schema v4 adds
 /// workspace-scoped Agent Models profiles. Schema v5 protects persisted per-role OMP
-/// thinking intent. Schema v6 protects workspace steering grants. Scalar fields stay optional so missing
+/// thinking intent. Schema v6 protects workspace steering grants. Schema v7 protects workspace rich
+/// presentation permissions. Scalar fields stay optional so missing
 /// JSON fields fall back through the typed GlobalSettingsStore accessors without
 /// losing current default behavior.
 struct GlobalSettingsDocument: Codable {
@@ -19,7 +20,10 @@ struct GlobalSettingsDocument: Codable {
     static let mcpAgentRoleOhMyPiThinkingSchemaVersion = 5
     /// Nonempty grants stamp v6 so builds without grant support preserve (never overwrite) them.
     static let workspaceSteeringGrantsSchemaVersion = 6
-    static let currentSchemaVersion = 6
+    /// Any granting rich presentation entry stamps v7 so builds without the feature preserve
+    /// (never overwrite) enablement and approved image hosts.
+    static let workspaceRichPresentationSchemaVersion = 7
+    static let currentSchemaVersion = 7
     /// Lineage marker for settings files written by this open-source CE schema family.
     ///
     /// CE inherited numeric schema versions from classic/internal builds, so version numbers
@@ -37,6 +41,9 @@ struct GlobalSettingsDocument: Codable {
     var copySettingsByWorkspaceID: [String: CopyGlobalSettings]
     var chatSettingsByWorkspaceID: [String: ChatGlobalSettings]
     var agentModelsSettingsByWorkspaceID: [String: WorkspaceAgentModelsSettings]?
+    /// Workspace rich presentation permissions; nil (the old-file default) means disabled with no
+    /// approved image hosts everywhere. Only entries that grant something are written.
+    var richPresentationSettingsByWorkspaceID: [String: WorkspaceRichPresentationSettings]?
     var globalDefaults: GlobalDefaults
     var scalarPreferences: GlobalScalarPreferences?
 
@@ -47,7 +54,8 @@ struct GlobalSettingsDocument: Codable {
         chatSettings: [UUID: ChatGlobalSettings] = [:],
         agentModelsSettings: [UUID: WorkspaceAgentModelsSettings] = [:],
         globalDefaults: GlobalDefaults = GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil),
-        scalarPreferences: GlobalScalarPreferences? = nil
+        scalarPreferences: GlobalScalarPreferences? = nil,
+        richPresentationSettings: [UUID: WorkspaceRichPresentationSettings] = [:]
     ) {
         self.schemaVersion = schemaVersion
         schemaLineage = Self.schemaLineage
@@ -57,6 +65,10 @@ struct GlobalSettingsDocument: Codable {
         agentModelsSettingsByWorkspaceID = agentModelsSettings.isEmpty
             ? nil
             : Self.encodeUUIDKeyedDictionary(agentModelsSettings)
+        let grantingRichPresentationSettings = richPresentationSettings.filter(\.value.grantsAnything)
+        richPresentationSettingsByWorkspaceID = grantingRichPresentationSettings.isEmpty
+            ? nil
+            : Self.encodeUUIDKeyedDictionary(grantingRichPresentationSettings)
         var normalizedGlobalDefaults = globalDefaults
         normalizedGlobalDefaults.mcpAgentRoleOhMyPiThinkingSelections =
             AgentModelsSettingsProfile.normalizedRoleThinkingSelections(
@@ -76,6 +88,10 @@ struct GlobalSettingsDocument: Codable {
 
     var agentModelsSettings: [UUID: WorkspaceAgentModelsSettings] {
         Self.decodeUUIDKeyedDictionary(agentModelsSettingsByWorkspaceID ?? [:])
+    }
+
+    var richPresentationSettings: [UUID: WorkspaceRichPresentationSettings] {
+        Self.decodeUUIDKeyedDictionary(richPresentationSettingsByWorkspaceID ?? [:])
     }
 
     /// Lowest CE schema version that can faithfully represent this document's content.
@@ -100,6 +116,9 @@ struct GlobalSettingsDocument: Codable {
         if scalarPreferences?.workspaceSteeringGrants?.isEmpty == false {
             requiredVersion = max(requiredVersion, Self.workspaceSteeringGrantsSchemaVersion)
         }
+        if richPresentationSettingsByWorkspaceID?.values.contains(where: \.grantsAnything) == true {
+            requiredVersion = max(requiredVersion, Self.workspaceRichPresentationSchemaVersion)
+        }
         return requiredVersion
     }
 
@@ -109,6 +128,7 @@ struct GlobalSettingsDocument: Codable {
         agentModelsSettings: [UUID: WorkspaceAgentModelsSettings],
         globalDefaults: GlobalDefaults,
         scalarPreferences: GlobalScalarPreferences? = nil,
+        richPresentationSettings: [UUID: WorkspaceRichPresentationSettings]? = nil,
         updatedAt: Date = Date()
     ) -> GlobalSettingsDocument {
         GlobalSettingsDocument(
@@ -118,7 +138,8 @@ struct GlobalSettingsDocument: Codable {
             chatSettings: chatSettings,
             agentModelsSettings: agentModelsSettings,
             globalDefaults: globalDefaults,
-            scalarPreferences: scalarPreferences ?? self.scalarPreferences
+            scalarPreferences: scalarPreferences ?? self.scalarPreferences,
+            richPresentationSettings: richPresentationSettings ?? self.richPresentationSettings
         )
     }
 
@@ -377,6 +398,93 @@ struct WorkspaceAgentModelsSettings: Codable, Equatable {
         inheritanceMode = try container.decodeIfPresent(AgentModelsInheritanceMode.self, forKey: .inheritanceMode)
             ?? .useGlobalSettings
         profile = try container.decodeIfPresent(AgentModelsSettingsProfile.self, forKey: .profile)
+    }
+}
+
+// MARK: - Workspace Rich Presentation
+
+/// One workspace's rich presentation permissions (rich presentation spec, A3). Missing fields mean
+/// disabled / no approved image hosts. A malformed stored entry — wrong field types, or any host
+/// the shared exact-host validator rejects — decodes as granting nothing and is flagged
+/// `storedEntryWasInvalid`; `enabled: true` is never salvaged from it.
+struct WorkspaceRichPresentationSettings: Codable, Equatable {
+    static let disabled = WorkspaceRichPresentationSettings()
+
+    var enabled: Bool
+    /// Canonical exact hosts: validated, deduplicated, sorted.
+    var approvedImageHosts: [String]
+    /// Diagnostic only (never encoded): the stored entry was malformed and grants nothing.
+    private(set) var storedEntryWasInvalid = false
+
+    init(enabled: Bool = false, approvedImageHosts: [String] = []) {
+        self.enabled = enabled
+        self.approvedImageHosts = Array(Set(approvedImageHosts)).sorted()
+    }
+
+    /// True when the entry needs to be persisted (enabled or approves at least one host).
+    var grantsAnything: Bool {
+        enabled || !approvedImageHosts.isEmpty
+    }
+
+    /// The entry with canonical hosts, or nil when any host fails strict validation.
+    /// Validation never trims, lowercases or otherwise repairs a host.
+    func validatedForStorage() -> WorkspaceRichPresentationSettings? {
+        guard approvedImageHosts.allSatisfy(Self.isValidApprovedHost) else { return nil }
+        return WorkspaceRichPresentationSettings(enabled: enabled, approvedImageHosts: approvedImageHosts)
+    }
+
+    static func isValidApprovedHost(_ host: String) -> Bool {
+        if case let .success(validated) = RichPresentationURLPolicy.validateApprovedHost(host) {
+            return validated == host
+        }
+        return false
+    }
+
+    private static let invalidStoredEntry: WorkspaceRichPresentationSettings = {
+        var entry = WorkspaceRichPresentationSettings()
+        entry.storedEntryWasInvalid = true
+        return entry
+    }()
+
+    private enum CodingKeys: String, CodingKey {
+        case enabled
+        case approvedImageHosts = "approved_image_hosts"
+    }
+
+    init(from decoder: Decoder) throws {
+        guard let container = try? decoder.container(keyedBy: CodingKeys.self) else {
+            self = Self.invalidStoredEntry
+            return
+        }
+        var enabled = false
+        if container.contains(.enabled) {
+            guard let stored = try? container.decode(Bool.self, forKey: .enabled) else {
+                self = Self.invalidStoredEntry
+                return
+            }
+            enabled = stored
+        }
+        var hosts: [String] = []
+        if container.contains(.approvedImageHosts) {
+            guard let stored = try? container.decode([String].self, forKey: .approvedImageHosts) else {
+                self = Self.invalidStoredEntry
+                return
+            }
+            hosts = stored
+        }
+        guard let validated = WorkspaceRichPresentationSettings(enabled: enabled, approvedImageHosts: hosts)
+            .validatedForStorage()
+        else {
+            self = Self.invalidStoredEntry
+            return
+        }
+        self = validated
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(enabled, forKey: .enabled)
+        try container.encode(approvedImageHosts, forKey: .approvedImageHosts)
     }
 }
 

@@ -352,6 +352,59 @@ final class AgentRecoveryVMProducerAdmissionTests: XCTestCase {
         XCTAssertEqual(viewModel.retrieveDraftText(for: tabID), "newer typing", "Newer typing is still untouched")
     }
 
+    /// A held composer intent carrying an attached document lists the document by name, and Edit
+    /// places the document back into the cleared composer with its text (Resume/Edit parity).
+    func testHeldComposerIntentWithDocumentListsItAndEditRestoresIt() async throws {
+        let documentsRoot = try RecoveryTestSupport.makeTemporaryRoot("AgentRecoveryVMProducerDocuments")
+        addTeardownBlock { try? FileManager.default.removeItem(at: documentsRoot) }
+        let documentStore = AgentDocumentAttachmentStore(rootURL: documentsRoot.appendingPathComponent("Managed", isDirectory: true))
+        let source = documentsRoot.appendingPathComponent("Brief 📄.pdf")
+        try Data("%PDF-1.4".utf8).write(to: source)
+        let imported = try await documentStore.importDocuments(from: [source])
+        let document = try XCTUnwrap(imported.first)
+
+        let controller = ProducerFakeCodexController()
+        let harness = try await makeHarness(windowID: 4718, controller: controller, documentStore: documentStore)
+        let lane = try await persistAndClaimLane(harness)
+        let viewModel = harness.viewModel
+        let tabID = harness.tabID
+        let session = harness.session
+        viewModel.storeDraftText(for: tabID, "with a document")
+        session.pendingDocumentAttachments = [document]
+
+        let result = await viewModel.submitUserTurnAdmittingRecoveryInput(
+            text: "with a document",
+            tabID: tabID,
+            origin: .composer,
+            isStillCurrent: {
+                viewModel.storeDraftText(for: tabID, "newer typing")
+                return false
+            }
+        )
+        XCTAssertEqual(result, .blocked(message: AgentModeViewModel.staleComposerSubmitTargetMessage))
+        let intents = await lane.store.read(sessionID: lane.sessionID).record?.intents ?? []
+        XCTAssertEqual(intents.map(\.deliveryState), [.queued])
+        XCTAssertEqual(intents.first?.payload.documents.map(\.id), [document.id], "The held intent carries the document")
+
+        let intentID = try XCTUnwrap(intents.first?.intentID)
+        let rowID = "intent-\(lane.sessionID.uuidString)-\(intentID.uuidString)"
+        func row() -> AgentRecoveryListRowProps? {
+            viewModel.recoveryListProps(forActiveSession: session)?.rows.first { $0.id == rowID }
+        }
+        let listed = await RecoveryTestSupport.eventually { row() != nil }
+        XCTAssertTrue(listed)
+        XCTAssertTrue(row()?.attachmentNames.contains("Brief 📄.pdf") == true, String(describing: row()?.attachmentNames))
+
+        // Edit needs an empty composer: the user clears the newer text and the document chip.
+        viewModel.storeDraftText(for: tabID, "")
+        session.pendingDocumentAttachments = []
+        await viewModel.performRecoveryListAction(rowID: rowID, action: .edit)
+        XCTAssertEqual(viewModel.retrieveDraftText(for: tabID), "with a document")
+        XCTAssertEqual(session.pendingDocumentAttachments.map(\.id), [document.id], "Placed with its document")
+        let afterEdit = await lane.store.read(sessionID: lane.sessionID).record?.intents ?? []
+        XCTAssertEqual(afterEdit.map(\.deliveryState), [.withdrawn], "Withdrawn only after placement")
+    }
+
     /// Stopping a run ends the live projection of its uncertain input: the possibly delivered
     /// message is listed at once (Remove only, never a resend-capable Edit) and the one whose
     /// handoff was in progress is listed view-only. While the run was open neither had a row.
@@ -1980,7 +2033,11 @@ final class AgentRecoveryVMProducerAdmissionTests: XCTestCase {
         )
     }
 
-    private func makeHarness(windowID: Int, controller: ProducerFakeCodexController) async throws -> Harness {
+    private func makeHarness(
+        windowID: Int,
+        controller: ProducerFakeCodexController,
+        documentStore: AgentDocumentAttachmentStore = .production
+    ) async throws -> Harness {
         let storageURL = try RecoveryTestSupport.makeTemporaryRoot("AgentRecoveryVMProducerWorkspace")
         let recoveryRoot = try RecoveryTestSupport.makeTemporaryRoot("AgentRecoveryVMProducerStore")
             .appendingPathComponent("AgentRecovery/v1", isDirectory: true)
@@ -1988,7 +2045,7 @@ final class AgentRecoveryVMProducerAdmissionTests: XCTestCase {
             try? FileManager.default.removeItem(at: storageURL)
             try? FileManager.default.removeItem(at: recoveryRoot.deletingLastPathComponent().deletingLastPathComponent())
         }
-        let store = AgentRecoveryStore(rootURL: recoveryRoot)
+        let store = AgentRecoveryStore(rootURL: recoveryRoot, documentStore: documentStore)
         let service = AgentSessionDataService(
             tombstoneRoot: recoveryRoot.appendingPathComponent("tombstones", isDirectory: true),
             recoveryStore: store
@@ -2020,6 +2077,7 @@ final class AgentRecoveryVMProducerAdmissionTests: XCTestCase {
             testWorkspaceDirectory: storageURL,
             codexControllerFactory: { _, _, _, _, _, _ in controller }
         )
+        viewModel.documentAttachmentStore = documentStore
         viewModel.test_initializeRunService()
         viewModel.installRecoveryCoordinator(coordinator, admissionMode: .mandatory)
         XCTAssertTrue(viewModel.test_dataService === service, "The VM writes through the coordinator's gated DataService")

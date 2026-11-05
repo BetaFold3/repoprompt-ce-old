@@ -135,4 +135,21 @@ package enum AgentModeMCPToolPolicy {
             ? tools.intersection(knowledgeAllowedTools)
             : tools
     }
+
+    /// The provider grants plus the dedicated rich-presentation grant derived only from the run
+    /// attempt's captured ownership (`AgentRichPresentationToolPolicy`), for every local provider
+    /// and profile. Knowledge still intersects with its positive ceiling, which lists the tool
+    /// but grants nothing by itself; restrictions applied later (delegation leaves) still win.
+    static func grantedTools(
+        forAgent agent: AgentProviderKind,
+        sessionProfile: AgentSessionProfile = .standard,
+        runOwnership: AgentRunOwnership?
+    ) -> Set<String> {
+        // The profile-specific base, then the rich grant within the same ceiling.
+        let tools = grantedTools(forAgent: agent, sessionProfile: sessionProfile)
+            .union(AgentRichPresentationToolPolicy.grantedTools(for: runOwnership))
+        return sessionProfile == .knowledge
+            ? tools.intersection(knowledgeAllowedTools)
+            : tools
+    }
 }

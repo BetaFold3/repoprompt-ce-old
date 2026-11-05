@@ -93,17 +93,30 @@ package struct AgentPendingInstruction: Equatable {
     package let text: String
     /// Ordered, never empty.
     package let constituents: [AgentQueuedInputIdentity]
+    /// Structured document records this entry delivers, in constituent order. `text` never carries
+    /// their manifest: provider augmentation preflights these records at dequeue and appends it.
+    package let documentAttachments: [AgentDocumentAttachment]
 
-    package init(text: String, identity: AgentQueuedInputIdentity) {
+    package init(
+        text: String,
+        identity: AgentQueuedInputIdentity,
+        documentAttachments: [AgentDocumentAttachment] = []
+    ) {
         self.text = text
         constituents = [identity]
+        self.documentAttachments = documentAttachments
     }
 
     /// `nil` when `constituents` is empty.
-    package init?(coalescedText text: String, constituents: [AgentQueuedInputIdentity]) {
+    package init?(
+        coalescedText text: String,
+        constituents: [AgentQueuedInputIdentity],
+        documentAttachments: [AgentDocumentAttachment] = []
+    ) {
         guard !constituents.isEmpty else { return nil }
         self.text = text
         self.constituents = constituents
+        self.documentAttachments = documentAttachments
     }
 
     /// Any constituent has a durable intent: lifecycle cleanup preserves it and it is never

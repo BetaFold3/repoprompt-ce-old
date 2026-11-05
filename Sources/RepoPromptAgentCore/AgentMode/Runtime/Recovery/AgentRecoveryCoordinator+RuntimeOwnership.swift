@@ -16,12 +16,16 @@ import Foundation
 package extension AgentRecoveryCoordinator {
     /// Attaches the app's single registry before startup and the windows' session-key lookup. The
     /// registry's change handler pulls fresh snapshots; nothing polls.
+    /// `automaticCrashHoldConfirmation`: whether crash holds are confirmed automatically when
+    /// process records prove their processes exited (the app's Reconcile gate, as for Check).
     func attachProcessRegistry(
         _ registry: AgentProcessRegistry,
-        ownershipKeys: @escaping @MainActor (UUID) -> [AgentRuntimeOwnershipKeys]
+        ownershipKeys: @escaping @MainActor (UUID) -> [AgentRuntimeOwnershipKeys],
+        automaticCrashHoldConfirmation: @escaping @MainActor () -> Bool = { false }
     ) {
         processRegistry = registry
         runtimeOwnershipKeys = ownershipKeys
+        automaticCrashHoldConfirmationActive = automaticCrashHoldConfirmation
     }
 
     /// Whether runtime ownership is enforced by this coordinator.
@@ -105,6 +109,9 @@ package extension AgentRecoveryCoordinator {
         let request = runtimeSnapshotRequest
         let snapshot = await registry.restrictionSnapshot()
         adoptRuntimeRestrictions(snapshot, request: request)
+        // The proof reads registry records the snapshot may not reflect (a re-read record, a
+        // persisted classification): check the holds again even when the snapshot is unchanged.
+        requestAutomaticCrashHoldConfirmation()
     }
 
     /// Persists Let finish for exactly the displayed runtime revision; it keeps watching and keeps
@@ -158,6 +165,8 @@ extension AgentRecoveryCoordinator {
         guard snapshot != runtimeRestrictions else { return }
         runtimeRestrictions = snapshot
         postCoordinatorDidChange()
+        // A process exit (or a Refresh) may now prove a crash hold's processes exited.
+        requestAutomaticCrashHoldConfirmation()
     }
 
     static func runtimeSendRefusalReason(_ restriction: AgentRuntimeRestriction) -> String {

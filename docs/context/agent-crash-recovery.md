@@ -2,7 +2,7 @@
 
 Scope: read when the task touches composer draft or queued-input persistence, durable send acknowledgement, quit or window-close preservation, the surviving-process registry, interrupted-turn state, delivery wording, the Needs Attention list, or Resume, Check, Reconcile and Continue after an app restart.
 Authority: Authoritative
-Last-verified: 2026-10-29
+Last-verified: 2026-11-04
 
 This feature is implemented and in production. Its completed plan, the per-step record and all review evidence are in [the lossless-restart spec](plans/completed/2026-10-18-lossless-app-restart-spec.md). Read it only when you need history; this page holds the durable facts.
 
@@ -59,10 +59,30 @@ This feature is implemented and in production. Its completed plan, the per-step 
 - Recovered intents become held input that needs one click; they never rejoin live queues.
   - The `previousInstance` hold is derived from the app-instance ID, never written.
 - `AgentProcessRegistry` reserves a runtime record before spawn and marks it live before the first message. Process identity is boot session, PID, start time and UID; the launcher sets `RPCE_RUNTIME_ID`.
-  - The registry records `writerPID`. Survivor rows show the process count, the launcher PID and the agent PID.
+  - Survivor rows show the process count, the launcher PID and the agent PID. `writerPID` is derived for display from the recorded writer members (the first one that isn't the root).
+  - `rootAlive` and `discoveryComplete` are display only. `rootAlive` is `false` when the record proves the root gone (`rootReaped`, or `toolsRemaining`), else the latest pass this launch, else unknown. `discoveryComplete` says that pass saw every recorded member alive and its result is saved. Both are kept only while the record reflects that pass. Ownership, admission and crash-hold proof never read them; a change republishes the snapshot.
+    - Root exited with a writer recorded: only the launcher exited; the agent is named as still running. No quit advice.
+    - Root exited without a writer: the row names the remaining member PIDs (at most five, then "and N more"), for example an orphaned Claude Code shell-snapshot `bash`.
+    - They are called running only when verified (`live`, `toolsRemaining`, or a complete, saved pass such as one detached at quit). Only then does the row advise checking each PID's command and start time before quitting it yourself. Otherwise they "may still be running", with no advice.
+    - With no members left, sending stays paused "until RepoPrompt confirms they exited".
   - Denied inspection means unknown, never exited.
 - **Two-writer rule:** no second managed writer while a recorded writer or launcher is alive, reserved or unverifiable.
-  - A crash hold is released by Check (confirmed exit) or Let it finish. Nothing is signalled automatically.
+  - A crash hold ("Sending paused") is released by "It stopped", by Check (confirmed exit) or by Let it finish. Nothing is signalled automatically.
+  - **Automatic confirmation (owner decision 2026-10-31):** the app runs Check's process-record proof on its own (`AgentRecoveryCoordinator+AutomaticCrashHoldConfirmation.swift`).
+    - A pass over every hold runs once startup is ready, when the adopted runtime snapshot changes (a watched process exits), after every Refresh and when a shutdown freeze ends.
+    - A pass over one session runs when its lane is claimed (opened), when a recovery action or It stopped releases it, when a crash-hold row it skipped leaves `.working` (Check, Open, Refresh or any row action; `setCatalogActionState`), and when a save retry covering it fires.
+    - Requests during a pass merge into one rerun. It never refreshes the registry itself.
+    - It writes the same acknowledgement as Check, settling every qualifying uncertain intent to `deliveryUnknown` (`.everyIntent`), and never resends. Dismissed holds are confirmed too.
+    - It is gated like Check (`isAvailable(.reconcileOnly)`, wired in `AgentRecoveryAppComposition`) and is off by default in tests that attach a registry directly.
+    - Confirming lets already-authorized scheduled sends run, as "It stopped" does.
+    - Holds the proof can't cover still need the user, by owner decision: intent-only holds, legacy turns, runs not registered at run start, and processes that may still run. So do exits the registry can't watch, until Refresh.
+    - The card and the paused indicator show the typed reason (`AgentRecoveryAutomaticCrashHoldRefusal`: a proof reason `AgentRecoveryCrashHoldNeedsYouReason`, or `saveFailed`) and offer Refresh for possibly-running or unidentified processes and for a failed save. The wording never promises that sending will resume. The reason is cleared however the hold is confirmed (`publishCrashHoldConfirmation`). Transient refusals (busy, changed, closing, snapshot catching up) keep the last reason.
+    - A failed save of a proven confirmation is retried after `automaticCrashHoldSaveRetryDelays` (5 s, 30 s, 2 min), then only on later triggers.
+      - Each hold is charged one delay per timer that covers it, never again while it is covered.
+      - A retry that finds the hold deferred schedules none; that hold's own trigger runs it again.
+      - A sooner retry replaces a later pending one, keeping its coverage. Timers carry an identity token, and the timer is cancelled when no failure is left.
+      - The banner's `saveFailed(retrying:)` is true only while a timer covers the hold.
+    - While it claims a session (proof to commit), Check and It stopped wait for that session's claim only, and `beginRecoveryAction` refuses ("session action in flight"). While It stopped confirms a session, the automatic path leaves it alone. Check reports a hold confirmed meanwhile as "This session's pause was already confirmed."
 - **Quit** runs in two stages within one 8-second deadline:
   - Stage A is reversible: freeze admission, commit records, flush sessions.
   - Stage B tears down.
@@ -93,6 +113,9 @@ This feature is implemented and in production. Its completed plan, the per-step 
 - After a second kill, an orphan tool result can show as a duplicate row.
 - If the app is force-killed after Stage A of a quit, the crash wording is lost.
 - Older builds may not decode the `notConfirmedByAgent` delivery value persisted in transcripts.
+- **Unknown-role orphan blocks sending.** A process discovery can't classify (`.unknown` role) keeps the runtime restricted indefinitely after the root exits, for example Claude Code's shell-snapshot `bash -c -l` hung while sourcing the user's `.bashrc`. Recovered Stop is off.
+  - Owner-agreed rules: never classify a process as a tool from its name, `ppid == 1`, age or having no children. Never release ownership by timeout or an unconditional override. Never hand-edit `AgentRecovery/v1/`.
+  - Manual path: inspect it (`ps -p PID -o pid,ppid,pgid,lstart,etime,state,command`, `lsof -nP -p PID`, `pgrep -P PID`), confirm its identity, `kill -TERM` that one PID only, and let the exit watch reconcile (Refresh if needed).
 
 ## Validation
 - **Recovery suites:**

@@ -84,7 +84,8 @@ extension AgentModeViewModel {
             attachments: AgentAttachmentStripSnapshot(
                 scopeTabID: tabID,
                 imageAttachments: pendingImageAttachments,
-                taggedFileAttachments: pendingTaggedFileAttachments
+                taggedFileAttachments: pendingTaggedFileAttachments,
+                documentAttachments: pendingDocumentAttachments
             ),
             scheduledSend: scheduledSend,
             staleResetRecovery: session.flatMap { staleResetRecoveryProps(for: $0) },
@@ -122,7 +123,8 @@ extension AgentModeViewModel {
             fileTagLookupContextIdentity: agentWorkspaceLookupContextIdentity(tabID: tabID, session: session),
             delegatedQuestions: delegatedQuestionBannerRows(forParentTabID: tabID),
             recoveryList: recoveryListProps(forActiveSession: session),
-            isShutdownFrozen: isShutdownFrozen
+            isShutdownFrozen: isShutdownFrozen,
+            documentImport: composerDocumentImportProps(tabID: tabID)
         )
     }
 

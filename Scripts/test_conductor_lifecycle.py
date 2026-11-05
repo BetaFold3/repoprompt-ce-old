@@ -6463,7 +6463,13 @@ class RunScriptTransitionTests(unittest.TestCase):
                     class ProcessIdentityError(Exception):
                         pass
 
-                    def matching_processes(_executable):
+                    def read_bundle_identifier(_bundle):
+                        return None
+
+                    def processes_registered_elsewhere(_bundle, _bundle_id, _name):
+                        return []
+
+                    def matching_processes(_executable, exact_only=False):
                         Path(os.environ['PROCESS_HELPER_MARKER']).write_text('invoked')
                         return []
 
@@ -6530,6 +6536,12 @@ class RunScriptTransitionTests(unittest.TestCase):
                     class ProcessIdentityError(Exception):
                         pass
 
+                    def read_bundle_identifier(_bundle):
+                        return None
+
+                    def processes_registered_elsewhere(_bundle, _bundle_id, _name):
+                        return []
+
                     def _state():
                         return "launched" if Path(os.environ["LAUNCHED_MARKER"]).exists() else "stopped"
 
@@ -6537,7 +6549,7 @@ class RunScriptTransitionTests(unittest.TestCase):
                         with Path(os.environ["EVENT_LOG"]).open("a", encoding="utf-8") as handle:
                             handle.write(f"{operation}:{_state()}:{executable}\\n")
 
-                    def matching_processes(executable):
+                    def matching_processes(executable, exact_only=False):
                         _log("list", executable)
                         return [4242] if _state() == "launched" else []
 
@@ -6652,6 +6664,12 @@ class RunScriptTransitionTests(unittest.TestCase):
                     class ProcessIdentityError(Exception):
                         pass
 
+                    def read_bundle_identifier(_bundle):
+                        return None
+
+                    def processes_registered_elsewhere(_bundle, _bundle_id, _name):
+                        return []
+
                     def _state():
                         return "launched" if Path(os.environ["LAUNCHED_MARKER"]).exists() else "stopped"
 
@@ -6659,7 +6677,7 @@ class RunScriptTransitionTests(unittest.TestCase):
                         with Path(os.environ["EVENT_LOG"]).open("a", encoding="utf-8") as handle:
                             handle.write(f"{operation}:{_state()}:{executable}\\n")
 
-                    def matching_processes(executable):
+                    def matching_processes(executable, exact_only=False):
                         _log("list", executable)
                         return [4242] if _state() == "launched" else []
 
@@ -6864,7 +6882,10 @@ class AppStatusIdentityTests(unittest.TestCase):
             ({"optimizedIncremental": True, "appArgs": ["--demo"], "subcommand": "relaunch"}, "debug-optimized-incremental"),
         )
         for args, config in cases:
-            with self.subTest(args=args), mock.patch.object(
+            # A nonexistent live bundle keeps the same-bundle-ID preflight off the host's real LaunchServices state.
+            with self.subTest(args=args), tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+                os.environ, {"REPOPROMPT_DEBUG_APP_BUNDLE": str(Path(tmp) / "missing" / "RepoPrompt.app")}
+            ), mock.patch.object(
                 conductor, "package_debug_app_under_heavy", return_value=(0, Path("/tmp/staged/RepoPrompt.app"))
             ) as package, mock.patch.object(conductor, "operation_app_launch_existing", return_value=0) as launch:
                 code = conductor.operation_debug_app_build_then_launch(Path("/tmp/repo"), dict(args))
@@ -6948,6 +6969,96 @@ class AppStatusIdentityTests(unittest.TestCase):
             self.assertTrue(compatibility_bundle.is_symlink())
             self.assertEqual(compatibility_bundle.resolve(strict=True), live.resolve(strict=True))
 
+    def test_same_bundle_id_instance_elsewhere_blocks_before_stop_activation_or_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            live = root / "DebugApps" / "RepoPrompt.app"
+            staged = root / "DebugApps" / ".staging" / "token" / "RepoPrompt.app"
+            self.make_bundle(live, "current")
+            self.make_bundle(staged, "new")
+            variant = root / "DebugApps" / ".RepoPrompt-variant.app"
+            output = io.StringIO()
+            with mock.patch.dict(os.environ, {"REPOPROMPT_DEBUG_APP_BUNDLE": str(live)}), mock.patch.object(
+                conductor, "machine_exclusive_lock", return_value=contextlib.nullcontext()
+            ), mock.patch.object(conductor, "report_launch_bundle_details"), mock.patch.object(
+                conductor, "read_bundle_identifier", return_value="com.example.debug"
+            ) as read_id, mock.patch.object(
+                conductor, "processes_registered_elsewhere", return_value=[(13855, variant)]
+            ) as elsewhere, mock.patch.object(
+                conductor, "_operation_app_stop_unlocked", return_value=0
+            ) as stop, mock.patch.object(conductor, "activate_staged_debug_bundle") as activate, mock.patch.object(
+                conductor, "run_operation_command", return_value=(0, "", "")
+            ) as launch, contextlib.redirect_stdout(output):
+                code = conductor.operation_app_launch_existing(root, {"stagedBundle": str(staged)})
+
+            self.assertEqual(code, 1)
+            read_id.assert_called_once_with(staged)
+            elsewhere.assert_called_once_with(live, "com.example.debug", "RepoPrompt")
+            stop.assert_not_called()
+            activate.assert_not_called()
+            launch.assert_not_called()
+            self.assertIn(f"PID 13855: {variant}", output.getvalue())
+            self.assertIn("Quit that app first", output.getvalue())
+            self.assertFalse(staged.exists())
+            self.assertEqual((live / "Contents" / "MacOS" / "RepoPrompt").read_text(encoding="utf-8"), "current")
+
+    def test_launch_confirmation_requires_exact_executable_and_reports_reactivated_stale_instance(self) -> None:
+        calls: list[dict[str, bool]] = []
+
+        def fake_matching(_executable: Path, exact_only: bool = False) -> list[int]:
+            calls.append({"exact_only": exact_only})
+            return [] if exact_only else [90908]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            live = root / "DebugApps" / "RepoPrompt.app"
+            self.make_bundle(live, "current")
+            output = io.StringIO()
+            with mock.patch.dict(os.environ, {"REPOPROMPT_DEBUG_APP_BUNDLE": str(live)}), mock.patch.object(
+                conductor, "machine_exclusive_lock", return_value=contextlib.nullcontext()
+            ), mock.patch.object(conductor, "report_launch_bundle_details"), mock.patch.object(
+                conductor, "report_same_bundle_id_instances_elsewhere", return_value=False
+            ), mock.patch.object(conductor, "_operation_app_stop_unlocked", return_value=0) as stop, mock.patch.object(
+                conductor, "run_operation_command", return_value=(0, "", "")
+            ), mock.patch.object(conductor, "matching_processes", side_effect=fake_matching), contextlib.redirect_stdout(output):
+                launched = conductor.wait_for_debug_app_process(timeout=0.0)
+                confirmation_calls = list(calls)
+                calls.clear()
+                with mock.patch.object(conductor, "wait_for_debug_app_process", return_value=[]):
+                    code = conductor.operation_app_launch_existing(root, {"appArgs": []})
+
+        self.assertEqual(launched, [])
+        self.assertTrue(confirmation_calls, confirmation_calls)
+        self.assertTrue(all(call == {"exact_only": True} for call in confirmation_calls), confirmation_calls)
+        self.assertEqual(code, 1)
+        self.assertEqual(calls, [{"exact_only": False}])
+        self.assertIn("macOS reactivated a stale instance still registered for this bundle (PID(s): 90908)", output.getvalue())
+        self.assertIn("Stopped stale PID(s) 90908", output.getvalue())
+        self.assertIn("./conductor app launch-existing", output.getvalue())
+        self.assertNotIn("Observed launched", output.getvalue())
+        self.assertEqual(stop.call_count, 2)
+
+    def test_build_then_launch_refuses_known_same_bundle_id_conflict_before_packaging(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            live = root / "DebugApps" / "RepoPrompt.app"
+            self.make_bundle(live, "current")
+            output = io.StringIO()
+            with mock.patch.dict(os.environ, {"REPOPROMPT_DEBUG_APP_BUNDLE": str(live)}), mock.patch.object(
+                conductor, "read_bundle_identifier", return_value="com.example.debug"
+            ), mock.patch.object(
+                conductor, "processes_registered_elsewhere", return_value=[(13855, root / "DebugApps" / ".variant.app")]
+            ), mock.patch.object(conductor, "package_debug_app_under_heavy") as package, mock.patch.object(
+                conductor, "operation_app_launch_existing"
+            ) as launch, contextlib.redirect_stdout(output):
+                code = conductor.operation_debug_app_build_then_launch(root, {"subcommand": "relaunch"})
+
+        self.assertEqual(code, 1)
+        package.assert_not_called()
+        launch.assert_not_called()
+        self.assertIn("PID 13855", output.getvalue())
+        self.assertIn("No package, stop or launch was performed.", output.getvalue())
+
     def test_launch_existing_falls_back_when_launch_services_cannot_resolve_verified_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -7025,7 +7136,9 @@ class AppStatusIdentityTests(unittest.TestCase):
         self.assertIn("existing debug app bundle is not launchable", output.getvalue())
 
     def test_split_build_failure_performs_no_lifecycle_action(self) -> None:
-        with mock.patch.object(conductor, "package_debug_app_under_heavy", return_value=(23, None)) as package, mock.patch.object(
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ, {"REPOPROMPT_DEBUG_APP_BUNDLE": str(Path(tmp) / "missing" / "RepoPrompt.app")}
+        ), mock.patch.object(conductor, "package_debug_app_under_heavy", return_value=(23, None)) as package, mock.patch.object(
             conductor, "operation_app_launch_existing"
         ) as launch, contextlib.redirect_stdout(io.StringIO()) as output:
             code = conductor.operation_debug_app_build_then_launch(Path("/tmp/repo"), {"appArgs": []})

@@ -67,6 +67,8 @@ extension AgentModeViewModel {
         case targetRejected(reason: String)
         case initialWorktreePreparationInProgress
         case executionLocationChangeInProgress
+        /// Attached documents are still being copied into managed storage for this composer.
+        case documentImportInProgress
 
         var diagnosticReason: String {
             switch self {
@@ -82,6 +84,8 @@ extension AgentModeViewModel {
                 "initial_worktree_preparation_in_progress"
             case .executionLocationChangeInProgress:
                 "execution_location_change_in_progress"
+            case .documentImportInProgress:
+                "document_import_in_progress"
             }
         }
     }
@@ -686,6 +690,7 @@ extension AgentModeViewModel {
         let workflow: AgentWorkflowDefinition?
         let imageAttachments: [AgentImageAttachment]
         let taggedFileAttachments: [AgentTaggedFileAttachment]
+        let documentAttachments: [AgentDocumentAttachment]
         let initialStartLocation: AgentInitialStartLocation
         let remoteHost: AgentSessionRemoteHostBinding?
 
@@ -693,6 +698,7 @@ extension AgentModeViewModel {
             workflow == nil
                 && imageAttachments.isEmpty
                 && taggedFileAttachments.isEmpty
+                && documentAttachments.isEmpty
                 && initialStartLocation == .local
                 && remoteHost == nil
         }

@@ -2687,6 +2687,7 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
             providerText: submission.providerText,
             images: submission.images,
             taggedFileAttachments: submission.taggedFileAttachments,
+            documentAttachments: submission.documentAttachments,
             model: selection.model,
             reasoningEffort: selection.reasoningEffort,
             serviceTier: selection.serviceTier,
@@ -2956,6 +2957,12 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
             )
             return
         }
+        // Attached documents are rechecked before any dispatch evidence is written (their manifest is
+        // already in the provider text), and again at the handoff below.
+        if let blocked = codexDocumentHandoffBlockedMessage(head.documentAttachments, session: session) {
+            await failCodexFallbackDispatchForDocuments(session: session, entry: head, message: blocked, evidence: nil)
+            return
+        }
         // Durable heads commit `dispatching` before the handoff; untracked heads (admission
         // inactive) write nothing. Revalidate the exact claim and controller after the await.
         let evidence: AgentRecoveryDispatchEvidence
@@ -2985,6 +2992,10 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
             )
             return
         }
+        // A successor attempt claimed above takes its own ownership on the retained route before
+        // its input reaches Codex. Placed here so the delivered-drop check and the final synchronous
+        // ownership check below revalidate the claim, controller and run after this await.
+        await refreshCodexRunAttemptRichPresentation(session: session, runID: head.originRunID)
         if dropDeliveredClaimedCodexFallbackIfNeeded(head, session: session) {
             evidence.noteNoHandoff(message: "Codex already accepted this MCP attempt through another dispatch.")
             return
@@ -3008,6 +3019,12 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
             } else {
                 holdDurableCodexFallbackInput(head.identity, session: session, after: evidence)
             }
+            return
+        }
+        // Final document check at the handoff, synchronous so no suspension separates it from
+        // `startUserTurn`: an original removed after enqueue sends nothing.
+        if let blocked = codexDocumentHandoffBlockedMessage(head.documentAttachments, session: session) {
+            await failCodexFallbackDispatchForDocuments(session: session, entry: head, message: blocked, evidence: evidence)
             return
         }
         let usageDispatchTicket = session.registerCodexUsageDispatch(requestedModel: head.model)
@@ -3073,6 +3090,143 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
                 evidence: evidence
             )
         }
+    }
+
+    package static let codexDocumentHostUnavailableMessage =
+        "Attached documents could not be checked before sending. Nothing was sent."
+
+    /// Re-preflights attached documents at a Codex handoff through the host's owning document store
+    /// (the store the documents were imported into). Synchronous, so a caller can run it with no
+    /// suspension before the handoff. With no host, nothing is sent.
+    private func codexDocumentHandoffBlockedMessage(
+        _ documents: [AgentDocumentAttachment],
+        session: AgentTabSession
+    ) -> String? {
+        guard !documents.isEmpty else { return nil }
+        guard let viewModel else { return Self.codexDocumentHostUnavailableMessage }
+        return viewModel.documentAttachmentBlockedMessage(documents, session: session)
+    }
+
+    /// A direct Codex send refused by its handoff document check: nothing was handed off. Durable
+    /// input is held for recovery (its intent is the only copy, never restored as a draft);
+    /// untracked input returns its images, document records, and manual draft text to the
+    /// composer, except a scheduled attempt's input, which its schedule keeps (never duplicated
+    /// into the composer). An already-active run is not ended by one refused steer.
+    private func rejectCodexSendForDocuments(
+        session: AgentTabSession,
+        identity: AgentQueuedInputIdentity,
+        context: AgentTabSession.CodexFallbackSubmissionContext?,
+        evidence: AgentRecoveryDispatchEvidence,
+        message: String,
+        attachmentReservationID: UUID?,
+        terminalize: Bool
+    ) async -> NativeSendOutcome {
+        clearCodexPendingAuthRetryTurn(session)
+        evidence.noteNoHandoff(message: message)
+        if identity.isDurable {
+            await rejectDurableCodexSendBeforeHandoff(
+                session: session,
+                identity: identity,
+                evidence: evidence,
+                message: message,
+                attachmentReservationID: attachmentReservationID,
+                terminalize: terminalize
+            )
+            return .stale(reason: message)
+        }
+        let scheduledInput = session.isScheduledAttemptInput(identity)
+        if scheduledInput {
+            // B N3: a scheduled attempt's schedule keeps its one copy (payload and bubble) and
+            // settles the attempt from this outcome; nothing also returns to the composer. Its
+            // image reservation is released without restoring or deleting the files.
+            viewModel?.finalizeAttachmentsForTurn(
+                for: session,
+                reservationID: attachmentReservationID,
+                disposition: .keepFiles
+            )
+        } else {
+            // Untracked input returns whole (images, tagged files, documents; deduplicated by ID)
+            // before its optimistic bubble is removed (B N12).
+            viewModel?.finalizeAttachmentsForTurn(
+                for: session,
+                reservationID: attachmentReservationID,
+                disposition: .restoreToPending
+            )
+            if let context {
+                let pendingTaggedIDs = Set(session.pendingTaggedFileAttachments.map(\.id))
+                session.pendingTaggedFileAttachments.append(contentsOf: context.taggedFileAttachments.filter {
+                    !pendingTaggedIDs.contains($0.id)
+                })
+                let pendingDocumentIDs = Set(session.pendingDocumentAttachments.map(\.id))
+                session.pendingDocumentAttachments.append(contentsOf: context.documentAttachments.filter {
+                    !pendingDocumentIDs.contains($0.id)
+                })
+            }
+            removeUntrackedOptimisticUserItem(identity, session: session)
+        }
+        if let context, !scheduledInput {
+            if case .manual = context.origin,
+               !context.draftText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            {
+                viewModel?.restoreCodexFallbackDraft(tabID: session.tabID, text: context.draftText, message: message)
+            }
+        }
+        if terminalize {
+            await finalizeCodexRun(
+                session,
+                turnStatus: .failed,
+                reason: "send-documents-unavailable",
+                errorMessage: message,
+                notifyOnCompleted: false
+            )
+        } else {
+            session.appendItem(AgentChatItem.error(message, sequenceIndex: session.nextSequenceIndex))
+            setRunningStatus(nil, source: nil, session: session)
+            viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+            viewModel?.scheduleSave(for: session.tabID)
+        }
+        return .failed(message: message)
+    }
+
+    /// A queued fallback refused by its document check: nothing was handed off. Durable input is
+    /// held (its intent keeps its text and document records, never duplicated as a draft);
+    /// untracked manual input also returns its draft text, as its images and documents return
+    /// through `failCodexFallbackDispatch`.
+    private func failCodexFallbackDispatchForDocuments(
+        session: AgentTabSession,
+        entry: AgentTabSession.CodexFallbackQueueEntry,
+        message: String,
+        evidence: AgentRecoveryDispatchEvidence?
+    ) async {
+        evidence?.noteNoHandoff(message: message)
+        await failCodexFallbackDispatch(session: session, entry: entry, message: message, evidence: evidence)
+        if !entry.identity.isDurable {
+            // Its images and documents returned above; its tagged files return too, deduplicated
+            // by ID, before the optimistic bubble is removed (B N12).
+            let pendingTaggedIDs = Set(session.pendingTaggedFileAttachments.map(\.id))
+            session.pendingTaggedFileAttachments.append(contentsOf: entry.taggedFileAttachments.filter {
+                !pendingTaggedIDs.contains($0.id)
+            })
+        }
+        removeUntrackedOptimisticUserItem(entry.identity, session: session)
+        if !entry.identity.isDurable, case .manual = entry.origin,
+           !entry.draftText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+            viewModel?.restoreCodexFallbackDraft(tabID: session.tabID, text: entry.draftText, message: message)
+        }
+    }
+
+    /// Untracked input refused before any handoff returns to the composer; its optimistic bubble
+    /// goes too, so a retry never shows the turn twice (same as fallback-queue teardown). Durable
+    /// input keeps its deterministic bubble.
+    private func removeUntrackedOptimisticUserItem(_ identity: AgentQueuedInputIdentity, session: AgentTabSession) {
+        guard !identity.isDurable,
+              let userItemID = identity.userItemID,
+              let index = session.items.firstIndex(where: { $0.id == userItemID && $0.kind == .user })
+        else { return }
+        _ = session.removeItem(at: index)
+        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+        viewModel?.scheduleSave(for: session.tabID)
     }
 
     /// Logs and surfaces an acceptance whose durable evidence could not be written: the record
@@ -3164,6 +3318,11 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
                 reservationID: entry.attachmentReservationID,
                 disposition: .restoreToPending
             )
+            // Document records return to the composer too (their originals are never deleted).
+            let pendingDocumentIDs = Set(session.pendingDocumentAttachments.map(\.id))
+            session.pendingDocumentAttachments.append(contentsOf: entry.documentAttachments.filter {
+                !pendingDocumentIDs.contains($0.id)
+            })
         }
         session.appendItem(.error(message, sequenceIndex: session.nextSequenceIndex))
         if session.activeRunOwnership != nil {
@@ -3229,6 +3388,10 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
                 let pendingTaggedIDs = Set(session.pendingTaggedFileAttachments.map(\.id))
                 session.pendingTaggedFileAttachments.append(contentsOf: entry.taggedFileAttachments.filter {
                     !pendingTaggedIDs.contains($0.id)
+                })
+                let pendingDocumentIDs = Set(session.pendingDocumentAttachments.map(\.id))
+                session.pendingDocumentAttachments.append(contentsOf: entry.documentAttachments.filter {
+                    !pendingDocumentIDs.contains($0.id)
                 })
                 if case .manual = entry.origin,
                    !entry.draftText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -4023,6 +4186,23 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
         viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
     }
 
+    /// Delivers the session's current run attempt ownership to the Codex run's live routed MCP
+    /// connections (rich-presentation authority and grant only), without a transport lease or a
+    /// controller change. Skipped when Codex tooling is unmanaged or no attempt is current.
+    private func refreshCodexRunAttemptRichPresentation(session: AgentTabSession, runID: UUID) async {
+        guard shouldManageCodexTooling,
+              session.runID == runID,
+              let ownership = session.activeRunOwnership,
+              session.isCurrentRunAttemptForCurrentBinding(ownership),
+              let clientName = AgentProviderKind.codexExec.mcpClientNameHint
+        else { return }
+        await runCoordinator.mcpHost.refreshRunAttemptRichPresentation(
+            for: clientName,
+            runID: runID,
+            runOwnership: ownership
+        )
+    }
+
     private func makeCodexRunLease(
         tabID: UUID,
         runID: UUID,
@@ -4031,7 +4211,8 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
         allowsAgentExternalControlTools: Bool = false,
         additionalRestrictedTools: Set<String> = [],
         runHasNativeShell: Bool = false,
-        codeModeEligibility: MCPCodeModeEligibility = .native
+        codeModeEligibility: MCPCodeModeEligibility = .native,
+        runOwnership: AgentRunOwnership?
     ) -> MCPBootstrapLease? {
         guard shouldManageCodexTooling else { return nil }
         viewModel?.bindPendingOracleReviewContext(tabID: tabID, runID: runID)
@@ -4046,7 +4227,8 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
             allowsAgentExternalControlTools: allowsAgentExternalControlTools,
             additionalRestrictedTools: additionalRestrictedTools,
             runHasNativeShell: runHasNativeShell,
-            codeModeEligibility: codeModeEligibility
+            codeModeEligibility: codeModeEligibility,
+            runOwnership: runOwnership
         )
         return MCPBootstrapLease(
             spec: leaseSpec,
@@ -5276,7 +5458,10 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
                 // companion entry this launch carries (Knowledge normalizes to native).
                 codeModeEligibility: Self.codexCodeModeEligibility(
                     companionServerName: session.codexController?.readOnlyCompanionServerName
-                )
+                ),
+                // The attempt admitted before this send (runner, compaction or fallback
+                // successor); a later attempt on the retained thread refreshes it below.
+                runOwnership: session.activeRunOwnership
             ) else { return }
             let acquired = await lease.acquire()
             guard acquired else { return }
@@ -5312,6 +5497,10 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
             return
         }
         guard requiresTransportStart else {
+            // Retained thread: no new transport lease. The current attempt's ownership reaches the
+            // live routed connection in place (rich-presentation part only, so the delegation
+            // policy keeps its transport-scoped lifetime); the controller is never replaced.
+            await refreshCodexRunAttemptRichPresentation(session: session, runID: runID)
             await ensureCodexToolTrackingForReadySessionIfNeeded(for: session, runID: runID)
             return
         }
@@ -5922,6 +6111,22 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
                     terminalizeRefusal: terminalizeRejectedSend && !wasRunAlreadyActive
                 )
             }
+        }
+
+        // Attached documents are re-preflighted at the handoff itself (the send's immutable
+        // submission context carries the records; its text already has their manifest), with no
+        // suspension before `turn/start` / `turn/steer`: an original removed after admission or
+        // enqueue sends nothing.
+        if let blocked = codexDocumentHandoffBlockedMessage(fallbackContext?.documentAttachments ?? [], session: session) {
+            return await rejectCodexSendForDocuments(
+                session: session,
+                identity: sendIdentity,
+                context: fallbackContext,
+                evidence: dispatchEvidence,
+                message: blocked,
+                attachmentReservationID: attachmentReservationID,
+                terminalize: terminalizeRejectedSend && !wasRunAlreadyActive
+            )
         }
 
         // Only `turn/start` dispatches register accounting work; `turn/steer` joins the already

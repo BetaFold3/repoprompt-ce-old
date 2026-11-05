@@ -22,6 +22,7 @@ struct AgentScheduledSendBanner: View {
     @State private var editorRunAlongside: Bool
     @State private var editorRemovedImageIDs: Set<UUID> = []
     @State private var editorRemovedTaggedFileIDs: Set<UUID> = []
+    @State private var editorRemovedDocumentIDs: Set<UUID> = []
     @State private var actionError: String?
     @State private var isActionInFlight = false
 
@@ -130,6 +131,7 @@ struct AgentScheduledSendBanner: View {
             editorRunAlongside = newProps.runAlongsideOtherSessions
             editorRemovedImageIDs = []
             editorRemovedTaggedFileIDs = []
+            editorRemovedDocumentIDs = []
         }
     }
 
@@ -173,7 +175,8 @@ struct AgentScheduledSendBanner: View {
                     snapshot: editorAttachments,
                     allowsRemoval: true,
                     onRemoveImage: { editorRemovedImageIDs.insert($0) },
-                    onRemoveTaggedFile: { editorRemovedTaggedFileIDs.insert($0) }
+                    onRemoveTaggedFile: { editorRemovedTaggedFileIDs.insert($0) },
+                    onRemoveDocument: { editorRemovedDocumentIDs.insert($0) }
                 )
                 .equatable()
             }
@@ -213,6 +216,9 @@ struct AgentScheduledSendBanner: View {
             },
             taggedFileAttachments: props.attachments.taggedFileAttachments.filter {
                 !editorRemovedTaggedFileIDs.contains($0.id)
+            },
+            documentAttachments: props.attachments.documentAttachments.filter {
+                !editorRemovedDocumentIDs.contains($0.id)
             }
         )
     }
@@ -234,6 +240,7 @@ struct AgentScheduledSendBanner: View {
         editorRunAlongside = props.runAlongsideOtherSessions
         editorRemovedImageIDs = []
         editorRemovedTaggedFileIDs = []
+        editorRemovedDocumentIDs = []
         editorMode = mode
     }
 
@@ -248,7 +255,8 @@ struct AgentScheduledSendBanner: View {
                 editorNotBefore,
                 editorRunAlongside,
                 editorRemovedImageIDs,
-                editorRemovedTaggedFileIDs
+                editorRemovedTaggedFileIDs,
+                editorRemovedDocumentIDs
             )
             isActionInFlight = false
             actionError = error

@@ -31,6 +31,11 @@ package enum MCPToolCapability: CaseIterable, Hashable {
     case workspaceSteering
     /// `code_mode`: scripts over the four exploration tools, gated by per-run eligibility.
     case codeMode
+    /// Inline rich presentation (`present_rich`). Granted only to a trusted local Agent Mode run
+    /// attempt whose captured workspace policy is enabled (`AgentRichPresentationToolPolicy`);
+    /// never a static grant, never to discovery, Oracle, external or unbound clients. The tool
+    /// stays unregistered until the rich-presentation spec's Step 4.
+    case richPresentation
 
     /// Stable snake_case name for MCP discovery serialization.
     var externalName: String {
@@ -57,6 +62,7 @@ package enum MCPToolCapability: CaseIterable, Hashable {
         case .appSettings: "app_settings"
         case .workspaceSteering: "workspace_steering"
         case .codeMode: "code_mode"
+        case .richPresentation: "rich_presentation"
         }
     }
 }
@@ -133,6 +139,9 @@ package enum MCPToolCapabilities {
         ],
         .codeMode: [
             "code_mode"
+        ],
+        .richPresentation: [
+            "present_rich"
         ]
     ]
 

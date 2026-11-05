@@ -41,7 +41,13 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Deque, Dict, FrozenSet, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from debug_app_process import ProcessIdentityError, matching_processes, terminate_matching_processes
+from debug_app_process import (
+    ProcessIdentityError,
+    matching_processes,
+    processes_registered_elsewhere,
+    read_bundle_identifier,
+    terminate_matching_processes,
+)
 
 
 def _load_sibling_helper(stem: str) -> Any:
@@ -7795,8 +7801,31 @@ def debug_app_executable_path() -> Path:
     return debug_app_bundle_path() / "Contents" / "MacOS" / "RepoPrompt"
 
 
-def find_debug_app_pids() -> List[str]:
-    return [str(pid) for pid in matching_processes(debug_app_executable_path())]
+def find_debug_app_pids(exact_only: bool = False) -> List[str]:
+    return [str(pid) for pid in matching_processes(debug_app_executable_path(), exact_only=exact_only)]
+
+
+def report_same_bundle_id_instances_elsewhere(bundle: Path, bundle_id_source: Path) -> bool:
+    """Print an error and return True when another bundle with the debug app's ID is running."""
+    bundle_id = read_bundle_identifier(bundle_id_source)
+    if not bundle_id:
+        return False
+    try:
+        others = processes_registered_elsewhere(bundle, bundle_id, "RepoPrompt")
+    except ProcessIdentityError as exc:
+        print(f"WARNING: could not check for other {bundle_id} instances: {exc}", flush=True)
+        return False
+    if not others:
+        return False
+    print(
+        f"ERROR: another app with bundle ID {bundle_id} is running from a different bundle, so macOS would "
+        f"only reactivate it instead of launching {bundle}:",
+        flush=True,
+    )
+    for pid, path in others:
+        print(f"  PID {pid}: {path}", flush=True)
+    print("Quit that app first (conductor never signals other bundles), then retry.", flush=True)
+    return True
 
 
 def execution_location_ui_smoke_timeout(env: Dict[str, str]) -> float:
@@ -7936,13 +7965,16 @@ def wait_for_no_debug_app_process(timeout: float = 5.0) -> bool:
 
 
 def wait_for_debug_app_process(timeout: float = STARTUP_TIMEOUT_SECONDS) -> List[str]:
+    # Exact executable path only: a fresh launch always runs the bundle's current executable, while a
+    # LaunchServices-only match would be a stale instance that `open -n` merely reactivated.
     deadline = now() + timeout
-    while now() <= deadline:
-        pids = find_debug_app_pids()
+    while True:
+        pids = find_debug_app_pids(exact_only=True)
         if pids:
             return pids
+        if now() > deadline:
+            return []
         time.sleep(APP_STOP_POLL_SECONDS)
-    return []
 
 
 def guard_delayed_debug_app_launch() -> int:
@@ -8179,6 +8211,8 @@ def operation_app_launch_existing(repo_root: Path, args: Dict[str, Any]) -> int:
         with machine_exclusive_lock(live_app_lock_path(), metadata, "live-app lock"):
             if staged_bundle is None:
                 report_launch_bundle_details(repo_root, bundle)
+            if report_same_bundle_id_instances_elsewhere(bundle, staged_bundle or bundle):
+                return 1
             print("Stopping existing RepoPrompt CE debug app instance", flush=True)
             stop_code = _operation_app_stop_unlocked(repo_root, {"guardDelayedLaunch": bool(args.get("guardDelayedLaunch"))})
             if stop_code != 0:
@@ -8216,7 +8250,24 @@ def operation_app_launch_existing(repo_root: Path, args: Dict[str, Any]) -> int:
                 return 1
             if not launched_pids:
                 print("ERROR: launch request returned, but no matching RepoPrompt CE debug app process appeared within 10 seconds.", flush=True)
-                _operation_app_stop_unlocked(repo_root, {"guardDelayedLaunch": True})
+                try:
+                    stale_pids = find_debug_app_pids()
+                except ProcessIdentityError as exc:
+                    stale_pids = []
+                    print(f"ERROR: could not safely identify a stale RepoPrompt CE debug app process: {exc}", flush=True)
+                if stale_pids:
+                    print(
+                        f"macOS reactivated a stale instance still registered for this bundle (PID(s): {', '.join(stale_pids)}).",
+                        flush=True,
+                    )
+                report_same_bundle_id_instances_elsewhere(bundle, bundle)
+                guard_code = _operation_app_stop_unlocked(repo_root, {"guardDelayedLaunch": True})
+                if stale_pids and guard_code == 0:
+                    print(
+                        f"Stopped stale PID(s) {', '.join(stale_pids)}. The new bundle is already installed; "
+                        "retry with './conductor app launch-existing'.",
+                        flush=True,
+                    )
                 return 1
             print(f"Observed launched RepoPrompt CE debug PID(s): {', '.join(launched_pids)}", flush=True)
         return 0
@@ -8227,6 +8278,11 @@ def operation_app_launch_existing(repo_root: Path, args: Dict[str, Any]) -> int:
 
 def operation_debug_app_build_then_launch(repo_root: Path, args: Dict[str, Any]) -> int:
     package_config = debug_package_config_for_request(args)
+    # Advisory early check so a known conflict doesn't cost a package; the locked check after packaging is authoritative.
+    live_bundle = debug_app_bundle_path()
+    if report_same_bundle_id_instances_elsewhere(live_bundle, live_bundle):
+        print("No package, stop or launch was performed.", flush=True)
+        return 1
     package_code, staged_bundle = package_debug_app_under_heavy(
         repo_root, "debug app build/package", package_config=package_config
     )

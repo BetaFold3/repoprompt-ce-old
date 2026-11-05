@@ -130,6 +130,10 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
     /// Tagged file attachments (@ mentioned files) for this user turn
     public var taggedFileAttachments: [AgentTaggedFileAttachment]
 
+    /// User-attached PDF/HTML documents whose originals live in app-managed storage. A separate
+    /// channel from images and tagged files; never rendered as an image or a mention.
+    public var documentAttachments: [AgentDocumentAttachment]
+
     /// Tool metadata (for toolCall/toolResult kinds)
     public var toolName: String?
     public var toolInvocationID: UUID?
@@ -175,6 +179,7 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         text: String,
         attachments: [AgentImageAttachment] = [],
         taggedFileAttachments: [AgentTaggedFileAttachment] = [],
+        documentAttachments: [AgentDocumentAttachment] = [],
         toolName: String? = nil,
         toolInvocationID: UUID? = nil,
         toolArgsJSON: String? = nil,
@@ -197,6 +202,7 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         self.text = text
         self.attachments = attachments
         self.taggedFileAttachments = taggedFileAttachments
+        self.documentAttachments = documentAttachments
         self.toolName = toolName
         self.toolInvocationID = toolInvocationID
         self.toolArgsJSON = toolArgsJSON
@@ -226,6 +232,7 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
             text: text,
             attachments: attachments,
             taggedFileAttachments: taggedFileAttachments,
+            documentAttachments: documentAttachments,
             toolName: toolName,
             toolInvocationID: toolInvocationID,
             toolArgsJSON: toolArgsJSON,
@@ -252,7 +259,7 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
     // MARK: - Codable (backwards-compatible decoding for new fields)
 
     private enum CodingKeys: String, CodingKey {
-        case id, timestamp, kind, text, attachments, taggedFileAttachments
+        case id, timestamp, kind, text, attachments, taggedFileAttachments, documentAttachments
         case toolName, toolInvocationID, toolArgsJSON, toolResultJSON, toolIsError
         case reasoning, sequenceIndex, isStreaming, workflow, codexGoalMode, scheduledSend
         case isLocalControlPlaneEcho, isUndeliveredRemoteSend, recoveryDelivery, codeModeParentInvocationID
@@ -266,6 +273,8 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         text = try c.decode(String.self, forKey: .text)
         attachments = try c.decodeIfPresent([AgentImageAttachment].self, forKey: .attachments) ?? []
         taggedFileAttachments = try c.decodeIfPresent([AgentTaggedFileAttachment].self, forKey: .taggedFileAttachments) ?? []
+        // Absent (older data) is no documents; a present but malformed array fails decoding.
+        documentAttachments = try c.decodeIfPresent([AgentDocumentAttachment].self, forKey: .documentAttachments) ?? []
         toolName = try c.decodeIfPresent(String.self, forKey: .toolName)
         toolInvocationID = try c.decodeIfPresent(UUID.self, forKey: .toolInvocationID)
         toolArgsJSON = try c.decodeIfPresent(String.self, forKey: .toolArgsJSON)
@@ -290,6 +299,7 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         id: UUID = UUID(),
         attachments: [AgentImageAttachment] = [],
         taggedFileAttachments: [AgentTaggedFileAttachment] = [],
+        documentAttachments: [AgentDocumentAttachment] = [],
         sequenceIndex: Int = 0,
         workflow: AgentWorkflowDefinition? = nil,
         codexGoalMode: AgentCodexGoalModeMetadata? = nil,
@@ -302,6 +312,7 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
             text: text,
             attachments: attachments,
             taggedFileAttachments: taggedFileAttachments,
+            documentAttachments: documentAttachments,
             sequenceIndex: sequenceIndex,
             workflow: workflow,
             codexGoalMode: codexGoalMode,
@@ -348,6 +359,7 @@ extension AgentChatItem {
             text: text,
             attachments: attachments,
             taggedFileAttachments: taggedFileAttachments,
+            documentAttachments: documentAttachments,
             toolName: toolName,
             toolInvocationID: toolInvocationID,
             toolArgsJSON: toolArgsJSON,
@@ -391,6 +403,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
     public var text: String
     public var attachments: [AgentImageAttachment]
     public var taggedFileAttachments: [AgentTaggedFileAttachment]
+    public var documentAttachments: [AgentDocumentAttachment]
     public var toolName: String?
     public var toolInvocationID: UUID?
     public var toolArgsJSON: String?
@@ -413,6 +426,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
         kind = item.kind
         attachments = item.attachments
         taggedFileAttachments = item.taggedFileAttachments
+        documentAttachments = item.documentAttachments
         toolName = item.toolName
         toolInvocationID = item.toolInvocationID
         toolArgsJSON = sanitizeToolResults && (item.kind == .toolCall || item.kind == .toolResult) ? nil : item.toolArgsJSON
@@ -487,6 +501,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
             text: restoredText,
             attachments: attachments,
             taggedFileAttachments: taggedFileAttachments,
+            documentAttachments: documentAttachments,
             toolName: toolName,
             toolInvocationID: toolInvocationID,
             toolArgsJSON: toolArgsJSON,
@@ -537,6 +552,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
         case text
         case attachments
         case taggedFileAttachments
+        case documentAttachments
         case toolName
         case toolInvocationID
         case toolArgsJSON
@@ -562,6 +578,8 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
         text = try container.decode(String.self, forKey: .text)
         attachments = try container.decodeIfPresent([AgentImageAttachment].self, forKey: .attachments) ?? []
         taggedFileAttachments = try container.decodeIfPresent([AgentTaggedFileAttachment].self, forKey: .taggedFileAttachments) ?? []
+        // Absent (older data) is no documents; a present but malformed array fails decoding.
+        documentAttachments = try container.decodeIfPresent([AgentDocumentAttachment].self, forKey: .documentAttachments) ?? []
         toolName = try container.decodeIfPresent(String.self, forKey: .toolName)
         toolInvocationID = try container.decodeIfPresent(UUID.self, forKey: .toolInvocationID)
         toolArgsJSON = try container.decodeIfPresent(String.self, forKey: .toolArgsJSON)

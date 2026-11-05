@@ -7563,7 +7563,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             self?.registerACPController(controller)
             return controller
         }
-        let policyInstaller: AgentConnectionPolicyInstaller = { clientName, _, _, _, _, _, _, runID, _, _, _, _, _, _, _, _ in
+        let policyInstaller: AgentConnectionPolicyInstaller = { clientName, _, _, _, _, _, _, runID, _, _, _, _, _, _, _, _, _ in
             recorder.record("policy:\(clientName):\(runID?.uuidString ?? "nil")")
             if autoSignalACPRouting, let runID {
                 await MCPRoutingWaiter.notifyRouted(runID: runID)
@@ -7725,7 +7725,9 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             },
             startFollowUpRun: startFollowUpRun ?? { _, _, _ in },
             restoreDraftText: { _, text, _, _ in recorder.record("draft:\(text)") },
-            augmentUserMessageForProviderSend: { text, _, _, _, _ in AgentStagedProviderText(text: text) },
+            augmentUserMessageForProviderSend: { text, _, _, _, _, _ in AgentStagedProviderText(text: text) },
+            documentAttachmentBlockedMessage: { _, _ in nil },
+            settleUnsentInput: { _, _, _, _, _, _, _, _ in },
             stageResumeRecoveryHandoffIfNeeded: stageResumeRecoveryHandoffIfNeeded ?? { _ in },
             prependPendingHandoffIfNeeded: { text, _ in AgentStagedProviderText(text: text) },
             stagePendingHandoffForDurableDispatch: stagePendingHandoffForDurableDispatch ?? { _, _ in .none },

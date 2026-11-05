@@ -99,6 +99,12 @@ final class ClaudeNativeRepoPromptMCPHealthTests: XCTestCase {
 
         func refreshRetainedRunPolicyForTurnStart(for _: String, runID _: UUID) {}
 
+        func refreshRunAttemptRichPresentation(
+            for _: String,
+            runID _: UUID,
+            runOwnership _: AgentRunOwnership
+        ) {}
+
         func releasePendingRunPolicyForProvenRoute(
             for _: String,
             windowID _: Int,
@@ -152,7 +158,8 @@ final class ClaudeNativeRepoPromptMCPHealthTests: XCTestCase {
             purpose _: MCPRunPurpose,
             taskLabelKind _: AgentModelCatalog.TaskLabelKind?,
             allowsAgentExternalControlTools _: Bool,
-            requiresExpectedAgentPID _: Bool
+            requiresExpectedAgentPID _: Bool,
+            runOwnership _: AgentRunOwnership?
         ) {}
 
         func clearClientConnectionPolicy(for _: String, windowID _: Int?, runID _: UUID?) {}

@@ -2040,7 +2040,7 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
                 controllers.add(controller)
                 return controller
             },
-            connectionPolicyInstaller: { clientName, windowID, restrictedTools, oneShot, reason, ttl, tabID, runID, additionalTools, allowedToolsOverride, sessionProfile, purpose, taskLabelKind, allowsAgentExternalControlTools, requiresExpectedAgentPID, codeModeEligibility in
+            connectionPolicyInstaller: { clientName, windowID, restrictedTools, oneShot, reason, ttl, tabID, runID, additionalTools, allowedToolsOverride, sessionProfile, purpose, taskLabelKind, allowsAgentExternalControlTools, requiresExpectedAgentPID, codeModeEligibility, runOwnership in
                 // The production installer's call, then the routing signal the fake process cannot send.
                 await ServerNetworkManager.shared.installClientConnectionPolicy(
                     for: clientName,
@@ -2058,7 +2058,8 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
                     taskLabelKind: taskLabelKind,
                     allowsAgentExternalControlTools: allowsAgentExternalControlTools,
                     requiresExpectedAgentPID: requiresExpectedAgentPID,
-                    codeModeEligibility: codeModeEligibility
+                    codeModeEligibility: codeModeEligibility,
+                    runOwnership: runOwnership
                 )
                 if let runID {
                     await MCPRoutingWaiter.notifyRouted(runID: runID)
@@ -2274,7 +2275,9 @@ final class AttentionNotificationAdmissionTests: XCTestCase {
             publishTerminalCommit: { _, _, _ in .accepted(successorEpoch: nil) },
             startFollowUpRun: startFollowUpRun,
             restoreDraftText: { _, _, _, _ in },
-            augmentUserMessageForProviderSend: { text, _, _, _, _ in AgentStagedProviderText(text: text) },
+            augmentUserMessageForProviderSend: { text, _, _, _, _, _ in AgentStagedProviderText(text: text) },
+            documentAttachmentBlockedMessage: { _, _ in nil },
+            settleUnsentInput: { _, _, _, _, _, _, _, _ in },
             stageResumeRecoveryHandoffIfNeeded: { _ in },
             prependPendingHandoffIfNeeded: { text, _ in AgentStagedProviderText(text: text) },
             stagePendingHandoffForDurableDispatch: { _, _ in .none },
