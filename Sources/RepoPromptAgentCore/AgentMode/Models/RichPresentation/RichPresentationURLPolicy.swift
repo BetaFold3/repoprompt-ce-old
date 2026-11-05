@@ -126,9 +126,13 @@ package enum RichPresentationURLPolicy {
             hostBytes = Array(authority[..<colon])
         }
         let host = String(decoding: hostBytes.map(lowercasedASCII), as: UTF8.self)
+        // `encodingInvalidCharacters: false`: a URL with characters that would otherwise be
+        // silently percent-encoded (`|`, `{`, `"`, `<`, …) is rejected, so the request carries
+        // exactly the supplied bytes.
         guard !host.isEmpty,
               host.utf8.allSatisfy(isHostByte),
-              let url = URL(string: text),
+              let url = URL(string: text, encodingInvalidCharacters: false),
+              url.absoluteString == text,
               url.scheme?.lowercased() == "https",
               url.user == nil, url.password == nil,
               url.host?.lowercased() == host,

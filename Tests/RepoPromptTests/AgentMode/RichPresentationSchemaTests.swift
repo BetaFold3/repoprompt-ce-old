@@ -220,6 +220,28 @@ final class RichPresentationSchemaTests: XCTestCase {
         XCTAssertNoThrow(try validate(withContent(lineChart()) { $0["sources"] = [["label": "L", "url": "HTTPS://Example.com:8443/p?q=1#f"]] }))
     }
 
+    /// Source URLs share the image URL parser: anything Foundation would silently percent-encode is
+    /// rejected (the whole input, not a placeholder), and already-encoded URLs are kept byte-for-byte.
+    func testSourceURLsAreRejectedRatherThanSilentlyRewritten() throws {
+        for bad in [
+            "https://example.com/a|b",
+            "https://example.com/{x}",
+            "https://example.com/\"q\"",
+            "https://example.com/<x>",
+            "https://example.com/a^b",
+            "https://example.com/a`b",
+            "https://example.com/Café",
+            "https://example.com/a%zz"
+        ] {
+            assertRejects(withContent(lineChart()) { $0["sources"] = [["label": "L", "url": bad]] }, field: "content.sources[0].url", code: .invalidValue)
+        }
+        for good in ["https://example.com/Caf%C3%A9?x=1&y=%E2%9C%93#f", "https://example.com/a%2Fb%7Cc"] {
+            let input = try validate(withContent(lineChart()) { $0["sources"] = [["label": "L", "url": good]] })
+            guard case let .chart(chart) = input.content else { return XCTFail("expected chart") }
+            XCTAssertEqual(chart.sources[0].url, good, "already-encoded URL kept byte-for-byte")
+        }
+    }
+
     func testBriefingSectionArticleAndImageCounts() {
         assertRejects(briefing(sections: []), field: "content.sections", code: .tooFew)
         assertRejects(briefing(sections: Array(repeating: ["heading": "H", "articles": [article()]], count: 7)), field: "content.sections", code: .tooMany)
