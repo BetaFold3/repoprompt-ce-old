@@ -35,6 +35,10 @@ package enum MCPWindowToolName {
 
     package static let workspaceSteer = "workspace_steer"
 
+    /// Inline rich presentation; listed only for a granted Agent Mode run attempt
+    /// (`AgentRichPresentationToolPolicy`).
+    package static let presentRich = "present_rich"
+
     package static let shareThoughts = "share_thoughts"
     package static let setStatus = "set_status"
     package static let waitForNextInstruction = "wait_for_next_user_instruction"

@@ -89,6 +89,15 @@ extension MCP.Tool.Annotations {
         openWorldHint: false
     )
 
+    /// Creates new durable local state on every call (never changes or deletes existing state) and
+    /// may reach the network (`present_rich` fetches images from owner-approved hosts).
+    static let repoPromptDurableCreationWithNetworkFetch = Self(
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: true
+    )
+
     static let repoPromptLocalDestructive = Self(
         readOnlyHint: false,
         destructiveHint: true,

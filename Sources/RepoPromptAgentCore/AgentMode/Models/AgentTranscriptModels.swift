@@ -904,6 +904,8 @@ public enum AgentTranscriptRenderBlockKind: String, Sendable, Equatable {
     case standaloneNote
     case middleSummary
     case conclusion
+    /// One turn-owned rich presentation, rendered as a single full outer block (never collapsed).
+    case richPresentation
 }
 
 public enum AgentTranscriptBlockPresentation: String, Sendable, Equatable {
@@ -1095,6 +1097,34 @@ public struct AgentTranscriptRenderBlock: Identifiable, Sendable, Equatable {
     public let groupedHistory: AgentTranscriptGroupedHistory?
     public let collapsedHistoryRange: AgentTranscriptCollapsedHistoryRange?
     public let defaultPresentation: AgentTranscriptBlockPresentation
+    /// The turn-owned reference rendered by a `.richPresentation` block; nil for every other kind.
+    /// Set only through `richPresentationBlock(...)`, so the public initializer is unchanged.
+    package private(set) var richPresentation: AgentTranscriptRichPresentation?
+
+    /// A `.richPresentation` block for one turn-owned reference. The ID derives only from the
+    /// session-stable activity and artifact identities (never a tier, row index or tab), so the
+    /// block keeps its identity across compaction, archive and reload.
+    package static func richPresentationBlock(
+        turnID: UUID,
+        retentionTier: AgentTranscriptRetentionTier,
+        isArchived: Bool,
+        presentation: AgentTranscriptRichPresentation
+    ) -> AgentTranscriptRenderBlock {
+        var block = AgentTranscriptRenderBlock(
+            id: richPresentationBlockID(for: presentation),
+            kind: .richPresentation,
+            turnID: turnID,
+            retentionTier: retentionTier,
+            rows: [],
+            isArchived: isArchived
+        )
+        block.richPresentation = presentation
+        return block
+    }
+
+    package static func richPresentationBlockID(for presentation: AgentTranscriptRichPresentation) -> String {
+        "rich-\(presentation.activityID.uuidString)-\(presentation.reference.artifactID.uuidString)"
+    }
 
     public init(
         id: String,

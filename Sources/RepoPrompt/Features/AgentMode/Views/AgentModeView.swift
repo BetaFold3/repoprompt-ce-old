@@ -1708,7 +1708,8 @@ struct AgentModeChatDetailView: View {
             !block.rows.isEmpty
         case .groupedHistory:
             !(block.groupedHistory?.sections.isEmpty ?? true)
-        case .request, .collapsedHistoryRange, .standaloneAssistant, .standaloneTool, .standaloneNote, .middleSummary, .conclusion:
+        case .request, .collapsedHistoryRange, .standaloneAssistant, .standaloneTool, .standaloneNote, .middleSummary, .conclusion,
+             .richPresentation:
             false
         }
     }
@@ -1770,7 +1771,7 @@ struct AgentModeChatDetailView: View {
             return groupedHistory.sections.flatMap { section in
                 section.childBlocks.flatMap { renderedRows(for: $0) }
             }
-        case .request, .standaloneAssistant, .standaloneTool, .standaloneNote, .middleSummary, .conclusion:
+        case .request, .standaloneAssistant, .standaloneTool, .standaloneNote, .middleSummary, .conclusion, .richPresentation:
             return block.rows
         case .collapsedHistoryRange:
             return []
@@ -2957,6 +2958,7 @@ struct AgentModeChatDetailView: View {
             transcriptBlockView(block: block, renderContext: renderContext)
                 .id(block.id)
         }
+        .environment(\.agentRichPresentationShownReferences, AgentRichPresentationShownReferences(blocks: blocks))
         .environment(\.agentMessageRuntimeFooterByItemID, transcriptSnapshot.runtimeFooterByItemID)
         .messageTimestampEnvironment()
     }
@@ -3065,6 +3067,13 @@ struct AgentModeChatDetailView: View {
                 }
             }
             .accessibilityIdentifier("agentTranscript.groupedHistory")
+        case .richPresentation:
+            if let presentation = block.richPresentation {
+                richPresentationBlockRow {
+                    RichPresentationBlockView(presentation: presentation, owner: richPresentationHistoryOwner)
+                }
+                .accessibilityIdentifier("agentTranscript.richPresentation")
+            }
         default:
             VStack(alignment: .leading, spacing: 8) {
                 ForEach(block.rows) { item in
@@ -3238,6 +3247,22 @@ struct AgentModeChatDetailView: View {
             return normalizedToolCardName(item.toolName) == "bash"
         }
         return true
+    }
+
+    /// The exact hydrated owner of the shown transcript, for rich-presentation history reads.
+    private var richPresentationHistoryOwner: RichPresentationHistoryLoader.Owner? {
+        let ownerTabID = transcriptSnapshot.presentation.tabID ?? transcriptSnapshot.currentTabID ?? currentTabID
+        return ownerTabID.flatMap { agentModeVM.richHistoryOwner(forTabID: $0) }
+    }
+
+    /// A full-width outer row for rich presentations: wide enough for the two-column briefing
+    /// layout, with the transcript's usual trailing gutter.
+    private func richPresentationBlockRow(@ViewBuilder content: () -> some View) -> some View {
+        HStack(alignment: .top, spacing: 0) {
+            content()
+                .frame(maxWidth: 1100, alignment: .leading)
+            Spacer(minLength: 40)
+        }
     }
 
     private func transcriptBlockRow(@ViewBuilder content: () -> some View) -> some View {

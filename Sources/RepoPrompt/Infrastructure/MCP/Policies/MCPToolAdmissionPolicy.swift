@@ -2,8 +2,11 @@ import Foundation
 import RepoPromptAgentCore
 
 enum MCPToolAdmissionClass: String, CaseIterable {
-    /// Mutating, lifecycle, approval, and interactive tools. The connection lane remains
-    /// named `ordinary` for diagnostics compatibility, but this class is deliberately exclusive.
+    /// Mutating, lifecycle, approval, and interactive tools whose safety relies on window-wide
+    /// (or app-wide) mutation exclusion. The connection lane remains named `ordinary` for
+    /// diagnostics compatibility, but this class is deliberately exclusive. Not every mutation
+    /// belongs here: a tool whose mutation is an independently protected transaction (its own
+    /// authority, session gates and commit checks) can run on `.control`.
     case exclusive
     case control
     case smallRead = "small_read"
@@ -71,7 +74,15 @@ enum MCPToolAdmissionPolicy {
         MCPWindowToolName.setStatus: .control,
         MCPWindowToolName.waitForNextInstruction: .control,
         MCPWindowToolName.history: .control,
-        MCPWindowToolName.workspaceSteer: .control
+        MCPWindowToolName.workspaceSteer: .control,
+        // present_rich mutates only its own session's artifacts through an independently protected
+        // transaction: exact attempt authority resolved at call time, the exact owner's save,
+        // the app-wide two-slot publication admission, the session persistence gate and the
+        // rich-artifact filesystem fence, and a final attempt/root revalidation on MainActor
+        // with the install. It reads no selection, active tab or workspace file content, so a
+        // window-wide mutation lease would only block other workers' edits for the length of the
+        // image fetch. Control lane, not exclusive (rich presentation spec Step 4, B-S4-02).
+        MCPWindowToolName.presentRich: .control
     ]
 
     static func classification(forCanonicalToolName toolName: String) -> MCPToolAdmissionClass? {

@@ -1,9 +1,9 @@
 import Foundation
 import RepoPromptAgentCore
 
-/// App-wide admission and root revisions. Not a tool: Step 4 owns activation/capture/rendering.
+/// App-wide admission and root revisions. Not a tool: `RichPresentationMCPToolService` calls it.
 @MainActor
-final class RichPresentationPublicationService {
+final class RichPresentationPublicationService: ObservableObject {
     static let shared = RichPresentationPublicationService()
     struct Storage: Equatable {
         let workspaceID: UUID
@@ -18,6 +18,9 @@ final class RichPresentationPublicationService {
 
     private var revisions: [UUID: UInt64] = [:]
     private var mutations: [UUID: Set<UUID>] = [:]
+    /// Advances when any root mutation begins or ends, so mounted history views re-evaluate their
+    /// load identity (a capture is refused while the mutation runs and has a new revision after).
+    @Published private(set) var storageGeneration: UInt64 = 0
     private var operations: [UUID: (workspaceID: UUID, sessionIDs: Set<UUID>, cancel: () -> Void)] = [:]
     private var deletionObserver: NSObjectProtocol?
     private let fetcher: RichPresentationImageFetcher
@@ -106,6 +109,7 @@ final class RichPresentationPublicationService {
         for id in workspaceIDs {
             revisions[id, default: 0] &+= 1
         }
+        storageGeneration &+= 1
         for operation in operations.values where workspaceIDs.contains(operation.workspaceID) {
             operation.cancel()
         }
@@ -114,10 +118,15 @@ final class RichPresentationPublicationService {
 
     func endMutation(_ mutation: Mutation) {
         mutations.removeValue(forKey: mutation.id)
+        storageGeneration &+= 1
     }
 
     /// Nonqueued two-slot bound, shared by publications and whole handoff transactions.
     /// The task remains owned and awaited through cancellation and local cleanup.
+    /// It covers publication work, including image acquisition, but not the owner save that
+    /// `RichPresentationMCPToolService` performs before calling `publish`. `present_rich` runs on
+    /// the control lane without a window-wide lease, so this bound (with the session gate, fence
+    /// and final install check) is what limits concurrent publication work.
     func withPublication<T>(
         workspaceID: UUID, sessionIDs: Set<UUID> = [], operation: @escaping @MainActor () async throws -> T
     ) async throws -> T {
@@ -145,7 +154,8 @@ final class RichPresentationPublicationService {
         // completed rename is picked up by the next capture without relaunch, a capture taken
         // before it fails by revision or root, and a workspace/session root disagreement refuses
         // here (before authority resolution, admission, download or any write), at capture, and
-        // at the final install check.
+        // at the final install check. `RichPresentationMCPToolService` checks the same agreement
+        // before the owner save, so a refused tool call saves nothing either.
         let currentRoot: @MainActor () throws -> URL = {
             try Self.currentAgreedStorageRoot(
                 workspaceID: workspace.id, dataService: dataService, workspaceManager: workspaceManager

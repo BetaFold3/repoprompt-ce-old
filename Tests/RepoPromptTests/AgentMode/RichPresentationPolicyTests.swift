@@ -1,5 +1,6 @@
 @testable import RepoPromptAgentCore
 @testable import RepoPromptApp
+import RepoPromptShared
 import XCTest
 
 /// Step 1 rich-presentation authority: attempt capture, the dedicated capability's grant, and the
@@ -275,11 +276,23 @@ final class RichPresentationPolicyTests: XCTestCase {
         XCTAssertEqual(legacy.additionalTools?.contains(toolName), false)
     }
 
-    // MARK: - Unregistered until Step 4
+    // MARK: - Registered (Step 4) and policy-gated
 
-    func testPresentRichIsNotRegistered() {
-        XCTAssertFalse(MCPWindowToolGroup.orderedToolNames.contains(toolName))
-        XCTAssertNil(MCPToolExecutionContractCatalog.contract(for: toolName))
+    /// Step 4 registers the tool in every window catalog; it stays hidden and uncallable unless an
+    /// attempt's grant adds it, runs under the ordinary bounded contract, and is admitted on the
+    /// control lane (no window-wide mutation lease; B-S4-02, main-approved).
+    func testPresentRichIsRegisteredPolicyGatedBoundedAndControlLane() {
+        XCTAssertEqual(MCPWindowToolName.presentRich, toolName)
+        XCTAssertEqual(MCPWindowToolGroup.orderedToolNames.filter { $0 == toolName }, [toolName])
+        XCTAssertEqual(MCPWindowToolGroup.richPresentation.orderedToolNames, [toolName])
+        XCTAssertTrue(MCPPolicyGatedTools.names.contains(toolName))
+        XCTAssertEqual(AgentRichPresentationToolPolicy.capabilityToolNames, [toolName])
+        guard case let .bounded(deadline, grace) = MCPToolExecutionContractCatalog.contract(for: toolName) else {
+            return XCTFail("present_rich must run under the bounded execution contract")
+        }
+        XCTAssertEqual(deadline, MCPTimeoutPolicy.boundedToolExecutionDeadline)
+        XCTAssertEqual(grace, MCPTimeoutPolicy.boundedToolCancellationCleanupGrace)
+        XCTAssertEqual(MCPToolAdmissionPolicy.classification(forCanonicalToolName: toolName), .control)
     }
 
     // MARK: - Helpers

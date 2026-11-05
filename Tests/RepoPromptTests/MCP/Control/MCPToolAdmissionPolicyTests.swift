@@ -10,7 +10,7 @@ import XCTest
 final class MCPToolAdmissionPolicyTests: XCTestCase {
     func testClassificationExhaustivelyCoversCanonicalCatalogWithoutDefault() {
         let canonicalTools = MCPToolExecutionContractCatalog.orderedAdvertisedToolNames
-        XCTAssertEqual(canonicalTools.count, 29)
+        XCTAssertEqual(canonicalTools.count, 30)
         XCTAssertEqual(Set(MCPToolAdmissionPolicy.classifications.keys), Set(canonicalTools))
         XCTAssertEqual(MCPToolAdmissionPolicy.classifications.count, canonicalTools.count)
         XCTAssertNil(MCPToolAdmissionPolicy.classification(forCanonicalToolName: "future_unreviewed_tool"))
@@ -42,7 +42,9 @@ final class MCPToolAdmissionPolicyTests: XCTestCase {
             MCPWindowToolName.setStatus,
             MCPWindowToolName.waitForNextInstruction,
             MCPWindowToolName.history,
-            MCPWindowToolName.workspaceSteer
+            MCPWindowToolName.workspaceSteer,
+            // Session/fence/final-check protected artifact install; no window-wide lease.
+            MCPWindowToolName.presentRich
         ])
         assertClass(.exclusive, tools: [
             MCPGlobalToolName.appSettings,
