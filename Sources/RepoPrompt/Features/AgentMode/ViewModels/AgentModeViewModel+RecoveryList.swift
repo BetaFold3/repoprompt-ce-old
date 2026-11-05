@@ -241,15 +241,25 @@ extension AgentModeViewModel {
         case .noDestination:
             return row("Recovery status unknown", "Recovered messages exist for a session whose saved conversation wasn't found. They are kept unchanged.")
         case let .crashHold(hold):
+            // Why the app couldn't confirm it from process records on its own, once it checked.
+            let refusal = coordinator.automaticCrashHoldRefusal(for: hold)
+            let automatic = refusal.map(Self.recoveryCrashHoldAutomaticText)
+            // A fresh process discovery can settle these (it also covers exits nothing watched).
+            let refresh: [AgentRecoveryListRowProps.Action] = refusal.map(Self.recoveryCrashHoldOffersRefresh) == true
+                ? [.refreshProcesses]
+                : []
             if pausedIndicator {
-                return row("Sending is paused", "The previous run may still be running. Confirm it stopped to send again.", actions: [.confirmStopped])
+                let detail = automatic.map { "\($0) If you know it stopped, confirm it to send again." }
+                    ?? "The previous run may still be running. Confirm it stopped to send again."
+                return row("Sending is paused", detail, actions: [.confirmStopped] + refresh)
             }
+            let reason = hold.previousExitProvenClean
+                ? "RepoPrompt closed while this session was working. Sending to it is paused until the previous run is known to have stopped."
+                : "RepoPrompt quit unexpectedly while this session was working. Sending to it is paused until the previous run is known to have stopped."
             return row(
                 "The previous run may still be running",
-                hold.previousExitProvenClean
-                    ? "RepoPrompt closed while this session was working. Sending to it is paused until you confirm the previous run has stopped."
-                    : "RepoPrompt quit unexpectedly while this session was working. Sending to it is paused until you confirm the previous run has stopped.",
-                actions: [.confirmStopped] + openAction + dismiss
+                automatic.map { "\(reason) \($0)" } ?? reason,
+                actions: [.confirmStopped] + refresh + openAction + dismiss
             )
         case let .scheduleTransfer(message):
             return row(
@@ -1521,6 +1531,48 @@ extension AgentModeViewModel {
               let intentID = UUID(uuidString: String(ids.suffix(36)))
         else { return nil }
         return (sessionID, intentID)
+    }
+
+    /// Why a crash hold wasn't confirmed automatically from process records, in plain words. It
+    /// promises no outcome: a later check may still need the user.
+    static func recoveryCrashHoldAutomaticText(_ refusal: AgentRecoveryAutomaticCrashHoldRefusal) -> String {
+        switch refusal {
+        case let .saveFailed(retrying):
+            retrying
+                ? "Process records show the previous run stopped, but RepoPrompt couldn't save that. It tries again shortly; Refresh tries now."
+                : "Process records show the previous run stopped, but RepoPrompt couldn't save that. Refresh tries again."
+        case let .needsYou(reason):
+            switch reason {
+            case .mayBeRunning:
+                "An agent process from an earlier launch may still be running for this session. RepoPrompt checks again when it sees that process exit; Refresh checks now."
+            case .mayBeRunningThisLaunch:
+                "An agent process started in this launch may still be running for this session. RepoPrompt checks again when it exits; Refresh checks now."
+            case .ownershipUncertain:
+                "Agent processes from an earlier launch couldn't be identified, so RepoPrompt can't check this run. Refresh checks again."
+            case .ownershipUpdating:
+                // Transient: never kept as a hold's reason, so not shown today.
+                "RepoPrompt is still updating its process records and checks again shortly."
+            case .notRegistered:
+                "RepoPrompt can't check this run's processes: it started before process tracking was on."
+            case .notRecorded:
+                "RepoPrompt has no process record for this run, so it can't check whether it stopped."
+            case .notOnlyRuns:
+                "It includes a saved message or an older interrupted turn, which process records can't settle."
+            case .messageNotOnProvenRun:
+                "A saved message isn't tied to a run RepoPrompt can check."
+            case .openToConfirm:
+                "Open this session so RepoPrompt can check it."
+            }
+        }
+    }
+
+    /// Whether a fresh process discovery (Refresh) may settle the reason.
+    static func recoveryCrashHoldOffersRefresh(_ refusal: AgentRecoveryAutomaticCrashHoldRefusal) -> Bool {
+        switch refusal {
+        // Refresh rediscovers processes and always runs the automatic confirmation again.
+        case .needsYou(.mayBeRunning), .needsYou(.mayBeRunningThisLaunch), .needsYou(.ownershipUncertain), .saveFailed: true
+        default: false
+        }
     }
 
     /// Row ID of a session's compact paused indicator (its crash-hold card is dismissed).

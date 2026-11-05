@@ -366,6 +366,10 @@ package extension AgentRecoveryCoordinator {
             if checksActive, case let .survivingRuntime(restriction) = item.payload, runtimeExitIsProven(restriction.runtimeID) {
                 return .resolved("The process exited.")
             }
+            // A crash hold confirmed meanwhile (automatically from process records, or It stopped).
+            if case let .crashHold(hold) = item.payload, crashHold(for: hold.sessionID) == hold, isCrashHoldConfirmed(hold) {
+                return .resolved(AgentRecoveryCrashHoldCheckText.alreadyConfirmed)
+            }
             return .couldNotCheck("It is no longer listed.")
         }
         guard checksActive else {
@@ -381,7 +385,7 @@ package extension AgentRecoveryCoordinator {
         }
         // A crash hold: confirmed only from process-record proof (checks are active here). The proof
         // compares the card with the captured one, sets the row `.working` and marks its work started
-        // before its first suspension.
+        // before the registry query (after waiting for an automatic confirmation of the session).
         if case let .crashHold(hold) = current.payload {
             return await confirmCrashHoldFromRegistryProof(item, hold: hold, wait: wait)
         }

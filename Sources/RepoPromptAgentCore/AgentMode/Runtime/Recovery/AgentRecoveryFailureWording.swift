@@ -120,6 +120,12 @@ package enum AgentRecoveryFailureDiagnostics {
         )
     }
 
+    /// The automatic crash-hold confirmation couldn't save its acknowledgement; the hold stays and
+    /// the next trigger retries.
+    package static func automaticCrashHoldConfirmationFailed(_ reason: String) {
+        logger.notice("automatic_crash_hold_confirmation_failed detail=\(reason, privacy: .private)")
+    }
+
     /// A shutdown-preparation (or finalization) blocker; `reason` is a fixed token.
     package static func shutdownBlocked(reason: String, tabID: UUID, failure: AgentRecoveryControllerFailure?) {
         logger.notice(

@@ -93,10 +93,17 @@ final class AgentRecoveryAppComposition {
             failure = nil
             // R6: existing runtime records are loaded and discovered during startup, before
             // admission opens; sessions are keyed by the windows hosting them.
+            // A crash hold is confirmed automatically when process records prove its processes
+            // exited, under the same gate as Check and resolve's process checks (Reconcile).
             if let processRegistry {
-                composed.attachProcessRegistry(processRegistry) { [weak self] sessionID in
-                    self?.runtimeOwnershipKeys(sessionID: sessionID) ?? []
-                }
+                let gate = Self.makeActionRunner(activation: activation, registry: processRegistry)
+                composed.attachProcessRegistry(
+                    processRegistry,
+                    ownershipKeys: { [weak self] sessionID in
+                        self?.runtimeOwnershipKeys(sessionID: sessionID) ?? []
+                    },
+                    automaticCrashHoldConfirmation: { gate.isAvailable(.reconcileOnly) }
+                )
             }
             // Schedules awaiting explicit confirmation are catalog items too (Phase 2): the shared
             // scheduler's summaries for hosted sessions, and every inventoried workspace's index for

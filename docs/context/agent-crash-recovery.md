@@ -67,7 +67,22 @@ This feature is implemented and in production. Its completed plan, the per-step 
     - With no members left, sending stays paused "until RepoPrompt confirms they exited".
   - Denied inspection means unknown, never exited.
 - **Two-writer rule:** no second managed writer while a recorded writer or launcher is alive, reserved or unverifiable.
-  - A crash hold is released by Check (confirmed exit) or Let it finish. Nothing is signalled automatically.
+  - A crash hold ("Sending paused") is released by "It stopped", by Check (confirmed exit) or by Let it finish. Nothing is signalled automatically.
+  - **Automatic confirmation (owner decision 2026-10-31):** the app runs Check's process-record proof on its own (`AgentRecoveryCoordinator+AutomaticCrashHoldConfirmation.swift`).
+    - A pass over every hold runs once startup is ready, when the adopted runtime snapshot changes (a watched process exits), after every Refresh and when a shutdown freeze ends.
+    - A pass over one session runs when its lane is claimed (opened), when a recovery action or It stopped releases it, when a crash-hold row it skipped leaves `.working` (Check, Open, Refresh or any row action; `setCatalogActionState`), and when a save retry covering it fires.
+    - Requests during a pass merge into one rerun. It never refreshes the registry itself.
+    - It writes the same acknowledgement as Check, settling every qualifying uncertain intent to `deliveryUnknown` (`.everyIntent`), and never resends. Dismissed holds are confirmed too.
+    - It is gated like Check (`isAvailable(.reconcileOnly)`, wired in `AgentRecoveryAppComposition`) and is off by default in tests that attach a registry directly.
+    - Confirming lets already-authorized scheduled sends run, as "It stopped" does.
+    - Holds the proof can't cover still need the user, by owner decision: intent-only holds, legacy turns, runs not registered at run start, and processes that may still run. So do exits the registry can't watch, until Refresh.
+    - The card and the paused indicator show the typed reason (`AgentRecoveryAutomaticCrashHoldRefusal`: a proof reason `AgentRecoveryCrashHoldNeedsYouReason`, or `saveFailed`) and offer Refresh for possibly-running or unidentified processes and for a failed save. The wording never promises that sending will resume. The reason is cleared however the hold is confirmed (`publishCrashHoldConfirmation`). Transient refusals (busy, changed, closing, snapshot catching up) keep the last reason.
+    - A failed save of a proven confirmation is retried after `automaticCrashHoldSaveRetryDelays` (5 s, 30 s, 2 min), then only on later triggers.
+      - Each hold is charged one delay per timer that covers it, never again while it is covered.
+      - A retry that finds the hold deferred schedules none; that hold's own trigger runs it again.
+      - A sooner retry replaces a later pending one, keeping its coverage. Timers carry an identity token, and the timer is cancelled when no failure is left.
+      - The banner's `saveFailed(retrying:)` is true only while a timer covers the hold.
+    - While it claims a session (proof to commit), Check and It stopped wait for that session's claim only, and `beginRecoveryAction` refuses ("session action in flight"). While It stopped confirms a session, the automatic path leaves it alone. Check reports a hold confirmed meanwhile as "This session's pause was already confirmed."
 - **Quit** runs in two stages within one 8-second deadline:
   - Stage A is reversible: freeze admission, commit records, flush sessions.
   - Stage B tears down.

@@ -519,11 +519,12 @@ final class AgentRecoveryStartupCompositionTests: XCTestCase {
         XCTAssertEqual(starts.count, 1, "Exactly one dispatch")
     }
 
-    /// Step 9-activation-b (review A P2-02, B A7): the same already-authorized new-session Send now
-    /// stays undispatched while Check confirms the crash hold from process records (the hold's run
-    /// was registered at run start and its only earlier-launch record exited), and dispatches
-    /// exactly once after the acknowledgement commits. The held session is never opened.
-    func testCrashHoldBlocksNewSessionSendNowUntilCheckConfirmsItThenDispatchesOnce() async throws {
+    /// Step 9-activation-b (review A P2-02, B A7), automatic since 2026-10-31: the same
+    /// already-authorized new-session Send now stays undispatched while the app confirms the crash
+    /// hold from process records on its own at startup (the hold's run was registered at run start
+    /// and its only earlier-launch record exited), and dispatches exactly once after the
+    /// acknowledgement commits. The held session is never opened and nobody clicks anything.
+    func testCrashHoldBlocksNewSessionSendNowUntilItIsConfirmedAutomaticallyThenDispatchesOnce() async throws {
         let fixture = try makeFixture()
         let processes = ScriptedProcessSystem()
 
@@ -578,14 +579,51 @@ final class AgentRecoveryStartupCompositionTests: XCTestCase {
             activation: .claudeAndCodex,
             loadInventory: { AgentRecoveryWorkspaceInventory(workspaces: destinations) }
         )
+        // The automatic confirmation starts once startup is ready; it is held just before its
+        // acknowledgement write until the send below is authorized.
+        @MainActor
+        final class CommitGate {
+            private(set) var reached = false
+            private var isOpen = false
+            private var waiters: [CheckedContinuation<Void, Never>] = []
+
+            func wait() async {
+                reached = true
+                guard !isOpen else { return }
+                await withCheckedContinuation { waiters.append($0) }
+            }
+
+            func open() {
+                isOpen = true
+                waiters.forEach { $0.resume() }
+                waiters = []
+            }
+        }
+        final class Starts {
+            var count = 0
+        }
+        final class Paused {
+            var startsBeforeCommit: Int?
+        }
+        let commitGate = CommitGate()
+        let starts = Starts()
+        let paused = Paused()
+        let coordinator = try XCTUnwrap(composition.coordinator)
+        coordinator.test_automaticCrashHoldAtCommit = { [scheduler, starts, paused, commitGate] in
+            await commitGate.wait()
+            scheduler.recordDidChange()
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            paused.startsBeforeCommit = starts.count
+        }
         let viewModel = makeViewModel(windowID: 4813, fixture: fixture)
         viewModel.test_initializeRunService()
         composition.install(into: viewModel)
         viewModel.attachScheduledSendCoordinator(scheduler)
         await composition.startupCompletion?.value
-        let coordinator = try XCTUnwrap(composition.coordinator)
         XCTAssertTrue(scheduler.isStartupAdmissionOpen)
         viewModel.test_establishPersistenceWorkspace(fixture.workspace)
+        let reached = await Support.eventually { commitGate.reached }
+        XCTAssertTrue(reached, "the automatic confirmation reached its write")
         XCTAssertNotNil(coordinator.blockingCrashHold(for: heldBinding))
 
         // Another tab in the same workspace schedules a new-session start and sends it now.
@@ -595,10 +633,6 @@ final class AgentRecoveryStartupCompositionTests: XCTestCase {
         scheduledTab.appendItem(.user("Earlier turn"))
         let saved = await viewModel.flushSave(for: scheduledTabID)
         XCTAssertTrue(saved)
-        final class Starts {
-            var count = 0
-        }
-        let starts = Starts()
         viewModel.scheduledDispatchRunStarter = { [starts] _, _, _, _ in
             starts.count += 1
             return .stale(reason: "test starter")
@@ -622,23 +656,13 @@ final class AgentRecoveryStartupCompositionTests: XCTestCase {
         XCTAssertTrue(blocked, "\(scheduler.disposition(scheduleID: scheduleID))")
         XCTAssertEqual(starts.count, 0)
 
-        // Check confirms the hold; just before its acknowledgement write, nothing has been sent.
-        final class Paused {
-            var startsBeforeCommit: Int?
-        }
-        let paused = Paused()
-        coordinator.test_crashHoldProofAtCommit = { [scheduler, starts, paused] in
-            scheduler.recordDidChange()
-            try? await Task.sleep(nanoseconds: 100_000_000)
-            paused.startsBeforeCommit = starts.count
-        }
-        let crash = try XCTUnwrap(coordinator.catalog.items.first { $0.sessionID == held.session.id && $0.kind == .crashHold })
-        let status = await coordinator.checkCatalogItems([crash], checksActive: true) { _ in
-            XCTFail("a crash hold is never reconciled")
-            return .notAttempted("no reconcile")
+        // The automatic confirmation writes the acknowledgement; just before it, nothing was sent.
+        commitGate.open()
+        while let automatic = coordinator.automaticCrashHoldTask {
+            await automatic.value
         }
         XCTAssertEqual(paused.startsBeforeCommit, 0, "the authorized send waits for the acknowledgement commit")
-        XCTAssertEqual(status?.entries.first?.outcome, .resolved(AgentRecoveryCrashHoldCheckText.confirmed))
+        XCTAssertNil(coordinator.blockingCrashHold(for: heldBinding), "confirmed without a click")
         let acknowledgement = await now.store.read(sessionID: held.session.id).record?.crashHoldAcknowledgement
         XCTAssertNotNil(acknowledgement)
         XCTAssertNil(coordinator.lane(for: held.session.id), "the held session was never opened")

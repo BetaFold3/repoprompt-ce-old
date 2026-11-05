@@ -727,6 +727,544 @@ final class AgentRecoveryCrashHoldProofTests: XCTestCase {
         await assertNotConfirmed(coordinator, now, held)
     }
 
+    // MARK: Automatic confirmation
+
+    @MainActor
+    private final class AutomaticGate {
+        var isOn = false
+    }
+
+    @MainActor
+    private final class CheckBox {
+        var task: Task<AgentRecoveryCheckStatus?, Never>?
+        var finished = false
+    }
+
+    @MainActor
+    private final class ConfirmBox {
+        var task: Task<Bool, Never>?
+    }
+
+    @MainActor
+    private final class Counter {
+        var value = 0
+        var flag = false
+    }
+
+    /// Holds a suspended step until the test opens it.
+    @MainActor
+    private final class Latch {
+        private var isOpen = false
+        private var waiters: [CheckedContinuation<Void, Never>] = []
+
+        func wait() async {
+            if isOpen { return }
+            await withCheckedContinuation { waiters.append($0) }
+        }
+
+        func open() {
+            isOpen = true
+            waiters.forEach { $0.resume() }
+            waiters = []
+        }
+    }
+
+    /// After a restart, a hold whose processes are proven exited by process records is confirmed
+    /// with no click, no Check and no opened session; the next launch doesn't ask again.
+    func testProvenHoldIsConfirmedAutomaticallyAtStartup() async throws {
+        let earlier = launch()
+        let home = try makeWorkspace("home")
+        let held = try await heldSession(earlier, in: home)
+        try seedRecord(held, state: .exited)
+
+        let now = launch()
+        let coordinator = try await startedCoordinator(now, workspaces: [home], automatic: { true })
+        await settleAutomatic(coordinator)
+
+        let hold = try XCTUnwrap(coordinator.crashHold(for: held.load.session.id))
+        XCTAssertNil(coordinator.blockingCrashHold(for: held.binding), "sending resumed without a click")
+        XCTAssertNil(coordinator.lane(for: held.load.session.id), "the session was never opened")
+        let acknowledgement = await acknowledgement(now, held)
+        XCTAssertTrue(hold.isCovered(by: acknowledgement), "the exact acknowledgement It stopped writes")
+        XCTAssertFalse(
+            coordinator.catalog.items.contains { $0.kind == .crashHold && $0.sessionID == held.load.session.id },
+            "the Sending paused card is gone"
+        )
+
+        let next = try await startedCoordinator(launch(), workspaces: [home])
+        XCTAssertNil(next.blockingCrashHold(for: held.binding), "the identical hold stays acknowledged")
+    }
+
+    /// Off while its gate is off (Check's process checks inactive); a dismissed hold, which still
+    /// pauses sending, is confirmed once the gate opens.
+    func testDismissedHoldIsConfirmedAutomaticallyAndNothingRunsWhileInactive() async throws {
+        let earlier = launch()
+        let home = try makeWorkspace("home")
+        let held = try await heldSession(earlier, in: home)
+        try seedRecord(held, state: .exited)
+
+        let now = launch()
+        let gate = AutomaticGate()
+        let coordinator = try await startedCoordinator(now, workspaces: [home], automatic: { gate.isOn })
+        await settleAutomatic(coordinator)
+        await assertNotConfirmed(coordinator, now, held)
+
+        let item = try XCTUnwrap(coordinator.catalog.item(id: crashHoldItemID(coordinator, held)))
+        let failure = await coordinator.dismissCatalogItem(item)
+        XCTAssertNil(failure)
+        let dismissed = await waitUntil { coordinator.catalog.item(id: item.id)?.isDismissed == true }
+        XCTAssertTrue(dismissed)
+        XCTAssertNotNil(coordinator.blockingCrashHold(for: held.binding), "Dismiss lifts nothing")
+
+        gate.isOn = true
+        coordinator.requestAutomaticCrashHoldConfirmation()
+        await settleAutomatic(coordinator)
+
+        let hold = try XCTUnwrap(coordinator.crashHold(for: held.load.session.id))
+        XCTAssertNil(coordinator.blockingCrashHold(for: held.binding), "the dismissed hold is confirmed")
+        let acknowledgement = await acknowledgement(now, held)
+        XCTAssertTrue(hold.isCovered(by: acknowledgement))
+    }
+
+    /// A possible writer keeps the hold; when the registry sees that process exit, the hold is
+    /// confirmed without any action.
+    func testHoldIsConfirmedAutomaticallyOnceItsProcessExits() async throws {
+        let earlier = launch()
+        let home = try makeWorkspace("home")
+        let held = try await heldSession(earlier, in: home)
+        let pid = try seedLiveRecord(held)
+
+        let now = launch()
+        let coordinator = try await startedCoordinator(now, workspaces: [home], automatic: { true })
+        await settleAutomatic(coordinator)
+        await assertNotConfirmed(coordinator, now, held)
+        let paused = try XCTUnwrap(coordinator.crashHold(for: held.load.session.id))
+        XCTAssertEqual(coordinator.automaticCrashHoldRefusal(for: paused), .needsYou(.mayBeRunning), "the banner says why")
+
+        XCTAssertEqual(processes.processExited(pid: pid), 1, "the registry watches the earlier launch's process")
+        let resumed = await waitUntil { coordinator.blockingCrashHold(for: held.binding) == nil }
+        XCTAssertTrue(resumed, "sending resumes once the process exited")
+        await settleAutomatic(coordinator)
+        let hold = try XCTUnwrap(coordinator.crashHold(for: held.load.session.id))
+        let acknowledgement = await acknowledgement(now, held)
+        XCTAssertTrue(hold.isCovered(by: acknowledgement))
+        XCTAssertNil(coordinator.automaticCrashHoldRefusal(for: hold), "the reason is cleared once confirmed")
+    }
+
+    /// A quit's freeze defers the confirmation (nothing is written while RepoPrompt closes); when the
+    /// quit is cancelled and the freeze ends, the hold is confirmed.
+    func testShutdownFreezeDefersAutomaticConfirmationUntilItEnds() async throws {
+        let earlier = launch()
+        let home = try makeWorkspace("home")
+        let held = try await heldSession(earlier, in: home)
+        try seedRecord(held, state: .exited)
+
+        let now = launch()
+        let gate = AutomaticGate()
+        let coordinator = try await startedCoordinator(now, workspaces: [home], automatic: { gate.isOn })
+        let token = coordinator.beginShutdownFreeze(scope: .application)
+        gate.isOn = true
+        coordinator.requestAutomaticCrashHoldConfirmation()
+        await settleAutomatic(coordinator)
+        await assertNotConfirmed(coordinator, now, held)
+
+        coordinator.endShutdownFreeze(token)
+        await settleAutomatic(coordinator)
+        XCTAssertNil(coordinator.blockingCrashHold(for: held.binding), "confirmed once the freeze ended")
+    }
+
+    /// Holds the proof doesn't cover keep asking the user: a run started before registration was
+    /// active, and a run no process record names.
+    func testAutomaticConfirmationLeavesHoldsTheProofDoesNotCover() async throws {
+        let earlier = launch()
+        let home = try makeWorkspace("home")
+        let unregistered = try await heldSession(earlier, in: home, marked: false)
+        try seedRecord(unregistered, state: .exited)
+        let unrecorded = try await heldSession(earlier, in: home)
+
+        let now = launch()
+        let coordinator = try await startedCoordinator(now, workspaces: [home], automatic: { true })
+        await settleAutomatic(coordinator)
+
+        await assertNotConfirmed(coordinator, now, unregistered)
+        await assertNotConfirmed(coordinator, now, unrecorded)
+        let unregisteredHold = try XCTUnwrap(coordinator.crashHold(for: unregistered.load.session.id))
+        let unrecordedHold = try XCTUnwrap(coordinator.crashHold(for: unrecorded.load.session.id))
+        XCTAssertEqual(coordinator.automaticCrashHoldRefusal(for: unregisteredHold), .needsYou(.notRegistered))
+        XCTAssertEqual(coordinator.automaticCrashHoldRefusal(for: unrecordedHold), .needsYou(.notRecorded))
+    }
+
+    /// Check started while the automatic confirmation commits waits for it instead of confirming
+    /// the hold again (it never reaches its own commit), then reports the hold resolved; one
+    /// acknowledgement is written.
+    func testCheckDuringAutomaticConfirmationReportsItAlreadyResolved() async throws {
+        let earlier = launch()
+        let home = try makeWorkspace("home")
+        let held = try await heldSession(earlier, in: home)
+        try seedRecord(held, state: .exited)
+
+        let now = launch()
+        let gate = AutomaticGate()
+        let coordinator = try await startedCoordinator(now, workspaces: [home], automatic: { gate.isOn })
+        let item = try XCTUnwrap(coordinator.catalog.item(id: crashHoldItemID(coordinator, held)))
+        let sessionID = held.load.session.id
+        let box = CheckBox()
+        let checkWaited = Counter()
+        coordinator.test_crashHoldProofBeforeCommit = { XCTFail("Check never confirms the hold itself") }
+        coordinator.test_automaticCrashHoldAtCommit = { [weak self, weak coordinator] in
+            guard let self, let coordinator else { return }
+            coordinator.test_automaticCrashHoldAtCommit = nil
+            box.task = Task { @MainActor in
+                await coordinator.checkCatalogItems([item], checksActive: true) { _ in
+                    XCTFail("a crash hold is never reconciled")
+                    return .notAttempted("no reconcile")
+                }
+            }
+            // The commit is held until Check waits on this session's claim.
+            checkWaited.flag = await waitUntil { coordinator.automaticCrashHoldClaimWaiters[sessionID]?.isEmpty == false }
+        }
+
+        gate.isOn = true
+        coordinator.requestAutomaticCrashHoldConfirmation()
+        await settleAutomatic(coordinator)
+        let task = try XCTUnwrap(box.task, "Check started during the commit")
+        let status = await task.value
+
+        XCTAssertTrue(checkWaited.flag, "Check waited for the automatic confirmation")
+        XCTAssertEqual(status?.entries.map(\.outcome), [.resolved(Text.alreadyConfirmed)])
+        XCTAssertNil(coordinator.blockingCrashHold(for: held.binding))
+        let hold = try XCTUnwrap(coordinator.crashHold(for: sessionID))
+        let acknowledgement = await acknowledgement(now, held)
+        XCTAssertTrue(hold.isCovered(by: acknowledgement))
+    }
+
+    /// Check waits only for its own session's automatic confirmation: it reports that session
+    /// resolved while the pass is still suspended on another session.
+    func testCheckWaitsOnlyForItsOwnSessionsAutomaticConfirmation() async throws {
+        let earlier = launch()
+        let home = try makeWorkspace("home")
+        let first = try await heldSession(earlier, in: home)
+        try seedRecord(first, state: .exited)
+        let second = try await heldSession(earlier, in: home)
+        try seedRecord(second, state: .exited)
+
+        let now = launch()
+        let gate = AutomaticGate()
+        let coordinator = try await startedCoordinator(now, workspaces: [home], automatic: { gate.isOn })
+        // The pass takes holds in session order: name the one it checks first.
+        let order = coordinator.unconfirmedCrashHolds.map(\.sessionID)
+        XCTAssertEqual(order.count, 2)
+        let (early, late) = order.first == first.load.session.id ? (first, second) : (second, first)
+        let item = try XCTUnwrap(coordinator.catalog.item(id: crashHoldItemID(coordinator, early)))
+        let box = CheckBox()
+        let commits = Counter()
+        let lateCommit = Latch()
+        coordinator.test_automaticCrashHoldAtCommit = { [weak self, weak coordinator] in
+            guard let self, let coordinator else { return }
+            commits.value += 1
+            if commits.value == 1 {
+                box.task = Task { @MainActor in
+                    let status = await coordinator.checkCatalogItems([item], checksActive: true) { _ in
+                        XCTFail("a crash hold is never reconciled")
+                        return .notAttempted("no reconcile")
+                    }
+                    box.finished = true
+                    return status
+                }
+                _ = await waitUntil {
+                    coordinator.automaticCrashHoldClaimWaiters[early.load.session.id]?.isEmpty == false
+                }
+            } else {
+                await lateCommit.wait()
+            }
+        }
+
+        gate.isOn = true
+        coordinator.requestAutomaticCrashHoldConfirmation()
+        let finished = await waitUntil { box.finished }
+
+        XCTAssertTrue(finished, "Check finished while the other session's commit is still held")
+        XCTAssertEqual(commits.value, 2, "the pass is suspended on the other session")
+        let status = try await XCTUnwrap(box.task).value
+        XCTAssertEqual(status?.entries.map(\.outcome), [.resolved(Text.alreadyConfirmed)])
+        lateCommit.open()
+        await settleAutomatic(coordinator)
+        XCTAssertNil(coordinator.blockingCrashHold(for: early.binding))
+        XCTAssertNil(coordinator.blockingCrashHold(for: late.binding))
+    }
+
+    /// A failed save of a proven confirmation is shown as such and retried a bounded number of
+    /// times; once those are spent, a later trigger still confirms it.
+    func testFailedAutomaticSaveIsShownAndRetriedWithABound() async throws {
+        let earlier = launch()
+        let home = try makeWorkspace("home")
+        let held = try await heldSession(earlier, in: home)
+        try seedRecord(held, state: .exited)
+
+        let failures = RecoveryStoreWriteFailureSwitch()
+        let now = launch(failures: failures)
+        let gate = AutomaticGate()
+        let coordinator = try await startedCoordinator(now, workspaces: [home], automatic: { gate.isOn })
+        coordinator.automaticCrashHoldSaveRetryDelays = [.milliseconds(1), .milliseconds(1)]
+        let commits = Counter()
+        coordinator.test_automaticCrashHoldAtCommit = {
+            commits.value += 1
+            failures.failingWritePathFragment = held.load.session.id.uuidString
+        }
+
+        gate.isOn = true
+        coordinator.requestAutomaticCrashHoldConfirmation()
+        let spent = await waitUntil {
+            commits.value == 3 && coordinator.automaticCrashHoldTask == nil
+                && coordinator.automaticCrashHoldSaveRetryTask == nil
+        }
+        XCTAssertTrue(spent, "the first attempt and two retries")
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(commits.value, 3, "no retry after the last delay")
+        XCTAssertNil(coordinator.automaticCrashHoldSaveRetryTask)
+        failures.failingWritePathFragment = nil
+        let hold = try XCTUnwrap(coordinator.crashHold(for: held.load.session.id))
+        XCTAssertEqual(
+            coordinator.automaticCrashHoldRefusal(for: hold),
+            .saveFailed(retrying: false),
+            "the banner says the save failed and no retry is pending"
+        )
+        await assertNotConfirmed(coordinator, now, held)
+
+        coordinator.test_automaticCrashHoldAtCommit = nil
+        coordinator.requestAutomaticCrashHoldConfirmation()
+        await settleAutomatic(coordinator)
+        XCTAssertNil(coordinator.blockingCrashHold(for: held.binding), "a later trigger confirms it")
+        XCTAssertNil(coordinator.automaticCrashHoldRefusal(for: hold))
+    }
+
+    /// Between its proof and its commit the automatic confirmation owns the session: a recovery
+    /// action on it is refused meanwhile, and acquired once the confirmation ended.
+    func testRecoveryActionIsRefusedWhileTheAutomaticConfirmationClaimsTheSession() async throws {
+        let earlier = launch()
+        let home = try makeWorkspace("home")
+        let held = try await heldSession(earlier, in: home)
+        try seedRecord(held, state: .exited)
+
+        let now = launch()
+        let gate = AutomaticGate()
+        let coordinator = try await startedCoordinator(now, workspaces: [home], automatic: { gate.isOn })
+        let lane = try await openLane(now, coordinator, held, in: home)
+        let card = try XCTUnwrap(coordinator.catalog.item(id: crashHoldItemID(coordinator, held))?.acknowledgement)
+        let request = try await AgentRecoveryActionRequest(
+            actionID: UUID(),
+            itemKey: card.key,
+            kind: .reconcileOnly,
+            expectedRevision: now.store.currentRevision(sessionID: held.load.session.id),
+            sourceRunAttemptID: held.runAttemptID,
+            target: AgentRecoveryActionTarget(providerKindRaw: "claudeCode", providerConversationID: Self.conversation)
+        )
+        let refusedDuringCommit = Counter()
+        coordinator.test_automaticCrashHoldAtCommit = { [weak coordinator] in
+            guard let coordinator else { return }
+            if case .refused = coordinator.beginRecoveryAction(request, lane: lane) { refusedDuringCommit.flag = true }
+        }
+
+        gate.isOn = true
+        coordinator.requestAutomaticCrashHoldConfirmation()
+        await settleAutomatic(coordinator)
+
+        XCTAssertTrue(refusedDuringCommit.flag)
+        XCTAssertNil(coordinator.blockingCrashHold(for: lane.binding))
+        guard case let .acquired(authorization) = coordinator.beginRecoveryAction(request, lane: lane) else {
+            return XCTFail("acquired once the confirmation ended")
+        }
+        coordinator.endRecoveryAction(authorization)
+    }
+
+    /// A hold confirmed another way (It stopped) drops the automatic confirmation's reason.
+    func testItStoppedClearsTheAutomaticReason() async throws {
+        let earlier = launch()
+        let home = try makeWorkspace("home")
+        let held = try await heldSession(earlier, in: home)
+        _ = try seedLiveRecord(held)
+
+        let now = launch()
+        let coordinator = try await startedCoordinator(now, workspaces: [home], automatic: { true })
+        await settleAutomatic(coordinator)
+        let hold = try XCTUnwrap(coordinator.crashHold(for: held.load.session.id))
+        XCTAssertEqual(coordinator.automaticCrashHoldRefusal(for: hold), .needsYou(.mayBeRunning))
+        let lane = try await openLane(now, coordinator, held, in: home)
+        await settleAutomatic(coordinator)
+
+        let confirmed = await coordinator.confirmCrashHold(hold, lane: lane)
+
+        XCTAssertTrue(confirmed)
+        XCTAssertNil(coordinator.automaticCrashHoldRefusals[held.load.session.id], "no stale reason is kept")
+        XCTAssertNil(coordinator.automaticCrashHoldRefusal(for: hold))
+    }
+
+    /// A delayed retry that finds the session busy is deferred and schedules no further retry (no
+    /// hidden polling); the end of the busy action runs it again.
+    func testDeferredSaveRetryIsNotRearmedAndRunsWhenTheActionEnds() async throws {
+        let earlier = launch()
+        let home = try makeWorkspace("home")
+        let held = try await heldSession(earlier, in: home)
+        try seedRecord(held, state: .exited)
+
+        let failures = RecoveryStoreWriteFailureSwitch()
+        let now = launch(failures: failures)
+        let gate = AutomaticGate()
+        let coordinator = try await startedCoordinator(now, workspaces: [home], automatic: { gate.isOn })
+        coordinator.automaticCrashHoldSaveRetryDelays = [.milliseconds(100), .milliseconds(100), .milliseconds(100)]
+        let lane = try await openLane(now, coordinator, held, in: home)
+        let card = try XCTUnwrap(coordinator.catalog.item(id: crashHoldItemID(coordinator, held))?.acknowledgement)
+        let request = try await AgentRecoveryActionRequest(
+            actionID: UUID(),
+            itemKey: card.key,
+            kind: .reconcileOnly,
+            expectedRevision: now.store.currentRevision(sessionID: held.load.session.id),
+            sourceRunAttemptID: held.runAttemptID,
+            target: AgentRecoveryActionTarget(providerKindRaw: "claudeCode", providerConversationID: Self.conversation)
+        )
+        let commits = Counter()
+        coordinator.test_automaticCrashHoldAtCommit = {
+            commits.value += 1
+            if commits.value == 1 { failures.failingWritePathFragment = held.load.session.id.uuidString }
+        }
+
+        gate.isOn = true
+        coordinator.requestAutomaticCrashHoldConfirmation()
+        await settleAutomatic(coordinator)
+        let hold = try XCTUnwrap(coordinator.crashHold(for: held.load.session.id))
+        XCTAssertEqual(coordinator.automaticCrashHoldRefusal(for: hold), .saveFailed(retrying: true))
+        XCTAssertNotNil(coordinator.automaticCrashHoldSaveRetryTask, "a retry is pending")
+        failures.failingWritePathFragment = nil
+        guard case let .acquired(authorization) = coordinator.beginRecoveryAction(request, lane: lane) else {
+            return XCTFail("the recovery action's hold is acquired")
+        }
+
+        let fired = await waitUntil {
+            coordinator.automaticCrashHoldSaveRetryTask == nil && coordinator.automaticCrashHoldTask == nil
+        }
+        XCTAssertTrue(fired)
+        try await Task.sleep(for: .milliseconds(250))
+        XCTAssertEqual(commits.value, 1, "the retry was deferred: no commit")
+        XCTAssertNil(coordinator.automaticCrashHoldSaveRetryTask, "a deferred retry is not re-armed")
+        XCTAssertEqual(
+            coordinator.automaticCrashHoldRefusal(for: hold),
+            .saveFailed(retrying: false),
+            "no retry is promised while none is pending"
+        )
+        XCTAssertNotNil(coordinator.blockingCrashHold(for: lane.binding))
+
+        coordinator.endRecoveryAction(authorization)
+        await settleAutomatic(coordinator)
+        XCTAssertEqual(commits.value, 2)
+        XCTAssertNil(coordinator.blockingCrashHold(for: lane.binding), "confirmed once the action ended")
+    }
+
+    /// A hold already covered by the pending retry isn't charged again when another trigger's
+    /// attempt fails too: the next delay still applies when that retry fails. A later success cancels
+    /// the pending retry.
+    func testFailedSaveCoveredByThePendingRetryIsNotChargedAgain() async throws {
+        let earlier = launch()
+        let home = try makeWorkspace("home")
+        let held = try await heldSession(earlier, in: home)
+        try seedRecord(held, state: .exited)
+
+        let failures = RecoveryStoreWriteFailureSwitch()
+        let now = launch(failures: failures)
+        let gate = AutomaticGate()
+        let coordinator = try await startedCoordinator(now, workspaces: [home], automatic: { gate.isOn })
+        coordinator.automaticCrashHoldSaveRetryDelays = [.milliseconds(300), .seconds(3600)]
+        let sessionID = held.load.session.id
+        let commits = Counter()
+        coordinator.test_automaticCrashHoldAtCommit = {
+            commits.value += 1
+            failures.failingWritePathFragment = sessionID.uuidString
+        }
+
+        gate.isOn = true
+        coordinator.requestAutomaticCrashHoldConfirmation()
+        await settleAutomatic(coordinator)
+        XCTAssertEqual(coordinator.automaticCrashHoldSaveFailures[sessionID]?.count, 1)
+        let firstFire = try XCTUnwrap(coordinator.automaticCrashHoldSaveRetryFireDate)
+
+        coordinator.requestAutomaticCrashHoldConfirmation()
+        await settleAutomatic(coordinator)
+        XCTAssertEqual(commits.value, 2)
+        XCTAssertEqual(coordinator.automaticCrashHoldSaveFailures[sessionID]?.count, 1, "covered: not charged again")
+        XCTAssertEqual(coordinator.automaticCrashHoldSaveRetryFireDate, firstFire, "the pending retry is kept")
+
+        let retried = await waitUntil { commits.value == 3 && coordinator.automaticCrashHoldTask == nil }
+        XCTAssertTrue(retried)
+        XCTAssertEqual(coordinator.automaticCrashHoldSaveFailures[sessionID]?.count, 2, "the next delay applies")
+        let hold = try XCTUnwrap(coordinator.crashHold(for: sessionID))
+        XCTAssertEqual(coordinator.automaticCrashHoldRefusal(for: hold), .saveFailed(retrying: true))
+
+        coordinator.test_automaticCrashHoldAtCommit = nil
+        failures.failingWritePathFragment = nil
+        coordinator.requestAutomaticCrashHoldConfirmation()
+        await settleAutomatic(coordinator)
+        XCTAssertNil(coordinator.blockingCrashHold(for: held.binding))
+        XCTAssertNil(coordinator.automaticCrashHoldSaveRetryTask, "nothing left to retry")
+    }
+
+    /// A hold skipped while its row is working (Open, Refresh, any row action) is checked again once
+    /// the row's action ends.
+    func testHoldSkippedWhileItsRowWorksIsConfirmedOnceTheRowIsIdle() async throws {
+        let earlier = launch()
+        let home = try makeWorkspace("home")
+        let held = try await heldSession(earlier, in: home)
+        try seedRecord(held, state: .exited)
+
+        let now = launch()
+        let gate = AutomaticGate()
+        let coordinator = try await startedCoordinator(now, workspaces: [home], automatic: { gate.isOn })
+        let itemID = try crashHoldItemID(coordinator, held)
+        coordinator.setCatalogActionState(.working, for: itemID)
+
+        gate.isOn = true
+        coordinator.requestAutomaticCrashHoldConfirmation()
+        await settleAutomatic(coordinator)
+        await assertNotConfirmed(coordinator, now, held)
+
+        coordinator.setCatalogActionState(nil, for: itemID)
+        await settleAutomatic(coordinator)
+        XCTAssertNil(coordinator.blockingCrashHold(for: held.binding), "confirmed once the row is idle")
+    }
+
+    /// It stopped clicked while the automatic confirmation commits waits for it instead of writing
+    /// alongside it, then reports the hold confirmed.
+    func testItStoppedDuringAutomaticConfirmationWaitsForIt() async throws {
+        let earlier = launch()
+        let home = try makeWorkspace("home")
+        let held = try await heldSession(earlier, in: home)
+        try seedRecord(held, state: .exited)
+
+        let now = launch()
+        let gate = AutomaticGate()
+        let coordinator = try await startedCoordinator(now, workspaces: [home], automatic: { gate.isOn })
+        let lane = try await openLane(now, coordinator, held, in: home)
+        let hold = try XCTUnwrap(coordinator.crashHold(for: held.load.session.id))
+        let sessionID = held.load.session.id
+        let box = ConfirmBox()
+        let waited = Counter()
+        coordinator.test_automaticCrashHoldAtCommit = { [weak self, weak coordinator] in
+            guard let self, let coordinator else { return }
+            coordinator.test_automaticCrashHoldAtCommit = nil
+            box.task = Task { @MainActor in await coordinator.confirmCrashHold(hold, lane: lane) }
+            waited.flag = await waitUntil { coordinator.automaticCrashHoldClaimWaiters[sessionID]?.isEmpty == false }
+        }
+
+        gate.isOn = true
+        coordinator.requestAutomaticCrashHoldConfirmation()
+        await settleAutomatic(coordinator)
+        let confirmed = try await XCTUnwrap(box.task).value
+
+        XCTAssertTrue(waited.flag, "It stopped waited for the automatic confirmation")
+        XCTAssertTrue(confirmed)
+        XCTAssertNil(coordinator.blockingCrashHold(for: lane.binding))
+        let acknowledgement = await acknowledgement(now, held)
+        XCTAssertTrue(hold.isCovered(by: acknowledgement))
+    }
+
     // MARK: Fixtures
 
     private func launch(failures: RecoveryStoreWriteFailureSwitch = RecoveryStoreWriteFailureSwitch()) -> Launch {
@@ -861,6 +1399,30 @@ final class AgentRecoveryCrashHoldProofTests: XCTestCase {
         )
     }
 
+    /// An earlier launch's record of the held run whose root still runs (a possible writer the
+    /// registry watches); returns the root's PID.
+    private func seedLiveRecord(_ held: Held) throws -> pid_t {
+        let pid = nextPID
+        nextPID += 1
+        processes.add(processes.observation(pid: pid, group: pid))
+        try Fixtures.seed(
+            rootURL: recoveryRoot,
+            root: processes.identity(pid: pid),
+            rootGroup: pid,
+            associations: [association(held, runAttemptID: held.runAttemptID, keys: true)],
+            conversationIDs: [Self.conversation],
+            worktreePaths: [Self.worktree]
+        )
+        return pid
+    }
+
+    /// Waits until no automatic confirmation pass runs (reruns included).
+    private func settleAutomatic(_ coordinator: AgentRecoveryCoordinator) async {
+        while let task = coordinator.automaticCrashHoldTask {
+            await task.value
+        }
+    }
+
     /// An earlier launch's possible writer (its root still alive).
     private func seedLiveWriter(session: AgentRuntimeSessionAssociation?, conversationID: String, worktreePath: String) throws {
         let pid = nextPID
@@ -892,11 +1454,13 @@ final class AgentRecoveryCrashHoldProofTests: XCTestCase {
     }
 
     /// A coordinator composed as in production (real sweep), with a registry over `registryStore`
-    /// (the coordinator's own store unless given), started and awaited to `.ready`.
+    /// (the coordinator's own store unless given), started and awaited to `.ready`. `automatic` is
+    /// the automatic crash-hold confirmation's gate (off unless given).
     private func startedCoordinator(
         _ launch: Launch,
         workspaces: [AgentRecoveryWorkspaceDestination],
-        registryStore: AgentRecoveryStore? = nil
+        registryStore: AgentRecoveryStore? = nil,
+        automatic: @escaping @MainActor () -> Bool = { false }
     ) async throws -> AgentRecoveryCoordinator {
         let service = launch.service
         let coordinator = try AgentRecoveryCoordinator(
@@ -919,9 +1483,11 @@ final class AgentRecoveryCrashHoldProofTests: XCTestCase {
         )
         let registry = AgentProcessRegistry(store: registryStore ?? launch.store, qualification: Fixtures.qualified(), system: processes.system)
         registries.append(registry)
-        coordinator.attachProcessRegistry(registry) { [weak self] sessionID in
-            self?.keysBySession[sessionID] ?? []
-        }
+        coordinator.attachProcessRegistry(
+            registry,
+            ownershipKeys: { [weak self] sessionID in self?.keysBySession[sessionID] ?? [] },
+            automaticCrashHoldConfirmation: automatic
+        )
         coordinator.startIfNeeded()
         let state = await coordinator.awaitStartup()
         XCTAssertEqual(state, .ready)

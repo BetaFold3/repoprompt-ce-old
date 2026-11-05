@@ -539,6 +539,33 @@ package final class AgentRecoveryCoordinator {
     package internal(set) var recoveryCheck: AgentRecoveryCheckStatus?
     /// The running check's wait on its current item, which Stop ends early (Step 9-activation).
     var recoveryCheckItemWait: AgentRecoveryCheckItemWait?
+    /// Automatic crash-hold confirmation from process records
+    /// (`AgentRecoveryCoordinator+AutomaticCrashHoldConfirmation.swift`): whether it may run (the
+    /// app's Reconcile gate, the same one Check uses; off unless attached), the running pass, what
+    /// the next pass covers (every hold, or only these sessions'), the sessions it is confirming
+    /// right now and who waits for them, the sessions it skipped because their row was working,
+    /// and the sessions It stopped is confirming right now (it yields to them).
+    var automaticCrashHoldConfirmationActive: @MainActor () -> Bool = { false }
+    var automaticCrashHoldTask: Task<Void, Never>?
+    var automaticCrashHoldPendingAll = false
+    var automaticCrashHoldPendingSessionIDs: Set<UUID> = []
+    var automaticCrashHoldSessionIDs: Set<UUID> = []
+    var automaticCrashHoldClaimWaiters: [UUID: [CheckedContinuation<Void, Never>]] = [:]
+    var automaticCrashHoldRowDeferredSessionIDs: Set<UUID> = []
+    var userCrashHoldConfirmationCounts: [UUID: Int] = [:]
+    /// Per session, the latest reason its exact hold still needs the user (paused banner).
+    var automaticCrashHoldRefusals: [UUID: (hold: AgentRecoveryCrashHold, refusal: AgentRecoveryAutomaticCrashHoldRefusal)] = [:]
+    /// Per session whose exact hold's proven confirmation failed to save, how many delayed retries
+    /// were charged to it (one per timer that covers it); the pending delayed retry with its fire
+    /// time and identity, the sessions it covers, and the coverage last published to the banner;
+    /// `automaticCrashHoldSaveRetryDelays` bounds the retries.
+    var automaticCrashHoldSaveFailures: [UUID: (hold: AgentRecoveryCrashHold, count: Int)] = [:]
+    var automaticCrashHoldSaveRetryTask: Task<Void, Never>?
+    var automaticCrashHoldSaveRetryFireDate: ContinuousClock.Instant?
+    var automaticCrashHoldSaveRetryToken: UUID?
+    var automaticCrashHoldSaveRetryEnrolled: Set<UUID> = []
+    var automaticCrashHoldSaveRetryPublished: Set<UUID> = []
+    package var automaticCrashHoldSaveRetryDelays: [Duration] = [.seconds(5), .seconds(30), .seconds(120)]
     #if DEBUG
         /// Runs after an item's wait is installed and its work queued, before Check waits on it
         /// (lets a test press Stop before the item's work has started).
@@ -549,6 +576,8 @@ package final class AgentRecoveryCoordinator {
         /// Runs after the last re-check, immediately before the acknowledgement write (lets a test
         /// commit a Dismiss or press Stop once nothing re-checks any more).
         package var test_crashHoldProofAtCommit: (@MainActor () async -> Void)?
+        /// Runs after the automatic confirmation's last re-check, immediately before its write.
+        package var test_automaticCrashHoldAtCommit: (@MainActor () async -> Void)?
     #endif
     /// Serial tail of launch-mark writes (`shutdownInProgress`, `cleanExit`, corrections).
     private var launchMarkTail: Task<Void, Never>?
@@ -831,9 +860,18 @@ package final class AgentRecoveryCoordinator {
     /// Sets (or clears, with `nil`) the shared action state of one catalog item.
     package func setCatalogActionState(_ state: AgentRecoveryCatalogActionState?, for itemID: String) {
         guard catalogActionStates[itemID] != state else { return }
+        let wasWorking = catalogActionStates[itemID] == .working
         catalogActionStates[itemID] = state
         // Action states are not projected into the catalog; only observers are woken.
         postCatalogChange()
+        // The automatic crash-hold confirmation skipped a hold whose row was working: check that
+        // hold again once the row's action (Check, Open, Refresh, ...) ended.
+        if wasWorking, state != .working, !automaticCrashHoldRowDeferredSessionIDs.isEmpty,
+           let item = catalog.item(id: itemID), item.kind == .crashHold, let sessionID = item.sessionID,
+           automaticCrashHoldRowDeferredSessionIDs.remove(sessionID) != nil
+        {
+            requestAutomaticCrashHoldConfirmation(sessionID: sessionID)
+        }
     }
 
     func postCatalogChange() {
@@ -1013,6 +1051,7 @@ package final class AgentRecoveryCoordinator {
         }
         postCoordinatorDidChange()
         requestIndexedScheduleRefresh()
+        requestAutomaticCrashHoldConfirmation()
     }
 
     /// Crash holds from authoritative results only (actionable sessions whose record matched the
@@ -1080,6 +1119,8 @@ package final class AgentRecoveryCoordinator {
     package func endShutdownFreeze(_ token: UUID) {
         guard shutdownFreezes.removeValue(forKey: token) != nil else { return }
         postCoordinatorDidChange()
+        // A hold skipped while frozen is checked again.
+        requestAutomaticCrashHoldConfirmation()
     }
 
     /// Whether a shutdown freeze covers `owner`'s lanes and producers.
@@ -1093,6 +1134,11 @@ package final class AgentRecoveryCoordinator {
 
     package var hasShutdownFreeze: Bool {
         !shutdownFreezes.isEmpty
+    }
+
+    /// Whether an app quit froze every lane.
+    var hasApplicationShutdownFreeze: Bool {
+        shutdownFreezes.values.contains(.application)
     }
 
     // MARK: Recovery action holds (review A P1-01)
@@ -1147,6 +1193,9 @@ package final class AgentRecoveryCoordinator {
         }) else {
             return .refused
         }
+        // The automatic crash-hold confirmation is between its proof and its commit for this
+        // session: nothing else may act on it meanwhile (proof condition (f), both ways).
+        guard !automaticCrashHoldSessionIDs.contains(sessionID) else { return .refused }
         let authorization = AgentRecoveryActionAuthorization(
             token: UUID(),
             actionID: request.actionID,
@@ -1248,6 +1297,8 @@ package final class AgentRecoveryCoordinator {
             waiter.resume(returning: hold.settlement ?? .uncertain(Self.recoveryActionEvidenceUnrecordedText))
         }
         postCoordinatorDidChange()
+        // A hold skipped while this action held its session is checked again.
+        requestAutomaticCrashHoldConfirmation(sessionID: hold.authorization.sessionID)
     }
 
     /// Whether an explicit recovery action holds `sessionID` itself or its workspace: the R9
@@ -1630,15 +1681,38 @@ package final class AgentRecoveryCoordinator {
                 && lane.binding.incarnationID == hold.incarnationID
                 && lane.binding.transcriptResetGeneration == hold.transcriptResetGeneration
         }
+        // The automatic confirmation is between its proof and its commit for this session: wait for
+        // it (it may confirm the same hold) rather than write alongside it. Meanwhile it yields to
+        // this confirmation, and checks the hold again if this ends without confirming it.
+        await waitForAutomaticCrashHoldClaim(sessionID: hold.sessionID)
         guard isCurrent() else { return false }
         if confirmedCrashHolds[hold.sessionID] == hold { return true }
-        guard case .success = await lane.recordCrashHoldAcknowledgement(hold), isCurrent() else { return false }
+        let sessionID = hold.sessionID
+        userCrashHoldConfirmationCounts[sessionID, default: 0] += 1
+        defer {
+            let remaining = (userCrashHoldConfirmationCounts[sessionID] ?? 1) - 1
+            userCrashHoldConfirmationCounts[sessionID] = remaining > 0 ? remaining : nil
+            if remaining <= 0, confirmedCrashHolds[sessionID] != hold {
+                requestAutomaticCrashHoldConfirmation(sessionID: sessionID)
+            }
+        }
+        guard case .success = await lane.recordCrashHoldAcknowledgement(hold), isCurrent() else {
+            // Confirmed meanwhile another way: the user's intent holds.
+            return isCurrent() && confirmedCrashHolds[sessionID] == hold
+        }
         return publishCrashHoldConfirmation(hold)
     }
 
     /// Whether exactly `hold` is published as confirmed.
     func isCrashHoldConfirmed(_ hold: AgentRecoveryCrashHold) -> Bool {
         confirmedCrashHolds[hold.sessionID] == hold
+    }
+
+    /// Every published hold not yet confirmed, in a stable order.
+    var unconfirmedCrashHolds: [AgentRecoveryCrashHold] {
+        crashHolds.values
+            .filter { confirmedCrashHolds[$0.sessionID] != $0 }
+            .sorted { $0.sessionID.uuidString < $1.sessionID.uuidString }
     }
 
     /// The one post-commit publication of a crash-hold confirmation, shared by "It stopped"
@@ -1648,8 +1722,13 @@ package final class AgentRecoveryCoordinator {
     /// when it is still the published hold; `false` (nothing lifted) when the hold changed.
     func publishCrashHoldConfirmation(_ hold: AgentRecoveryCrashHold) -> Bool {
         guard crashHolds[hold.sessionID] == hold else { return false }
+        // However it was confirmed, the automatic confirmation's reason and retry no longer apply.
+        let hadReason = automaticCrashHoldRefusals.removeValue(forKey: hold.sessionID) != nil
+        clearAutomaticCrashHoldSaveFailure(hold.sessionID)
         if confirmedCrashHolds[hold.sessionID] != hold {
             confirmedCrashHolds[hold.sessionID] = hold
+            postCoordinatorDidChange()
+        } else if hadReason {
             postCoordinatorDidChange()
         }
         return true
@@ -1720,6 +1799,8 @@ package final class AgentRecoveryCoordinator {
             lane.questionPersistence.adoptLiveInteractions(inheritedLiveQuestions, after: afterRetirement)
         }
         invalidateCatalog()
+        // An opened session gains a write destination its hold may have lacked.
+        requestAutomaticCrashHoldConfirmation(sessionID: sessionID)
         return lane
     }
 
