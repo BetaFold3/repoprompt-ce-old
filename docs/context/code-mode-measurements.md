@@ -2,7 +2,7 @@
 
 Scope: read when the task touches code-mode cost, correctness or long-session evidence, re-running the code-mode lab, or the numbers behind the D3 gate in the code-mode plan.
 Authority: Reference
-Last-verified: 2026-10-12
+Last-verified: 2026-10-17
 
 This is the persistent record of every number the code-mode lab produced. The decisions and gate live in the plan (`docs/context/plans/2026-10-03-code-mode-readiness-and-git-narrowing-plan.md`, §3 and §7); this file keeps the full per-arm, per-task and per-turn figures so they survive the local lab folder. All numbers are local aggregates from runs against this repository; no session content is quoted.
 
@@ -491,3 +491,4 @@ Claude Code, 2026-04-03 to 2026-10-10, 1,152 user turns with direct exploration 
 - The executor ran in a proxy in front of `repoprompt_ce_cli_debug`, not inside the app; Phase 6 of the plan re-measures with the in-app executor.
 - Wall time is noisy: runs share one RepoPrompt window and the machine was often loaded. Tokens and turns are unaffected.
 - No session reached compaction; the longest sessions here are 11 turns.
+- Task paths and expected answers match the tree before the app-module split (valid up to main `d1e4ce69`). On today's tree, T3 (OpenCode moved into `RepoPromptAgentCore`), T4 (more files in the MCP policies folder), T7 (line count changed) and U1–U3 and E1–E3 (moved paths) no longer match; T1, T2, T5, T6 and T8 still do. The numbers above stay valid for the tree they ran on; the next run pins a corpus SHA and re-derives the truths (plan §7).
