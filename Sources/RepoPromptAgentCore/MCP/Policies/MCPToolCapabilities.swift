@@ -28,8 +28,8 @@ package enum MCPToolCapability: CaseIterable, Hashable {
     case workspaceSteering
     /// Inline rich presentation (`present_rich`). Granted only to a trusted local Agent Mode run
     /// attempt whose captured workspace policy is enabled (`AgentRichPresentationToolPolicy`);
-    /// never a static grant, never to discovery, Oracle, external or unbound clients. The tool
-    /// stays unregistered until the rich-presentation spec's Step 4.
+    /// never a static grant, never to discovery, Oracle, external or unbound clients. The tool is
+    /// registered in every window catalog and policy-gated (`MCPPolicyGatedTools`).
     case richPresentation
 
     /// Stable snake_case name for MCP discovery serialization.

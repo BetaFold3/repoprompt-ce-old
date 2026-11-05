@@ -219,6 +219,23 @@ package enum AgentRichArtifactStore {
         return manifest
     }
 
+    /// History read: the validated manifest only. Assets are read separately so a missing image
+    /// degrades to its placeholder while a missing manifest degrades to the labeled fallback.
+    /// The strict `read`/`copy` contracts (every asset must validate) are unchanged.
+    package static func readManifest(root: URL, sessionID: UUID, reference: RichPresentationReference) throws -> AgentRichArtifactManifest {
+        try readBundle(root: root, sessionID: sessionID, reference: reference).0
+    }
+
+    /// History read of one asset named by `manifest`, validated against its recorded dimensions.
+    package static func readAsset(root: URL, sessionID: UUID, manifest: AgentRichArtifactManifest, assetID: UUID) throws -> Data {
+        guard manifest.assetIDs.contains(assetID) else { throw AgentRichArtifactError.invalidManifest }
+        let session = try sessionDirectory(root: root, sessionID: sessionID)
+        let bundle = try Directory(parent: session, name: manifest.artifactID.uuidString)
+        let bytes = try bundle.read(assetID.uuidString + ".jpg", limit: 4 * 1024 * 1024)
+        try validateAsset(bytes, manifest: manifest, id: assetID)
+        return bytes
+    }
+
     package static func stage(
         root: URL, sessionID: UUID, manifest: AgentRichArtifactManifest, assets: [UUID: Data], cancellation: Cancellation? = nil
     ) throws -> Staged {

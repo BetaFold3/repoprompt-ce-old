@@ -16,6 +16,7 @@ enum MCPWindowToolGroup: CaseIterable, Hashable {
     case agentSessionControl
     case history
     case workspaceSteering
+    case richPresentation
 
     var orderedToolNames: [String] {
         switch self {
@@ -70,6 +71,8 @@ enum MCPWindowToolGroup: CaseIterable, Hashable {
             [MCPWindowToolName.history]
         case .workspaceSteering:
             [MCPWindowToolName.workspaceSteer]
+        case .richPresentation:
+            [MCPWindowToolName.presentRich]
         }
     }
 

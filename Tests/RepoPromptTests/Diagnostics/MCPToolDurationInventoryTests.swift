@@ -19,7 +19,8 @@ import XCTest
                     MCPToolExecutionContractCatalog.orderedAdvertisedToolNames,
                     caseLabel
                 )
-                XCTAssertEqual(MCPToolDurationInventory.entries.count, 28, caseLabel)
+                // 28 + workspace_steer (pre-existing catalog gap) + present_rich (rich-presentation Step 4).
+                XCTAssertEqual(MCPToolDurationInventory.entries.count, 30, caseLabel)
                 XCTAssertEqual(
                     Set(MCPToolDurationInventory.entries.map(\.toolName)).count,
                     MCPToolDurationInventory.entries.count,
@@ -85,7 +86,8 @@ import XCTest
                     ],
                     caseLabel
                 )
-                XCTAssertEqual(MCPToolDurationInventory.boundedToolNames.count, 12, caseLabel)
+                // 12 + workspace_steer (pre-existing gap) + present_rich: both bounded.
+                XCTAssertEqual(MCPToolDurationInventory.boundedToolNames.count, 14, caseLabel)
                 XCTAssertTrue(
                     MCPToolDurationInventory.entries.allSatisfy {
                         !$0.expectedActiveDuration.isEmpty
@@ -220,7 +222,7 @@ import XCTest
                     caseLabel
                 )
                 let tools = try XCTUnwrap(payload["tools"] as? [[String: Any]], caseLabel)
-                XCTAssertEqual(tools.count, 28, caseLabel)
+                XCTAssertEqual(tools.count, 30, caseLabel)
                 let manageWorkspaces = try XCTUnwrap(tools.first {
                     $0["tool"] as? String == MCPGlobalToolName.manageWorkspaces
                 }, caseLabel)

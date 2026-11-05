@@ -4081,6 +4081,9 @@ package enum AgentTranscriptIO {
                     categories: &categories
                 )
             }
+            // Each turn-owned rich presentation replays exactly once as its labeled <=2 KiB
+            // summary: after its result row when that row survives, else at the turn's end.
+            var pendingRichPresentations = turn.richPresentations
             for activity in renderableRows(for: turn, includeArchivedPresentation: true) {
                 guard activity.kind != .user else { continue }
                 examinedRowCount += 1
@@ -4125,6 +4128,14 @@ package enum AgentTranscriptIO {
                             categories: &categories
                         )
                     }
+                    if let index = pendingRichPresentations.firstIndex(where: { $0.activityID == activity.id }) {
+                        recordLine(
+                            richPresentationReplayLine(pendingRichPresentations.remove(at: index)),
+                            category: .toolResult,
+                            writer: &writer,
+                            categories: &categories
+                        )
+                    }
                 case .system:
                     recordLine(
                         "<system>\(activity.text)</system>",
@@ -4142,6 +4153,14 @@ package enum AgentTranscriptIO {
                 case .user, .thinking:
                     break
                 }
+            }
+            for entry in pendingRichPresentations {
+                recordLine(
+                    richPresentationReplayLine(entry),
+                    category: .toolResult,
+                    writer: &writer,
+                    categories: &categories
+                )
             }
         }
 
@@ -4211,6 +4230,18 @@ package enum AgentTranscriptIO {
                     AgentDisplayableText.hasDisplayableBody(activity.text)
             })?.id
 
+            var pendingRichPresentations = turn.richPresentations
+            func appendRichPresentation(_ entry: AgentTranscriptRichPresentation) {
+                let line = richPresentationReplayLine(entry)
+                appendItem(BoundedReplayItem(
+                    category: .toolResult,
+                    line: line,
+                    unboundedLineUTF8Bytes: line.utf8.count,
+                    omissionPriority: .toolResult,
+                    emittedToolArgumentCharacters: 0,
+                    toolArgumentsWereTruncated: false
+                ))
+            }
             for activity in rows {
                 guard activity.kind != .user else { continue }
                 examinedRowCount += 1
@@ -4264,16 +4295,20 @@ package enum AgentTranscriptIO {
                         toolArgumentsWereTruncated: omittedCharacterCount > 0
                     ))
                 case .toolResult:
-                    guard let toolName = AgentTranscriptToolVisibilityPolicy.normalizedVisibleToolName(activity.toolName) else { continue }
-                    let line = "<tool_result name=\"\(toolName)\"/>"
-                    appendItem(BoundedReplayItem(
-                        category: .toolResult,
-                        line: line,
-                        unboundedLineUTF8Bytes: line.utf8.count,
-                        omissionPriority: .toolResult,
-                        emittedToolArgumentCharacters: 0,
-                        toolArgumentsWereTruncated: false
-                    ))
+                    if let toolName = AgentTranscriptToolVisibilityPolicy.normalizedVisibleToolName(activity.toolName) {
+                        let line = "<tool_result name=\"\(toolName)\"/>"
+                        appendItem(BoundedReplayItem(
+                            category: .toolResult,
+                            line: line,
+                            unboundedLineUTF8Bytes: line.utf8.count,
+                            omissionPriority: .toolResult,
+                            emittedToolArgumentCharacters: 0,
+                            toolArgumentsWereTruncated: false
+                        ))
+                    }
+                    if let index = pendingRichPresentations.firstIndex(where: { $0.activityID == activity.id }) {
+                        appendRichPresentation(pendingRichPresentations.remove(at: index))
+                    }
                 case .system:
                     let line = "<system>\(activity.text)</system>"
                     appendItem(BoundedReplayItem(
@@ -4298,6 +4333,7 @@ package enum AgentTranscriptIO {
                     break
                 }
             }
+            pendingRichPresentations.forEach(appendRichPresentation)
         }
 
         let unboundedOutputUTF8Bytes = conversationReplayOutputUTF8Bytes(
@@ -4391,6 +4427,19 @@ package enum AgentTranscriptIO {
                 categories: categories
             )
         )
+    }
+
+    /// The replay line of one turn-owned rich presentation: its clearly labeled summary only
+    /// (`fallbackText`, validated to at most 2 KiB UTF-8), never the full document.
+    static func richPresentationReplayLine(_ entry: AgentTranscriptRichPresentation) -> String {
+        "<rich_presentation>\(entry.reference.fallbackText)</rich_presentation>"
+    }
+
+    /// The fork/handoff XML form of the same summary line. The summary is plain text derived from
+    /// model input (it carries the title), so it is XML-escaped with the export's existing escaper:
+    /// text such as `</rich_presentation>` or `<system>` in a title can't become export markup.
+    static func richPresentationForkXMLLine(_ entry: AgentTranscriptRichPresentation) -> String {
+        "<rich_presentation>\(forkTranscriptXMLAttributeEscaped(entry.reference.fallbackText))</rich_presentation>"
     }
 
     private static func emptyConversationReplayCategoryMetrics() -> [AgentConversationReplayCategory: AgentConversationReplayCategoryMetrics] {
@@ -4511,6 +4560,19 @@ package enum AgentTranscriptIO {
         var pos = 0
         for entry in entries {
             let tid = entry.turnID
+            if let presentation = entry.richPresentation {
+                // One bounded labeled summary per turn-owned reference (its outer block appears
+                // once per projection), whatever the turn's tier.
+                forkItems.append(ForkItem(
+                    pos: pos,
+                    payload: .rawXML(richPresentationForkXMLLine(presentation)),
+                    dropPriority: .context,
+                    turnID: tid,
+                    hostRowID: presentation.activityID,
+                    timestamp: nil
+                ))
+                pos += 1
+            }
             for row in entry.xmlItems {
                 defer { flatIndex += 1 }
                 switch row.kind {
@@ -5108,6 +5170,10 @@ package enum AgentTranscriptIO {
         /// True when this entry represents tool activity (raw tool call or grouped history summary).
         /// Used by the intermediate-assistant filter to detect tool boundaries.
         let isToolBoundary: Bool
+        /// A turn-owned rich presentation's outer block: the text-only XML gets its bounded labeled
+        /// summary line (replay's summary, XML-escaped), never the document. Not migrated: rich
+        /// references move with the handoff's own reference copy.
+        var richPresentation: AgentTranscriptRichPresentation?
     }
 
     /// Returns the turns included in a handoff export, sliced at the turn containing `upToRowID`.
@@ -5166,8 +5232,46 @@ package enum AgentTranscriptIO {
         }
         logHandoffDebug("handoffExportEntries blocks=\(blocks.count) archived=\(projection.archivedBlocks.count) working=\(projection.workingBlocks.count)")
         var entries: [HandoffExportEntry] = []
-        for block in blocks {
+        /// A rich block follows its host rows, so a cutoff at (or after) the host returns before
+        /// reaching it. Append the cutoff turn's later rich blocks that `selectHandoffTranscript`
+        /// selects for the same cutoff (activity order at or before the cutoff activity; none for a
+        /// request-row cutoff; all for a synthetic summary row). Each block is reached only here,
+        /// so nothing is emitted twice.
+        func cutoffEntries(afterBlockAt blockIndex: Int, turnID: UUID, cutoff rowID: UUID) -> [HandoffExportEntry] {
+            let turn = turnsByID[turnID]
+            let cutoffOrder: Int? = if rowID == turn?.request?.id {
+                -1
+            } else {
+                turn?.allActivities.first(where: { $0.id == rowID })?.sequenceIndex
+            }
+            var result = entries
+            for later in blocks[(blockIndex + 1)...] where later.kind == .richPresentation && later.turnID == turnID {
+                guard let presentation = later.richPresentation else { continue }
+                if let cutoffOrder, presentation.activityOrder > cutoffOrder { continue }
+                result.append(HandoffExportEntry(
+                    migratedItem: nil,
+                    sourceRowID: nil,
+                    xmlItems: [],
+                    turnID: turnID,
+                    isToolBoundary: true,
+                    richPresentation: presentation
+                ))
+            }
+            return filterHandoffEntries(result, preserveIntermediateAssistantNarration: preserveIntermediateAssistantNarration)
+        }
+        for (blockIndex, block) in blocks.enumerated() {
             logHandoffDebug("block kind=\(block.kind) rows=\(block.rows.count) groupedSections=\(block.groupedHistory?.sections.count ?? 0) activityIDs=\(block.activityIDs.count)")
+            if block.kind == .richPresentation, let presentation = block.richPresentation {
+                entries.append(HandoffExportEntry(
+                    migratedItem: nil,
+                    sourceRowID: nil,
+                    xmlItems: [],
+                    turnID: block.turnID,
+                    isToolBoundary: true,
+                    richPresentation: presentation
+                ))
+                continue
+            }
             if block.kind == .groupedHistory {
                 if let summary = block.groupedHistory?.summary,
                    let summaryItem = groupedHistorySummaryItem(for: block, summary: summary)
@@ -5189,10 +5293,7 @@ package enum AgentTranscriptIO {
                    block.activityIDs.contains(upToRowID)
                 {
                     logHandoffDebug("cutoff matched hidden groupedHistory activity currentEntries=\(entries.count)")
-                    return filterHandoffEntries(
-                        entries,
-                        preserveIntermediateAssistantNarration: preserveIntermediateAssistantNarration
-                    )
+                    return cutoffEntries(afterBlockAt: blockIndex, turnID: block.turnID, cutoff: upToRowID)
                 }
             }
             // Standalone tool blocks only have .toolResult rows (no .toolCall rows).
@@ -5219,10 +5320,7 @@ package enum AgentTranscriptIO {
                 }
                 if let upToRowID, block.rows.contains(where: { $0.id == upToRowID }) {
                     logHandoffDebug("cutoff matched standaloneTool block currentEntries=\(entries.count)")
-                    return filterHandoffEntries(
-                        entries,
-                        preserveIntermediateAssistantNarration: preserveIntermediateAssistantNarration
-                    )
+                    return cutoffEntries(afterBlockAt: blockIndex, turnID: block.turnID, cutoff: upToRowID)
                 }
                 continue
             }
@@ -5276,10 +5374,7 @@ package enum AgentTranscriptIO {
                 ))
                 if let upToRowID, row.id == upToRowID {
                     logHandoffDebug("cutoff matched row kind=\(row.kind) seq=\(row.sequenceIndex) currentEntries=\(entries.count)")
-                    return filterHandoffEntries(
-                        entries,
-                        preserveIntermediateAssistantNarration: preserveIntermediateAssistantNarration
-                    )
+                    return cutoffEntries(afterBlockAt: blockIndex, turnID: block.turnID, cutoff: upToRowID)
                 }
             }
         }
@@ -5566,7 +5661,7 @@ package enum AgentTranscriptIO {
                         isToolBoundary: false
                     ))
                 }
-            case .request, .activityCluster, .groupedHistory, .collapsedHistoryRange, .middleSummary, .conclusion:
+            case .request, .activityCluster, .groupedHistory, .collapsedHistoryRange, .middleSummary, .conclusion, .richPresentation:
                 break
             }
         }
@@ -6558,6 +6653,9 @@ enum AgentTranscriptCompactor {
         protection: AgentTranscriptProjectionProtection = .none,
         enforceActualByteBackstop: Bool = true
     ) -> AgentTranscript {
+        // Capture turn-owned rich-presentation references before any tier downshift, archive or
+        // structural trim can drop the activity that carries them (idempotent).
+        let transcript = AgentRichPresentationCapture.captured(transcript)
         switch mode {
         case .recomputeAll:
             return AgentTranscriptDurableFrontierSupport.normalizedTranscript(
@@ -7128,6 +7226,9 @@ package struct AgentTranscriptTurnProjectionCache: Equatable {
         let activityCount: Int
         let conclusionActivityID: UUID?
         let frozenDetailedToolTailLimit: Int?
+        /// Turn-owned rich-presentation references: adding, reordering or replacing one invalidates
+        /// the cached projection even when no activity changed.
+        var richPresentations: [AgentTranscriptRichPresentation] = []
     }
 
     let token: ValidationToken
@@ -7839,7 +7940,8 @@ package enum AgentTranscriptProjectionBuilder {
         switch block.kind {
         case .groupedHistory:
             []
-        case .request, .activityCluster, .standaloneAssistant, .standaloneTool, .standaloneNote, .middleSummary, .conclusion:
+        case .request, .activityCluster, .standaloneAssistant, .standaloneTool, .standaloneNote, .middleSummary, .conclusion,
+             .richPresentation:
             block.rows
         case .collapsedHistoryRange:
             []
@@ -7962,7 +8064,8 @@ package enum AgentTranscriptProjectionBuilder {
             responseSpanCount: turn.responseSpans.count,
             activityCount: turn.allActivities.count,
             conclusionActivityID: turn.conclusionActivityID,
-            frozenDetailedToolTailLimit: turn.frozenDetailedToolTailLimit
+            frozenDetailedToolTailLimit: turn.frozenDetailedToolTailLimit,
+            richPresentations: turn.richPresentations
         )
     }
 
@@ -8324,7 +8427,18 @@ package enum AgentTranscriptProjectionBuilder {
                 compactedBlocks(for: turn, archived: archived)
             }
         }
-        return unsortedBlocks.enumerated().sorted { lhs, rhs in
+        // Each turn-owned rich presentation is one durable outer block at every tier, ordered by
+        // its activity's session-wide sequence index (after its result row on a tie). It is never
+        // folded into grouped history, so it is never collapsed.
+        let richBlocks = turn.richPresentations.map { presentation in
+            AgentTranscriptRenderBlock.richPresentationBlock(
+                turnID: turn.id,
+                retentionTier: turn.retentionTier,
+                isArchived: archived,
+                presentation: presentation
+            )
+        }
+        return (unsortedBlocks + richBlocks).enumerated().sorted { lhs, rhs in
             let lhsSequence = blockSequenceIndex(lhs.element)
             let rhsSequence = blockSequenceIndex(rhs.element)
             if lhsSequence == rhsSequence {
@@ -8335,6 +8449,9 @@ package enum AgentTranscriptProjectionBuilder {
     }
 
     private static func blockSequenceIndex(_ block: AgentTranscriptRenderBlock) -> Int {
+        if let richPresentation = block.richPresentation {
+            return richPresentation.activityOrder
+        }
         if let rowSequence = block.rows.map(\.sequenceIndex).min() {
             return rowSequence
         }
@@ -8720,7 +8837,7 @@ package enum AgentTranscriptProjectionBuilder {
 
     private static func presentedItemCount(for block: AgentTranscriptRenderBlock) -> Int {
         switch block.kind {
-        case .activityCluster, .groupedHistory, .collapsedHistoryRange:
+        case .activityCluster, .groupedHistory, .collapsedHistoryRange, .richPresentation:
             1
         case .request, .standaloneAssistant, .standaloneTool, .standaloneNote, .middleSummary, .conclusion:
             block.rows.count
@@ -9540,7 +9657,7 @@ package enum AgentTranscriptProjectionBuilder {
             .activity
         case .standaloneNote:
             block.rows.contains(where: { $0.kind == .thinking }) ? .activity : .notes
-        case .request, .activityCluster, .groupedHistory, .collapsedHistoryRange, .middleSummary, .conclusion:
+        case .request, .activityCluster, .groupedHistory, .collapsedHistoryRange, .middleSummary, .conclusion, .richPresentation:
             .mixed
         }
     }
@@ -9564,7 +9681,7 @@ package enum AgentTranscriptProjectionBuilder {
                 } else {
                     containsNotes = true
                 }
-            case .request, .activityCluster, .groupedHistory, .collapsedHistoryRange, .middleSummary, .conclusion:
+            case .request, .activityCluster, .groupedHistory, .collapsedHistoryRange, .middleSummary, .conclusion, .richPresentation:
                 containsMixed = true
             }
         }

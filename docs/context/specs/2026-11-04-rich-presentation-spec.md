@@ -100,7 +100,7 @@ Step 3 — done | rounds 2/2 | open: none | downgraded: none | assumed: A4 | def
 - Change: `present_rich` provider via `MCPWindowToolRuntime` with freshness none; canonical names/group/catalog, capabilities/grants, admission/execution contracts and recognition; Core turn model/sanitizer/compactor; App outer block renderer. Advertise only once storage and full-inline retention are integrated.
 - Validation: `AgentToolResultPersistencePolicyTests`, `AgentTranscriptGroupInspectionTests`, catalog/admission tests and one end-to-end fixture: publish → sanitize twice including ACP → save → all retention tiers → reload → render exactly once, with missing assets and creation disabled.
 - Done when: complete content stays outer-inline with stable ordering and no historical network traffic or duplicate success body.
-Step 4 — todo | rounds 0/2 | open: activation and inline retention | downgraded: none | assumed: A1,A2,A6 | deferred: activation gates in step3-final.md
+Step 4 — done | rounds 1/2 | open: none | downgraded: none | assumed: A1,A2,A6; existing outer history reveal | deferred: advisory findings and live acceptance in step4-final.md
 ### Step 5 — Acceptance and durable guidance
 - Change: fix only observed integration defects and update this owning spec's status/contract; keep raw evidence outside it.
 - Validation: affected `make dev-test FILTER=<Suite>`, `make dev-lint`, product build and `make guardrails`; context checker plus its negative suite. With immediate owner approval, exercise Claude/Codex/OMP tool refresh, worker/Knowledge output, long history, resizing, selection, restart, handoff and image denial in the Dev app.

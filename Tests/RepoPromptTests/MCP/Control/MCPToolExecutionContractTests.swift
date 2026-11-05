@@ -41,7 +41,9 @@ final class MCPToolExecutionContractTests: XCTestCase {
                 MCPGlobalToolName.orderedToolNames + MCPWindowToolGroup.orderedToolNames,
                 caseLabel
             )
-            XCTAssertEqual(MCPToolExecutionContractCatalog.orderedAdvertisedToolNames.count, 28, caseLabel)
+            // 28 + workspace_steer (a pre-existing catalog gap, registered before this count was
+            // updated) + present_rich (rich-presentation Step 4).
+            XCTAssertEqual(MCPToolExecutionContractCatalog.orderedAdvertisedToolNames.count, 30, caseLabel)
             XCTAssertEqual(
                 Set(MCPToolExecutionContractCatalog.orderedAdvertisedToolNames).count,
                 MCPToolExecutionContractCatalog.orderedAdvertisedToolNames.count,
@@ -73,7 +75,9 @@ final class MCPToolExecutionContractTests: XCTestCase {
                 MCPWindowToolName.agentManage,
                 MCPWindowToolName.shareThoughts,
                 MCPWindowToolName.setStatus,
-                MCPWindowToolName.history
+                MCPWindowToolName.history,
+                MCPWindowToolName.workspaceSteer,
+                MCPWindowToolName.presentRich
             ], caseLabel)
 
             for toolName in names(for: .bounded) {

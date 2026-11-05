@@ -42,7 +42,8 @@ enum AgentTranscriptHistoricalTruncationPolicy {
         let turnCount = transcript.turns.count
         guard turnCount > exemptCount else { return transcript }
 
-        var copy = transcript
+        // Rich-presentation references are captured before any old-turn rewrite (idempotent).
+        var copy = AgentRichPresentationCapture.captured(transcript)
         let eligibleEnd = turnCount - exemptCount
         for index in 0 ..< eligibleEnd {
             truncateTurnFields(&copy.turns[index])
