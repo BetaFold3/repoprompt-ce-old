@@ -560,6 +560,12 @@ public struct AgentTranscriptTurn: Codable, Identifiable, Sendable, Equatable {
     /// Set when cold restore closed this open turn as its recorded ordinary outcome (never together
     /// with an interruption).
     public var recoveredOutcome: AgentTranscriptTurnRecoveredOutcome?
+    /// Durable ordered references, independent of destructively retained tool activities.
+    package var richPresentations: [AgentTranscriptRichPresentation] = []
+    /// The persisted `richPresentations` value when this build cannot decode it (a newer format or
+    /// corruption). Kept verbatim and re-encoded unchanged so the session, its text history and the
+    /// unread references stay intact; handoff refuses while it is present (never a silent drop).
+    package var unreadableRichPresentations: AgentScheduledSendJSONValue?
 
     public init(
         id: UUID = UUID(),
@@ -605,6 +611,7 @@ public struct AgentTranscriptTurn: Codable, Identifiable, Sendable, Equatable {
         case frozenDetailedToolTailLimit
         case interruption
         case recoveredOutcome
+        case richPresentations
     }
 
     public init(from decoder: Decoder) throws {
@@ -623,6 +630,15 @@ public struct AgentTranscriptTurn: Codable, Identifiable, Sendable, Equatable {
         // Additive member: an unreadable record never fails the session.
         interruption = try? container.decodeIfPresent(AgentTranscriptTurnInterruption.self, forKey: .interruption)
         recoveredOutcome = try? container.decodeIfPresent(AgentTranscriptTurnRecoveredOutcome.self, forKey: .recoveredOutcome)
+        // Missing is legacy. An undecodable present value never fails the session (or its text
+        // history) and is never discarded: it is preserved raw for verbatim re-encoding.
+        if container.contains(.richPresentations) {
+            if let decoded = try? container.decode([AgentTranscriptRichPresentation].self, forKey: .richPresentations) {
+                richPresentations = decoded
+            } else {
+                unreadableRichPresentations = try container.decode(AgentScheduledSendJSONValue.self, forKey: .richPresentations)
+            }
+        }
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -640,6 +656,24 @@ public struct AgentTranscriptTurn: Codable, Identifiable, Sendable, Equatable {
         try container.encodeIfPresent(frozenDetailedToolTailLimit, forKey: .frozenDetailedToolTailLimit)
         try container.encodeIfPresent(interruption, forKey: .interruption)
         try container.encodeIfPresent(recoveredOutcome, forKey: .recoveredOutcome)
+        // Omitted when empty so legacy session bytes are unchanged; an unreadable value round-trips.
+        // One representation per turn: both together would silently drop the readable list.
+        assert(
+            richPresentations.isEmpty || unreadableRichPresentations == nil,
+            "A turn holds both readable and unreadable rich presentations"
+        )
+        if let unreadableRichPresentations {
+            try container.encode(unreadableRichPresentations, forKey: .richPresentations)
+        } else if !richPresentations.isEmpty {
+            try container.encode(richPresentations, forKey: .richPresentations)
+        }
+    }
+
+    /// Rebuilds derive turns from rows; turn-owned references (readable or preserved raw) are
+    /// carried from the turn being replaced instead.
+    package mutating func carryRichPresentations(from turn: AgentTranscriptTurn) {
+        richPresentations = turn.richPresentations
+        unreadableRichPresentations = turn.unreadableRichPresentations
     }
 
     public var isCompleted: Bool {

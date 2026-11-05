@@ -6169,6 +6169,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     // MARK: - CRUD
 
     func deleteWorkspace(_ workspace: WorkspaceModel) {
+        let richMutation = RichPresentationPublicationService.shared.beginMutation(workspaceIDs: [workspace.id])
         workspaces.removeAll { $0.id == workspace.id }
         if activeWorkspaceID == workspace.id {
             activeWorkspaceID = nil
@@ -6181,14 +6182,21 @@ class WorkspaceManagerViewModel: ObservableObject {
             await GitDiffDataMaintenance.shared.deleteAllGitData(workspaceDirectory: workspaceDir)
         }
 
-        if workspace.customStoragePath == nil {
-            // For default storage, delete the entire workspace folder
-            do {
-                if FileManager.default.fileExists(atPath: workspaceDir.path) {
-                    try FileManager.default.removeItem(at: workspaceDir)
-                }
-            } catch {
-                print("Failed to remove workspace folder: \(error)")
+        Task {
+            let fence = AgentRichArtifactFilesystemFence.shared
+            await fence.acquire()
+            defer {
+                fence.release()
+                RichPresentationPublicationService.shared.endMutation(richMutation)
+            }
+            if workspace.customStoragePath == nil {
+                do {
+                    try await AgentRichArtifactStore.offMain {
+                        if FileManager.default.fileExists(atPath: workspaceDir.path) {
+                            try FileManager.default.removeItem(at: workspaceDir)
+                        }
+                    }
+                } catch { print("Failed to remove workspace folder: \(error)") }
             }
         }
 
@@ -6206,50 +6214,62 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
     }
 
-    func renameWorkspace(_ workspace: WorkspaceModel, newName: String) {
-        guard let index = workspaces.firstIndex(where: { $0.id == workspace.id }) else { return }
+    /// Physical workspace-root mutations: synchronously (before any suspension) advance the rich
+    /// storage revision and cancel admitted rich work for the affected workspaces, then wait for
+    /// in-flight rich filesystem work (the shared fence), then run the existing mutation. The
+    /// fence is never held while acquiring session gates or activating a workspace. The revision
+    /// stays advanced even if the mutation fails, so captured roots cannot commit afterwards.
+    private func withRichStorageMutation<T>(
+        workspaceIDs: Set<UUID>, operation: () async throws -> T
+    ) async rethrows -> T {
+        let service = RichPresentationPublicationService.shared
+        let mutation = service.beginMutation(workspaceIDs: workspaceIDs)
+        let fence = AgentRichArtifactFilesystemFence.shared
+        await fence.acquire()
+        defer {
+            fence.release()
+            service.endMutation(mutation)
+        }
+        return try await operation()
+    }
+
+    func renameWorkspace(_ workspace: WorkspaceModel, newName: String) async {
         let finalName = newName.trimmingCharacters(in: .whitespaces)
-        guard !finalName.isEmpty else { return }
+        guard !finalName.isEmpty, workspaces.contains(where: { $0.id == workspace.id }) else { return }
 
-        workspaces[index].name = finalName
-        workspaces[index].dateModified = Date()
-
-        if workspaces[index].customStoragePath == nil {
-            // Preserve the original base location (global or default)
-            let baseLocation = currentBaseRoot
-            // 'workspace' param still holds the old name – use it to locate old folder
-            let oldFolder = workspaceDirectory(for: workspace)
-            let newFolder = baseLocation.appendingPathComponent(
-                "Workspace-\(finalName)-\(workspace.id.uuidString)"
-            )
-            do {
-                if FileManager.default.fileExists(atPath: oldFolder.path) {
-                    try FileManager.default.moveItem(at: oldFolder, to: newFolder)
+        await withRichStorageMutation(workspaceIDs: [workspace.id]) {
+            // As before: the in-memory name and the same-volume folder rename change together in
+            // one synchronous main-actor section, so no writer resolves a half-renamed root.
+            guard let index = workspaces.firstIndex(where: { $0.id == workspace.id }) else { return }
+            let previous = workspaces[index]
+            workspaces[index].name = finalName
+            workspaces[index].dateModified = Date()
+            if previous.customStoragePath == nil {
+                let oldFolder = workspaceDirectory(for: previous)
+                let newFolder = workspaceDirectory(for: workspaces[index])
+                do {
+                    if oldFolder != newFolder, FileManager.default.fileExists(atPath: oldFolder.path) {
+                        try FileManager.default.moveItem(at: oldFolder, to: newFolder)
+                    }
+                } catch {
+                    print("Failed to rename workspace folder: \(error)")
                 }
-            } catch {
-                print("Failed to rename workspace folder: \(error)")
             }
         }
 
-        // Schedule async save of the specific workspace and index update, with flushes before notify
-        Task {
-            do {
-                let finalURL = try await saveWorkspaceToFileAsync(workspaces[index], source: .renameWorkspace)
-                await WorkspaceDiskWriter.shared.flush(url: finalURL)
-
-                await rebuildAndSaveIndexAsync()
-                await WorkspaceDiskWriter.shared.flush(url: workspaceIndexFileURL)
-
-                await MainActor.run {
-                    NotificationCenter.default.post(
-                        name: .workspaceListDidChange,
-                        object: nil,
-                        userInfo: ["managerID": instanceID]
-                    )
-                }
-            } catch {
-                print("Error saving renamed workspace: \(error)")
-            }
+        do {
+            guard let index = workspaces.firstIndex(where: { $0.id == workspace.id }) else { return }
+            let finalURL = try await saveWorkspaceToFileAsync(workspaces[index], source: .renameWorkspace)
+            await WorkspaceDiskWriter.shared.flush(url: finalURL)
+            await rebuildAndSaveIndexAsync()
+            await WorkspaceDiskWriter.shared.flush(url: workspaceIndexFileURL)
+            NotificationCenter.default.post(
+                name: .workspaceListDidChange,
+                object: nil,
+                userInfo: ["managerID": instanceID]
+            )
+        } catch {
+            print("Error saving renamed workspace: \(error)")
         }
     }
 
@@ -7882,36 +7902,40 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     // MARK: - Reset to Default
 
-    func resetGlobalStorageToDefault(migrate: Bool = true) throws {
-        guard let currentGlobal = globalCustomStorageURL else {
+    func resetGlobalStorageToDefault(migrate: Bool = true) async throws {
+        guard globalCustomStorageURL != nil else {
             print("Already using default storage.")
             return
         }
+        // Every workspace's resolved root changes (custom paths are cleared too).
+        try await withRichStorageMutation(workspaceIDs: Set(workspaces.map(\.id))) {
+            // Unchanged physical semantics, after admitted rich filesystem work has drained.
+            guard let currentGlobal = globalCustomStorageURL else { return }
+            for ws in workspaces {
+                let oldFolder = currentGlobal.appendingPathComponent(directoryName(for: ws))
+                let newFolder = defaultWorkspaceRoot().appendingPathComponent(directoryName(for: ws))
 
-        for ws in workspaces {
-            let oldFolder = currentGlobal.appendingPathComponent(directoryName(for: ws))
-            let newFolder = defaultWorkspaceRoot().appendingPathComponent(directoryName(for: ws))
-
-            if !FileManager.default.fileExists(atPath: newFolder.path) {
-                try FileManager.default.createDirectory(
-                    at: newFolder,
-                    withIntermediateDirectories: true,
-                    attributes: nil
-                )
-            }
-
-            if FileManager.default.fileExists(atPath: oldFolder.path) {
-                if migrate {
-                    try moveFolderContents(from: oldFolder, to: newFolder)
+                if !FileManager.default.fileExists(atPath: newFolder.path) {
+                    try FileManager.default.createDirectory(
+                        at: newFolder,
+                        withIntermediateDirectories: true,
+                        attributes: nil
+                    )
                 }
-                try? FileManager.default.removeItem(at: oldFolder)
-            }
 
-            if let idx = workspaces.firstIndex(where: { $0.id == ws.id }) {
-                workspaces[idx].customStoragePath = nil
+                if FileManager.default.fileExists(atPath: oldFolder.path) {
+                    if migrate {
+                        try moveFolderContents(from: oldFolder, to: newFolder)
+                    }
+                    try? FileManager.default.removeItem(at: oldFolder)
+                }
+
+                if let idx = workspaces.firstIndex(where: { $0.id == ws.id }) {
+                    workspaces[idx].customStoragePath = nil
+                }
             }
+            globalCustomStorageURL = nil
         }
-        globalCustomStorageURL = nil
 
         // Schedule async index save
         Task {
@@ -7940,17 +7964,21 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
     }
 
-    func updateGlobalStoragePath(_ newURL: URL) throws {
-        let oldBase = currentBaseRoot
-        for ws in workspaces {
-            let oldFolder = oldBase.appendingPathComponent(directoryName(for: ws))
-            let newFolder = newURL.appendingPathComponent(directoryName(for: ws))
-            if FileManager.default.fileExists(atPath: oldFolder.path) {
-                try FileManager.default.moveItem(at: oldFolder, to: newFolder)
+    func updateGlobalStoragePath(_ newURL: URL) async throws {
+        // Only workspaces without a per-workspace override resolve under the global base.
+        let affected = Set(workspaces.filter { $0.customStoragePath == nil }.map(\.id))
+        try await withRichStorageMutation(workspaceIDs: affected) {
+            // Unchanged physical semantics, after admitted rich filesystem work has drained.
+            let oldBase = currentBaseRoot
+            for ws in workspaces {
+                let oldFolder = oldBase.appendingPathComponent(directoryName(for: ws))
+                let newFolder = newURL.appendingPathComponent(directoryName(for: ws))
+                if FileManager.default.fileExists(atPath: oldFolder.path) {
+                    try FileManager.default.moveItem(at: oldFolder, to: newFolder)
+                }
             }
+            globalCustomStorageURL = newURL
         }
-
-        globalCustomStorageURL = newURL
 
         // Schedule async index save
         Task {
@@ -8979,44 +9007,51 @@ class WorkspaceManagerViewModel: ObservableObject {
         let workspaceDirectories = try fm.contentsOfDirectory(at: exportFolder, includingPropertiesForKeys: nil)
             .filter { $0.lastPathComponent.hasPrefix("Workspace-") && $0.hasDirectoryPath }
 
-        // We'll hold onto newly loaded workspaces in memory
-        var newlyLoadedWorkspaces: [WorkspaceModel] = []
+        // Restore physically replaces workspace trees: participate in the rich storage mutation
+        // fence (no session gates or activation inside it). Activation happens afterwards.
+        let newlyLoadedWorkspaces: [WorkspaceModel] = try await withRichStorageMutation(
+            workspaceIDs: Set(workspaces.map(\.id))
+        ) {
+            // We'll hold onto newly loaded workspaces in memory
+            var newlyLoadedWorkspaces: [WorkspaceModel] = []
 
-        for backupWsDir in workspaceDirectories {
-            // Inside this folder, we expect a "workspace.json"
-            let potentialWorkspaceFile = backupWsDir.appendingPathComponent("workspace.json")
-            guard fm.fileExists(atPath: potentialWorkspaceFile.path) else {
-                print("No workspace.json in \(backupWsDir.path). Skipping.")
-                continue
+            for backupWsDir in workspaceDirectories {
+                // Inside this folder, we expect a "workspace.json"
+                let potentialWorkspaceFile = backupWsDir.appendingPathComponent("workspace.json")
+                guard fm.fileExists(atPath: potentialWorkspaceFile.path) else {
+                    print("No workspace.json in \(backupWsDir.path). Skipping.")
+                    continue
+                }
+
+                // We read workspace.json to figure out the workspace's ID, name, etc.
+                let data = try Data(contentsOf: potentialWorkspaceFile)
+                let workspace = try JSONDecoder().decode(WorkspaceModel.self, from: data)
+
+                // Build the local folder path, e.g. ~/Library/Application Support/RepoPrompt CE/Workspaces/Workspace-Name-UUID
+                let localWsDir: URL = if let customURL = workspace.customStoragePath {
+                    customURL
+                } else {
+                    defaultWorkspaceRoot()
+                        .appendingPathComponent("Workspace-\(workspace.name)-\(workspace.id)")
+                }
+
+                // If it already exists, remove it to avoid partial merges
+                if fm.fileExists(atPath: localWsDir.path) {
+                    try fm.removeItem(at: localWsDir)
+                }
+
+                // Copy the entire folder from backup into local
+                try fm.copyItem(at: backupWsDir, to: localWsDir)
+
+                // Now load the final workspace from disk again
+                // (We do this so we confirm it's in the correct location + we store it with local paths).
+                let finalWorkspaceFile = localWsDir.appendingPathComponent("workspace.json")
+                let finalData = try Data(contentsOf: finalWorkspaceFile)
+                let finalWorkspace = try JSONDecoder().decode(WorkspaceModel.self, from: finalData)
+
+                newlyLoadedWorkspaces.append(finalWorkspace)
             }
-
-            // We read workspace.json to figure out the workspace's ID, name, etc.
-            let data = try Data(contentsOf: potentialWorkspaceFile)
-            let workspace = try JSONDecoder().decode(WorkspaceModel.self, from: data)
-
-            // Build the local folder path, e.g. ~/Library/Application Support/RepoPrompt CE/Workspaces/Workspace-Name-UUID
-            let localWsDir: URL = if let customURL = workspace.customStoragePath {
-                customURL
-            } else {
-                defaultWorkspaceRoot()
-                    .appendingPathComponent("Workspace-\(workspace.name)-\(workspace.id)")
-            }
-
-            // If it already exists, remove it to avoid partial merges
-            if fm.fileExists(atPath: localWsDir.path) {
-                try fm.removeItem(at: localWsDir)
-            }
-
-            // Copy the entire folder from backup into local
-            try fm.copyItem(at: backupWsDir, to: localWsDir)
-
-            // Now load the final workspace from disk again
-            // (We do this so we confirm it's in the correct location + we store it with local paths).
-            let finalWorkspaceFile = localWsDir.appendingPathComponent("workspace.json")
-            let finalData = try Data(contentsOf: finalWorkspaceFile)
-            let finalWorkspace = try JSONDecoder().decode(WorkspaceModel.self, from: finalData)
-
-            newlyLoadedWorkspaces.append(finalWorkspace)
+            return newlyLoadedWorkspaces
         }
 
         // 5) Replace your in-memory array with newly loaded (or appended) ones

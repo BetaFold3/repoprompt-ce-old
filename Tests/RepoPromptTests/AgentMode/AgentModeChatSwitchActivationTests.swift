@@ -1,9 +1,11 @@
 import Combine
 import Foundation
+import ImageIO
 @_spi(TestSupport) @testable import RepoPromptAgentCore
 @testable import RepoPromptPlatform
 @testable import RepoPromptUI
 @testable import RepoPromptWorkspace
+import UniformTypeIdentifiers
 import XCTest
 @_spi(TestSupport) @testable import RepoPromptApp
 
@@ -1474,6 +1476,553 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
                 workspaceTabIDsBefore,
                 "The destination tab is closed when the commit check fails"
             )
+        }
+    }
+
+    func testPrepareHandoffHeadlessFinalCheckFailureAfterSaveNeverExposesDestinationAndKeepsSource() async throws {
+        try await withFixture { fixture in
+            let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+            let tabIDsBefore = Set(workspace.composeTabs.map(\.id))
+            let sessionTabsBefore = Set(fixture.viewModel.sessions.keys)
+            let filesBefore = try await Set(fixture.viewModel.dataService.listAgentSessions(for: workspace))
+            let sourceTexts = fixture.sessionA.items.map(\.text)
+            struct LateStaleLineage: Error {}
+            var calls = 0
+            do {
+                _ = try await fixture.viewModel.prepareHandoffHeadless(
+                    sourceTabID: fixture.tabAID,
+                    upToItemID: nil,
+                    destinationAgent: fixture.sessionA.selectedAgent,
+                    destinationModelRaw: fixture.sessionA.selectedModelRaw,
+                    destinationReasoningEffortRaw: fixture.sessionA.selectedReasoningEffortRaw,
+                    delegationParentSessionID: fixture.sessionBID,
+                    delegationCommitCheck: {
+                        calls += 1
+                        // Every check, including those after the private initial save, sees no
+                        // destination tab, session, or workspace compose tab.
+                        XCTAssertEqual(Set(fixture.viewModel.sessions.keys), sessionTabsBefore)
+                        XCTAssertEqual(
+                            Set(fixture.window.workspaceManager.activeWorkspace?.composeTabs.map(\.id) ?? []),
+                            tabIDsBefore
+                        )
+                        // 1 before preparation; then the transaction's initial, pre-save and final checks.
+                        if calls == 4 { throw LateStaleLineage() }
+                    }
+                )
+                XCTFail("A failed final commit check must abort the fork")
+            } catch is LateStaleLineage {}
+
+            XCTAssertEqual(calls, 4, "The failure was injected at the final check, after the initial save")
+            XCTAssertEqual(Set(fixture.viewModel.sessions.keys), sessionTabsBefore)
+            XCTAssertEqual(
+                Set(fixture.window.workspaceManager.activeWorkspace?.composeTabs.map(\.id) ?? []),
+                tabIDsBefore
+            )
+            XCTAssertFalse(fixture.viewModel.sessions.values.contains { $0.parentSessionID == fixture.sessionBID })
+            let filesAfter = try await Set(fixture.viewModel.dataService.listAgentSessions(for: workspace))
+            XCTAssertEqual(filesAfter, filesBefore, "The saved destination was rolled back through deletion")
+            XCTAssertEqual(fixture.sessionA.items.map(\.text), sourceTexts, "The source is unchanged")
+
+            // The same source still hands off normally afterwards.
+            let destinationTabID = try await fixture.viewModel.prepareHandoffHeadless(
+                sourceTabID: fixture.tabAID,
+                upToItemID: nil,
+                destinationAgent: fixture.sessionA.selectedAgent,
+                destinationModelRaw: fixture.sessionA.selectedModelRaw,
+                destinationReasoningEffortRaw: fixture.sessionA.selectedReasoningEffortRaw
+            )
+            let destination = try XCTUnwrap(fixture.viewModel.sessions[destinationTabID])
+            XCTAssertEqual(destination.items.map(\.text), fixture.tabATexts)
+            XCTAssertNotNil(destination.persistenceState, "Exposed only after its initial save")
+            XCTAssertTrue(
+                fixture.window.workspaceManager.activeWorkspace?.composeTabs.contains { $0.id == destinationTabID } ?? false
+            )
+        }
+    }
+
+    // MARK: - Rich presentation storage identity through the production handoff seam
+
+    /// S3-01/B3-04: a production rename that completes while an ordinary handoff is suspended
+    /// before its private commit aborts that handoff without recreating the old directory or
+    /// exposing a destination; a fresh attempt captures the renamed storage and succeeds.
+    func testOrdinaryHandoffSuspendedAcrossProductionRenameNeverRecreatesOldDirectoryAndRetrySucceeds() async throws {
+        try await withFixture { fixture in
+            let manager = fixture.window.workspaceManager
+            let dataService = fixture.viewModel.dataService
+            fixture.sessionA.isDirty = true
+            let sourceSaved = await fixture.viewModel.saveSession(for: fixture.tabAID)
+            XCTAssertTrue(sourceSaved, "Precondition: the workspace storage folder exists before the rename")
+            let before = try XCTUnwrap(manager.activeWorkspace)
+            let oldRoot = dataService.workspaceStorageRoot(for: before)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: oldRoot.path))
+            let sessionTabsBefore = Set(fixture.viewModel.sessions.keys)
+            let tabIDsBefore = Set(before.composeTabs.map(\.id))
+            let renamedDuringHandoff = RichHandoffFlag()
+            fixture.viewModel.test_privateHandoffBeforeCommitHook = {
+                guard !renamedDuringHandoff.value else { return }
+                renamedDuringHandoff.value = true
+                await manager.renameWorkspace(before, newName: "Renamed \(UUID().uuidString.prefix(8))")
+            }
+            do {
+                _ = try await fixture.viewModel.prepareHandoffHeadless(
+                    sourceTabID: fixture.tabAID,
+                    upToItemID: nil,
+                    destinationAgent: fixture.sessionA.selectedAgent,
+                    destinationModelRaw: fixture.sessionA.selectedModelRaw,
+                    destinationReasoningEffortRaw: fixture.sessionA.selectedReasoningEffortRaw
+                )
+                XCTFail("A handoff whose destination storage changed mid-call must abort")
+            } catch {
+                XCTAssertEqual(error.localizedDescription, AgentRichArtifactError.storageMoved.localizedDescription)
+            }
+            fixture.viewModel.test_privateHandoffBeforeCommitHook = nil
+            XCTAssertTrue(renamedDuringHandoff.value)
+
+            let renamed = try XCTUnwrap(manager.activeWorkspace)
+            let newRoot = dataService.workspaceStorageRoot(for: renamed)
+            XCTAssertNotEqual(newRoot.standardizedFileURL, oldRoot.standardizedFileURL)
+            XCTAssertFalse(
+                FileManager.default.fileExists(atPath: oldRoot.path),
+                "The stale handoff never recreated the pre-rename directory"
+            )
+            XCTAssertEqual(Set(fixture.viewModel.sessions.keys), sessionTabsBefore, "No destination session exposed")
+            XCTAssertEqual(Set(renamed.composeTabs.map(\.id)), tabIDsBefore, "No destination compose tab exposed")
+            let files = try await dataService.listAgentSessions(for: renamed).map(\.lastPathComponent)
+            XCTAssertEqual(files, ["AgentSession-\(fixture.sessionAID.uuidString).json"], "Only the moved source exists")
+
+            let destinationTabID = try await fixture.viewModel.prepareHandoffHeadless(
+                sourceTabID: fixture.tabAID,
+                upToItemID: nil,
+                destinationAgent: fixture.sessionA.selectedAgent,
+                destinationModelRaw: fixture.sessionA.selectedModelRaw,
+                destinationReasoningEffortRaw: fixture.sessionA.selectedReasoningEffortRaw
+            )
+            let destination = try XCTUnwrap(fixture.viewModel.sessions[destinationTabID])
+            let destinationID = try XCTUnwrap(destination.activeAgentSessionID)
+            XCTAssertNotNil(destination.persistenceState)
+            XCTAssertTrue(FileManager.default.fileExists(
+                atPath: newRoot.appendingPathComponent("AgentSessions/AgentSession-\(destinationID.uuidString).json").path
+            ))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: oldRoot.path))
+        }
+    }
+
+    /// B3-01/B3-08: after a completed production rename (the live source keeps its pre-rename
+    /// stamp), a cutoff handoff copies a compacted turn's reference through the production view
+    /// model; the destination keeps it through exposure, a later save and reload, and its copy
+    /// survives source deletion.
+    func testRichHandoffAfterProductionRenameCopiesCompactedReferenceThroughSaveReloadAndSourceDeletion() async throws {
+        try await withFixture { fixture in
+            let manager = fixture.window.workspaceManager
+            let dataService = fixture.viewModel.dataService
+            let rich = try await persistSourceWithCompactedReference(fixture)
+            let before = try XCTUnwrap(manager.activeWorkspace)
+            let oldRoot = dataService.workspaceStorageRoot(for: before)
+            await manager.renameWorkspace(before, newName: "Renamed \(UUID().uuidString.prefix(8))")
+            let renamed = try XCTUnwrap(manager.activeWorkspace)
+            let newRoot = dataService.workspaceStorageRoot(for: renamed)
+            XCTAssertNotEqual(newRoot.standardizedFileURL, oldRoot.standardizedFileURL)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: oldRoot.path), "Precondition: the rename moved storage")
+            let sourceState = try XCTUnwrap(fixture.sessionA.persistenceState(for: fixture.sessionAID))
+            XCTAssertEqual(sourceState, rich.sourceState, "Precondition: the live source still holds its pre-rename stamp")
+
+            let destinationTabID = try await fixture.viewModel.prepareHandoffHeadless(
+                sourceTabID: fixture.tabAID,
+                upToItemID: rich.cutoffID,
+                destinationAgent: fixture.sessionA.selectedAgent,
+                destinationModelRaw: fixture.sessionA.selectedModelRaw,
+                destinationReasoningEffortRaw: fixture.sessionA.selectedReasoningEffortRaw
+            )
+            let destination = try XCTUnwrap(fixture.viewModel.sessions[destinationTabID])
+            let destinationID = try XCTUnwrap(destination.activeAgentSessionID)
+            XCTAssertEqual(destination.transcript.turns.flatMap(\.richPresentations).map(\.reference), [rich.reference])
+            // Force a real later owner save from the exposed (refreshed) in-memory state.
+            destination.isDirty = true
+            let destinationSaved = await fixture.viewModel.saveSession(for: destinationTabID)
+            XCTAssertTrue(destinationSaved, "The later save rewrites the destination file")
+            XCTAssertFalse(FileManager.default.fileExists(atPath: oldRoot.path), "The old root is never recreated")
+
+            let reloaded = try await dataService.loadAgentSession(id: destinationID, for: renamed)
+            XCTAssertEqual(
+                reloaded?.transcript?.turns.flatMap(\.richPresentations).map(\.reference),
+                [rich.reference],
+                "Exposure refresh and the later save keep the reference"
+            )
+
+            try await dataService.deleteAgentSession(id: fixture.sessionAID, for: renamed)
+            XCTAssertFalse(FileManager.default.fileExists(
+                atPath: richSessionDirectory(root: newRoot, sessionID: fixture.sessionAID).path
+            ))
+            let destinationState = try XCTUnwrap(destination.persistenceState)
+            let read = try await dataService.readRichArtifact(state: destinationState, root: newRoot, reference: rich.reference)
+            XCTAssertEqual(read, rich.manifest)
+            let copiedAsset = richSessionDirectory(root: newRoot, sessionID: destinationID)
+                .appendingPathComponent(rich.reference.artifactID.uuidString)
+                .appendingPathComponent(rich.assetID.uuidString + ".jpg")
+            XCTAssertEqual(try Data(contentsOf: copiedAsset), rich.bytes)
+        }
+    }
+
+    /// S3-02 under D2 (production global storage move): a completed `updateGlobalStoragePath` makes
+    /// the workspace's actual directory differ from its session-persistence directory, so rich
+    /// creation through the production `publish` and a copying handoff are refused as unsupported
+    /// (not retryable) before any authority resolution, download, write or exposure, and neither
+    /// root is created. They are never served from the self-consistent session root. After a
+    /// completed reset the roots agree again: a capture taken before the reset fails, creation
+    /// passes the gate, a new publication succeeds, and a committed tombstone stays authoritative.
+    func testGlobalStorageMoveRefusesRichCreationAndCopyingHandoffAndResetRestoresAgreement() async throws {
+        try await withFixture { fixture in
+            let manager = fixture.window.workspaceManager
+            XCTAssertNil(manager.globalCustomStorageURL, "Precondition: default storage")
+            let globalURL = fixture.rootURL.appendingPathComponent("GlobalStorage", isDirectory: true)
+            try FileManager.default.createDirectory(at: globalURL, withIntermediateDirectories: true)
+            let transport = RichPresentationImageFixtureTransport.state
+            transport.reset()
+            // The production move and reset write the process-local persisted location; restore
+            // whatever it was before, not an assumed nil.
+            let previousGlobal = WorkspaceGlobalCustomStorageLocation.load()
+            do {
+                try await assertGlobalStorageLifecycle(fixture, globalURL: globalURL)
+            } catch {
+                transport.reset()
+                if manager.globalCustomStorageURL != nil { try? await manager.resetGlobalStorageToDefault() }
+                WorkspaceGlobalCustomStorageLocation.store(previousGlobal)
+                throw error
+            }
+            transport.reset()
+            if manager.globalCustomStorageURL != nil { try? await manager.resetGlobalStorageToDefault() }
+            WorkspaceGlobalCustomStorageLocation.store(previousGlobal)
+        }
+    }
+
+    private func assertGlobalStorageLifecycle(_ fixture: Fixture, globalURL: URL) async throws {
+        let manager = fixture.window.workspaceManager
+        let dataService = fixture.viewModel.dataService
+        let publication = RichPresentationPublicationService.shared
+        let fileManager = FileManager.default
+        let transport = RichPresentationImageFixtureTransport.state
+        func current() throws -> WorkspaceModel {
+            try XCTUnwrap(manager.activeWorkspace)
+        }
+        func sessionRoot() throws -> URL {
+            try dataService.workspaceStorageRoot(for: current())
+        }
+        func agreedRoot() throws -> URL {
+            try RichPresentationPublicationService.currentAgreedStorageRoot(
+                workspaceID: current().id, dataService: dataService, workspaceManager: manager
+            )
+        }
+        func listing(_ directory: URL) -> [String] {
+            ((try? fileManager.contentsOfDirectory(atPath: directory.path)) ?? []).sorted()
+        }
+        let unsupported = AgentRichArtifactError.storageLocationUnsupported.localizedDescription
+        XCTAssertEqual(
+            try agreedRoot(), try sessionRoot().standardizedFileURL.resolvingSymlinksInPath(),
+            "Precondition: default storage agrees"
+        )
+
+        // A deleted session whose unlink failed: the committed tombstone is its only authority.
+        fixture.sessionB.isDirty = true
+        let savedB = await fixture.viewModel.saveSession(for: fixture.tabBID)
+        XCTAssertTrue(savedB)
+        let stateB = try XCTUnwrap(fixture.sessionB.persistenceState(for: fixture.sessionBID))
+        let residueName = "AgentSessions/AgentSession-\(fixture.sessionBID.uuidString).json"
+        struct InjectedUnlinkFailure: Error {}
+        await dataService.test_setAgentSessionDeletionFailureInjector { _ in InjectedUnlinkFailure() }
+        try await dataService.deleteAgentSession(id: fixture.sessionBID, for: current())
+        await dataService.test_setAgentSessionDeletionFailureInjector(nil)
+        XCTAssertTrue(
+            try fileManager.fileExists(atPath: sessionRoot().appendingPathComponent(residueName).path),
+            "Precondition: tombstoned residue remains"
+        )
+        // A source whose compacted turn owns a published reference, at the agreed default root.
+        let rich = try await persistSourceWithCompactedReference(fixture)
+
+        // 1) Completed production global storage update.
+        let staleBeforeUpdate = try publication.capture(workspaceID: current().id, root: agreedRoot())
+        try await manager.updateGlobalStoragePath(globalURL)
+        XCTAssertEqual(manager.globalCustomStorageURL, globalURL)
+        let sessionRootAfter = try sessionRoot()
+        let workspaceRootAfter = try manager.workspaceDirectory(for: current())
+        XCTAssertNotEqual(
+            sessionRootAfter.standardizedFileURL, workspaceRootAfter.standardizedFileURL,
+            "Precondition: the workspace directory and the session-persistence directory now differ"
+        )
+        XCTAssertFalse(fileManager.fileExists(atPath: sessionRootAfter.path), "Precondition: the move vacated the session root")
+        XCTAssertTrue(
+            fileManager.fileExists(atPath: richSessionDirectory(root: workspaceRootAfter, sessionID: fixture.sessionAID).path),
+            "Precondition: the source's artifacts moved with the workspace directory"
+        )
+        XCTAssertThrowsError(try agreedRoot()) { XCTAssertEqual($0.localizedDescription, unsupported) }
+        XCTAssertThrowsError(try publication.validateAgreedStorage(
+            staleBeforeUpdate, dataService: dataService, workspaceManager: manager
+        )) { XCTAssertEqual($0.localizedDescription, unsupported) }
+        // The revision alone also refuses the stale capture, even at the unchanged session root.
+        XCTAssertThrowsError(try publication.validate(staleBeforeUpdate, currentRoot: sessionRootAfter)) {
+            XCTAssertEqual($0.localizedDescription, AgentRichArtifactError.storageMoved.localizedDescription)
+        }
+        let globalSessionsBefore = listing(workspaceRootAfter.appendingPathComponent("AgentSessions"))
+        let globalRichBefore = listing(workspaceRootAfter.appendingPathComponent("agent_rich_artifacts"))
+
+        // Rich creation through the production publish: refused before resolving authority or
+        // fetching the requested image (the fixture transport would answer it), and nothing is
+        // written at either root.
+        transport.setBehavior { _ in .respond(status: 200, headers: ["Content-Type": "image/jpeg"], chunks: [rich.bytes]) }
+        let creation = RichPresentationPublicationService(fetcher: fixtureImageFetcher())
+        let sourceState = try XCTUnwrap(fixture.sessionA.persistenceState(for: fixture.sessionAID))
+        do {
+            _ = try await creation.publish(
+                data: richBriefingToolInput(), metadata: Self.unroutedMetadata(), resolver: Self.unusedResolver(),
+                dataService: dataService, workspace: current(), state: sourceState, workspaceManager: manager
+            )
+            XCTFail("Rich creation must be refused while the roots differ")
+        } catch {
+            XCTAssertEqual(error.localizedDescription, unsupported)
+        }
+        XCTAssertTrue(transport.requests.isEmpty, "Nothing was downloaded")
+
+        // A copying handoff: refused before source flush, preparation, copy or exposure.
+        let sessionTabsBefore = Set(fixture.viewModel.sessions.keys)
+        let tabIDsBefore = try Set(current().composeTabs.map(\.id))
+        do {
+            _ = try await fixture.viewModel.prepareHandoffHeadless(
+                sourceTabID: fixture.tabAID,
+                upToItemID: rich.cutoffID,
+                destinationAgent: fixture.sessionA.selectedAgent,
+                destinationModelRaw: fixture.sessionA.selectedModelRaw,
+                destinationReasoningEffortRaw: fixture.sessionA.selectedReasoningEffortRaw
+            )
+            XCTFail("A copying handoff must be refused while the roots differ")
+        } catch {
+            XCTAssertEqual(error.localizedDescription, unsupported)
+        }
+        XCTAssertEqual(Set(fixture.viewModel.sessions.keys), sessionTabsBefore, "No destination session exposed")
+        XCTAssertEqual(try Set(current().composeTabs.map(\.id)), tabIDsBefore, "No destination compose tab exposed")
+        XCTAssertFalse(fileManager.fileExists(atPath: sessionRootAfter.path), "The session root was never created")
+        XCTAssertEqual(listing(workspaceRootAfter.appendingPathComponent("AgentSessions")), globalSessionsBefore)
+        XCTAssertEqual(listing(workspaceRootAfter.appendingPathComponent("agent_rich_artifacts")), globalRichBefore)
+
+        // 2) Completed reset to the default location: the roots agree again.
+        let staleBeforeReset = try publication.capture(workspaceID: current().id, root: sessionRoot())
+        try await manager.resetGlobalStorageToDefault()
+        XCTAssertNil(manager.globalCustomStorageURL)
+        XCTAssertEqual(try agreedRoot(), try sessionRoot().standardizedFileURL.resolvingSymlinksInPath())
+        XCTAssertThrowsError(try publication.validate(staleBeforeReset, currentRoot: agreedRoot())) {
+            XCTAssertEqual($0.localizedDescription, AgentRichArtifactError.storageMoved.localizedDescription)
+        }
+        XCTAssertTrue(
+            try fileManager.fileExists(atPath: sessionRoot().appendingPathComponent(residueName).path),
+            "Precondition: the moves carried the tombstoned residue back beside session storage"
+        )
+        let reloadedB = try await dataService.loadAgentSessionForEditing(id: fixture.sessionBID, for: current())
+        XCTAssertNil(reloadedB, "The tombstone hides the residue")
+        let chartB = try richChart(sessionID: fixture.sessionBID)
+        do {
+            try await dataService.publishRichArtifact(
+                state: stateB, root: agreedRoot(), manifest: chartB.manifest, assets: [:], commitCheck: {}
+            )
+            XCTFail("A tombstoned session never publishes")
+        } catch {}
+        XCTAssertFalse(try fileManager.fileExists(
+            atPath: richSessionDirectory(root: agreedRoot(), sessionID: fixture.sessionBID).path
+        ))
+
+        // With agreeing roots, production creation passes the storage gate and reaches authority
+        // resolution (which refuses this unrouted request), still without downloading.
+        do {
+            _ = try await creation.publish(
+                data: richBriefingToolInput(), metadata: Self.unroutedMetadata(), resolver: Self.unusedResolver(),
+                dataService: dataService, workspace: current(), state: sourceState, workspaceManager: manager
+            )
+            XCTFail("An unrouted request has no creation authority")
+        } catch {
+            XCTAssertEqual(
+                error as? RichPresentationMCPAuthorityResolver.Denial,
+                .invalidContext(RichPresentationMCPAuthorityResolver.noAttemptAuthorityMessage)
+            )
+        }
+        XCTAssertTrue(transport.requests.isEmpty)
+
+        // A newly captured publication for a session created after the reset succeeds.
+        let fresh = try AgentSession(
+            workspaceID: current().id, composeTabID: UUID(), name: "After reset",
+            transcript: AgentTranscriptIO.handoffTranscript(fromLegacyItems: [
+                .user("Q", sequenceIndex: 0), .assistant("A", sequenceIndex: 1)
+            ])
+        )
+        let freshLoad = try await dataService.prepareInitialAgentSessionPersistence(
+            initialSession: fresh, for: current(), preparation: .alreadyCanonicalTranscript
+        )
+        let storage = try publication.capture(workspaceID: current().id, root: agreedRoot())
+        let root = try await dataService.captureRichArtifactRoot(
+            state: freshLoad.persistenceState, workspace: current(), resolvedRoot: storage.root
+        )
+        let chart = try richChart(sessionID: fresh.id)
+        try await dataService.publishRichArtifact(
+            state: freshLoad.persistenceState, root: root, manifest: chart.manifest, assets: [:]
+        ) {
+            try publication.validateAgreedStorage(storage, dataService: dataService, workspaceManager: manager)
+        }
+        let read = try await dataService.readRichArtifact(state: freshLoad.persistenceState, root: root, reference: chart.reference)
+        XCTAssertEqual(read, chart.manifest)
+    }
+
+    /// D2 gate, pure: default and per-workspace custom roots agree (a custom root agrees even with a
+    /// global location set); a persisted global location that another window changed refuses the
+    /// default-root workspace even though this window's manager still resolves the default base.
+    /// Nothing is created.
+    func testStorageAgreementAcceptsDefaultAndPerWorkspaceCustomRootsAndRefusesAnotherWindowsGlobalLocation() async throws {
+        try await withFixture { fixture in
+            let manager = fixture.window.workspaceManager
+            let dataService = fixture.viewModel.dataService
+            let workspace = try XCTUnwrap(manager.activeWorkspace)
+            @MainActor func agreed(_ workspace: WorkspaceModel) throws -> URL {
+                try RichPresentationPublicationService.agreedStorageRoot(
+                    for: workspace, dataService: dataService, workspaceManager: manager
+                )
+            }
+            func canonical(_ url: URL) -> URL {
+                url.standardizedFileURL.resolvingSymlinksInPath()
+            }
+            let customURL = fixture.rootURL.appendingPathComponent("CustomStore", isDirectory: true)
+            let globalURL = fixture.rootURL.appendingPathComponent("OtherWindowGlobal", isDirectory: true)
+            var custom = workspace
+            custom.customStoragePath = customURL
+            XCTAssertEqual(try agreed(workspace), canonical(dataService.workspaceStorageRoot(for: workspace)))
+            XCTAssertEqual(try agreed(custom), canonical(customURL))
+
+            XCTAssertNil(manager.globalCustomStorageURL)
+            // Process-local under XCTest; restored to whatever it was, not assumed nil.
+            let previousGlobal = WorkspaceGlobalCustomStorageLocation.load()
+            WorkspaceGlobalCustomStorageLocation.store(globalURL)
+            defer { WorkspaceGlobalCustomStorageLocation.store(previousGlobal) }
+            XCTAssertThrowsError(try agreed(workspace)) {
+                XCTAssertEqual($0.localizedDescription, AgentRichArtifactError.storageLocationUnsupported.localizedDescription)
+            }
+            XCTAssertEqual(try agreed(custom), canonical(customURL), "A per-workspace custom root ignores the global base")
+            XCTAssertFalse(FileManager.default.fileExists(atPath: customURL.path))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: globalURL.path))
+        }
+    }
+
+    /// D2 final check for creation: roots that stop agreeing after capture (here a global location
+    /// changed by another window, which advances no revision) refuse at the install check that
+    /// `publish` uses; the staged bytes are discarded and nothing is installed. Once they agree
+    /// again a fresh capture publishes.
+    func testCreationFinalCheckRefusesWhenRootsStopAgreeingAfterCaptureAndInstallsNothing() async throws {
+        try await withFixture { fixture in
+            let manager = fixture.window.workspaceManager
+            let dataService = fixture.viewModel.dataService
+            let publication = RichPresentationPublicationService.shared
+            let workspace = try XCTUnwrap(manager.activeWorkspace)
+            fixture.sessionB.isDirty = true
+            let saved = await fixture.viewModel.saveSession(for: fixture.tabBID)
+            XCTAssertTrue(saved)
+            let state = try XCTUnwrap(fixture.sessionB.persistenceState(for: fixture.sessionBID))
+            @MainActor func capture() async throws -> (RichPresentationPublicationService.Storage, URL) {
+                let storage = try publication.capture(
+                    workspaceID: workspace.id,
+                    root: RichPresentationPublicationService.currentAgreedStorageRoot(
+                        workspaceID: workspace.id, dataService: dataService, workspaceManager: manager
+                    )
+                )
+                let root = try await dataService.captureRichArtifactRoot(
+                    state: state, workspace: workspace, resolvedRoot: storage.root
+                )
+                return (storage, root)
+            }
+            let (storage, root) = try await capture()
+            let chart = try richChart(sessionID: fixture.sessionBID)
+            let globalURL = fixture.rootURL.appendingPathComponent("OtherWindowGlobal", isDirectory: true)
+            let previousGlobal = WorkspaceGlobalCustomStorageLocation.load()
+            WorkspaceGlobalCustomStorageLocation.store(globalURL)
+            defer { WorkspaceGlobalCustomStorageLocation.store(previousGlobal) }
+            do {
+                try await dataService.publishRichArtifact(
+                    state: state, root: root, manifest: chart.manifest, assets: [:]
+                ) {
+                    try publication.validateAgreedStorage(storage, dataService: dataService, workspaceManager: manager)
+                }
+                XCTFail("The final check must refuse disagreeing roots")
+            } catch {
+                XCTAssertEqual(error.localizedDescription, AgentRichArtifactError.storageLocationUnsupported.localizedDescription)
+            }
+            WorkspaceGlobalCustomStorageLocation.store(previousGlobal)
+            let artifactDirectory = richSessionDirectory(root: root, sessionID: fixture.sessionBID)
+                .appendingPathComponent(chart.manifest.artifactID.uuidString)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: artifactDirectory.path), "Nothing was installed")
+            XCTAssertFalse(FileManager.default.fileExists(atPath: globalURL.path))
+
+            let (freshStorage, freshRoot) = try await capture()
+            try await dataService.publishRichArtifact(
+                state: state, root: freshRoot, manifest: chart.manifest, assets: [:]
+            ) {
+                try publication.validateAgreedStorage(freshStorage, dataService: dataService, workspaceManager: manager)
+            }
+            let read = try await dataService.readRichArtifact(state: state, root: freshRoot, reference: chart.reference)
+            XCTAssertEqual(read, chart.manifest)
+        }
+    }
+
+    /// D2 final check for a copying handoff: roots that stop agreeing while the handoff is suspended
+    /// before its private commit (a global location changed by another window; no revision
+    /// advances) refuse at the commit check before any copy, destination file or exposure. The
+    /// source and its artifacts are unchanged, and a retry with agreeing roots succeeds.
+    func testCopyingHandoffRefusesAtCommitCheckWhenRootsStopAgreeingBeforeCopyOrExposure() async throws {
+        try await withFixture { fixture in
+            let manager = fixture.window.workspaceManager
+            let dataService = fixture.viewModel.dataService
+            let rich = try await persistSourceWithCompactedReference(fixture)
+            let workspace = try XCTUnwrap(manager.activeWorkspace)
+            let root = dataService.workspaceStorageRoot(for: workspace)
+            func listing(_ name: String) -> [String] {
+                ((try? FileManager.default.contentsOfDirectory(atPath: root.appendingPathComponent(name).path)) ?? []).sorted()
+            }
+            let sessionsBefore = listing("AgentSessions")
+            let richBefore = listing("agent_rich_artifacts")
+            let sessionTabsBefore = Set(fixture.viewModel.sessions.keys)
+            let tabIDsBefore = Set(workspace.composeTabs.map(\.id))
+            let globalURL = fixture.rootURL.appendingPathComponent("OtherWindowGlobal", isDirectory: true)
+            let changed = RichHandoffFlag()
+            let previousGlobal = WorkspaceGlobalCustomStorageLocation.load()
+            fixture.viewModel.test_privateHandoffBeforeCommitHook = {
+                guard !changed.value else { return }
+                changed.value = true
+                WorkspaceGlobalCustomStorageLocation.store(globalURL)
+            }
+            defer {
+                fixture.viewModel.test_privateHandoffBeforeCommitHook = nil
+                WorkspaceGlobalCustomStorageLocation.store(previousGlobal)
+            }
+            do {
+                _ = try await fixture.viewModel.prepareHandoffHeadless(
+                    sourceTabID: fixture.tabAID,
+                    upToItemID: rich.cutoffID,
+                    destinationAgent: fixture.sessionA.selectedAgent,
+                    destinationModelRaw: fixture.sessionA.selectedModelRaw,
+                    destinationReasoningEffortRaw: fixture.sessionA.selectedReasoningEffortRaw
+                )
+                XCTFail("A copying handoff must be refused when the roots stop agreeing")
+            } catch {
+                XCTAssertEqual(error.localizedDescription, AgentRichArtifactError.storageLocationUnsupported.localizedDescription)
+            }
+            XCTAssertTrue(changed.value)
+            WorkspaceGlobalCustomStorageLocation.store(previousGlobal)
+            XCTAssertEqual(Set(fixture.viewModel.sessions.keys), sessionTabsBefore, "No destination session exposed")
+            try XCTAssertEqual(Set(XCTUnwrap(manager.activeWorkspace).composeTabs.map(\.id)), tabIDsBefore)
+            XCTAssertEqual(listing("AgentSessions"), sessionsBefore, "No destination session file")
+            XCTAssertEqual(listing("agent_rich_artifacts"), richBefore, "No destination artifacts copied")
+            XCTAssertFalse(FileManager.default.fileExists(atPath: globalURL.path))
+
+            let destinationTabID = try await fixture.viewModel.prepareHandoffHeadless(
+                sourceTabID: fixture.tabAID,
+                upToItemID: rich.cutoffID,
+                destinationAgent: fixture.sessionA.selectedAgent,
+                destinationModelRaw: fixture.sessionA.selectedModelRaw,
+                destinationReasoningEffortRaw: fixture.sessionA.selectedReasoningEffortRaw
+            )
+            let destination = try XCTUnwrap(fixture.viewModel.sessions[destinationTabID])
+            XCTAssertEqual(destination.transcript.turns.flatMap(\.richPresentations).map(\.reference), [rich.reference])
         }
     }
 
@@ -3996,6 +4545,157 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
         XCTAssertEqual(presentation.workingRows.map(\.text), expectedTexts, file: file, line: line)
     }
 
+    private struct PublishedSourceReference {
+        let sourceState: AgentSessionPersistenceState
+        let reference: RichPresentationReference
+        let manifest: AgentRichArtifactManifest
+        let assetID: UUID
+        let bytes: Data
+        let cutoffID: UUID
+    }
+
+    /// Saves tab A as a durable incarnation whose first turn (tool activity, compacted to the
+    /// summary tier) owns one briefing reference, then publishes the briefing (one real local JPEG)
+    /// through the production capture, D2-agreed root and gated publication path (the same
+    /// capture and final check `RichPresentationPublicationService.publish` uses).
+    private func persistSourceWithCompactedReference(_ fixture: Fixture) async throws -> PublishedSourceReference {
+        let session = fixture.sessionA
+        let invocationID = UUID()
+        session.setItemsSilently(
+            [
+                .user("Gather sources", sequenceIndex: 0),
+                .toolCall(name: "read_file", invocationID: invocationID, argsJSON: #"{"path":"/tmp/a.swift"}"#, sequenceIndex: 1),
+                .toolResult(name: "read_file", invocationID: invocationID, resultJSON: #"{"content":"ok"}"#, sequenceIndex: 2),
+                .assistant("Sources gathered", sequenceIndex: 3),
+                .user("Follow up", sequenceIndex: 4),
+                .assistant("Follow-up answer", sequenceIndex: 5)
+            ],
+            reason: .testOverride
+        )
+        fixture.viewModel.refreshDerivedTranscriptState(for: session)
+        XCTAssertEqual(session.transcript.turns.count, 2, "Precondition: two turns")
+        let toolActivity = try XCTUnwrap(session.transcript.turns.first?.allActivities.first { $0.toolExecution != nil })
+        let briefing = try richBriefing(sessionID: fixture.sessionAID)
+        session.transcript.turns[0].retentionTier = .summary
+        session.transcript.turns[0].richPresentations = [AgentTranscriptRichPresentation(
+            reference: briefing.reference, activityID: toolActivity.id, activityOrder: toolActivity.sequenceIndex
+        )]
+        session.isDirty = true
+        let saved = await fixture.viewModel.saveSession(for: fixture.tabAID)
+        XCTAssertTrue(saved)
+        let state = try XCTUnwrap(session.persistenceState(for: fixture.sessionAID))
+        let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+        let dataService = fixture.viewModel.dataService
+        let persisted = try await dataService.loadAgentSession(id: fixture.sessionAID, for: workspace)
+        let persistedTurn = try XCTUnwrap(persisted?.transcript?.turns.first)
+        XCTAssertEqual(persistedTurn.retentionTier, .summary, "Precondition: the owning turn is compacted on disk")
+        XCTAssertEqual(persistedTurn.richPresentations.map(\.reference), [briefing.reference])
+
+        let publication = RichPresentationPublicationService.shared
+        let manager = fixture.window.workspaceManager
+        let storage = try publication.capture(
+            workspaceID: workspace.id,
+            root: RichPresentationPublicationService.currentAgreedStorageRoot(
+                workspaceID: workspace.id, dataService: dataService, workspaceManager: manager
+            )
+        )
+        let root = try await dataService.captureRichArtifactRoot(state: state, workspace: workspace, resolvedRoot: storage.root)
+        try await dataService.publishRichArtifact(
+            state: state, root: root, manifest: briefing.manifest, assets: [briefing.assetID: briefing.bytes]
+        ) {
+            try publication.validateAgreedStorage(storage, dataService: dataService, workspaceManager: manager)
+        }
+        let cutoffID = try XCTUnwrap(session.transcript.turns.last?.allActivities.last?.id)
+        return PublishedSourceReference(
+            sourceState: state, reference: briefing.reference, manifest: briefing.manifest,
+            assetID: briefing.assetID, bytes: briefing.bytes, cutoffID: cutoffID
+        )
+    }
+
+    private func richSessionDirectory(root: URL, sessionID: UUID) -> URL {
+        root.appendingPathComponent("agent_rich_artifacts").appendingPathComponent(sessionID.uuidString)
+    }
+
+    private func richChart(sessionID: UUID) throws -> (manifest: AgentRichArtifactManifest, reference: RichPresentationReference) {
+        let id = UUID()
+        let input = RichPresentationInput(title: "Local data", content: .chart(RichPresentationChart(
+            chartType: .bar, xLabel: "Item", unit: "count", x: ["A"], series: [.init(name: "Measured", y: [2])],
+            sources: [.init(label: "Local fixture")]
+        )))
+        let manifest = try AgentRichArtifactManifest(
+            artifactID: id, input: input, outcomes: [],
+            provenance: .init(runID: UUID(), attemptID: UUID(), sessionID: sessionID, toolInvocationID: UUID())
+        )
+        return (manifest, RichPresentationReference(
+            artifactID: id, kind: .chart, title: input.title, fallbackText: "Rich presentation summary: Local data"
+        ))
+    }
+
+    private func richBriefing(sessionID: UUID) throws -> (
+        manifest: AgentRichArtifactManifest, reference: RichPresentationReference, assetID: UUID, bytes: Data
+    ) {
+        let id = UUID()
+        let assetID = UUID()
+        let input = RichPresentationInput(title: "Brief", content: .briefing(.init(
+            date: "2026-11-05", sections: [.init(heading: "News", articles: [.init(
+                headline: "Headline", body: "Accepted text", sources: [.init(label: "Local")],
+                image: .init(url: "https://images.example.com/a.jpg", alt: "Photo", credit: "Wire")
+            )])]
+        )))
+        let manifest = try AgentRichArtifactManifest(
+            artifactID: id, input: input,
+            outcomes: [.init(sectionIndex: 0, articleIndex: 0, outcome: .asset(.init(
+                assetID: assetID, width: 4, height: 3, alt: "Photo", credit: "Wire", origin: "https://images.example.com"
+            )))],
+            provenance: .init(runID: UUID(), attemptID: UUID(), sessionID: sessionID, toolInvocationID: UUID())
+        )
+        let reference = RichPresentationReference(
+            artifactID: id, kind: .briefing, title: "Brief", fallbackText: "Rich presentation summary: Brief"
+        )
+        return try (manifest, reference, assetID, richJPEG(width: 4, height: 3))
+    }
+
+    /// An image fetcher whose only transport is the local fixture protocol (never the network).
+    private func fixtureImageFetcher() -> RichPresentationImageFetcher {
+        let configuration = RichPresentationImageFetcher.makeConfiguration()
+        configuration.protocolClasses = [RichPresentationImageFixtureTransport.self]
+        return RichPresentationImageFetcher(configuration: configuration)
+    }
+
+    /// Serialized `present_rich`-shaped input: a briefing requesting one approved-host image.
+    private func richBriefingToolInput() throws -> Data {
+        try JSONEncoder().encode(RichPresentationInput(title: "Brief", content: .briefing(.init(
+            date: "2026-11-05", sections: [.init(heading: "News", articles: [.init(
+                headline: "Headline", body: "Accepted text", sources: [.init(label: "Local")],
+                image: .init(url: "https://images.example.com/a.jpg", alt: "Photo", credit: "Wire")
+            )])]
+        ))))
+    }
+
+    /// Request metadata with no routed run: authority resolution refuses it before reading windows.
+    private static func unroutedMetadata() -> MCPServerViewModel.RequestMetadata {
+        MCPServerViewModel.RequestMetadata(connectionID: nil, clientName: nil, windowID: nil, actorRoutedRunTab: nil)
+    }
+
+    private static func unusedResolver() -> RichPresentationMCPAuthorityResolver {
+        RichPresentationMCPAuthorityResolver(isGatewayPrincipalConnection: { _ in false }, windows: { [] })
+    }
+
+    private func richJPEG(width: Int, height: Int) throws -> Data {
+        let context = try XCTUnwrap(CGContext(
+            data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+        ))
+        context.setFillColor(red: 0.2, green: 0.4, blue: 0.6, alpha: 1)
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        let image = try XCTUnwrap(context.makeImage())
+        let data = NSMutableData()
+        let destination = try XCTUnwrap(CGImageDestinationCreateWithData(data, UTType.jpeg.identifier as CFString, 1, nil))
+        CGImageDestinationAddImage(destination, image, nil)
+        XCTAssertTrue(CGImageDestinationFinalize(destination))
+        return data as Data
+    }
+
     private struct Fixture {
         let window: WindowState
         let rootURL: URL
@@ -4009,6 +4709,11 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
         let tabATexts: [String]
         let tabBTexts: [String]
     }
+}
+
+@MainActor
+private final class RichHandoffFlag {
+    var value = false
 }
 
 @MainActor

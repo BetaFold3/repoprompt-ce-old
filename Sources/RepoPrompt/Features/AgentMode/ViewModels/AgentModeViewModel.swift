@@ -768,6 +768,10 @@ final class AgentModeViewModel: ObservableObject {
         /// captured and immediately before the durable write, so a mutation can land during the
         /// awaited write.
         var test_saveSessionBeforeWriteHook: (@MainActor (AgentTabSession) async -> Void)?
+        /// Test seam: awaited by `prepareHandoffHeadless` after the private destination, Oracle
+        /// preparation and payload are built and immediately before the private commit, so a
+        /// workspace rename or storage move can complete while the handoff is suspended there.
+        var test_privateHandoffBeforeCommitHook: (@MainActor () async -> Void)?
         /// Test seam (O11): when it returns an outcome, Send saved's placement save uses that outcome
         /// instead of the owner write (suppressed, reset-only, non-writing, or stale outcomes).
         var test_recoverySavedPlacementSaveOutcomeOverride: (@MainActor (AgentTabSession) async -> SessionSaveOutcome?)?
@@ -23739,7 +23743,7 @@ final class AgentModeViewModel: ObservableObject {
         destinationReasoningEffortRaw: String?,
         destinationOhMyPiThinkingSelections: OhMyPiThinkingSelections = .empty,
         delegationParentSessionID: UUID? = nil,
-        delegationCommitCheck: () throws -> Void = {}
+        delegationCommitCheck: @escaping () throws -> Void = {}
     ) async throws -> UUID {
         guard let promptManager,
               let workspaceManager
@@ -23775,110 +23779,192 @@ final class AgentModeViewModel: ObservableObject {
 
         // 1) Resolve the transcript copy once, before any destination-side mutation.
         let sourceTabName = workspaceManager.composeTabName(with: sourceTabID) ?? "Session"
-        let migratedItems = buildHandoffTranscriptItems(
-            sourceTranscript: sourceTranscript,
-            upToItemID: upToItemID
-        )
-
-        // 2) Create a fork-duplicate tab in the background (copies selection, prompt,
-        //    expansions, overrides, discover config, etc. but clears session bindings).
-        guard let destTab = await promptManager.createBackgroundForkComposeTab(
-            sourceTabID: sourceTabID,
-            named: "\(sourceTabName) (handoff)"
-        ) else {
-            throw AgentSessionError.emptySession
-        }
-        let destTabID = destTab.id
-
-        // 3) Pre-allocate the durable destination Agent Mode identity before any Oracle
-        //    clone can be persisted or published.
-        guard let destSession = session(for: destTabID, createIfNeeded: true) else {
-            await promptManager.closeComposeTab(destTabID)
-            throw SessionAccessError.tabUnavailable(tabID: destTabID)
-        }
-        guard destSession.adoptSessionProfile(sourceSession.profile) else {
-            await promptManager.closeComposeTab(destTabID)
-            throw PersistentBindingMutationError.staleTransition
-        }
-        destSession.selectedAgent = destinationAgent
-        destSession.selectedModelRaw = destinationModelRaw
-        destSession.selectedReasoningEffortRaw = destinationReasoningEffortRaw
-        destSession.ohMyPiThinkingSelections = destinationAgent == .ohMyPi
-            ? destinationOhMyPiThinkingSelections
-            : .empty
-        destSession.autoEditEnabled = sourceSession.autoEditEnabled
-        guard let destinationAgentModeSessionID = ensureSessionBoundToTab(destSession) else {
-            await promptManager.closeComposeTab(destTabID)
-            throw PersistentBindingMutationError.staleTransition
-        }
-        // Branches never inherit source accounting; the destination starts its own identity.
-        destSession.replaceUsageAccounting(nil)
-        // MCP forks re-check the requester and destination placement after the suspensions above,
-        // then record delegation lineage on the durable identity before any Oracle clone or
-        // payload is published. UI handoffs pass nil and stay parentless.
+        // The same cutoff selects migrated items and the turn-owned rich references (including
+        // references owned by compacted turns) that the destination must own independently.
+        let selection: AgentTranscriptIO.HandoffSelection
         do {
-            try delegationCommitCheck()
-        } catch {
-            await promptManager.closeComposeTab(destTabID)
-            throw error
+            selection = try AgentTranscriptIO.selectHandoffTranscript(from: sourceTranscript, upToRowID: upToItemID)
+        } catch AgentRichArtifactError.invalidHandoffCutoff {
+            throw AgentSessionError.invalidHandoffCutoff
         }
-        if let delegationParentSessionID {
-            applySpawnParentSessionID(
-                delegationParentSessionID,
-                to: destSession,
-                inheritWorktreeBindings: false
+        let migratedItems = selection.items
+        let copiesArtifacts = !selection.richPresentations.isEmpty
+
+        // 2) Prepare a fork-duplicate tab PRIVATELY (copies selection, prompt, expansions,
+        //    overrides, discover config, etc. but clears session bindings). Nothing is exposed
+        //    until required artifact copies and the destination's initial save succeed.
+        try delegationCommitCheck()
+        guard let workspace = workspaceManager.activeWorkspace else { throw AgentSessionError.noActiveWorkspace }
+        let publication = RichPresentationPublicationService.shared
+        let sessionDataService = dataService
+        // Every handoff (ordinary or copying) captures the destination's storage identity: the
+        // session-persistence root and its mutation revision. It is revalidated against the
+        // current workspace before the initial save and in the final exposure section, so a
+        // rename, storage move or storage-path change during preparation aborts (retryable)
+        // instead of saving into, or recreating, a stale directory. Capturing takes no slot.
+        // An artifact-bearing handoff additionally requires the D2 storage agreement (the
+        // workspace's actual resolved directory is the session-persistence directory) here,
+        // before any source flush, preparation or copy, and in every commit check; an ordinary
+        // handoff keeps the session-persistence root check alone.
+        let currentStorageRoot: @MainActor (WorkspaceModel) throws -> URL = { current in
+            copiesArtifacts
+                ? try RichPresentationPublicationService.agreedStorageRoot(
+                    for: current, dataService: sessionDataService, workspaceManager: workspaceManager
+                )
+                : sessionDataService.workspaceStorageRoot(for: current)
+        }
+        let capturedStorage = try publication.capture(workspaceID: workspace.id, root: currentStorageRoot(workspace))
+        var sourceState: AgentSessionPersistenceState?
+        if copiesArtifacts {
+            // Copy authority is the acknowledged durable source incarnation; a debounced save is
+            // not. Flush through the existing ownership-aware save only when none exists yet.
+            if sourceSession.persistenceState(for: sourceAgentModeSessionID) == nil {
+                _ = await saveSession(for: sourceTabID)
+            }
+            guard let state = sourceSession.persistenceState(for: sourceAgentModeSessionID) else {
+                throw AgentRichArtifactError.sourceUnavailable
+            }
+            sourceState = state
+        }
+        let capturedSourceState = sourceState
+        let transaction: @MainActor () async throws -> UUID = {
+            let preparedTab = try promptManager.preparePrivateHandoffTab(
+                sourceTabID: sourceTabID, name: "\(sourceTabName) (handoff)"
             )
-            guard destSession.parentSessionID == delegationParentSessionID else {
-                await promptManager.closeComposeTab(destTabID)
+            let destTabID = preparedTab.tab.id
+            let destinationID = UUID()
+            let destSession = self.makeSession(for: destTabID)
+            guard destSession.adoptSessionProfile(sourceSession.profile) else {
                 throw PersistentBindingMutationError.staleTransition
             }
-        }
+            // Session-local binding only: no workspace metadata, sidebar or binding notification
+            // until exposure. Branches never inherit source accounting (a new session has none).
+            _ = destSession.beginPersistentBindingTransition()
+            destSession.installPersistentSessionBinding(
+                AgentPersistentSessionBindingIdentity(tabID: destTabID, sessionID: destinationID)
+            )
+            destSession.selectedAgent = destinationAgent
+            destSession.selectedModelRaw = destinationModelRaw
+            destSession.selectedReasoningEffortRaw = destinationReasoningEffortRaw
+            destSession.ohMyPiThinkingSelections = destinationAgent == .ohMyPi
+                ? destinationOhMyPiThinkingSelections
+                : .empty
+            destSession.autoEditEnabled = sourceSession.autoEditEnabled
+            // Persist lineage in the initial file; exposure re-applies it with its side effects.
+            destSession.parentSessionID = delegationParentSessionID
+            // Unchanged destination shape: the transcript is derived from the migrated items, as
+            // before. Selected references are then attached to the turns holding their rows.
+            destSession.setItemsSilently(migratedItems, reason: .persistedSessionHydration)
+            destSession.lastActivityAt = Date()
+            destSession.hasSentFirstMessage = migratedItems.contains { $0.kind == .user }
+            destSession.hasLoadedPersistedState = true
+            self.refreshDerivedTranscriptState(for: destSession, publishActivePresentation: false)
+            destSession.transcript = try AgentTranscriptIO.attachingHandoffRichPresentations(
+                selection, sourceTranscript: sourceTranscript, to: destSession.transcript
+            )
 
-        // 4) Clone only Oracle/chat sessions owned by the source Agent Mode session.
-        //    The run ID stays nil until the destination's first explicit continuation.
-        var oracleChatIDMapping = OracleViewModel.HandoffChatIDMapping.empty
-        if let oracleViewModel {
-            do {
-                let idMapping = try await oracleViewModel.cloneChatSessions(
-                    fromTabID: sourceTabID,
-                    toTabID: destTabID,
-                    sourceAgentModeSessionID: sourceAgentModeSessionID,
-                    destinationAgentModeSessionID: destinationAgentModeSessionID
+            let oracle = self.oracleViewModel
+            let preparedChats = try await oracle?.preparePrivateHandoffChats(
+                fromTabID: sourceTabID, toTabID: destTabID,
+                sourceAgentModeSessionID: sourceAgentModeSessionID,
+                destinationAgentModeSessionID: destinationID
+            )
+            var savedChats: OracleViewModel.PreparedHandoffChats?
+            let payload = await self.buildHandoffPayload(
+                sourceTabID: sourceTabID, sourceSession: sourceSession,
+                sourceTranscript: sourceTranscript, upToItemID: upToItemID,
+                oracleChatIDMapping: preparedChats?.handoffMapping ?? .empty
+            )
+            destSession.pendingHandoff = AgentPendingHandoffState(
+                payload: payload, createdAt: Date(), sourceItemID: upToItemID, payloadID: UUID(),
+                defersProviderLockUntilSend: true, isStagedForSend: false
+            )
+            let counts = AgentTranscriptProjectionBuilder.projectionCounts(for: destSession.transcript)
+            let initial = self.makePersistedAgentSession(
+                for: destSession, tabID: destTabID, sessionID: destinationID,
+                workspaceID: workspace.id, sessionName: preparedTab.tab.name,
+                persistableSnapshot: PersistableTranscriptSnapshot(
+                    transcript: destSession.transcript, projectionCounts: counts,
+                    canonicalVisibleRowCount: counts.canonicalVisibleRowCount,
+                    lastUserMessageAt: AgentTranscriptIO.lastUserInteractionDate(in: destSession.transcript)
+                        ?? AgentTranscriptIO.lastUserInteractionDate(in: migratedItems)
                 )
-                oracleChatIDMapping = oracleViewModel.handoffChatIDMapping(
-                    for: idMapping,
-                    destinationTabID: destTabID
-                )
-            } catch {
-                await promptManager.closeComposeTab(destTabID)
-                throw error
-            }
+            )
+            #if DEBUG
+                if let hook = self.test_privateHandoffBeforeCommitHook { await hook() }
+            #endif
+            try await sessionDataService.commitPrivateHandoff(
+                sourceState: capturedSourceState, initialSession: initial, workspace: workspace,
+                root: capturedStorage.root,
+                references: selection.references,
+                persistPrivateRecords: {
+                    if let preparedChats { savedChats = try await oracle?.persistPrivateHandoffChats(preparedChats) }
+                },
+                discardPrivateRecords: {
+                    if let savedChats { await oracle?.discardPrivateHandoffChats(savedChats) }
+                },
+                commitCheck: {
+                    try Task.checkCancellation()
+                    try delegationCommitCheck()
+                    try promptManager.validatePrivateHandoffTab(preparedTab)
+                    guard self.sessions[sourceTabID] === sourceSession,
+                          sourceSession.activeAgentSessionID == sourceAgentModeSessionID,
+                          let currentWorkspace = workspaceManager.activeWorkspace,
+                          currentWorkspace.id == workspace.id
+                    else { throw PersistentBindingMutationError.staleTransition }
+                    try publication.validate(capturedStorage, currentRoot: currentStorageRoot(currentWorkspace))
+                },
+                expose: { committed in
+                    // Lineage eligibility before any publication: the re-apply below refuses only
+                    // without a bound destination identity or when it equals the parent. Failing
+                    // here rolls back unexposed, never exposing an MCP fork without its lineage.
+                    if let delegationParentSessionID {
+                        guard destSession.activeAgentSessionID == destinationID,
+                              delegationParentSessionID != destinationID
+                        else { throw PersistentBindingMutationError.staleTransition }
+                    }
+                    destSession.persistenceState = committed.persistenceState
+                    destSession.persistedIncarnationSessionID = destinationID
+                    destSession.markCurrentBindingHydrated()
+                    destSession.isDirty = false
+                    // One synchronous exposure, after required bytes and the session file exist.
+                    self.sessions[destTabID] = destSession
+                    promptManager.publishPrivateHandoffTab(
+                        preparedTab, sessionID: destinationID, chatID: savedChats?.activeID
+                    )
+                    if let savedChats { oracle?.publishPrivateHandoffChats(savedChats) }
+                    self.ensureApplyEditsApprovalSessionSync(for: destSession)
+                    // The binding observers ensureSessionBoundToTab used to notify, now at exposure.
+                    self.handleSidebarRefreshBindingMutation(tabID: destTabID, sessionID: destinationID)
+                    self.postAgentSessionBindingDidChange(
+                        tabID: destTabID, previousSessionID: nil, sessionID: destinationID
+                    )
+                    if let delegationParentSessionID {
+                        // Re-apply as an assignment so index repair and MCP permission refresh run.
+                        destSession.parentSessionID = nil
+                        self.applySpawnParentSessionID(
+                            delegationParentSessionID, to: destSession, inheritWorktreeBindings: false
+                        )
+                        // Unreachable after the eligibility guard; never let the following save
+                        // overwrite the persisted lineage with nil. A divergence means the guard
+                        // no longer matches applySpawnParentSessionID's refusals: fail DEBUG runs.
+                        if destSession.parentSessionID != delegationParentSessionID {
+                            assertionFailure("Handoff lineage eligibility diverged from applySpawnParentSessionID")
+                            destSession.parentSessionID = delegationParentSessionID
+                        }
+                    }
+                    self.refreshDerivedTranscriptState(for: destSession)
+                    self.scheduleSave(for: destTabID)
+                }
+            )
+            return destTabID
         }
-
-        // 5) Build the payload only after cloning so structured chat IDs can point at the
-        //    destination clones and prose can carry an explicit old → new table.
-        let payload = await buildHandoffPayload(
-            sourceTabID: sourceTabID,
-            sourceSession: sourceSession,
-            sourceTranscript: sourceTranscript,
-            upToItemID: upToItemID,
-            oracleChatIDMapping: oracleChatIDMapping
+        // A copy transaction occupies one of the two app-wide rich slots (busy, never queued);
+        // an ordinary handoff with nothing to copy is unchanged and takes no slot.
+        guard copiesArtifacts else { return try await transaction() }
+        return try await publication.withPublication(
+            workspaceID: workspace.id, sessionIDs: [sourceAgentModeSessionID], operation: transaction
         )
-
-        // 6) Install the migrated transcript and deferred payload, then persist the mapping.
-        destSession.replaceItems(migratedItems)
-        refreshDerivedTranscriptState(for: destSession)
-        destSession.hasSentFirstMessage = migratedItems.contains { $0.kind == .user }
-        destSession.pendingHandoff = AgentPendingHandoffState(
-            payload: payload,
-            createdAt: Date(),
-            sourceItemID: upToItemID,
-            payloadID: UUID(),
-            defersProviderLockUntilSend: true,
-            isStagedForSend: false
-        )
-        scheduleSave(for: destTabID)
-        return destTabID
     }
 
     /// Handoff the current session to a new tab, then foreground the prepared destination.

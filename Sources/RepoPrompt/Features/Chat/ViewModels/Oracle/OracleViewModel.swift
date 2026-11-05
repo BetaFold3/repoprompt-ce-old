@@ -2405,13 +2405,13 @@ class OracleViewModel: ObservableObject {
     /// - Returns: A mapping of source session ID → cloned session ID.
     @MainActor
     @discardableResult
-    func cloneChatSessions(
+    func preparePrivateHandoffChats(
         fromTabID sourceTabID: UUID,
         toTabID destTabID: UUID,
         sourceAgentModeSessionID: UUID,
         destinationAgentModeSessionID: UUID,
         setActiveSessionToClonedSourceActive: Bool = true
-    ) async throws -> [UUID: UUID] {
+    ) async throws -> PreparedHandoffChats {
         let sourceSessions = sessions(forTabID: sourceTabID)
         let ownedSourceSessions = sourceSessions.filter {
             Self.sessionMatchesOracleOwnerForExplicitContinuation(
@@ -2420,22 +2420,11 @@ class OracleViewModel: ObservableObject {
                 agentModeRunID: nil
             )
         }
-        guard !ownedSourceSessions.isEmpty else { return [:] }
 
         let sourceActiveID = workspaceManager.activeChatSessionID(forTabID: sourceTabID)
         var idMapping: [UUID: UUID] = [:]
         var handoffReplacements: [String: String] = [:]
-
-        func rollbackClones() async {
-            let clonedIDs = Set(idMapping.values)
-            for clonedID in clonedIDs {
-                if let clone = sessions.first(where: { $0.id == clonedID }) {
-                    await deleteSession(clone)
-                }
-            }
-            handoffChatIDReplacementsByTabID.removeValue(forKey: destTabID)
-            handoffChatIDMappingRowsByTabID.removeValue(forKey: destTabID)
-        }
+        var clones: [ChatSession] = []
 
         for sourceSession in ownedSourceSessions {
             // Force-load the full session to avoid copying empty stubs.
@@ -2446,7 +2435,6 @@ class OracleViewModel: ObservableObject {
                       agentModeRunID: nil
                   )
             else {
-                await rollbackClones()
                 throw ChatToolError.internalError(
                     "Failed to load an owned Oracle chat during handoff; no chats were cloned"
                 )
@@ -2457,7 +2445,7 @@ class OracleViewModel: ObservableObject {
             // StoredMessage is a value type — copy directly.
             // Use the fully-loaded session's messages (StoredMessage) rather than
             // the live messageStore (AIChatMessage) since we're creating a ChatSession.
-            var cloned = ChatSession(
+            let cloned = ChatSession(
                 id: clonedID,
                 workspaceID: fullSession.workspaceID,
                 composeTabID: destTabID,
@@ -2478,42 +2466,15 @@ class OracleViewModel: ObservableObject {
                 lastSendModelPresetID: fullSession.lastSendModelPresetID
             )
 
-            // Persist the clone and capture the file URL so the stub can resolve it later.
-            do {
-                #if DEBUG
-                    try await oracleCloneWillPersistObserverForTesting?(
-                        fullSession.id,
-                        clonedID
-                    )
-                #endif
-                let url = try await autosaveSession(cloned)
-                cloned.fileURL = url
-            } catch {
-                await rollbackClones()
-                throw ChatToolError.internalError(
-                    "Failed to persist an owned Oracle chat during handoff; no chats were cloned. \(error.localizedDescription)"
-                )
-            }
-
-            // Register as a list stub in memory (lazy-loaded when activated)
-            sessions.append(cloned.listStub())
+            clones.append(cloned)
             idMapping[fullSession.id] = clonedID
             handoffReplacements[fullSession.id.uuidString] = cloned.shortID
             handoffReplacements[fullSession.shortID] = cloned.shortID
         }
 
-        // Set destination tab's active chat session to the clone of the source active.
-        // If the source active wasn't cloned (or was nil), fall back to the first clone
-        // to prevent ensureActiveSessionForCurrentTab from creating a blank "New Chat".
-        if setActiveSessionToClonedSourceActive, !idMapping.isEmpty {
-            let clonedActive: UUID = if let srcActive = sourceActiveID, let mapped = idMapping[srcActive] {
-                mapped
-            } else {
-                // Deterministic fallback: use the clone of the first source session
-                idMapping[ownedSourceSessions.first!.id] ?? idMapping.values.first!
-            }
-            workspaceManager.setActiveChatSessionID(clonedActive, forTabID: destTabID)
-        }
+        let activeID = setActiveSessionToClonedSourceActive
+            ? sourceActiveID.flatMap { idMapping[$0] } ?? clones.first?.id
+            : nil
 
         let handoffMapping = HandoffChatIDMapping(
             replacements: handoffReplacements,
@@ -2521,16 +2482,78 @@ class OracleViewModel: ObservableObject {
                 .map { (oldID: $0.key, newID: $0.value) }
                 .sorted { $0.oldID < $1.oldID }
         )
-        if handoffMapping.replacements.isEmpty {
-            handoffChatIDReplacementsByTabID.removeValue(forKey: destTabID)
-            handoffChatIDMappingRowsByTabID.removeValue(forKey: destTabID)
-        } else {
-            handoffChatIDReplacementsByTabID[destTabID] = handoffMapping.replacements
-            handoffChatIDMappingRowsByTabID[destTabID] = handoffMapping.rows
-        }
+        return PreparedHandoffChats(
+            destinationTabID: destTabID, clones: clones, mapping: idMapping,
+            handoffMapping: handoffMapping, activeID: activeID
+        )
+    }
 
+    struct PreparedHandoffChats {
+        let destinationTabID: UUID
+        var clones: [ChatSession]
+        let mapping: [UUID: UUID]
+        let handoffMapping: HandoffChatIDMapping
+        let activeID: UUID?
+    }
+
+    /// Persist private identities, but do not append stubs, change active chats or refresh lists.
+    func persistPrivateHandoffChats(_ prepared: PreparedHandoffChats) async throws -> PreparedHandoffChats {
+        var saved = prepared
+        do {
+            for index in saved.clones.indices {
+                try Task.checkCancellation()
+                #if DEBUG
+                    let sourceID = saved.mapping.first(where: { $0.value == saved.clones[index].id })!.key
+                    try await oracleCloneWillPersistObserverForTesting?(sourceID, saved.clones[index].id)
+                #endif
+                saved.clones[index].fileURL = try await autosaveSession(saved.clones[index])
+            }
+            return saved
+        } catch is CancellationError {
+            await discardPrivateHandoffChats(saved)
+            throw CancellationError()
+        } catch {
+            await discardPrivateHandoffChats(saved)
+            throw ChatToolError.internalError(
+                "Failed to persist an owned Oracle chat during handoff; no chats were cloned. \(error.localizedDescription)"
+            )
+        }
+    }
+
+    func discardPrivateHandoffChats(_ prepared: PreparedHandoffChats) async {
+        for clone in prepared.clones {
+            if let fileURL = clone.fileURL {
+                do { try await chatData.deleteChatSessionFile(fileURL) }
+                catch { print("[Oracle] private handoff clone cleanup failed: \(error)") }
+            }
+        }
+    }
+
+    func publishPrivateHandoffChats(_ prepared: PreparedHandoffChats) {
+        sessions.append(contentsOf: prepared.clones.map { $0.listStub() })
+        if !prepared.handoffMapping.replacements.isEmpty {
+            handoffChatIDReplacementsByTabID[prepared.destinationTabID] = prepared.handoffMapping.replacements
+            handoffChatIDMappingRowsByTabID[prepared.destinationTabID] = prepared.handoffMapping.rows
+        }
         refreshSessionLists()
-        return idMapping
+    }
+
+    @discardableResult
+    func cloneChatSessions(
+        fromTabID sourceTabID: UUID, toTabID destTabID: UUID,
+        sourceAgentModeSessionID: UUID, destinationAgentModeSessionID: UUID,
+        setActiveSessionToClonedSourceActive: Bool = true
+    ) async throws -> [UUID: UUID] {
+        let prepared = try await preparePrivateHandoffChats(
+            fromTabID: sourceTabID, toTabID: destTabID,
+            sourceAgentModeSessionID: sourceAgentModeSessionID,
+            destinationAgentModeSessionID: destinationAgentModeSessionID,
+            setActiveSessionToClonedSourceActive: setActiveSessionToClonedSourceActive
+        )
+        let saved = try await persistPrivateHandoffChats(prepared)
+        publishPrivateHandoffChats(saved)
+        if let activeID = saved.activeID { workspaceManager.setActiveChatSessionID(activeID, forTabID: destTabID) }
+        return saved.mapping
     }
 
     struct HandoffChatIDMapping {

@@ -2821,6 +2821,11 @@ package enum AgentTranscriptIO {
         var remainingWorkingTurns = workingTranscript.turns
         var mergedTurns: [AgentTranscriptTurn] = []
         mergedTurns.reserveCapacity(max(transcript.turns.count, workingTranscript.turns.count))
+        // Turn-owned rich references are never rebuilt from items (like interruption evidence). A
+        // displaced turn's references stay on an evidence-only envelope; readable ones are then
+        // re-homed where possible. Envelopes are tracked by position (later appends never shift
+        // them), never by ID: a rebuilt real turn may carry the displaced turn's ID.
+        var envelopeIndices: Set<Int> = []
 
         for turn in transcript.turns {
             guard turn.retentionTier == .full else {
@@ -2828,21 +2833,42 @@ package enum AgentTranscriptIO {
                 continue
             }
             if let matchedIndex = remainingWorkingTurns.firstIndex(where: { $0.id == turn.id }) {
-                mergedTurns.append(remainingWorkingTurns.remove(at: matchedIndex))
+                var rebuilt = remainingWorkingTurns.remove(at: matchedIndex)
+                rebuilt.carryRichPresentations(from: turn)
+                mergedTurns.append(rebuilt)
             } else if explicitTurnIDs.contains(turn.id) {
                 // An explicit canonical envelope is never stood in for by another rebuilt turn. One
                 // without request or activities (evidence only) has no rows to rebuild it from, so it
                 // stays exactly as it is.
                 if turn.request == nil, turn.allActivities.isEmpty {
                     mergedTurns.append(turn)
+                } else if !turn.richPresentations.isEmpty || turn.unreadableRichPresentations != nil {
+                    if let sameID = mergedTurns.firstIndex(where: { $0.id == turn.id }) {
+                        // A positional stand-in for an earlier turn already holds this turn's
+                        // rows under its ID: its rich state belongs there when that turn has
+                        // none; otherwise it keeps an envelope under a fresh ID (never two turns
+                        // with one ID, never two representations on one turn).
+                        if mergedTurns[sameID].richPresentations.isEmpty, mergedTurns[sameID].unreadableRichPresentations == nil {
+                            mergedTurns[sameID].carryRichPresentations(from: turn)
+                        } else {
+                            envelopeIndices.insert(mergedTurns.count)
+                            mergedTurns.append(evidenceOnlyEnvelope(of: turn, id: UUID()))
+                        }
+                    } else {
+                        envelopeIndices.insert(mergedTurns.count)
+                        mergedTurns.append(evidenceOnlyEnvelope(of: turn, id: turn.id))
+                    }
                 }
             } else if !remainingWorkingTurns.isEmpty {
-                mergedTurns.append(remainingWorkingTurns.removeFirst())
+                var rebuilt = remainingWorkingTurns.removeFirst()
+                rebuilt.carryRichPresentations(from: turn)
+                mergedTurns.append(rebuilt)
             } else {
                 mergedTurns.append(turn)
             }
         }
         mergedTurns.append(contentsOf: remainingWorkingTurns)
+        reattachDisplacedRichPresentations(fromEnvelopesAt: envelopeIndices, in: &mergedTurns)
         return AgentTranscript(
             version: max(transcript.version, workingTranscript.version),
             turns: mergedTurns,
@@ -3419,7 +3445,10 @@ package enum AgentTranscriptIO {
             ))
         }
         var updatedTranscript = existingTranscript
-        updatedTranscript.turns[updatedTranscript.turns.count - 1] = rebuiltFinalTurn
+        var carriedFinalTurn = rebuiltFinalTurn
+        // Same request (guarded above): durable turn-owned references survive the final-turn rebuild.
+        carriedFinalTurn.carryRichPresentations(from: existingFinalTurn)
+        updatedTranscript.turns[updatedTranscript.turns.count - 1] = carriedFinalTurn
         updatedTranscript.nextSequenceIndex = nextSequenceIndex ?? updatedTranscript.nextSequenceIndex
         let compacted = AgentTranscriptCompactor.compact(
             updatedTranscript,
@@ -4802,8 +4831,240 @@ package enum AgentTranscriptIO {
         )
     }
 
+    /// One cutoff-selected, turn-owned reference and the source turn that owned it.
+    package struct SelectedRichPresentation: Equatable {
+        package let sourceTurnID: UUID
+        package let entry: AgentTranscriptRichPresentation
+    }
+
+    package struct HandoffSelection {
+        package let items: [AgentChatItem]
+        /// Source turn that produced each migrated item (parallel to `items`), including synthetic
+        /// summary rows whose IDs never match a source row.
+        package let itemSourceTurnIDs: [UUID?]
+        /// Ordered, deduplicated by artifact ID; includes references owned by compacted turns.
+        package let richPresentations: [SelectedRichPresentation]
+        package var references: [RichPresentationReference] {
+            richPresentations.map(\.entry.reference)
+        }
+    }
+
+    /// Selects migrated items AND the turn-owned references the same cutoff covers. A transcript
+    /// with no turn-owned references (readable or preserved unreadable) takes exactly the existing
+    /// export (`buildHandoffTranscriptItems`), whose callers already validate the cutoff; otherwise
+    /// it uses the existing materialized export row universe and never widens an unknown cutoff to
+    /// the whole history. Within the cutoff turn, references after the cutoff activity are excluded; a
+    /// request-row cutoff excludes all of that turn's references; a synthetic summary row (which
+    /// the export emits for a turn retained only as a summary) covers the whole turn.
+    package static func selectHandoffTranscript(
+        from transcript: AgentTranscript, upToRowID: UUID?
+    ) throws -> HandoffSelection {
+        guard transcript.turns.contains(where: { !$0.richPresentations.isEmpty || $0.unreadableRichPresentations != nil })
+        else {
+            // Nothing to copy: exactly the pre-existing export (the caller already resolved the
+            // cutoff), with no extra materialization and no new failure mode.
+            let entries = handoffExportEntries(from: transcript, upToRowID: upToRowID).filter { $0.migratedItem != nil }
+            return HandoffSelection(
+                items: renumberedHandoffItems(entries.compactMap(\.migratedItem)),
+                itemSourceTurnIDs: entries.map(\.turnID),
+                richPresentations: []
+            )
+        }
+        var selectedTurns = transcript.turns[...]
+        var boundary: (turnID: UUID, order: Int)?
+        if let rowID = upToRowID {
+            guard isValidHandoffExportCutoffRowID(rowID, in: transcript) else {
+                throw AgentRichArtifactError.invalidHandoffCutoff
+            }
+            let materialized = AgentTranscriptPolicyPipeline.handoffTranscript(from: transcript, upToRowID: nil)
+            let blocks = materialized.projection.archivedBlocks + materialized.projection.workingBlocks
+            guard let block = blocks.first(where: { $0.rows.contains { $0.id == rowID } || $0.activityIDs.contains(rowID) }),
+                  let index = transcript.turns.firstIndex(where: { $0.id == block.turnID })
+            else { throw AgentRichArtifactError.invalidHandoffCutoff }
+            selectedTurns = transcript.turns[...index]
+            let turn = transcript.turns[index]
+            if rowID == turn.request?.id {
+                boundary = (turn.id, -1)
+            } else if let activity = turn.allActivities.first(where: { $0.id == rowID }) {
+                boundary = (turn.id, activity.sequenceIndex)
+            }
+        }
+        var seen: [UUID: AgentTranscriptRichPresentation] = [:]
+        var selected: [SelectedRichPresentation] = []
+        for turn in selectedTurns {
+            // A preserved unreadable value may hold required references: refuse, never drop.
+            guard turn.unreadableRichPresentations == nil else { throw AgentRichArtifactError.unreadableReferences }
+            for entry in turn.richPresentations {
+                guard entry.activityOrder >= 0, entry.reference.version == RichPresentationLimits.schemaVersion else {
+                    throw AgentRichArtifactError.invalidManifest
+                }
+                if let boundary, boundary.turnID == turn.id, entry.activityOrder > boundary.order { continue }
+                if let previous = seen[entry.reference.artifactID] {
+                    // One artifact has one identity; conflicting entries are corruption, not a choice.
+                    guard previous == entry else { throw AgentRichArtifactError.invalidManifest }
+                    continue
+                }
+                seen[entry.reference.artifactID] = entry
+                selected.append(SelectedRichPresentation(sourceTurnID: turn.id, entry: entry))
+            }
+        }
+        let entries = handoffExportEntries(from: transcript, upToRowID: upToRowID).filter { $0.migratedItem != nil }
+        return HandoffSelection(
+            items: renumberedHandoffItems(entries.compactMap(\.migratedItem)),
+            itemSourceTurnIDs: entries.map(\.turnID),
+            richPresentations: selected
+        )
+    }
+
+    /// Attaches selected references to the destination transcript derived from `selection.items`.
+    /// Migrated rows keep their source IDs (sequence indices are renumbered), so each reference
+    /// lands on the destination turn holding its activity; otherwise on the turn holding the
+    /// nearest earlier retained row of its source turn (a compacted turn keeps its request);
+    /// otherwise on the last row migrated from its source turn (synthetic summary rows count);
+    /// otherwise on the last row of the nearest earlier source turn, else the first row.
+    /// `activityOrder` is remapped to that destination sequence index. Never drops a reference:
+    /// it fails only when the destination has no row to own it.
+    package static func attachingHandoffRichPresentations(
+        _ selection: HandoffSelection,
+        sourceTranscript: AgentTranscript,
+        to destination: AgentTranscript
+    ) throws -> AgentTranscript {
+        let selected = selection.richPresentations
+        guard !selected.isEmpty else { return destination }
+        var result = destination
+        var destinationRows: [UUID: (turn: Int, order: Int)] = [:]
+        for (turnIndex, turn) in result.turns.enumerated() {
+            if let request = turn.request { destinationRows[request.id] = (turnIndex, request.sequenceIndex) }
+            for activity in turn.allActivities {
+                destinationRows[activity.id] = (turnIndex, activity.sequenceIndex)
+            }
+        }
+        let sourceTurns = Dictionary(sourceTranscript.turns.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let sourceTurnOrder = Dictionary(
+            sourceTranscript.turns.enumerated().map { ($1.id, $0) }, uniquingKeysWith: { first, _ in first }
+        )
+        let itemTurnOrders = selection.items.indices.map { index in
+            index < selection.itemSourceTurnIDs.count ? selection.itemSourceTurnIDs[index].flatMap { sourceTurnOrder[$0] } : nil
+        }
+        func lastPlacedItem(where predicate: (Int?) -> Bool) -> (turn: Int, order: Int)? {
+            for index in selection.items.indices.reversed() where predicate(itemTurnOrders[index]) {
+                if let hit = destinationRows[selection.items[index].id] { return hit }
+            }
+            return nil
+        }
+        // Source order (turn, then original activity order) before remapping, so fallback
+        // placements that tie on a destination row keep activity order rather than capture order.
+        let sourceOrdered = selected.enumerated().sorted { lhs, rhs in
+            let left = (sourceTurnOrder[lhs.element.sourceTurnID] ?? Int.max, lhs.element.entry.activityOrder, lhs.offset)
+            let right = (sourceTurnOrder[rhs.element.sourceTurnID] ?? Int.max, rhs.element.entry.activityOrder, rhs.offset)
+            return left < right
+        }.map(\.element)
+        var touchedTurns = Set<Int>()
+        for item in sourceOrdered {
+            let entry = item.entry
+            var placement = destinationRows[entry.activityID]
+            if placement == nil, let sourceTurn = sourceTurns[item.sourceTurnID] {
+                var earlier = sourceTurn.allActivities
+                    .filter { $0.sequenceIndex <= entry.activityOrder }
+                    .map { (id: $0.id, order: $0.sequenceIndex) }
+                if let request = sourceTurn.request { earlier.append((id: request.id, order: -1)) }
+                for row in earlier.sorted(by: { $0.order > $1.order }) {
+                    if let hit = destinationRows[row.id] {
+                        placement = hit
+                        break
+                    }
+                }
+            }
+            if placement == nil, let order = sourceTurnOrder[item.sourceTurnID] {
+                placement = lastPlacedItem { $0 == order } ?? lastPlacedItem { ($0 ?? Int.max) < order }
+            }
+            if placement == nil {
+                placement = selection.items.lazy.compactMap { destinationRows[$0.id] }.first
+            }
+            guard let placement else { throw AgentRichArtifactError.invalidHandoffCutoff }
+            result.turns[placement.turn].richPresentations.append(AgentTranscriptRichPresentation(
+                reference: entry.reference, activityID: entry.activityID, activityOrder: max(0, placement.order)
+            ))
+            touchedTurns.insert(placement.turn)
+        }
+        // Fallback placements can land out of order; keep each turn ordered by remapped order.
+        for index in touchedTurns {
+            result.turns[index].richPresentations = orderedByActivity(result.turns[index].richPresentations)
+        }
+        return result
+    }
+
+    /// Stable order by activity order (ties keep their existing relative order).
+    private static func orderedByActivity(
+        _ entries: [AgentTranscriptRichPresentation]
+    ) -> [AgentTranscriptRichPresentation] {
+        entries.enumerated()
+            .sorted { ($0.element.activityOrder, $0.offset) < ($1.element.activityOrder, $1.offset) }
+            .map(\.element)
+    }
+
+    /// The evidence-only shape (no request, no activities, one closed empty span under the turn's
+    /// deterministic span ID) that later rebuilds keep verbatim as an explicit envelope. It carries
+    /// only the displaced turn's rich state, unchanged, under `id` (the turn's own ID unless another
+    /// turn already has it).
+    private static func evidenceOnlyEnvelope(of turn: AgentTranscriptTurn, id: UUID) -> AgentTranscriptTurn {
+        let closedAt = turn.completedAt ?? turn.lastActivityAt ?? turn.startedAt
+        var envelope = AgentTranscriptTurn(
+            id: id,
+            responseSpans: [AgentTranscriptProviderResponseSpan(
+                id: deterministicSpanID(turnID: id, ordinal: 0), lifecycle: .completed,
+                startedAt: turn.startedAt, lastActivityAt: closedAt, completedAt: closedAt
+            )],
+            startedAt: turn.startedAt,
+            lastActivityAt: closedAt,
+            completedAt: closedAt
+        )
+        envelope.richPresentations = turn.richPresentations
+        envelope.unreadableRichPresentations = turn.unreadableRichPresentations
+        return envelope
+    }
+
+    /// Re-homes readable references from displaced-turn envelopes: onto the turn now containing
+    /// their activity, else the last turn, skipping any turn that holds a preserved unreadable value
+    /// (a turn encodes one or the other, so a readable reference there would be lost on save) and
+    /// the displaced envelopes themselves. An envelope keeps whatever has no such owner, and is
+    /// removed once empty. Unreadable values are never moved or combined: each stays verbatim on
+    /// its own envelope. Keeps per-turn order by activity order.
+    private static func reattachDisplacedRichPresentations(
+        fromEnvelopesAt envelopeIndices: Set<Int>, in turns: inout [AgentTranscriptTurn]
+    ) {
+        guard !envelopeIndices.isEmpty else { return }
+        func canOwn(_ index: Int) -> Bool {
+            !envelopeIndices.contains(index) && turns[index].unreadableRichPresentations == nil
+        }
+        var present = Set(turns.indices.filter { !envelopeIndices.contains($0) }.flatMap {
+            turns[$0].richPresentations.map(\.reference.artifactID)
+        })
+        for envelopeIndex in envelopeIndices.sorted() {
+            var kept: [AgentTranscriptRichPresentation] = []
+            for entry in turns[envelopeIndex].richPresentations {
+                let activityOwner = turns.firstIndex { $0.allActivities.contains { $0.id == entry.activityID } }
+                guard let owner = activityOwner.flatMap({ canOwn($0) ? $0 : nil }) ?? turns.indices.last(where: canOwn) else {
+                    kept.append(entry)
+                    continue
+                }
+                guard present.insert(entry.reference.artifactID).inserted else { continue }
+                turns[owner].richPresentations.append(entry)
+                turns[owner].richPresentations = orderedByActivity(turns[owner].richPresentations)
+            }
+            turns[envelopeIndex].richPresentations = kept
+        }
+        for index in envelopeIndices.sorted(by: >) where turns[index].richPresentations.isEmpty && turns[index].unreadableRichPresentations == nil {
+            turns.remove(at: index)
+        }
+    }
+
     package static func buildHandoffTranscriptItems(from transcript: AgentTranscript, upToRowID: UUID?) -> [AgentChatItem] {
-        handoffExportEntries(from: transcript, upToRowID: upToRowID).compactMap(\.migratedItem).enumerated().map { index, item in
+        renumberedHandoffItems(handoffExportEntries(from: transcript, upToRowID: upToRowID).compactMap(\.migratedItem))
+    }
+
+    private static func renumberedHandoffItems(_ items: [AgentChatItem]) -> [AgentChatItem] {
+        items.enumerated().map { index, item in
             var copy = item
             copy.isStreaming = false
             copy.sequenceIndex = index

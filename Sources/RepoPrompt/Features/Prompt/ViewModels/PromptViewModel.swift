@@ -2860,6 +2860,51 @@ class PromptViewModel: ObservableObject {
         await createBackgroundComposeTab(strategy: .forkDuplicate(sourceTabID: sourceTabID), name: name)
     }
 
+    struct PreparedHandoffTab {
+        let workspaceID: UUID
+        let sourceTabID: UUID
+        let tab: ComposeTabState
+    }
+
+    /// Private fork preparation never evicts another tab or publishes workspace metadata.
+    @MainActor
+    func preparePrivateHandoffTab(sourceTabID: UUID, name: String) throws -> PreparedHandoffTab {
+        guard let manager = workspaceManager, let workspace = manager.activeWorkspace,
+              let index = manager.workspaces.firstIndex(where: { $0.id == workspace.id }),
+              workspace.composeTabs.contains(where: { $0.id == sourceTabID }),
+              workspace.composeTabs.count < maxComposeTabs
+        else { throw NSError(domain: "AgentHandoff", code: 1, userInfo: [NSLocalizedDescriptionKey: "Cannot prepare handoff. Close a tab and retry."]) }
+        flushAndSnapshotSourceTabIfNeeded(for: .forkDuplicate(sourceTabID: sourceTabID), in: manager, workspaceIndex: index)
+        guard let tab = makeComposeTab(
+            for: .forkDuplicate(sourceTabID: sourceTabID), explicitName: name, workspaceIndex: index, manager: manager
+        ) else { throw AgentSessionError.emptySession }
+        return PreparedHandoffTab(workspaceID: workspace.id, sourceTabID: sourceTabID, tab: tab)
+    }
+
+    @MainActor
+    func validatePrivateHandoffTab(_ prepared: PreparedHandoffTab) throws {
+        guard let workspace = workspaceManager?.activeWorkspace, workspace.id == prepared.workspaceID,
+              workspace.composeTabs.contains(where: { $0.id == prepared.sourceTabID }),
+              !workspace.composeTabs.contains(where: { $0.id == prepared.tab.id }),
+              workspace.composeTabs.count < maxComposeTabs
+        else { throw NSError(domain: "AgentHandoff", code: 1, userInfo: [NSLocalizedDescriptionKey: "Handoff placement changed. Close a tab and retry."]) }
+    }
+
+    /// Caller has validated placement on this same non-suspending main-actor stack.
+    @MainActor
+    func publishPrivateHandoffTab(_ prepared: PreparedHandoffTab, sessionID: UUID, chatID: UUID?) {
+        guard let manager = workspaceManager,
+              let index = manager.workspaces.firstIndex(where: { $0.id == prepared.workspaceID })
+        else { return }
+        var tab = prepared.tab
+        tab.activeAgentSessionID = sessionID
+        tab.activeChatSessionID = chatID
+        manager.workspaces[index].composeTabs.append(tab)
+        loadComposeTabsFromWorkspace(manager.workspaces[index])
+        manager.markWorkspaceDirty()
+        manager.pollAndSaveState()
+    }
+
     /// Ensure a tab is active; if the tab does not exist, create a new one with the provided strategy.
     /// Returns the activated tab state.
     /// - Parameters:
