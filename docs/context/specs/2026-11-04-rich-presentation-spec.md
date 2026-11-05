@@ -89,7 +89,7 @@ Step 1 — done | rounds 1/2 | open: none | downgraded: none | assumed: A1,A2,A3
 - Change: App image-fetch service using existing HTTP injection/isolation patterns and ImageIO; Core value outcomes. No changes to preview network policy.
 - Validation: proposed `RichPresentationImageFetcherTests` covers exact hosts, redirect/auth isolation, deadline/cancellation, lying lengths and byte/pixel/format boundaries; controlled transport fixtures distinguish actual URLSession behavior from mocks.
 - Done when: failures yield terminal placeholders, text survives, and no unbounded or post-publication work exists.
-Step 2 — todo | rounds 2/2 | open: none | downgraded: none | assumed: A4,A5 | deferred: none
+Step 2 — done | rounds 1/2 | open: none | downgraded: none | assumed: A4,A5; strict no-trailer images | deferred: entropy-corruption and live transport limits in step2-dispositions.md
 ### Step 3 — Durable publication and independent copies
 - Change: Core artifact service/store at `AgentSessionDataService` storage/deletion gate; trusted MCP owner resolver; App handoff and root-change seams. No dependency on concurrently changing document-attachment work.
 - Validation: proposed `RichPresentationLifecycleTests` covers partial writes, deletion/cancellation/storage move during fetch, worker-session reload, compacted-cutoff copy then source deletion, copy failure, and custom-storage movement.
