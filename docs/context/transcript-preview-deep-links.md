@@ -42,6 +42,10 @@ Structured-JSON exception: a JSON object or array body that comes from the app's
 - Canonical tool-result detection and click provenance: `make dev-test FILTER=ToolResultMarkdownLinkifierTests`.
 - Tool-result body typing, the structured-JSON exception, and raw-copy policy: `make dev-test FILTER=ToolResultBodyPresentationTests`.
 
+## Related planned work
+
+The [inline rich presentation spec](specs/2026-11-04-rich-presentation-spec.md) covers opt-in native charts and newspaper briefings, approved-host images, and durable transcript artifacts. It is not implemented and does not change Preview link or WebKit security behavior.
+
 ## Explicit non-goals
 
 Fenced-code-interior linkification, Bash-specific linkification, unified-diff linkification, compressed tool-group or header-chip linkification, line-number scrolling inside Preview, chat-mode or Preview-panel auto-linkification, OS scheme registration, persistence changes, and Preview security changes are out of scope.
