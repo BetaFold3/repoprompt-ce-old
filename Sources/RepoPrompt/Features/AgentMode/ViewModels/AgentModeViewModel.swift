@@ -618,6 +618,14 @@ final class AgentModeViewModel: ObservableObject {
     weak var promptManager: PromptViewModel?
     private let workspaceFileContextStore: WorkspaceFileContextStore?
     weak var workspaceManager: WorkspaceManagerViewModel?
+    /// The per-workspace rich-presentation read sampled once per admitted run attempt
+    /// (`richPresentationAttemptPolicy(for:)`): the entry committed on disk now, so a change saved
+    /// by another running build applies to this build's next attempt. Nil (unreadable or a
+    /// preserved future/foreign schema) admits the attempt with no rich-presentation authority.
+    var richPresentationSettingsRead: @MainActor (UUID) -> WorkspaceRichPresentationSettings? = {
+        GlobalSettingsStore.shared.persistedRichPresentationSettings(for: $0)
+    }
+
     private weak var mcpServer: MCPServerViewModel?
     /// The session writer. When recovery is composed it is the coordinator's DataService (the one
     /// whose gate fences the recovery store), so every transcript save, reset commit, and recovery
@@ -2365,7 +2373,8 @@ final class AgentModeViewModel: ObservableObject {
         purpose: MCPRunPurpose,
         taskLabelKind: AgentModelCatalog.TaskLabelKind? = nil,
         allowsAgentExternalControlTools: Bool = false,
-        requiresExpectedAgentPID: Bool = false
+        requiresExpectedAgentPID: Bool = false,
+        runOwnership: AgentRunOwnership?
     ) async {
         await ServerNetworkManager.shared.installClientConnectionPolicy(
             for: clientName,
@@ -2382,7 +2391,8 @@ final class AgentModeViewModel: ObservableObject {
             purpose: purpose,
             taskLabelKind: taskLabelKind,
             allowsAgentExternalControlTools: allowsAgentExternalControlTools,
-            requiresExpectedAgentPID: requiresExpectedAgentPID
+            requiresExpectedAgentPID: requiresExpectedAgentPID,
+            runOwnership: runOwnership
         )
     }
 
@@ -2475,7 +2485,7 @@ final class AgentModeViewModel: ObservableObject {
         acpControllerFactory = { provider, runRequest in
             try ACPAgentSessionController(provider: provider, runRequest: runRequest, mcpHost: ServerNetworkManager.shared)
         }
-        connectionPolicyInstaller = { clientName, windowID, restrictedTools, oneShot, reason, ttl, tabID, runID, additionalTools, allowedToolsOverride, sessionProfile, purpose, taskLabelKind, allowsAgentExternalControlTools, requiresExpectedAgentPID in
+        connectionPolicyInstaller = { clientName, windowID, restrictedTools, oneShot, reason, ttl, tabID, runID, additionalTools, allowedToolsOverride, sessionProfile, purpose, taskLabelKind, allowsAgentExternalControlTools, requiresExpectedAgentPID, runOwnership in
             await Self.defaultConnectionPolicyInstaller(
                 clientName: clientName,
                 windowID: windowID,
@@ -2491,7 +2501,8 @@ final class AgentModeViewModel: ObservableObject {
                 purpose: purpose,
                 taskLabelKind: taskLabelKind,
                 allowsAgentExternalControlTools: allowsAgentExternalControlTools,
-                requiresExpectedAgentPID: requiresExpectedAgentPID
+                requiresExpectedAgentPID: requiresExpectedAgentPID,
+                runOwnership: runOwnership
             )
         }
         mcpServerEnabler = { [weak mcpServer] in
@@ -2619,7 +2630,7 @@ final class AgentModeViewModel: ObservableObject {
             acpControllerFactory: @escaping AgentACPControllerFactory = { provider, runRequest in
                 try ACPAgentSessionController(provider: provider, runRequest: runRequest, mcpHost: ServerNetworkManager.shared)
             },
-            connectionPolicyInstaller: @escaping AgentConnectionPolicyInstaller = { clientName, windowID, restrictedTools, oneShot, reason, ttl, tabID, runID, additionalTools, allowedToolsOverride, sessionProfile, purpose, taskLabelKind, allowsAgentExternalControlTools, requiresExpectedAgentPID in
+            connectionPolicyInstaller: @escaping AgentConnectionPolicyInstaller = { clientName, windowID, restrictedTools, oneShot, reason, ttl, tabID, runID, additionalTools, allowedToolsOverride, sessionProfile, purpose, taskLabelKind, allowsAgentExternalControlTools, requiresExpectedAgentPID, runOwnership in
                 await AgentModeViewModel.defaultConnectionPolicyInstaller(
                     clientName: clientName,
                     windowID: windowID,
@@ -2635,7 +2646,8 @@ final class AgentModeViewModel: ObservableObject {
                     purpose: purpose,
                     taskLabelKind: taskLabelKind,
                     allowsAgentExternalControlTools: allowsAgentExternalControlTools,
-                    requiresExpectedAgentPID: requiresExpectedAgentPID
+                    requiresExpectedAgentPID: requiresExpectedAgentPID,
+                    runOwnership: runOwnership
                 )
             },
             mcpRunRoutingCleaner: @escaping MCPRunRoutingCleaner = { runID, windowID, reason in
@@ -4323,6 +4335,9 @@ final class AgentModeViewModel: ObservableObject {
         }
         newSession.onPendingQuestionUIChanged = { [weak self] session in
             self?.catchUpDerivedTranscriptForPendingQuestionUIChange(session)
+        }
+        newSession.richPresentationPolicyResolver = { [weak self] session in
+            self?.richPresentationAttemptPolicy(for: session)
         }
         newSession.onUsageAccountingChanged = { [weak self] session, didChangeAcceptedAccounting in
             guard let self else { return }

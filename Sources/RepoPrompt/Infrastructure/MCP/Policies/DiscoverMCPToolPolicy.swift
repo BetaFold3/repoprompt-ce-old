@@ -19,7 +19,9 @@ enum DiscoverMCPToolPolicy {
         .agentExternalControl,
         .agentExploreControl,
         .agentReasoningControl,
-        .agentSessionControl
+        .agentSessionControl,
+        // Context Builder runs never present rich content.
+        .richPresentation
     ]
 
     static let restrictedTools: Set<String> = MCPToolCapabilities.toolNames(for: restrictedCapabilities)

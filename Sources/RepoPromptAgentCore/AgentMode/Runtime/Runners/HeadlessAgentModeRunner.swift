@@ -44,7 +44,7 @@ final class HeadlessAgentModeRunner {
         initialMessageForRun: String,
         attachments: [AgentImageAttachment],
         handoff: AgentProviderHandoff,
-        makeLease: (_ runID: UUID) -> MCPBootstrapLease
+        makeLease: (_ runID: UUID, _ ownership: AgentRunOwnership) -> MCPBootstrapLease
     ) async {
         // The run task owns the handoff once created; every earlier exit never reached the provider.
         var runTaskOwnsHandoff = false
@@ -63,13 +63,14 @@ final class HeadlessAgentModeRunner {
         hooks.startNonCodexTurnAccountingIfNeeded(session, initialMessageForRun)
 
         let runID = AgentModeProcessRunIdentity.startFreshProcessRun(for: session)
-        let lease = makeLease(runID)
 
         session.activeReasoningItemID = nil
         session.reasoningItemIDsByGroupID.removeAll()
         session.codexReasoningSegmentsByKey.removeAll()
 
+        // Admitted before the lease is built: the lease's policy carries this exact attempt.
         let ownership = session.beginRunAttempt(source: "headless", inputUserItemID: handoff.attributedUserItemID)
+        let lease = makeLease(runID, ownership)
         let runAttemptID = ownership.attemptID
         session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .preparingRuntime)
         session.runningStatusText = nil

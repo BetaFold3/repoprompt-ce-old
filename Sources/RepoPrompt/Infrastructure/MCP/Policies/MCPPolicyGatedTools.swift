@@ -12,7 +12,10 @@ enum MCPPolicyGatedTools {
         .agentConversationSend,
         .conversationLog,
         // Only Agent Mode runs are granted `workspace_steer`; external MCP clients never see it.
-        .workspaceSteering
+        .workspaceSteering,
+        // Granted only to an Agent Mode run attempt whose captured workspace policy enables it
+        // (`AgentRichPresentationToolPolicy`); Oracle, external and unbound clients never see it.
+        .richPresentation
     ]
 
     /// Tool names that require explicit policy grant to be visible/callable.

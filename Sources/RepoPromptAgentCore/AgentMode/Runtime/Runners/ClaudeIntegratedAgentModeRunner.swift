@@ -67,7 +67,7 @@ final class ClaudeIntegratedAgentModeRunner {
         initialMessageForRun: String,
         attachments: [AgentImageAttachment],
         handoff: AgentProviderHandoff,
-        makeLease: (_ runID: UUID) -> MCPBootstrapLease
+        makeLease: (_ runID: UUID, _ ownership: AgentRunOwnership) -> MCPBootstrapLease
     ) async {
         let attachmentReservationID = hooks.reserveAttachmentsForTurn(attachments, session)
 
@@ -84,8 +84,10 @@ final class ClaudeIntegratedAgentModeRunner {
         let runID = session.claudeController.flatMap { _ in
             AgentModeProcessRunIdentity.existingProcessRunID(for: session)
         } ?? AgentModeProcessRunIdentity.startFreshProcessRun(for: session)
-        let lease = makeLease(runID)
+        // Admit first: a Claude follow-up reuses its process run ID, so the attempt (not the run
+        // ID) owns this turn's policy; the lease is built from that exact ownership.
         let ownership = session.beginRunAttempt(source: "claudeNative", inputUserItemID: handoff.attributedUserItemID)
+        let lease = makeLease(runID, ownership)
         session.installRunAttemptTerminalResources(ownership: ownership) { terminalState in
             {
                 switch terminalState {

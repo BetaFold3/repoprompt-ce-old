@@ -16,7 +16,9 @@ final class KnowledgeSessionMCPPolicyTests: XCTestCase {
             MCPWindowToolName.askOracle,
             MCPWindowToolName.oracleChatLog,
             MCPWindowToolName.agentRun,
-            MCPWindowToolName.workspaceSteer
+            MCPWindowToolName.workspaceSteer,
+            // Ceiling membership only; the attempt's captured rich-presentation grant decides.
+            AgentRichPresentationToolPolicy.toolName
         ]
 
         XCTAssertEqual(AgentModeMCPToolPolicy.knowledgeAllowedTools, expected)

@@ -19,23 +19,7 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
         _ computerUseEnabled: Bool
     ) -> any CodexSessionControlling
 
-    package typealias ConnectionPolicyInstaller = (
-        _ clientName: String,
-        _ windowID: Int,
-        _ restrictedTools: Set<String>,
-        _ oneShot: Bool,
-        _ reason: String?,
-        _ ttl: TimeInterval,
-        _ tabID: UUID?,
-        _ runID: UUID?,
-        _ additionalTools: Set<String>?,
-        _ allowedToolsOverride: Set<String>?,
-        _ sessionProfile: AgentSessionProfile,
-        _ purpose: MCPRunPurpose,
-        _ taskLabelKind: AgentModelCatalog.TaskLabelKind?,
-        _ allowsAgentExternalControlTools: Bool,
-        _ requiresExpectedAgentPID: Bool
-    ) async -> Void
+    package typealias ConnectionPolicyInstaller = AgentConnectionPolicyInstaller
     package typealias ActiveToolQuery = AgentCodexActiveToolQuery
     package typealias ActiveAgentRunWaitQuery = AgentCodexAgentRunWaitQuery
     package typealias ActiveAgentRunWaitDrain = AgentCodexAgentRunWaitDrain
@@ -3003,6 +2987,10 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
             )
             return
         }
+        // A successor attempt claimed above takes its own ownership on the retained route before
+        // its input reaches Codex. Placed here so the delivered-drop check and the final synchronous
+        // ownership check below revalidate the claim, controller and run after this await.
+        await refreshCodexRunAttemptRichPresentation(session: session, runID: head.originRunID)
         if dropDeliveredClaimedCodexFallbackIfNeeded(head, session: session) {
             evidence.noteNoHandoff(message: "Codex already accepted this MCP attempt through another dispatch.")
             return
@@ -4193,13 +4181,31 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
         viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
     }
 
+    /// Delivers the session's current run attempt ownership to the Codex run's live routed MCP
+    /// connections (rich-presentation authority and grant only), without a transport lease or a
+    /// controller change. Skipped when Codex tooling is unmanaged or no attempt is current.
+    private func refreshCodexRunAttemptRichPresentation(session: AgentTabSession, runID: UUID) async {
+        guard shouldManageCodexTooling,
+              session.runID == runID,
+              let ownership = session.activeRunOwnership,
+              session.isCurrentRunAttemptForCurrentBinding(ownership),
+              let clientName = AgentProviderKind.codexExec.mcpClientNameHint
+        else { return }
+        await runCoordinator.mcpHost.refreshRunAttemptRichPresentation(
+            for: clientName,
+            runID: runID,
+            runOwnership: ownership
+        )
+    }
+
     private func makeCodexRunLease(
         tabID: UUID,
         runID: UUID,
         sessionProfile: AgentSessionProfile = .standard,
         taskLabelKind: AgentModelCatalog.TaskLabelKind? = nil,
         allowsAgentExternalControlTools: Bool = false,
-        additionalRestrictedTools: Set<String> = []
+        additionalRestrictedTools: Set<String> = [],
+        runOwnership: AgentRunOwnership?
     ) -> MCPBootstrapLease? {
         guard shouldManageCodexTooling else { return nil }
         viewModel?.bindPendingOracleReviewContext(tabID: tabID, runID: runID)
@@ -4212,7 +4218,8 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
             sessionProfile: sessionProfile,
             taskLabelKind: taskLabelKind,
             allowsAgentExternalControlTools: allowsAgentExternalControlTools,
-            additionalRestrictedTools: additionalRestrictedTools
+            additionalRestrictedTools: additionalRestrictedTools,
+            runOwnership: runOwnership
         )
         return MCPBootstrapLease(
             spec: leaseSpec,
@@ -5407,7 +5414,10 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
                 sessionProfile: session.profile,
                 taskLabelKind: session.mcpControlContext?.taskLabelKind,
                 allowsAgentExternalControlTools: delegationPolicy.allowsAgentExternalControlTools,
-                additionalRestrictedTools: delegationPolicy.additionalRestrictedTools
+                additionalRestrictedTools: delegationPolicy.additionalRestrictedTools,
+                // The attempt admitted before this send (runner, compaction or fallback
+                // successor); a later attempt on the retained thread refreshes it below.
+                runOwnership: session.activeRunOwnership
             ) else { return }
             let acquired = await lease.acquire()
             guard acquired else { return }
@@ -5443,6 +5453,10 @@ package final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObser
             return
         }
         guard requiresTransportStart else {
+            // Retained thread: no new transport lease. The current attempt's ownership reaches the
+            // live routed connection in place (rich-presentation part only, so the delegation
+            // policy keeps its transport-scoped lifetime); the controller is never replaced.
+            await refreshCodexRunAttemptRichPresentation(session: session, runID: runID)
             await ensureCodexToolTrackingForReadySessionIfNeeded(for: session, runID: runID)
             return
         }
