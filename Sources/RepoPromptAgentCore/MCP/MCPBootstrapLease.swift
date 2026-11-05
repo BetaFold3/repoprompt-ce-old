@@ -33,6 +33,9 @@ package struct MCPBootstrapLeaseSpec {
     /// When true, the queued policy is reserved until the MCP peer PID is a descendant
     /// of an explicitly registered expected agent process.
     package let requiresExpectedAgentPID: Bool
+    /// The admitted Agent Mode run attempt this lease's policy belongs to; `nil` for every
+    /// non-Agent-Mode lease. Rich-presentation grants derive only from it, never from live Settings.
+    package let runOwnership: AgentRunOwnership?
 
     init(
         runID: UUID,
@@ -50,7 +53,8 @@ package struct MCPBootstrapLeaseSpec {
         purpose: MCPRunPurpose,
         taskLabelKind: AgentModelCatalog.TaskLabelKind?,
         allowsAgentExternalControlTools: Bool,
-        requiresExpectedAgentPID: Bool
+        requiresExpectedAgentPID: Bool,
+        runOwnership: AgentRunOwnership? = nil
     ) {
         self.runID = runID
         self.gateID = gateID
@@ -68,6 +72,7 @@ package struct MCPBootstrapLeaseSpec {
         self.taskLabelKind = taskLabelKind
         self.allowsAgentExternalControlTools = allowsAgentExternalControlTools
         self.requiresExpectedAgentPID = requiresExpectedAgentPID
+        self.runOwnership = runOwnership
     }
 }
 
@@ -841,7 +846,8 @@ package actor MCPBootstrapLease {
                 purpose: spec.purpose,
                 taskLabelKind: spec.taskLabelKind,
                 allowsAgentExternalControlTools: spec.allowsAgentExternalControlTools,
-                requiresExpectedAgentPID: spec.requiresExpectedAgentPID
+                requiresExpectedAgentPID: spec.requiresExpectedAgentPID,
+                runOwnership: spec.runOwnership
             )
         }
     }
@@ -879,6 +885,15 @@ package actor MCPBootstrapLease {
         { spec in
             guard let clientName = spec.clientName else { return }
             await mcpHost.refreshRetainedRunPolicyForTurnStart(for: clientName, runID: spec.runID)
+            // Every provider's live routed connections of the run take this attempt's ownership
+            // (and its rich-presentation grant) before the turn's message is sent.
+            if spec.purpose == .agentModeRun, let runOwnership = spec.runOwnership {
+                await mcpHost.refreshRunAttemptRichPresentation(
+                    for: clientName,
+                    runID: spec.runID,
+                    runOwnership: runOwnership
+                )
+            }
         }
     }
 

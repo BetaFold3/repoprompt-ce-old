@@ -70,6 +70,16 @@ enum PersistedWorkspaceSteeringGrantsRead: Equatable {
     case unreadable
 }
 
+/// Result of reading only the workspace rich presentation settings from the settings file.
+enum PersistedRichPresentationSettingsRead: Equatable {
+    case missingFile
+    case settings([UUID: WorkspaceRichPresentationSettings])
+    /// Future or foreign schema; the file store refuses to overwrite it.
+    case preservedSchema
+    /// Unreadable bytes or an undecodable settings map.
+    case unreadable
+}
+
 /// File-backed store for the versioned global settings document.
 ///
 /// Primary location:
@@ -597,6 +607,30 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
         }
 
         let scalarPreferences: Scalars?
+    }
+
+    /// Side-effect-free read of the workspace rich presentation settings in the file at `fileURL`,
+    /// which another running build may have changed. Classification matches
+    /// `readWorkspaceSteeringGrants`. Malformed entries decode as granting nothing.
+    static func readRichPresentationSettings(at fileURL: URL) -> PersistedRichPresentationSettingsRead {
+        guard FileManager.default.fileExists(atPath: fileURL.path) else { return .missingFile }
+        guard let data = try? Data(contentsOf: fileURL) else { return .unreadable }
+        guard let header = try? decoder.decode(GlobalSettingsDocumentHeader.self, from: data) else {
+            return isJSONDocument(data) ? .preservedSchema : .unreadable
+        }
+        guard preservationBlockReason(for: header) == nil else { return .preservedSchema }
+        guard let probe = try? decoder.decode(RichPresentationSettingsProbe.self, from: data) else {
+            return .unreadable
+        }
+        let stored = probe.richPresentationSettingsByWorkspaceID ?? [:]
+        return .settings(stored.reduce(into: [UUID: WorkspaceRichPresentationSettings]()) { result, entry in
+            guard let workspaceID = UUID(uuidString: entry.key) else { return }
+            result[workspaceID] = entry.value
+        })
+    }
+
+    private struct RichPresentationSettingsProbe: Decodable {
+        let richPresentationSettingsByWorkspaceID: [String: WorkspaceRichPresentationSettings]?
     }
 
     private static func isJSONDocument(_ data: Data) -> Bool {

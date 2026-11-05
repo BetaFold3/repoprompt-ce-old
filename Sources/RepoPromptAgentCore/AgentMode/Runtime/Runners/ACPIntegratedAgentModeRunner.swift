@@ -209,7 +209,7 @@ package final class ACPIntegratedAgentModeRunner {
         attachments: [AgentImageAttachment],
         handoff: AgentProviderHandoff,
         runRequest: ACPRunRequest,
-        makeLease: @escaping (_ runID: UUID) -> MCPBootstrapLease,
+        makeLease: @escaping (_ runID: UUID, _ ownership: AgentRunOwnership) -> MCPBootstrapLease,
         providerStartAuthorizer: @escaping (_ runID: UUID) -> Bool,
         providerStartBoundaryReporter: @escaping (
             _ runID: UUID?,
@@ -301,7 +301,7 @@ package final class ACPIntegratedAgentModeRunner {
                 #endif
                 let deferredLease = runRequest.agentKind.requiresPrePromptAgentModeMCPRouting
                     ? nil
-                    : makeLease(runID)
+                    : makeLease(runID, ownership)
                 session.installRunAttemptTerminalResources(ownership: ownership) { [weak self] terminalState in
                     let trackerTeardown = self?.prepareToolTrackingTeardown(for: session, matchingRunID: runID)
                     return {
@@ -349,7 +349,7 @@ package final class ACPIntegratedAgentModeRunner {
         guard isStartupStillCurrent(session: session, runID: runID, runAttemptID: runAttemptID) else { return }
         // R6: the launch and every write of this attempt carry its lifecycle, attempt and process run.
         let freshRunRequest = runRequest.withRuntimeSession(session.runtimeSessionScope)
-        let lease = makeLease(runID)
+        let lease = makeLease(runID, ownership)
 
         guard let provider = providerFactory(runRequest.agentKind, runRequest.modelString) else {
             #if DEBUG
@@ -1577,6 +1577,27 @@ package final class ACPIntegratedAgentModeRunner {
         }
     }
 
+    /// Delivers the current attempt's ownership to the reused controller's live routed MCP
+    /// connections (rich-presentation authority and grant only). Skipped unless `runAttemptID` is
+    /// still the session's current attempt on its current binding.
+    private func refreshReusedRouteForCurrentAttempt(
+        session: AgentTabSession,
+        runID: UUID,
+        runAttemptID: UUID,
+        agentKind: AgentProviderKind
+    ) async {
+        guard let clientName = agentKind.mcpClientNameHint,
+              let ownership = session.activeRunOwnership,
+              ownership.attemptID == runAttemptID,
+              session.isCurrentRunAttemptForCurrentBinding(ownership)
+        else { return }
+        await mcpHost.refreshRunAttemptRichPresentation(
+            for: clientName,
+            runID: runID,
+            runOwnership: ownership
+        )
+    }
+
     private func continueRun(
         tabID: UUID,
         session: AgentTabSession,
@@ -1650,6 +1671,15 @@ package final class ACPIntegratedAgentModeRunner {
                 await deferredLease.releaseGateForDeferredRouting()
                 log("deferred MCP routing until ACP follow-up prompt", runID: runID)
             }
+            // The reused controller keeps its routed helper: give it this attempt's ownership
+            // (and rich-presentation grant) before the prompt, without restarting anything. A
+            // prompt-deferred route with no connection yet takes it from the pending policy.
+            await refreshReusedRouteForCurrentAttempt(
+                session: session,
+                runID: runID,
+                runAttemptID: runAttemptID,
+                agentKind: runRequest.agentKind
+            )
 
             await runPromptTurn(
                 session: session,

@@ -84,7 +84,7 @@ Paths below abbreviate `Sources/RepoPrompt` as App and `Sources/RepoPromptAgentC
 - Change: Core models/validator; App `GlobalSettingsDocument`/`GlobalSettingsManager` and workspace Settings; run-service, Claude/Codex attempt/lease inputs; dedicated capability, gated tools, Knowledge/Explore rules. Compile minimal native chart integration to avoid an unproven renderer dependency.
 - Validation: proposed `RichPresentationPolicyTests` and schema cases cover missing fields/save failure, all profiles, direct-call denial, reused process ID with a new attempt, reconnect and mid-attempt edits; `make dev-swift-build PRODUCT=RepoPrompt` proves Charts linkage.
 - Done when: settings, advertisement and execution agree for each attempt; no active-tab fallback or retroactive host changes.
-Step 1 — todo | rounds 2/2 | open: none | downgraded: worker-lifetime conjecture replaced by reload test | assumed: A1,A2,A3 | deferred: none
+Step 1 — done | rounds 1/2 | open: none | downgraded: none | assumed: A1,A2,A3 | deferred: advisory P3 follow-ups and Step 4 activation checks in step1-dispositions.md
 ### Step 2 — Bounded image acquisition
 - Change: App image-fetch service using existing HTTP injection/isolation patterns and ImageIO; Core value outcomes. No changes to preview network policy.
 - Validation: proposed `RichPresentationImageFetcherTests` covers exact hosts, redirect/auth isolation, deadline/cancellation, lying lengths and byte/pixel/format boundaries; controlled transport fixtures distinguish actual URLSession behavior from mocks.

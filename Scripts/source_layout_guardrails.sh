@@ -780,6 +780,8 @@ allowed_tracked_docs=(
   "docs/context/plans/completed/evidence/2026-10-18-lossless-app-restart/fix-9live-claude-home-review-oracleb-r2.md"
   "docs/context/plans/completed/evidence/2026-10-18-lossless-app-restart/diag-9live-r3-rewrite-worker.md"
   "docs/context/review-policy.md"
+  "docs/context/specs/2026-11-04-rich-presentation-spec.md"
+  "docs/context/plans/2026-10-18-turn-worktree-checkpoints-spec.md"
   "docs/context/plans/completed/2026-10-04-swift-build-measurement-and-debug-dsym-plan.md"
   "docs/context/plans/completed/2026-10-08-swift-compile-follow-ups-plan.md"
   "docs/context/oracle-failure-inspection.md"

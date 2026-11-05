@@ -18,7 +18,11 @@ package typealias AgentConnectionPolicyInstaller = (
     _ purpose: MCPRunPurpose,
     _ taskLabelKind: AgentModelCatalog.TaskLabelKind?,
     _ allowsAgentExternalControlTools: Bool,
-    _ requiresExpectedAgentPID: Bool
+    _ requiresExpectedAgentPID: Bool,
+    // The admitted run attempt this policy belongs to (`nil` for non-Agent-Mode installs). Its
+    // captured rich-presentation policy is stored with the policy and applied with it to each
+    // connection, so request authority comes from the applied connection, not the latest run.
+    _ runOwnership: AgentRunOwnership?
 ) async -> Void
 package typealias AgentMCPServerEnabler = () async -> Void
 package typealias AgentCodexActiveToolQuery = (_ runID: UUID) -> Bool

@@ -801,7 +801,9 @@ package final class AgentModeRunService {
         let taskLabelKind = session.mcpControlContext?.taskLabelKind
         let delegationPolicy = dependencies.delegationRunToolPolicyResolver(session)
         let runCoordinator = runCoordinator
-        let makeLease: (_ runID: UUID) -> MCPBootstrapLease = { runID in
+        // Every runner admits its run attempt first and passes that exact ownership: the lease's
+        // rich-presentation grant derives only from it (never from live Settings).
+        let makeLease: (_ runID: UUID, _ ownership: AgentRunOwnership) -> MCPBootstrapLease = { runID, ownership in
             self.dependencies.bindPendingOracleReviewContext(tabID, runID)
             let leaseSpec = MCPBootstrapLeaseSpec.agentMode(
                 tabID: tabID,
@@ -812,7 +814,8 @@ package final class AgentModeRunService {
                 sessionProfile: session.profile,
                 taskLabelKind: taskLabelKind,
                 allowsAgentExternalControlTools: delegationPolicy.allowsAgentExternalControlTools,
-                additionalRestrictedTools: delegationPolicy.additionalRestrictedTools
+                additionalRestrictedTools: delegationPolicy.additionalRestrictedTools,
+                runOwnership: ownership
             )
             #if DEBUG
                 let provenRoutePolicyReleaser = self.dependencies.testProvenRoutePolicyReleaser

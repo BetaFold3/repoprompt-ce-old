@@ -90,19 +90,34 @@ package struct AgentRunOwnership: Equatable, Hashable {
     /// captured once with `providerKindRaw` from the authority the session's managed launchers use.
     /// Only the run-attempt creator that precedes the run's first provider write records it.
     package let runtimeRegistrationRaw: String?
+    /// The workspace rich-presentation permission captured once, synchronously, when this attempt
+    /// was admitted (`AgentTabSession.beginRunAttempt`). Runtime-only and immutable: a Settings
+    /// edit during the attempt never changes it, and a newly admitted attempt resamples even when
+    /// the provider reuses its process run ID. `nil` means no local workspace authority was
+    /// established (unconfigured session, Context Builder, unbound or remote-host run): rich
+    /// creation fails closed.
+    package let richPresentationPolicy: AgentRichPresentationAttemptPolicy?
+    /// The owning tab session's monotonic admission counter (`AgentTabSession.runAttemptGeneration`)
+    /// at admission; 0 when not admitted through a session. Orders attempts of the same tab so a
+    /// delayed predecessor's policy refresh can never replace its successor's applied ownership.
+    package let admissionSequence: UInt64
 
     init(
         attemptID: UUID = UUID(),
         binding: AgentRunBindingIdentity,
         turnEpoch: AgentRunTurnEpoch? = nil,
         providerKindRaw: String? = nil,
-        runtimeRegistrationRaw: String? = nil
+        runtimeRegistrationRaw: String? = nil,
+        richPresentationPolicy: AgentRichPresentationAttemptPolicy? = nil,
+        admissionSequence: UInt64 = 0
     ) {
         self.attemptID = attemptID
         self.binding = binding
         self.turnEpoch = turnEpoch
         self.providerKindRaw = providerKindRaw
         self.runtimeRegistrationRaw = runtimeRegistrationRaw
+        self.richPresentationPolicy = richPresentationPolicy
+        self.admissionSequence = admissionSequence
     }
 }
 
@@ -213,6 +228,8 @@ package struct AgentRunLifecycleTracker: Equatable {
         turnEpoch: AgentRunTurnEpoch? = nil,
         providerKindRaw: String? = nil,
         runtimeRegistrationRaw: String? = nil,
+        richPresentationPolicy: AgentRichPresentationAttemptPolicy? = nil,
+        admissionSequence: UInt64 = 0,
         timestampUptimeNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds
     ) -> AgentRunOwnership {
         let ownership = AgentRunOwnership(
@@ -225,7 +242,9 @@ package struct AgentRunLifecycleTracker: Equatable {
             ),
             turnEpoch: turnEpoch,
             providerKindRaw: providerKindRaw,
-            runtimeRegistrationRaw: runtimeRegistrationRaw
+            runtimeRegistrationRaw: runtimeRegistrationRaw,
+            richPresentationPolicy: richPresentationPolicy,
+            admissionSequence: admissionSequence
         )
         activeOwnership = ownership
         liveness = AgentRunLivenessSnapshot(

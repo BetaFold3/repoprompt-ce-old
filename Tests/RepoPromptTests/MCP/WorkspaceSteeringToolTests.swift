@@ -1017,7 +1017,8 @@ import XCTest
             purpose: MCPRunPurpose,
             taskLabelKind: AgentModelCatalog.TaskLabelKind?,
             allowsAgentExternalControlTools: Bool,
-            requiresExpectedAgentPID: Bool
+            requiresExpectedAgentPID: Bool,
+            runOwnership: AgentRunOwnership?
         ) async {
             await ServerNetworkManager.shared.installClientConnectionPolicy(
                 for: clientName,
@@ -1034,7 +1035,8 @@ import XCTest
                 purpose: purpose,
                 taskLabelKind: taskLabelKind,
                 allowsAgentExternalControlTools: allowsAgentExternalControlTools,
-                requiresExpectedAgentPID: requiresExpectedAgentPID
+                requiresExpectedAgentPID: requiresExpectedAgentPID,
+                runOwnership: runOwnership
             )
         }
 

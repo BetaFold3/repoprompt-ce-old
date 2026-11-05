@@ -859,6 +859,13 @@ package final class AgentTabSession: ObservableObject {
         }
     #endif
 
+    /// Resolves the workspace rich-presentation policy captured by each newly admitted run attempt
+    /// (`beginRunAttempt`). Installed by the App's common managed-session setup from the session's
+    /// exact workspace binding and committed Settings. Unset (Context Builder sessions, test and
+    /// ephemeral sessions) means no authority: the attempt captures `nil` and rich creation fails
+    /// closed. Never consulted after admission.
+    package var richPresentationPolicyResolver: AgentRichPresentationPolicyResolver?
+
     /// The managed session context of this tab's provider work right now: the live lane's durable
     /// lifecycle binding plus the current run attempt and process run when they exist. `unavailable`
     /// (never a fabricated or sessionless identity) when no live recovery lane binds the session.
@@ -1991,6 +1998,15 @@ package final class AgentTabSession: ObservableObject {
         )
     }
 
+    /// The rich-presentation policy for an attempt being admitted now: only a local session with a
+    /// persistent binding and an App-installed resolver is sampled; otherwise `nil` (fails closed).
+    private func captureRichPresentationAttemptPolicy() -> AgentRichPresentationAttemptPolicy? {
+        guard remoteHost == nil, persistentSessionBindingIdentity != nil, let richPresentationPolicyResolver else {
+            return nil
+        }
+        return richPresentationPolicyResolver(self)
+    }
+
     #if DEBUG
         func testInstallPersistentSessionBinding(sessionID: UUID?) {
             _ = beginPersistentBindingTransition()
@@ -2047,6 +2063,9 @@ package final class AgentTabSession: ObservableObject {
                 mcpControlContext = context
             }
         }
+        // Captured synchronously with the binding fields below (no suspension in between), once
+        // per admitted attempt; a run on an authoritative remote host has no local authority.
+        let richPresentationPolicy = captureRichPresentationAttemptPolicy()
         let ownership = runLifecycleTracker.begin(
             tabID: tabID,
             persistentSessionID: activeAgentSessionID,
@@ -2060,7 +2079,9 @@ package final class AgentTabSession: ObservableObject {
             // authority and provider. A run on an authoritative remote host launches nothing here.
             runtimeRegistrationRaw: remoteHost == nil
                 ? runtimeLaunchAuthority.runStartRegistrationMark(providerKindRaw: selectedAgent.rawValue)
-                : nil
+                : nil,
+            richPresentationPolicy: richPresentationPolicy,
+            admissionSequence: runAttemptGeneration
         )
         attentionTextProvenance = AttentionTextProvenance(
             attemptID: ownership.attemptID,

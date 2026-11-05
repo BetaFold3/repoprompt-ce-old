@@ -11,7 +11,10 @@ extension MCPBootstrapLeaseSpec {
         sessionProfile: AgentSessionProfile = .standard,
         taskLabelKind: AgentModelCatalog.TaskLabelKind? = nil,
         allowsAgentExternalControlTools: Bool = false,
-        additionalRestrictedTools: Set<String> = []
+        additionalRestrictedTools: Set<String> = [],
+        // The admitted attempt this lease serves. Production run paths always pass it; `nil`
+        // (direct policy tests) grants no rich presentation.
+        runOwnership: AgentRunOwnership? = nil
     ) -> MCPBootstrapLeaseSpec {
         MCPBootstrapLeaseSpec(
             runID: runID,
@@ -24,7 +27,8 @@ extension MCPBootstrapLeaseSpec {
             restrictedTools: AgentModeMCPToolPolicy.restrictedTools.union(additionalRestrictedTools),
             additionalTools: AgentModeMCPPolicyInstaller.additionalTools(
                 for: agent,
-                sessionProfile: sessionProfile
+                sessionProfile: sessionProfile,
+                runOwnership: runOwnership
             ),
             allowedToolsOverride: sessionProfile == .knowledge
                 ? AgentModeMCPToolPolicy.knowledgeAllowedTools
@@ -36,7 +40,8 @@ extension MCPBootstrapLeaseSpec {
             purpose: .agentModeRun,
             taskLabelKind: taskLabelKind,
             allowsAgentExternalControlTools: allowsAgentExternalControlTools,
-            requiresExpectedAgentPID: agent.requiresExpectedPIDOwnedAgentModeMCPRouting
+            requiresExpectedAgentPID: agent.requiresExpectedPIDOwnedAgentModeMCPRouting,
+            runOwnership: runOwnership
         )
     }
 }
@@ -62,7 +67,8 @@ extension MCPBootstrapLease {
                 leaseSpec.purpose,
                 leaseSpec.taskLabelKind,
                 leaseSpec.allowsAgentExternalControlTools,
-                leaseSpec.requiresExpectedAgentPID
+                leaseSpec.requiresExpectedAgentPID,
+                leaseSpec.runOwnership
             )
         }
     }

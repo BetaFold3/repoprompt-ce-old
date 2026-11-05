@@ -26,6 +26,9 @@ import SwiftUI
 struct AgentModeGeneralSettingsView: View {
     @ObservedObject var promptVM: PromptViewModel
     @ObservedObject var apiSettingsVM: APISettingsViewModel
+    /// Active workspace for workspace-specific sections; nil disables them.
+    var workspaceID: UUID?
+    var workspaceName: String?
     var onNavigate: ((SettingsTab) -> Void)?
 
     /// Observe secure permission-store changes so the read-only summary rebuilds
@@ -52,6 +55,12 @@ struct AgentModeGeneralSettingsView: View {
                 headerSection
 
                 configurationSummarySection
+
+                RichPresentationSettingsSection(
+                    settings: globalSettings,
+                    workspaceID: workspaceID,
+                    workspaceName: workspaceName
+                )
             }
             .padding(fontPreset.scaledClamped(20, max: 28))
             .frame(maxWidth: .infinity, alignment: .topLeading)

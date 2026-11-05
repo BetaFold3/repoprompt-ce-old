@@ -3449,7 +3449,7 @@ final class AgentScheduledSendDispatchTests: XCTestCase {
                 claudeControllerFactory: { _, _, _, _ in
                     claudeController ?? LifecycleFakeNativeController(recorder: LifecycleRecorder())
                 },
-                connectionPolicyInstaller: { _, _, _, _, _, _, _, runID, _, _, _, _, _, _, _ in
+                connectionPolicyInstaller: { _, _, _, _, _, _, _, runID, _, _, _, _, _, _, _, _ in
                     if let runID {
                         await MCPRoutingWaiter.notifyRouted(runID: runID)
                     }

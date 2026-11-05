@@ -551,7 +551,7 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
             fileStore: GlobalSettingsFileStore(fileURL: fileURL)
         )
 
-        XCTAssertEqual(GlobalSettingsDocument.currentSchemaVersion, 6)
+        XCTAssertEqual(GlobalSettingsDocument.currentSchemaVersion, 7)
         XCTAssertTrue(store.worktreeVisualIdentitiesByRepositoryID().isEmpty)
     }
 
@@ -1113,7 +1113,7 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         let globalDocument = GlobalSettingsDocument(globalDefaults: globalDefaults)
 
         XCTAssertEqual(GlobalSettingsDocument.mcpAgentRoleOhMyPiThinkingSchemaVersion, 5)
-        XCTAssertEqual(GlobalSettingsDocument.currentSchemaVersion, 6)
+        XCTAssertEqual(GlobalSettingsDocument.currentSchemaVersion, 7)
         XCTAssertEqual(
             globalDocument.requiredSchemaVersion,
             GlobalSettingsDocument.mcpAgentRoleOhMyPiThinkingSchemaVersion

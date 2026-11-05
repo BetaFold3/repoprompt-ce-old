@@ -674,7 +674,7 @@ final class AgentModeDocumentAttachmentPipelineTests: XCTestCase {
             testWorkspacePath: root.path,
             codexControllerFactory: { _, _, _, _, _, _ in DocumentPipelineNoopCodexController() },
             claudeControllerFactory: { _, _, _, _ in controller },
-            connectionPolicyInstaller: { _, _, _, _, _, _, _, runID, _, _, _, _, _, _, _ in
+            connectionPolicyInstaller: { _, _, _, _, _, _, _, runID, _, _, _, _, _, _, _, _ in
                 if let runID {
                     await MCPRoutingWaiter.notifyRouted(runID: runID)
                 }
@@ -1320,7 +1320,7 @@ final class AgentModeDocumentAttachmentPipelineTests: XCTestCase {
         let controller = DocumentPipelineNoopCodexController()
         let viewModel = AgentModeViewModel(
             codexControllerFactory: { _, _, _, _, _, _ in controller },
-            connectionPolicyInstaller: { _, _, _, _, _, _, _, runID, _, _, _, _, _, _, _ in
+            connectionPolicyInstaller: { _, _, _, _, _, _, _, runID, _, _, _, _, _, _, _, _ in
                 if let runID {
                     await MCPRoutingWaiter.notifyRouted(runID: runID)
                 }
@@ -1364,7 +1364,7 @@ final class AgentModeDocumentAttachmentPipelineTests: XCTestCase {
         let controller = DocumentPipelineNoopCodexController()
         let viewModel = AgentModeViewModel(
             codexControllerFactory: { _, _, _, _, _, _ in controller },
-            connectionPolicyInstaller: { _, _, _, _, _, _, _, runID, _, _, _, _, _, _, _ in
+            connectionPolicyInstaller: { _, _, _, _, _, _, _, runID, _, _, _, _, _, _, _, _ in
                 if let runID {
                     await MCPRoutingWaiter.notifyRouted(runID: runID)
                 }
