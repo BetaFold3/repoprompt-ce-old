@@ -27,6 +27,23 @@ struct AgentComposerActions {
     let cancelRun: (_ target: AgentRunCancelTarget) async -> Void
     let attachImages: (_ tabID: UUID, _ urls: [URL]) -> Void
     let removeImage: (_ tabID: UUID, _ attachmentID: UUID) -> Void
+    /// Claimed explicit PDF/HTML gesture for `tabID`: starts a managed-store import (true) or shows
+    /// the refusal (false). Never inserts text.
+    let admitDocumentFiles: (_ tabID: UUID, _ admission: ComposerDocumentFileAdmission) -> Bool
+    /// Surrounding SwiftUI drop of file-URL providers for `tabID`: reserves the destination (blocking
+    /// send and schedule) before the original URLs load, then imports PDF/HTML originals, refuses a
+    /// mixed drop, or runs `onNotDocuments` (the image path). Returns whether the drop was accepted.
+    let admitDroppedFiles: (
+        _ tabID: UUID,
+        _ providers: [NSItemProvider],
+        _ adapter: AgentImageInputAdapter,
+        _ onNotDocuments: @escaping @MainActor () -> Void
+    ) -> Bool
+    /// Drops one document reference from the composer; the managed original is retained.
+    let removeDocument: (_ tabID: UUID, _ attachmentID: UUID) -> Void
+    let dismissDocumentImportFailure: (_ tabID: UUID) -> Void
+    /// Abandons the tab's in-flight document admissions; the draft is kept.
+    let cancelDocumentImport: (_ tabID: UUID) -> Void
     let commitTaggedFile: (_ tabID: UUID, _ suggestion: MentionSuggestion, _ displayName: String) -> Void
     let removeTaggedFile: (_ tabID: UUID, _ attachmentID: UUID) -> Void
     let agentWorkspaceLookupContext: (_ tabID: UUID?) async -> WorkspaceLookupContext
@@ -269,7 +286,8 @@ struct AgentInputBar: View {
                     notBefore,
                     runAlongsideOtherSessions,
                     removingImageAttachmentIDs,
-                    removingTaggedFileAttachmentIDs in
+                    removingTaggedFileAttachmentIDs,
+                    removingDocumentAttachmentIDs in
                     await agentModeVM.updateScheduledSend(
                         tabID: tabID,
                         scheduleID: scheduleID,
@@ -277,7 +295,8 @@ struct AgentInputBar: View {
                         notBefore: notBefore,
                         runAlongsideOtherSessions: runAlongsideOtherSessions,
                         removingImageAttachmentIDs: removingImageAttachmentIDs,
-                        removingTaggedFileAttachmentIDs: removingTaggedFileAttachmentIDs
+                        removingTaggedFileAttachmentIDs: removingTaggedFileAttachmentIDs,
+                        removingDocumentAttachmentIDs: removingDocumentAttachmentIDs
                     )
                 },
                 cancel: { tabID, scheduleID in
@@ -311,6 +330,22 @@ struct AgentInputBar: View {
             cancelRun: { target in _ = await agentModeVM.cancelAgentRun(target: target, cause: .userCancel) },
             attachImages: { tabID, urls in agentModeVM.attachImages(tabID: tabID, urls: urls) },
             removeImage: { tabID, attachmentID in agentModeVM.removePendingImage(tabID: tabID, attachmentID: attachmentID) },
+            admitDocumentFiles: { tabID, admission in
+                agentModeVM.admitComposerDocumentFiles(tabID: tabID, admission: admission)
+            },
+            admitDroppedFiles: { tabID, providers, adapter, onNotDocuments in
+                agentModeVM.admitDroppedComposerFiles(
+                    tabID: tabID,
+                    providers: providers,
+                    adapter: adapter,
+                    onNotDocuments: onNotDocuments
+                ) != nil
+            },
+            removeDocument: { tabID, attachmentID in
+                agentModeVM.removePendingDocument(tabID: tabID, attachmentID: attachmentID)
+            },
+            dismissDocumentImportFailure: { tabID in agentModeVM.dismissComposerDocumentImportFailure(tabID: tabID) },
+            cancelDocumentImport: { tabID in agentModeVM.cancelComposerDocumentImports(tabID: tabID) },
             commitTaggedFile: { tabID, suggestion, displayName in
                 agentModeVM.commitPendingTaggedFile(
                     tabID: tabID,
@@ -563,8 +598,23 @@ struct AgentComposerView: View, Equatable {
         props.attachments.hasTaggedFiles
     }
 
+    private var hasPendingDocumentAttachments: Bool {
+        props.attachments.hasDocuments
+    }
+
     private var hasPendingAttachments: Bool {
-        hasPendingImageAttachments || hasPendingTaggedFileAttachments
+        hasPendingImageAttachments || hasPendingTaggedFileAttachments || hasPendingDocumentAttachments
+    }
+
+    /// This rendered tab's document imports or last document failure.
+    private var renderedDocumentImport: AgentComposerDocumentImportProps? {
+        guard props.currentTabID == currentTabID else { return nil }
+        return props.documentImport
+    }
+
+    /// Send and schedule wait until this tab's document imports settle.
+    private var isImportingDocuments: Bool {
+        renderedDocumentImport?.isImporting == true
     }
 
     private var isCodexRunActive: Bool {
@@ -590,6 +640,7 @@ struct AgentComposerView: View, Equatable {
     private var canSubmitToRenderedTarget: Bool {
         props.canSendWithCurrentProvider
             && renderedSubmitTarget != nil
+            && !isImportingDocuments
             && !submissionLatch.isLatched(for: currentTabID)
     }
 
@@ -635,6 +686,7 @@ struct AgentComposerView: View, Equatable {
             && hasSchedulableContent
             && props.canSendWithCurrentProvider
             && renderedSubmitTarget != nil
+            && !isImportingDocuments
             && !submissionLatch.isLatched(for: currentTabID)
     }
 
@@ -704,11 +756,18 @@ struct AgentComposerView: View, Equatable {
             + AgentAttachmentStripLayout.composerVerticalSpacingWhenPresent
     }
 
+    private var documentImportStatusReservedHeight: CGFloat {
+        guard renderedDocumentImport != nil else { return 0 }
+        return AgentAttachmentStripLayout.fileOnlyStripHeight + AgentAttachmentStripLayout.composerVerticalSpacingWhenPresent
+    }
+
     private var mainContentHeight: CGFloat {
         editorTextFieldHeight + AgentAttachmentStripLayout.reservedHeight(
             hasImages: hasPendingImageAttachments,
-            hasTaggedFiles: hasPendingTaggedFileAttachments
-        ) + steeringUnsupportedInfoBoxReservedHeight + scheduledSendBannerReservedHeight
+            hasTaggedFiles: hasPendingTaggedFileAttachments,
+            hasDocuments: hasPendingDocumentAttachments
+        ) + documentImportStatusReservedHeight
+            + steeringUnsupportedInfoBoxReservedHeight + scheduledSendBannerReservedHeight
             + staleResetRecoveryBannerReservedHeight + delegatedQuestionsBannerReservedHeight
             + recoveryListBannerReservedHeight
     }
@@ -913,6 +972,64 @@ struct AgentComposerView: View, Equatable {
         .overlay(imageDropOutline)
     }
 
+    // MARK: - Document Import Status
+
+    /// In-flight imports (no chip until the managed copy exists) or the last document failure.
+    private func documentImportStatusRow(_ documentImport: AgentComposerDocumentImportProps) -> some View {
+        HStack(spacing: 6) {
+            if documentImport.isImporting {
+                ProgressView()
+                    .controlSize(.small)
+                    .scaleEffect(0.7)
+                Text(AgentComposerDocumentImportPresentation.importingText(documentImport.importingFilenames))
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer(minLength: 0)
+                // Releases this composer's reservations (and stops running copies); the typed text
+                // and already attached documents stay.
+                Button {
+                    if let tabID = currentTabID {
+                        actions.cancelDocumentImport(tabID)
+                    }
+                } label: {
+                    Text("Cancel")
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .accessibilityLabel("Cancel attaching documents")
+            } else if let failure = documentImport.failureMessage {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .semibold))
+                    .foregroundStyle(.orange)
+                Text(failure)
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .hoverTooltip(failure)
+                Spacer(minLength: 0)
+                Button {
+                    if let tabID = currentTabID {
+                        actions.dismissDocumentImportFailure(tabID)
+                    }
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Dismiss")
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(height: AgentAttachmentStripLayout.fileOnlyStripHeight)
+        // `.contain` keeps Cancel and Dismiss individually reachable by VoiceOver.
+        .accessibilityElement(children: .contain)
+    }
+
     // MARK: - Transient Submit Guidance
 
     @ViewBuilder
@@ -975,12 +1092,17 @@ struct AgentComposerView: View, Equatable {
                 steeringUnsupportedInfoBox
             }
 
+            if let documentImport = renderedDocumentImport {
+                documentImportStatusRow(documentImport)
+            }
+
             if hasPendingAttachments {
                 AgentAttachmentsStrip(
                     snapshot: props.attachments,
                     allowsRemoval: true,
                     onRemoveImage: removeImageAttachment,
-                    onRemoveTaggedFile: removeTaggedFileAttachment
+                    onRemoveTaggedFile: removeTaggedFileAttachment,
+                    onRemoveDocument: removeDocumentAttachment
                 )
                 .equatable()
             }
@@ -991,6 +1113,7 @@ struct AgentComposerView: View, Equatable {
                 onReturn: sendMessage,
                 resetTrigger: $resetTextFieldTrigger,
                 onImagePaste: handleImagePaste(pasteboard:),
+                onDocumentFiles: handleDocumentFiles(_:),
                 features: .agentInputBar(
                     fileTagStore: promptManager.fileManager.workspaceFileContextStore,
                     fileTagSearchService: workspaceSearchService,
@@ -2405,6 +2528,11 @@ struct AgentComposerView: View, Equatable {
             logViewSubmitRejection(reason: "local_attempt_latched", target: renderedSubmitTarget, persistent: true)
             return
         }
+        guard !isImportingDocuments else {
+            logViewSubmitRejection(reason: "document_import_in_progress", target: renderedSubmitTarget, persistent: true)
+            showSteeringUnsupportedNotice(AgentModeViewModel.composerDocumentImportInProgressMessage)
+            return
+        }
         guard canScheduleToRenderedTarget else {
             logViewSubmitRejection(reason: "schedule_unavailable_for_rendered_target", target: renderedSubmitTarget, persistent: true)
             return
@@ -2468,7 +2596,7 @@ struct AgentComposerView: View, Equatable {
             if case .activeAttemptExists = rejection {
                 return
             }
-            showSteeringUnsupportedNotice(Self.staleSubmitTargetMessage)
+            showSteeringUnsupportedNotice(Self.claimRejectionNotice(rejection))
         }
     }
 
@@ -2489,6 +2617,11 @@ struct AgentComposerView: View, Equatable {
             } else {
                 openCLIProvidersSettings()
             }
+            return
+        }
+        guard !isImportingDocuments else {
+            logViewSubmitRejection(reason: "document_import_in_progress", target: renderedSubmitTarget, persistent: true)
+            showSteeringUnsupportedNotice(AgentModeViewModel.composerDocumentImportInProgressMessage)
             return
         }
         let rawDraftSnapshot = localInputText
@@ -2545,7 +2678,7 @@ struct AgentComposerView: View, Equatable {
             if case .activeAttemptExists = rejection {
                 return
             }
-            showSteeringUnsupportedNotice(Self.staleSubmitTargetMessage)
+            showSteeringUnsupportedNotice(Self.claimRejectionNotice(rejection))
         }
     }
 
@@ -2660,6 +2793,31 @@ struct AgentComposerView: View, Equatable {
         }
     }
 
+    private static func claimRejectionNotice(_ rejection: AgentModeViewModel.AgentComposerSubmitClaimRejection) -> String {
+        if case .documentImportInProgress = rejection {
+            return AgentModeViewModel.composerDocumentImportInProgressMessage
+        }
+        return staleSubmitTargetMessage
+    }
+
+    private func removeDocumentAttachment(_ attachmentID: UUID) {
+        guard let tabID = currentTabID else { return }
+        actions.removeDocument(tabID, attachmentID)
+    }
+
+    /// Text-view paste, `readSelection` and drop of explicit PDF/HTML originals (claimed before any
+    /// image or native handling). Returns whether an import started.
+    private func handleDocumentFiles(_ admission: ComposerDocumentFileAdmission) -> Bool {
+        guard let tabID = currentTabID else { return false }
+        // Frozen: claimed but refused, so nothing is inserted or attached.
+        guard !actions.isShutdownFrozen() else { return false }
+        return actions.admitDocumentFiles(tabID, admission)
+    }
+
+    /// Surrounding SwiftUI drop. A drop carrying explicit file references reserves this composer
+    /// before their original URLs load, then is classified from those URLs: PDF/HTML originals
+    /// import as documents, a mix of documents with anything else is refused whole, and every other
+    /// drop keeps the existing image path unchanged.
     private func handleImageDrop(providers: [NSItemProvider]) -> Bool {
         guard let tabID = currentTabID else {
             return false
@@ -2668,7 +2826,16 @@ struct AgentComposerView: View, Equatable {
         guard !actions.isShutdownFrozen() else {
             return false
         }
-        return imageInputAdapter.loadPreparedImages(from: providers) { prepared in
+        guard providers.contains(where: { $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) }) else {
+            return loadDroppedImages(from: providers, tabID: tabID)
+        }
+        return actions.admitDroppedFiles(tabID, providers, imageInputAdapter) {
+            _ = loadDroppedImages(from: providers, tabID: tabID)
+        }
+    }
+
+    private func loadDroppedImages(from providers: [NSItemProvider], tabID: UUID) -> Bool {
+        imageInputAdapter.loadPreparedImages(from: providers) { prepared in
             guard !prepared.isEmpty else { return }
             Task { @MainActor in
                 // A freeze that began while the images loaded: the composer is not changed.
@@ -2725,6 +2892,19 @@ struct AgentComposerView: View, Equatable {
         setLocalInputText(actions.retrieveDraft(tabID), forceRevision: true)
         DispatchQueue.main.async {
             isSyncingDraftFromSession = false
+        }
+    }
+}
+
+enum AgentComposerDocumentImportPresentation {
+    static func importingText(_ filenames: [String]) -> String {
+        switch filenames.count {
+        case 0:
+            "Checking dropped files…"
+        case 1:
+            "Importing \(filenames[0])…"
+        default:
+            "Importing \(filenames.count) documents…"
         }
     }
 }
@@ -2879,6 +3059,35 @@ struct AgentImageInputAdapter {
             }
         }
         return true
+    }
+
+    /// Loads each dropped provider's explicit original file URL, in provider order, with no image,
+    /// preview or suggested-name fallback: `.notFile` for a provider that advertises no file URL,
+    /// `.unreadable` for an advertised file URL that failed to load or decode. The completion runs
+    /// on the main queue.
+    func loadDroppedFileReferences(
+        from providers: [NSItemProvider],
+        completion: @escaping ([ComposerFileReference]) -> Void
+    ) {
+        let lockQueue = DispatchQueue(label: "AgentImageInputAdapter.fileReferences")
+        let group = DispatchGroup()
+        var references = [ComposerFileReference](repeating: .notFile, count: providers.count)
+        for (index, provider) in providers.enumerated()
+            where provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
+        {
+            group.enter()
+            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                let reference = droppedFileURL(from: item).map(ComposerFileReference.url) ?? .unreadable
+                lockQueue.sync {
+                    references[index] = reference
+                }
+                group.leave()
+            }
+        }
+        group.notify(queue: .main) {
+            let loaded = lockQueue.sync { references }
+            completion(loaded)
+        }
     }
 
     func cleanupTemporaryFiles(_ prepared: [PreparedImage]) {

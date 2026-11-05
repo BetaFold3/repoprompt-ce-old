@@ -607,6 +607,53 @@ final class AgentScheduledSendDispatchTests: XCTestCase {
         return try (XCTUnwrap(imported.first), store)
     }
 
+    func testComposerDocumentImportGatesScheduleAndDocumentOnlyScheduleCarriesIt() async throws {
+        let harness = try await makeHarness(windowID: 4398)
+        XCTAssertNotNil(harness.viewModel.ensureSessionBoundToTab(harness.session))
+        let store = AgentDocumentAttachmentStore(rootURL: harness.storageURL.appendingPathComponent("Documents", isDirectory: true))
+        harness.viewModel.documentAttachmentStore = store
+        let source = harness.storageURL.appendingPathComponent("Only.pdf")
+        try Data("%PDF-1.4".utf8).write(to: source)
+        let late = harness.storageURL.appendingPathComponent("Late.pdf")
+        try Data("%PDF-1.4".utf8).write(to: late)
+
+        // An import in flight blocks the schedule claim.
+        let task = try XCTUnwrap(harness.viewModel.attachDocumentFiles(tabID: harness.tabID, urls: [source]))
+        XCTAssertThrowsError(try claimComposer(harness, draft: "")) { error in
+            XCTAssertEqual((error as? ClaimRejected)?.reason, "document_import_in_progress")
+        }
+        guard case let .attached(documents) = await task.value else { return XCTFail("Import failed") }
+
+        // Once claimed, a new document gesture is refused visibly rather than lost to the
+        // schedule's capture and clear.
+        let claim = try claimComposer(harness, draft: "")
+        XCTAssertNil(harness.viewModel.attachDocumentFiles(tabID: harness.tabID, urls: [late]))
+        XCTAssertEqual(
+            harness.viewModel.ui.composer.props.documentImport?.failureMessage,
+            AgentModeViewModel.composerSubmitInFlightDocumentMessage
+        )
+
+        // A document-only composer schedules: the record (and its durable copy) carries the documents.
+        let result = await harness.viewModel.executeComposerScheduleAttempt(
+            text: "",
+            notBefore: Date().addingTimeInterval(1800),
+            runAlongsideOtherSessions: false,
+            claim: claim
+        )
+        guard case let .scheduled(scheduleID) = result else {
+            return XCTFail("Expected .scheduled, got \(result)")
+        }
+        let record = try XCTUnwrap(harness.session.pendingScheduledSendRecord)
+        XCTAssertEqual(record.id, scheduleID)
+        XCTAssertEqual(record.documents, documents)
+        XCTAssertEqual(record.rawText, "")
+        XCTAssertTrue(harness.session.pendingDocumentAttachments.isEmpty, "Moved into the record, not copied")
+        XCTAssertFalse(harness.session.isComposerSubmissionInFlight)
+        let persisted = try await harness.persistedSession()
+        XCTAssertEqual(persisted.scheduledSend?.persistedValue?.documents, documents)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: store.managedFileURL(for: documents[0]).path))
+    }
+
     func testScheduledDocumentSnapshotDispatchesRecordsAndManifest() async throws {
         let harness = try await makeHarness(windowID: 4391)
         let clock = DispatchFakeClock(now: Date())

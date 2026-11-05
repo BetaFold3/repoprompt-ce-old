@@ -608,7 +608,8 @@ final class AgentScheduledMessagesViewModel: ObservableObject {
         notBefore: Date,
         runAlongsideOtherSessions: Bool,
         removingImageAttachmentIDs: Set<UUID> = [],
-        removingTaggedFileAttachmentIDs: Set<UUID> = []
+        removingTaggedFileAttachmentIDs: Set<UUID> = [],
+        removingDocumentAttachmentIDs: Set<UUID> = []
     ) async -> String? {
         guard let (host, props) = actionTarget(for: row) else { return "Open this session to manage its scheduled message." }
         let result = await host.updateScheduledSend(
@@ -618,7 +619,8 @@ final class AgentScheduledMessagesViewModel: ObservableObject {
             notBefore: notBefore,
             runAlongsideOtherSessions: runAlongsideOtherSessions,
             removingImageAttachmentIDs: removingImageAttachmentIDs,
-            removingTaggedFileAttachmentIDs: removingTaggedFileAttachmentIDs
+            removingTaggedFileAttachmentIDs: removingTaggedFileAttachmentIDs,
+            removingDocumentAttachmentIDs: removingDocumentAttachmentIDs
         )
         await reload()
         return result

@@ -251,10 +251,19 @@ final class AgentModeViewModel: ObservableObject {
     var contextUsageSnapshot: ContextUsageSnapshot?
     @Published var pendingImageAttachments: [AgentImageAttachment] = []
     @Published var pendingTaggedFileAttachments: [AgentTaggedFileAttachment] = []
-    /// Active session's pending document attachments (mirror of the session; no UI renders it yet).
+    /// Active session's pending document attachments (mirror of the session for the composer strip).
     @Published var pendingDocumentAttachments: [AgentDocumentAttachment] = []
     /// Store that owns managed document originals; preflight resolves every reference through it.
     var documentAttachmentStore: AgentDocumentAttachmentStore = .production
+    /// In-flight composer document imports by destination tab (transient, never persisted). A tab
+    /// with an entry cannot send or schedule until its imports settle.
+    var composerDocumentImports: [UUID: [AgentComposerDocumentImport]] = [:]
+    /// The last document admission or import failure of each tab's composer, shown until dismissed
+    /// or replaced by the next document gesture (transient, never persisted).
+    var composerDocumentImportFailures: [UUID: String] = [:]
+    /// Running managed-store copies by reservation ID, cancelled when their reservation is cancelled
+    /// (transient, never persisted).
+    var composerDocumentImportCopyTasks: [UUID: Task<AgentComposerDocumentImportOutcome, Never>] = [:]
     /// The user's Codex shell-tool setting as read for document delivery (injectable so tests
     /// neither depend on nor mutate real preferences).
     var codexShellToolPreference: () -> Bool = { CodexAgentToolPreferences.bashToolEnabled() }
@@ -6361,6 +6370,7 @@ final class AgentModeViewModel: ObservableObject {
         session.pendingImageAttachments.removeAll()
         session.pendingTaggedFileAttachments.removeAll()
         session.pendingDocumentAttachments.removeAll()
+        cancelComposerDocumentImports(tabID: session.tabID)
         session.pendingTurnRuntimeAnchors.removeAll()
         session.agentMessageRuntimeFootersByItemID.removeAll()
         session.providerSessionID = nil
@@ -21195,6 +21205,12 @@ final class AgentModeViewModel: ObservableObject {
             resyncAfterRejectedSubmitTarget(target)
             return .rejected(rejection)
         }
+        if isImportingComposerDocuments(tabID: target.tabID) {
+            let rejection = AgentComposerSubmitClaimRejection.documentImportInProgress
+            logRejectedSubmitTarget(target, session: session, reason: rejection.diagnosticReason, attempt: attempt)
+            resyncAfterRejectedSubmitTarget(target)
+            return .rejected(rejection)
+        }
 
         session.activeComposerSubmitAttempt = attempt
         session.composerSubmissionToken = UUID()
@@ -22863,6 +22879,7 @@ final class AgentModeViewModel: ObservableObject {
             session.pendingTaggedFileAttachments.removeAll()
             session.pendingDocumentAttachments.removeAll()
         }
+        cancelComposerDocumentImports(tabID: session.tabID)
         session.attachmentsPendingProviderConsumptionCleanup.removeAll()
         session.nextSequenceIndex = 0
         session.attentionTextProvenance = nil
@@ -23314,6 +23331,7 @@ final class AgentModeViewModel: ObservableObject {
         let hasPendingAttachments = !session.pendingImageAttachments.isEmpty
             || !session.pendingTaggedFileAttachments.isEmpty
             || !session.pendingDocumentAttachments.isEmpty
+            || isImportingComposerDocuments(tabID: session.tabID)
         let hasPendingInteraction = session.runState == .waitingForUser
             || session.hasPendingQuestionUI
             || session.pendingApproval != nil

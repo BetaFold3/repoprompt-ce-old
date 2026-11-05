@@ -340,12 +340,14 @@ struct AgentMessageBubble: View {
             Spacer(minLength: 60)
 
             VStack(alignment: .trailing, spacing: 6) {
-                if !item.attachments.isEmpty {
+                if !item.attachments.isEmpty || !item.documentAttachments.isEmpty {
                     HStack(spacing: 0) {
                         Spacer(minLength: 0)
+                        // Tagged files keep their badge; the strip shows them only beside images.
                         AgentAttachmentsStrip(
                             imageAttachments: item.attachments,
-                            taggedFileAttachments: item.taggedFileAttachments,
+                            taggedFileAttachments: item.attachments.isEmpty ? [] : item.taggedFileAttachments,
+                            documentAttachments: item.documentAttachments,
                             disabled: true,
                             allowsRemoval: false
                         )

@@ -8,15 +8,19 @@ struct AgentAttachmentStripSnapshot: Equatable {
     let scopeTabID: UUID?
     let imageAttachments: [AgentImageAttachment]
     let taggedFileAttachments: [AgentTaggedFileAttachment]
+    /// Managed PDF/HTML originals (references only; the chip never shows a path).
+    let documentAttachments: [AgentDocumentAttachment]
 
     init(
         scopeTabID: UUID? = nil,
         imageAttachments: [AgentImageAttachment],
-        taggedFileAttachments: [AgentTaggedFileAttachment]
+        taggedFileAttachments: [AgentTaggedFileAttachment],
+        documentAttachments: [AgentDocumentAttachment]
     ) {
         self.scopeTabID = scopeTabID
         self.imageAttachments = imageAttachments
         self.taggedFileAttachments = taggedFileAttachments
+        self.documentAttachments = documentAttachments
     }
 
     var hasImages: Bool {
@@ -27,14 +31,19 @@ struct AgentAttachmentStripSnapshot: Equatable {
         !taggedFileAttachments.isEmpty
     }
 
+    var hasDocuments: Bool {
+        !documentAttachments.isEmpty
+    }
+
     var hasAny: Bool {
-        hasImages || hasTaggedFiles
+        hasImages || hasTaggedFiles || hasDocuments
     }
 
     static func == (lhs: AgentAttachmentStripSnapshot, rhs: AgentAttachmentStripSnapshot) -> Bool {
         lhs.scopeTabID == rhs.scopeTabID
             && lhs.imageAttachments.map(\.id) == rhs.imageAttachments.map(\.id)
             && lhs.taggedFileAttachments.map { TaggedFileRenderKey($0) } == rhs.taggedFileAttachments.map { TaggedFileRenderKey($0) }
+            && lhs.documentAttachments == rhs.documentAttachments
     }
 
     private struct TaggedFileRenderKey: Equatable {
@@ -61,11 +70,11 @@ enum AgentAttachmentStripLayout {
 
     static let composerVerticalSpacingWhenPresent: CGFloat = 8
 
-    static func reservedHeight(hasImages: Bool, hasTaggedFiles: Bool) -> CGFloat {
+    static func reservedHeight(hasImages: Bool, hasTaggedFiles: Bool, hasDocuments: Bool) -> CGFloat {
         if hasImages {
             return imageStripHeight + composerVerticalSpacingWhenPresent
         }
-        if hasTaggedFiles {
+        if hasTaggedFiles || hasDocuments {
             return fileOnlyStripHeight + composerVerticalSpacingWhenPresent
         }
         return 0
@@ -78,6 +87,7 @@ struct AgentAttachmentsStrip: View, Equatable {
     var allowsRemoval: Bool = true
     var onRemoveImage: ((UUID) -> Void)?
     var onRemoveTaggedFile: ((UUID) -> Void)?
+    var onRemoveDocument: ((UUID) -> Void)?
     @ObservedObject private var fontScale = FontScaleManager.shared
     private var fontPreset: FontScalePreset {
         fontScale.preset
@@ -88,34 +98,40 @@ struct AgentAttachmentsStrip: View, Equatable {
         disabled: Bool = false,
         allowsRemoval: Bool = true,
         onRemoveImage: ((UUID) -> Void)? = nil,
-        onRemoveTaggedFile: ((UUID) -> Void)? = nil
+        onRemoveTaggedFile: ((UUID) -> Void)? = nil,
+        onRemoveDocument: ((UUID) -> Void)? = nil
     ) {
         self.snapshot = snapshot
         self.disabled = disabled
         self.allowsRemoval = allowsRemoval
         self.onRemoveImage = onRemoveImage
         self.onRemoveTaggedFile = onRemoveTaggedFile
+        self.onRemoveDocument = onRemoveDocument
     }
 
     init(
         scopeTabID: UUID? = nil,
         imageAttachments: [AgentImageAttachment],
         taggedFileAttachments: [AgentTaggedFileAttachment],
+        documentAttachments: [AgentDocumentAttachment],
         disabled: Bool = false,
         allowsRemoval: Bool = true,
         onRemoveImage: ((UUID) -> Void)? = nil,
-        onRemoveTaggedFile: ((UUID) -> Void)? = nil
+        onRemoveTaggedFile: ((UUID) -> Void)? = nil,
+        onRemoveDocument: ((UUID) -> Void)? = nil
     ) {
         self.init(
             snapshot: AgentAttachmentStripSnapshot(
                 scopeTabID: scopeTabID,
                 imageAttachments: imageAttachments,
-                taggedFileAttachments: taggedFileAttachments
+                taggedFileAttachments: taggedFileAttachments,
+                documentAttachments: documentAttachments
             ),
             disabled: disabled,
             allowsRemoval: allowsRemoval,
             onRemoveImage: onRemoveImage,
-            onRemoveTaggedFile: onRemoveTaggedFile
+            onRemoveTaggedFile: onRemoveTaggedFile,
+            onRemoveDocument: onRemoveDocument
         )
     }
 
@@ -128,6 +144,7 @@ struct AgentAttachmentsStrip: View, Equatable {
     private enum AttachmentItem: Identifiable {
         case image(AgentImageAttachment)
         case file(AgentTaggedFileAttachment)
+        case document(AgentDocumentAttachment)
 
         var id: String {
             switch self {
@@ -135,6 +152,8 @@ struct AgentAttachmentsStrip: View, Equatable {
                 "image-\(attachment.id.uuidString)"
             case let .file(attachment):
                 "file-\(attachment.id.uuidString)"
+            case let .document(attachment):
+                "document-\(attachment.id.uuidString)"
             }
         }
 
@@ -144,13 +163,23 @@ struct AgentAttachmentsStrip: View, Equatable {
                 attachment.createdAt
             case let .file(attachment):
                 attachment.createdAt
+            case let .document(attachment):
+                attachment.createdAt
             }
         }
     }
 
     private var items: [AttachmentItem] {
-        (snapshot.imageAttachments.map(AttachmentItem.image) + snapshot.taggedFileAttachments.map(AttachmentItem.file))
-            .sorted { $0.createdAt < $1.createdAt }
+        let all = snapshot.imageAttachments.map(AttachmentItem.image)
+            + snapshot.taggedFileAttachments.map(AttachmentItem.file)
+            + snapshot.documentAttachments.map(AttachmentItem.document)
+        return all.sorted { $0.createdAt < $1.createdAt }
+    }
+
+    /// Chip label of a document reference: its original filename and type, never a path.
+    static func documentChipTitle(_ attachment: AgentDocumentAttachment) -> String {
+        let name = attachment.originalFilename.trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty ? "\(attachment.kind.displayName) document" : name
     }
 
     var body: some View {
@@ -163,6 +192,8 @@ struct AgentAttachmentsStrip: View, Equatable {
                             imageAttachmentCard(attachment)
                         case let .file(attachment):
                             fileAttachmentCard(attachment)
+                        case let .document(attachment):
+                            documentAttachmentCard(attachment)
                         }
                     }
                 }
@@ -242,6 +273,48 @@ struct AgentAttachmentsStrip: View, Equatable {
         .background(Color.secondary.opacity(0.08))
         .clipShape(Capsule())
         .hoverTooltip(attachment.relativePath)
+    }
+
+    private func documentAttachmentCard(_ attachment: AgentDocumentAttachment) -> some View {
+        let title = Self.documentChipTitle(attachment)
+        let help = "\(title) (\(attachment.kind.displayName), \(ByteCountFormatter.string(fromByteCount: attachment.byteCount, countStyle: .file)))"
+        return HStack(spacing: 6) {
+            Image(systemName: attachment.kind == .pdf ? "doc.richtext.fill" : "chevron.left.forwardslash.chevron.right")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .medium))
+                .foregroundStyle(.secondary)
+
+            Text(title)
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .frame(maxWidth: fontPreset.scaledMetric(170), alignment: .leading)
+
+            Text(attachment.kind.displayName)
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 9, weight: .semibold))
+                .foregroundStyle(.secondary)
+
+            if allowsRemoval, let onRemoveDocument {
+                Button {
+                    onRemoveDocument(attachment.id)
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 12))
+                        .foregroundColor(disabled ? .gray : .secondary)
+                        .background(Color(NSColor.windowBackgroundColor).clipShape(Circle()))
+                }
+                .buttonStyle(.plain)
+                .disabled(disabled)
+                .accessibilityLabel("Remove \(title)")
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(Color.secondary.opacity(0.08))
+        .clipShape(Capsule())
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(help)
+        .hoverTooltip(help)
     }
 
     private func title(for attachment: AgentImageAttachment) -> String {

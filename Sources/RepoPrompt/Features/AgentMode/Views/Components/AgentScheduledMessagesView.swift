@@ -144,14 +144,16 @@ struct AgentScheduledMessagesView: View {
                 notBefore,
                 runAlongside,
                 removingImageAttachmentIDs,
-                removingTaggedFileAttachmentIDs in
+                removingTaggedFileAttachmentIDs,
+                removingDocumentAttachmentIDs in
                 await model.update(
                     row,
                     text: text,
                     notBefore: notBefore,
                     runAlongsideOtherSessions: runAlongside,
                     removingImageAttachmentIDs: removingImageAttachmentIDs,
-                    removingTaggedFileAttachmentIDs: removingTaggedFileAttachmentIDs
+                    removingTaggedFileAttachmentIDs: removingTaggedFileAttachmentIDs,
+                    removingDocumentAttachmentIDs: removingDocumentAttachmentIDs
                 )
             },
             cancel: { _, _ in await model.cancel(row) },

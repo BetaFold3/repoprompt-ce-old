@@ -620,6 +620,7 @@ extension AgentModeViewModel {
 
     private static func recoveryListAttachmentNames(_ content: AgentRecoveryInputContent) -> [String] {
         content.images.map { $0.title ?? $0.managedFileName ?? "Image" } + content.taggedFiles.map(\.displayName)
+            + content.documents.map(\.originalFilename)
     }
 
     private static func recoveryListFailureSuffix(_ failure: AgentRecoveryControllerFailure?) -> String {
@@ -1694,7 +1695,8 @@ extension AgentModeViewModel {
         guard let placed = recoveryInputContent(for: session, store: lane.store, sessionID: lane.sessionID),
               placed.text == intent.payload.text,
               placed.images.count == intent.payload.images.count,
-              placed.taggedFiles.count == intent.payload.taggedFiles.count
+              placed.taggedFiles.count == intent.payload.taggedFiles.count,
+              placed.documents.map(\.id) == intent.payload.documents.map(\.id)
         else {
             return "The saved message couldn't be placed into the message box (an attachment is missing). It is still saved here."
         }

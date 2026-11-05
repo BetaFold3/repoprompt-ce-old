@@ -20,8 +20,10 @@ enum ImagePasteboardTypes {
         "png", "jpg", "jpeg", "jfif", "jpe", "gif", "bmp", "webp", "avif", "heic", "heif", "tif", "tiff", "svg", "ico"
     ]
 
-    /// Explicit file payloads outrank their icons/previews. Never partially consume a file selection.
-    static func filePayload(in pasteboard: NSPasteboard, fileManager: FileManager = .default) -> FilePayload {
+    /// Every explicit `public.file-url` reference on the board (one per advertised file item, with a
+    /// board-level fallback), decoded but not validated: `nil` entries are undecodable references.
+    /// Empty when the board has no explicit file payload. Never reads plain text or generic URLs.
+    static func explicitFileReferences(in pasteboard: NSPasteboard) -> [URL?] {
         let fileItems = (pasteboard.pasteboardItems ?? []).filter { $0.types.contains(.fileURL) }
         var references = fileItems.map { item in
             fileURL(string: item.string(forType: .fileURL), data: item.data(forType: .fileURL))
@@ -32,6 +34,12 @@ enum ImagePasteboardTypes {
                 data: pasteboard.data(forType: .fileURL)
             ))
         }
+        return references
+    }
+
+    /// Explicit file payloads outrank their icons/previews. Never partially consume a file selection.
+    static func filePayload(in pasteboard: NSPasteboard, fileManager: FileManager = .default) -> FilePayload {
+        let references = explicitFileReferences(in: pasteboard)
         guard !references.isEmpty else { return .none }
 
         var urls: [URL] = []
@@ -110,9 +118,131 @@ enum ImagePasteboardTypes {
     }
 }
 
+/// One item of a composer file gesture, as far as its explicit original file reference goes.
+enum ComposerFileReference: Equatable {
+    /// A decoded explicit `public.file-url` payload (a path or Finder file-reference URL; resolved
+    /// during classification).
+    case url(URL)
+    /// An advertised explicit `public.file-url` payload that could not be decoded or loaded.
+    case unreadable
+    /// A dropped item with no explicit file URL at all (raw image data, text, …).
+    case notFile
+}
+
+/// Admission of explicit PDF/HTML document files (Finder copy or drag) for an opt-in composer.
+///
+/// Classification uses only the explicit original file references (never icons, previews, text,
+/// suggested names or generic URLs) and the document kind of each resolved original's filename.
+/// - A gesture without any explicit file payload is `.notDocuments` (existing handling).
+/// - An advertised explicit file payload that cannot be decoded, loaded or resolved (for example a
+///   Finder file reference whose file was deleted or whose volume was ejected) refuses the whole
+///   gesture visibly: never an icon, preview, image or filename substitute.
+/// - A recognized document is claimed even when it is missing or unreadable, so its import fails
+///   visibly. A selection that mixes documents with anything else is refused whole.
+/// - Successfully resolved non-document selections (for example PNG/JPEG originals) stay
+///   `.notDocuments`, keeping the existing image path.
+enum ComposerDocumentFileAdmission: Equatable {
+    /// No explicit document file: existing image and native handling continue unchanged.
+    case notDocuments
+    /// Every explicit file is a PDF/HTML original (deduplicated, in selection order).
+    case documents([URL])
+    /// A refused gesture (mixed selection or unreadable file reference); nothing is attached.
+    case rejected(String)
+
+    static let mixedSelectionMessage =
+        "PDF and HTML documents can't be attached together with images or other files. Nothing was attached; attach the documents on their own."
+    static let unreadableReferenceMessage =
+        "A pasted or dropped file could not be found or read (it may have been moved, deleted or ejected). Nothing was attached."
+
+    var isClaimed: Bool {
+        self != .notDocuments
+    }
+
+    static func classify(pasteboard: NSPasteboard) -> Self {
+        classify(references: ImagePasteboardTypes.explicitFileReferences(in: pasteboard).map { reference in
+            reference.map(ComposerFileReference.url) ?? .unreadable
+        })
+    }
+
+    static func classify(references: [ComposerFileReference]) -> Self {
+        // No explicit file payload at all: not this admission's gesture.
+        guard references.contains(where: { $0 != .notFile }) else { return .notDocuments }
+        var documents: [URL] = []
+        var seenPaths: Set<String> = []
+        var hasOtherItem = false
+        var hasUnreadableReference = false
+        for reference in references {
+            switch reference {
+            case .notFile:
+                hasOtherItem = true
+            case .unreadable:
+                hasUnreadableReference = true
+            case let .url(reference):
+                // Finder writes file-reference URLs (`file:///.file/id=…`): resolve to the original
+                // path. A path URL resolves to itself; an unresolvable reference has no path.
+                guard reference.isFileURL, let resolved = (reference as NSURL).filePathURL else {
+                    hasUnreadableReference = true
+                    continue
+                }
+                let url = resolved.standardizedFileURL
+                guard AgentDocumentKind(pathExtension: url.pathExtension) != nil else {
+                    hasOtherItem = true
+                    continue
+                }
+                if seenPaths.insert(url.path).inserted {
+                    documents.append(url)
+                }
+            }
+        }
+        guard !hasUnreadableReference else { return .rejected(unreadableReferenceMessage) }
+        guard !documents.isEmpty else { return .notDocuments }
+        guard !hasOtherItem else { return .rejected(mixedSelectionMessage) }
+        return .documents(documents)
+    }
+}
+
 final class ImageAwareTextView: NSTextView {
     var imagePasteHandler: ((NSPasteboard) -> Bool)?
     var enablesImagePasteHandling = false
+    /// Opt-in explicit PDF/HTML file handler, consulted before image and native handling. Returns
+    /// whether the claimed admission was accepted (an import started); a refusal still suppresses
+    /// native filename/icon insertion. `nil` keeps the text view's previous behavior.
+    var documentFileHandler: ((ComposerDocumentFileAdmission) -> Bool)? {
+        didSet {
+            // Re-register only when opting in or out (the representable re-assigns every update).
+            if (oldValue == nil) != (documentFileHandler == nil) {
+                updateDragTypeRegistration()
+            }
+        }
+    }
+
+    /// NSTextView itself registers only the legacy filenames and `public.url` drag types; an
+    /// opted-in composer also registers the explicit `public.file-url` its document admission reads.
+    override var acceptableDragTypes: [NSPasteboard.PasteboardType] {
+        var types = super.acceptableDragTypes
+        if documentFileHandler != nil, !types.contains(.fileURL) {
+            types.append(.fileURL)
+        }
+        return types
+    }
+
+    enum DocumentFileHandling: Equatable {
+        case unclaimed
+        case accepted
+        case refused
+    }
+
+    func canClaimDocumentFiles(from pasteboard: NSPasteboard) -> Bool {
+        documentFileHandler != nil && ComposerDocumentFileAdmission.classify(pasteboard: pasteboard).isClaimed
+    }
+
+    func handleDocumentFiles(from pasteboard: NSPasteboard) -> DocumentFileHandling {
+        guard let documentFileHandler else { return .unclaimed }
+        let admission = ComposerDocumentFileAdmission.classify(pasteboard: pasteboard)
+        guard admission.isClaimed else { return .unclaimed }
+        return documentFileHandler(admission) ? .accepted : .refused
+    }
+
     var onDidMoveToWindow: (() -> Void)?
 
     override func viewDidMoveToWindow() {
@@ -160,6 +290,9 @@ final class ImageAwareTextView: NSTextView {
 
     override func paste(_ sender: Any?) {
         let pasteboard = sender as? NSPasteboard ?? NSPasteboard.general
+        if handleDocumentFiles(from: pasteboard) != .unclaimed {
+            return
+        }
         if enablesImagePasteHandling,
            ImagePasteboardTypes.filePayload(in: pasteboard) != .deferToNative,
            imagePasteHandler?(pasteboard) == true
@@ -170,6 +303,10 @@ final class ImageAwareTextView: NSTextView {
     }
 
     override func readSelection(from pboard: NSPasteboard, type: NSPasteboard.PasteboardType) -> Bool {
+        // A claimed document selection (accepted or refused) never falls back to another type.
+        if handleDocumentFiles(from: pboard) != .unclaimed {
+            return true
+        }
         if enablesImagePasteHandling,
            isImageLikePasteboardType(type),
            ImagePasteboardTypes.filePayload(in: pboard) != .deferToNative,
@@ -181,6 +318,9 @@ final class ImageAwareTextView: NSTextView {
     }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        if canClaimDocumentFiles(from: sender.draggingPasteboard) {
+            return .copy
+        }
         let superOperation = super.draggingEntered(sender)
         if superOperation != [] {
             return superOperation
@@ -191,7 +331,17 @@ final class ImageAwareTextView: NSTextView {
         return canHandleImageDrop(from: sender.draggingPasteboard) ? .copy : []
     }
 
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        if canClaimDocumentFiles(from: sender.draggingPasteboard) {
+            return .copy
+        }
+        return super.draggingUpdated(sender)
+    }
+
     override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        if canClaimDocumentFiles(from: sender.draggingPasteboard) {
+            return true
+        }
         guard enablesImagePasteHandling else {
             return super.prepareForDragOperation(sender)
         }
@@ -202,6 +352,15 @@ final class ImageAwareTextView: NSTextView {
     }
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        // Claimed documents never reach native insertion: a refusal reports a failed drop.
+        switch handleDocumentFiles(from: sender.draggingPasteboard) {
+        case .accepted:
+            return true
+        case .refused:
+            return false
+        case .unclaimed:
+            break
+        }
         guard enablesImagePasteHandling else {
             return super.performDragOperation(sender)
         }
@@ -385,6 +544,8 @@ struct ResizableTextField: View {
     var onReturn: () -> Void
     @Binding var resetTrigger: Bool
     var onImagePaste: ((NSPasteboard) -> Bool)?
+    /// Opt-in explicit PDF/HTML file handling (see `ImageAwareTextView.documentFileHandler`).
+    var onDocumentFiles: ((ComposerDocumentFileAdmission) -> Bool)?
     var features: ResizableTextFieldFeatures = .plain
 
     /// Callback for height changes to coordinate with parent
@@ -436,6 +597,7 @@ struct ResizableTextField: View {
             placeholder: placeholder,
             onReturn: onReturn,
             onImagePaste: onImagePaste,
+            onDocumentFiles: onDocumentFiles,
             features: features,
             currentHeightPresetIndex: $currentHeightPresetIndex,
             onHeightChange: onHeightChange
@@ -469,6 +631,7 @@ struct CustomTextField: NSViewRepresentable {
     var placeholder: String
     var onReturn: () -> Void
     var onImagePaste: ((NSPasteboard) -> Bool)?
+    var onDocumentFiles: ((ComposerDocumentFileAdmission) -> Bool)?
     var features: ResizableTextFieldFeatures = .plain
     @Binding var currentHeightPresetIndex: Int
 
@@ -528,6 +691,7 @@ struct CustomTextField: NSViewRepresentable {
 
         textView.delegate = context.coordinator
         textView.imagePasteHandler = onImagePaste
+        textView.documentFileHandler = onDocumentFiles
         textView.onDidMoveToWindow = { [weak coordinator = context.coordinator, weak textView] in
             guard let coordinator, let textView else { return }
             coordinator.composerTextViewDidMoveToWindow(textView)
@@ -584,6 +748,7 @@ struct CustomTextField: NSViewRepresentable {
             textView.isEditable = isEditable
         }
         textView.imagePasteHandler = onImagePaste
+        textView.documentFileHandler = onDocumentFiles
         textView.enablesImagePasteHandling = onImagePaste != nil
         if textView.font != fontPreset.nsFont {
             textView.font = fontPreset.nsFont
@@ -1012,6 +1177,9 @@ struct CustomTextField: NSViewRepresentable {
             if commandSelector == #selector(NSResponder.insertLineBreak(_:)) { return false }
             if commandSelector == #selector(NSText.paste(_:)) {
                 if let imageAwareTextView = textView as? ImageAwareTextView {
+                    if imageAwareTextView.handleDocumentFiles(from: NSPasteboard.general) != .unclaimed {
+                        return true
+                    }
                     return imageAwareTextView.imagePasteHandler?(NSPasteboard.general) == true
                 }
                 return parent.onImagePaste?(NSPasteboard.general) == true
