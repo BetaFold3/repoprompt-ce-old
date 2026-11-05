@@ -97,9 +97,12 @@ package struct AgentRunOwnership: Equatable, Hashable {
     /// established (unconfigured session, Context Builder, unbound or remote-host run): rich
     /// creation fails closed.
     package let richPresentationPolicy: AgentRichPresentationAttemptPolicy?
-    /// The owning tab session's monotonic admission counter (`AgentTabSession.runAttemptGeneration`)
-    /// at admission; 0 when not admitted through a session. Orders attempts of the same tab so a
-    /// delayed predecessor's policy refresh can never replace its successor's applied ownership.
+    /// The process-wide admission ordinal (`AgentRunAdmissionSequence.next()`) issued when
+    /// `AgentTabSession.beginRunAttempt` admitted this attempt; 0 when not admitted through a
+    /// session (such a candidate can never hold rich authority). Strictly increasing across every
+    /// session-owner object in this process, so it orders attempts even when a tab's owner is
+    /// recreated and its local `runAttemptGeneration` restarts; it is never persisted and resets
+    /// only with the process. Ordering only: it proves nothing about the currently bound session.
     package let admissionSequence: UInt64
 
     init(
@@ -118,6 +121,24 @@ package struct AgentRunOwnership: Equatable, Hashable {
         self.runtimeRegistrationRaw = runtimeRegistrationRaw
         self.richPresentationPolicy = richPresentationPolicy
         self.admissionSequence = admissionSequence
+    }
+}
+
+/// Process-wide issuer of `AgentRunOwnership.admissionSequence`.
+///
+/// Synchronous and MainActor-isolated: each `AgentTabSession.beginRunAttempt` receives exactly one
+/// strictly increasing positive value, whatever owner object admits it. Zero stays the "not admitted
+/// through a session" sentinel. Exhaustion traps rather than wrapping to a duplicate or to zero.
+/// No persistence, no reset, no clock or UUID ordering.
+@MainActor
+enum AgentRunAdmissionSequence {
+    private static var last: UInt64 = 0
+
+    static func next() -> UInt64 {
+        let (value, overflow) = last.addingReportingOverflow(1)
+        precondition(!overflow, "AgentRunAdmissionSequence exhausted")
+        last = value
+        return value
     }
 }
 
@@ -219,6 +240,9 @@ package struct AgentRunLifecycleTracker: Equatable {
 
     package init() {}
 
+    /// `admissionSequence`: the process-wide `AgentRunAdmissionSequence` ordinal for a session
+    /// admission (`AgentTabSession.beginRunAttempt`); the default 0 marks a non-session admission,
+    /// which never carries rich authority.
     package mutating func begin(
         tabID: UUID,
         persistentSessionID: UUID?,

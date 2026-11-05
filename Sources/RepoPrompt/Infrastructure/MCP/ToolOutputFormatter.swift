@@ -1090,6 +1090,10 @@ extension ToolOutputFormatter {
             return formatDiscoverContext(value: result)
         case "app_settings":
             return formatAppSettings(args: args, value: result)
+        case "present_rich":
+            // The canonical text result is exactly `{"presentation": Reference}` JSON (no markdown
+            // fence), so every provider's transcript capture recognizes it.
+            return [.text(rawJSONString(result))]
         case "agent_explore":
             return formatAgentExplore(args: args, value: result)
         case "agent_run":

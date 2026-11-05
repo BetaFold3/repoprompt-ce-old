@@ -743,24 +743,42 @@ final class RichPresentationLifecycleTests: XCTestCase {
         movedWorkspace.customStoragePath = moved
         let state = f.source.persistenceState
 
-        let root = try await f.service.captureRichArtifactRoot(state: state, workspace: movedWorkspace, resolvedRoot: moved)
-        let read = try await f.service.readRichArtifact(state: state, root: root, reference: reference)
+        // History keeps reading the same incarnation at the moved root with the never-refreshed stamp.
+        let read = try await f.service.readRichArtifact(state: state, root: moved, reference: reference)
         XCTAssertEqual(read, manifest)
-        let (second, secondReference) = try chart(f)
-        try await f.service.publishRichArtifact(state: state, root: root, manifest: second, assets: [:], commitCheck: {})
-        let secondRead = try await f.service.readRichArtifact(state: state, root: root, reference: secondReference)
-        XCTAssertEqual(secondRead, second)
 
+        // Step 4 gate 2 (deliberate contract change from Step 3): creation with a stamp that
+        // predates the completed move is refused at capture and at publication, and writes nothing.
+        do {
+            _ = try await f.service.captureRichArtifactRoot(state: state, workspace: movedWorkspace, resolvedRoot: moved)
+            XCTFail("Creation must refuse a stamp that predates the move")
+        } catch {
+            XCTAssertEqual(error.localizedDescription, AgentRichArtifactError.staleSessionStamp.localizedDescription)
+        }
+        let (second, secondReference) = try chart(f)
+        do {
+            try await f.service.publishRichArtifact(state: state, root: moved, manifest: second, assets: [:], commitCheck: {})
+            XCTFail("Publication must refuse a stamp that predates the move")
+        } catch {
+            XCTAssertEqual(error.localizedDescription, AgentRichArtifactError.staleSessionStamp.localizedDescription)
+        }
+        let secondArtifactPath = moved
+            .appendingPathComponent("agent_rich_artifacts")
+            .appendingPathComponent(f.source.session.id.uuidString)
+            .appendingPathComponent(secondReference.artifactID.uuidString).path
+        XCTAssertFalse(FileManager.default.fileExists(atPath: secondArtifactPath))
+
+        // Handoff still copies the same incarnation's artifact from the moved root.
         let dest = AgentSession(workspaceID: f.workspace.id, composeTabID: UUID(), name: "Fork", transcript: f.source.session.transcript)
         let committed = Box<AgentSessionEditableLoad?>(nil)
         try await f.service.commitPrivateHandoff(
             sourceState: state, initialSession: dest, workspace: movedWorkspace, root: moved,
-            references: [reference, secondReference], commitCheck: {}, expose: { committed.value = $0 }
+            references: [reference], commitCheck: {}, expose: { committed.value = $0 }
         )
         let copied = try await f.service.readRichArtifact(
-            state: XCTUnwrap(committed.value).persistenceState, root: moved, reference: secondReference
+            state: XCTUnwrap(committed.value).persistenceState, root: moved, reference: reference
         )
-        XCTAssertEqual(copied, second)
+        XCTAssertEqual(copied, manifest)
 
         do {
             _ = try await f.service.captureRichArtifactRoot(state: state, workspace: movedWorkspace, resolvedRoot: f.root)

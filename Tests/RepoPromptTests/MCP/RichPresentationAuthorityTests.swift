@@ -391,6 +391,42 @@ final class RichPresentationAuthorityTests: XCTestCase {
             )
             XCTAssertEqual(fullEligibility, .directTools)
             XCTAssertEqual(fullMatches, true)
+
+            // A routing reseed must carry eligibility without granting a revoked rich owner.
+            // First stage the opposite eligibility without applying it to the connection.
+            await manager.installClientConnectionPolicy(
+                for: fixture.clientName, windowID: fixture.windowID,
+                restrictedTools: AgentModeMCPToolPolicy.restrictedTools,
+                tabID: fixture.tabID, runID: fixture.runID,
+                additionalTools: AgentModeMCPPolicyInstaller.additionalTools(for: .codexExec, runOwnership: second),
+                purpose: .agentModeRun, codeModeEligibility: .native, runOwnership: second
+            )
+            await manager.debugReseedRunPolicyRouting(
+                runID: fixture.runID, windowID: fixture.windowID,
+                workspaceID: UUID(), tabID: fixture.tabID
+            )
+            let reseededEligibility = await manager.debugRunCodeModeEligibility(for: fixture.runID)
+            let revokedRouting = await manager.requestRoutingContext(for: fixture.connectionID)
+            let revokedMatches = await manager.debugAppliedRunPolicyProjectionMatchesRunPolicy(
+                connectionID: fixture.connectionID, runID: fixture.runID
+            )
+            XCTAssertEqual(reseededEligibility, .native)
+            XCTAssertNil(revokedRouting.appliedRunOwnership)
+            XCTAssertEqual(revokedMatches, false, "Rich revocation must not fingerprint unapplied eligibility")
+
+            // A later routing reseed preserves a non-native code-mode policy too.
+            await manager.installClientConnectionPolicy(
+                for: fixture.clientName, windowID: fixture.windowID,
+                restrictedTools: AgentModeMCPToolPolicy.restrictedTools,
+                tabID: fixture.tabID, runID: fixture.runID,
+                purpose: .agentModeRun, codeModeEligibility: .directTools
+            )
+            await manager.debugReseedRunPolicyRouting(
+                runID: fixture.runID, windowID: fixture.windowID,
+                workspaceID: UUID(), tabID: fixture.tabID
+            )
+            let retainedEligibility = await manager.debugRunCodeModeEligibility(for: fixture.runID)
+            XCTAssertEqual(retainedEligibility, .directTools)
             await cleanUp(fixture, on: manager)
         #else
             throw XCTSkip("Connection policy diagnostics require DEBUG helpers.")

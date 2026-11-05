@@ -5,6 +5,9 @@ import SwiftUI
 
 extension EnvironmentValues {
     @Entry var agentWindowIsFocused: Bool = true
+    /// The rich references the rendered transcript blocks show; a successful `present_rich` result
+    /// row whose reference is shown uses a compact card instead of duplicating the content.
+    @Entry var agentRichPresentationShownReferences: AgentRichPresentationShownReferences = .empty
 }
 
 // MARK: - Message Footer Strip
@@ -192,6 +195,7 @@ struct AgentMessageBubble: View {
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.agentRecentAssistantItemIDs) private var recentAssistantItemIDs
     @Environment(\.agentMessageRuntimeFooterByItemID) private var runtimeFooterByItemID
+    @Environment(\.agentRichPresentationShownReferences) private var richPresentationShownReferences
     @Environment(\.agentAssistantExpansionStore) private var assistantExpansionStore
     @Environment(\.agentAssistantSearchFlashedItemID) private var flashedAssistantItemID
     @StateObject private var fallbackAssistantExpansionStore = AssistantTranscriptExpansionStore()
@@ -309,6 +313,8 @@ struct AgentMessageBubble: View {
             } else if normalizedToolName == "context_builder", let contextBuilderContext {
                 ContextBuilderResultCard(item: renderItem, context: contextBuilderContext)
                     .id(rawToolResultPayloadRenderRevision)
+            } else if richPresentationShownReferences.suppressesSuccessBody(of: renderItem) {
+                RichPresentationToolResultCard(item: renderItem)
             } else {
                 ToolCardRouter.resultView(
                     for: renderItem,

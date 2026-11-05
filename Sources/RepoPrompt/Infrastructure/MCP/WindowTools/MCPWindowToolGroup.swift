@@ -16,8 +16,9 @@ enum MCPWindowToolGroup: CaseIterable, Hashable {
     case agentSessionControl
     case history
     case workspaceSteering
-    /// Last so adding it leaves every earlier catalog position unchanged.
+    /// Appended without changing preceding catalog positions.
     case codeMode
+    case richPresentation
 
     var orderedToolNames: [String] {
         switch self {
@@ -75,6 +76,8 @@ enum MCPWindowToolGroup: CaseIterable, Hashable {
             [MCPWindowToolName.workspaceSteer]
         case .codeMode:
             [MCPWindowToolName.codeMode]
+        case .richPresentation:
+            [MCPWindowToolName.presentRich]
         }
     }
 

@@ -801,6 +801,11 @@ final class MCPServerViewModel: ObservableObject {
         )
     }
 
+    /// `present_rich`: authority comes only from this request's trusted metadata.
+    private var richPresentationToolService: RichPresentationMCPToolService {
+        RichPresentationMCPToolService(captureRequestMetadata: { [self] in await captureRequestMetadata() })
+    }
+
     private var agentRunToolService: AgentRunMCPToolService {
         AgentRunMCPToolService(
             toolName: MCPWindowToolName.agentRun,
@@ -1381,6 +1386,10 @@ final class MCPServerViewModel: ObservableObject {
             guard let self else { throw MCPError.internalError("Window deallocated while executing workspace_steer") }
             return try await workspaceSteeringToolService.execute(args: args)
         },
+        executePresentRich: { [weak self] args in
+            guard let self else { throw MCPError.internalError("Window deallocated while executing present_rich") }
+            return try await richPresentationToolService.execute(args: args)
+        },
         requireTargetWindow: { [weak self] in
             guard let self else { throw MCPError.internalError("Window deallocated while resolving target window") }
             return try requireTargetWindow()
@@ -1906,7 +1915,8 @@ final class MCPServerViewModel: ObservableObject {
             MCPAgentSessionControlToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies),
             MCPHistoryToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies),
             MCPWorkspaceSteeringToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies),
-            MCPCodeModeToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies)
+            MCPCodeModeToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies),
+            MCPRichPresentationToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies)
         ]
     )
     private var cancellables: Set<AnyCancellable> = []

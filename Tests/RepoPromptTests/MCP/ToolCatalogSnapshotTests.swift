@@ -1006,7 +1006,8 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         "24|wait_for_next_user_instruction|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=3a59a13a0026414ae04dd21d730a7144b91c67146dce77340fe730c865bea3d7|schema=15335c3bbadf042948d0a1ba52f0fcb01125428dda4952dbda418051904d82ef",
         "25|history|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=c4a738f11afe9f2c43772dfbf9842353c11370be23f3d66c1359b46ec5a01455|schema=62e0b861675086e0619134fac7d8823a71531b2afccb6b4451d9c7f519389e5d",
         "26|workspace_steer|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=369edee840b6334709591f2c990c009a1d74a830a909d04e7494cbeace9ff07f|schema=f1c4d5e91f4ea005cf2d5ac34594703265e6a6062d827489ff9d428c5016378c",
-        "27|code_mode|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=81d387c9a0be4a15c9a6034cf9a295e27d9fdcee32ee50c67b64d2bc85361baf|schema=3a53ad002b6be098358ec6e27e5d3ea0d51d9671493b1d446f0bcdaf31afb7bf"
+        "27|code_mode|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=81d387c9a0be4a15c9a6034cf9a295e27d9fdcee32ee50c67b64d2bc85361baf|schema=3a53ad002b6be098358ec6e27e5d3ea0d51d9671493b1d446f0bcdaf31afb7bf",
+        "28|present_rich|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=false,openWorld=true|desc=7aa0a39f3d6d09d17e62decaba62b28c1ad39258624a1427e3a2b8490a72eedd|schema=4ad2afd122f585733a4fe1a16dfa05d8ec51348b0715d5d3d6158fb3330bf167"
     ]
 
     private static func signatures(for tools: [RepoPromptApp.Tool]) throws -> [String] {

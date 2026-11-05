@@ -62,7 +62,8 @@ package enum MCPIntegrationHelper {
         "agent_run",
         "agent_manage",
         "set_status",
-        "app_settings"
+        "app_settings",
+        "present_rich"
     ]
 
     // MARK: - Command Install Mode

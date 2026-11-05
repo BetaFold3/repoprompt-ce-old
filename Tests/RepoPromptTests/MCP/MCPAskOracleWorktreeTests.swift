@@ -5248,9 +5248,13 @@ import XCTest
                 XCTAssertEqual(admission.outcome, "applied")
                 XCTAssertEqual(admission.sessionProfile, .knowledge)
                 let advertisedToolNames = try await endpoint.listToolNames()
+                // The Knowledge ceiling names present_rich, but only an attempt whose captured
+                // policy grants it lists the tool; this policy carries no attempt ownership.
                 XCTAssertEqual(
                     Set(advertisedToolNames),
                     AgentModeMCPToolPolicy.knowledgeAllowedTools
+                        .subtracting(AgentRichPresentationToolPolicy.capabilityToolNames)
+                        .union(AgentRichPresentationToolPolicy.grantedTools(for: nil))
                 )
             } else if let spec {
                 // A production lease builder supplies every field the run's policy installs.

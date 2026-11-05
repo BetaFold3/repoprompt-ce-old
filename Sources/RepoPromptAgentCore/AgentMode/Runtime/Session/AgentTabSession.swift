@@ -2069,6 +2069,9 @@ package final class AgentTabSession: ObservableObject {
         // Captured synchronously with the binding fields below (no suspension in between), once
         // per admitted attempt; a run on an authoritative remote host has no local authority.
         let richPresentationPolicy = captureRichPresentationAttemptPolicy()
+        // Process-wide ordinal (not the object-local `runAttemptGeneration`, which restarts when
+        // the tab's owner is recreated): orders this admission against every predecessor.
+        let admissionSequence = AgentRunAdmissionSequence.next()
         let ownership = runLifecycleTracker.begin(
             tabID: tabID,
             persistentSessionID: activeAgentSessionID,
@@ -2084,7 +2087,7 @@ package final class AgentTabSession: ObservableObject {
                 ? runtimeLaunchAuthority.runStartRegistrationMark(providerKindRaw: selectedAgent.rawValue)
                 : nil,
             richPresentationPolicy: richPresentationPolicy,
-            admissionSequence: runAttemptGeneration
+            admissionSequence: admissionSequence
         )
         attentionTextProvenance = AttentionTextProvenance(
             attemptID: ownership.attemptID,

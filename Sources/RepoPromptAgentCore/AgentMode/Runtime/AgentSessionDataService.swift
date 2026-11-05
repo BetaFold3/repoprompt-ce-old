@@ -4938,6 +4938,19 @@ package actor AgentSessionDataService {
         else { throw AgentScheduledSendMutationError.staleIncarnation(expected: stamp.incarnationID, actual: nil) }
     }
 
+    /// Creation-only predicate (on top of `validateRichAuthority`): the stamp's own session file
+    /// must be this session's file under `root`. A stamp that predates a completed rename or move
+    /// is refused for creation (no stamp refresh or persistence unification); history and handoff
+    /// keep reading the same incarnation at the moved root.
+    private func validateRichCreationStamp(_ state: AgentSessionPersistenceState, root: URL) throws {
+        let expected = agentSessionFileURL(
+            id: state.stamp.sessionID, in: root.appendingPathComponent(Self.agentSessionsFolderName)
+        )
+        guard state.stamp.fileURL.standardizedFileURL.resolvingSymlinksInPath()
+            == expected.standardizedFileURL.resolvingSymlinksInPath()
+        else { throw AgentRichArtifactError.staleSessionStamp }
+    }
+
     package func captureRichArtifactRoot(
         state: AgentSessionPersistenceState, workspace: some AgentWorkspaceStorageReference,
         resolvedRoot: URL
@@ -4948,6 +4961,7 @@ package actor AgentSessionDataService {
               workspaceFolderURL(for: workspace).standardizedFileURL.resolvingSymlinksInPath() == resolvedRoot.standardizedFileURL.resolvingSymlinksInPath()
         else { throw AgentRichArtifactError.storageMoved }
         try validateRichAuthority(state, root: resolvedRoot)
+        try validateRichCreationStamp(state, root: resolvedRoot)
         return resolvedRoot
     }
 
@@ -4964,6 +4978,7 @@ package actor AgentSessionDataService {
         defer { fence.release() }
         try Task.checkCancellation()
         try validateRichAuthority(state, root: root)
+        try validateRichCreationStamp(state, root: root)
         guard manifest.provenance.sessionID == sessionID else { throw AgentRichArtifactError.invalidManifest }
         #if DEBUG
             try await test_richArtifactPhase?("beforeStage", sessionID)
@@ -4977,6 +4992,7 @@ package actor AgentSessionDataService {
             #endif
             try Task.checkCancellation()
             try validateRichAuthority(state, root: root)
+            try validateRichCreationStamp(state, root: root)
             // The final exact-attempt/root check and the single rename cannot interleave with a
             // root mutation request. Bulk bytes have already been written off-main.
             try await MainActor.run {
@@ -4990,17 +5006,127 @@ package actor AgentSessionDataService {
         // Rename committed: no post-commit cancellation error or automatic retry.
     }
 
-    package func readRichArtifact(
-        state: AgentSessionPersistenceState, root: URL, reference: RichPresentationReference
-    ) async throws -> AgentRichArtifactManifest {
-        await acquireSessionPersistence(for: state.stamp.sessionID)
-        defer { releaseSessionPersistence(for: state.stamp.sessionID) }
+    #if DEBUG
+        /// Test-only strict read (manifest plus every asset) at a caller-supplied root. Production
+        /// history never passes a root: it uses `captureRichArtifactReadCapability` and the
+        /// capability reads below.
+        package func readRichArtifact(
+            state: AgentSessionPersistenceState, root: URL, reference: RichPresentationReference
+        ) async throws -> AgentRichArtifactManifest {
+            await acquireSessionPersistence(for: state.stamp.sessionID)
+            defer { releaseSessionPersistence(for: state.stamp.sessionID) }
+            let fence = AgentRichArtifactFilesystemFence.shared
+            await fence.acquire()
+            defer { fence.release() }
+            try validateRichAuthority(state, root: root)
+            return try await AgentRichArtifactStore.offMain {
+                try AgentRichArtifactStore.read(root: root, sessionID: state.stamp.sessionID, reference: reference)
+            }
+        }
+    #endif
+
+    // MARK: Historical reads
+
+    /// A trusted current storage directory for one workspace, resolved by the App from its exact
+    /// workspace model (the workspace manager's ACTUAL current directory, not this service's root
+    /// and not the D2 agreement: history renders even where creation is refused) together with the
+    /// App's storage revision at resolution.
+    // swiftformat:disable:next redundantSendable
+    package struct ResolvedRichHistoryStorage: Hashable, Sendable {
+        package let workspaceID: UUID
+        package let directory: URL
+        package let revision: UInt64
+
+        package init(workspaceID: UUID, directory: URL, revision: UInt64) {
+            self.workspaceID = workspaceID
+            self.directory = directory.standardizedFileURL.resolvingSymlinksInPath()
+            self.revision = revision
+        }
+    }
+
+    /// Read authority for one exact hydrated session at one resolved storage directory. Opaque to
+    /// callers: it can only be minted by `captureRichArtifactReadCapability`.
+    // swiftformat:disable:next redundantSendable
+    package struct RichArtifactReadCapability: Hashable, Sendable {
+        package let sessionID: UUID
+        package let storage: ResolvedRichHistoryStorage
+        fileprivate let incarnationID: UUID
+    }
+
+    /// Captures read authority for the exact hydrated owner `state` at `resolvedStorage`: the
+    /// stamp's service and deletion generation, no tombstone, this session's own file under that
+    /// directory, and the stamp's durable incarnation there. The stamp is never refreshed and its
+    /// absolute path may predate a completed move. `checkCurrentContext` runs on the main actor
+    /// under the gates and must throw unless the owner and storage are still current.
+    package func captureRichArtifactReadCapability(
+        state: AgentSessionPersistenceState,
+        resolvedStorage: ResolvedRichHistoryStorage,
+        checkCurrentContext: @escaping @MainActor () throws -> Void
+    ) async throws -> RichArtifactReadCapability {
+        let stamp = state.stamp
+        guard stamp.workspaceID == resolvedStorage.workspaceID else { throw AgentRichArtifactError.storageMoved }
+        await acquireSessionPersistence(for: stamp.sessionID)
+        defer { releaseSessionPersistence(for: stamp.sessionID) }
+        try validateRichAuthority(state, root: resolvedStorage.directory)
+        guard let incarnationID = stamp.incarnationID else {
+            throw AgentScheduledSendMutationError.staleIncarnation(expected: nil, actual: nil)
+        }
+        try await MainActor.run { try checkCurrentContext() }
+        return RichArtifactReadCapability(sessionID: stamp.sessionID, storage: resolvedStorage, incarnationID: incarnationID)
+    }
+
+    /// Re-validates a capability under the session gate and the filesystem fence (so no root move
+    /// interleaves), then runs `read` off-main.
+    private func withRichReadCapability<T: Sendable>(
+        _ capability: RichArtifactReadCapability,
+        checkCurrentStorage: @escaping @MainActor () throws -> Void,
+        read: @escaping @Sendable (URL) throws -> T
+    ) async throws -> T {
+        await acquireSessionPersistence(for: capability.sessionID)
+        defer { releaseSessionPersistence(for: capability.sessionID) }
         let fence = AgentRichArtifactFilesystemFence.shared
         await fence.acquire()
         defer { fence.release() }
-        try validateRichAuthority(state, root: root)
-        return try await AgentRichArtifactStore.offMain {
-            try AgentRichArtifactStore.read(root: root, sessionID: state.stamp.sessionID, reference: reference)
+        try Task.checkCancellation()
+        try requireNoTombstone(for: capability.sessionID)
+        let root = capability.storage.directory
+        let fileURL = agentSessionFileURL(
+            id: capability.sessionID, in: root.appendingPathComponent(Self.agentSessionsFolderName)
+        )
+        guard FileManager.default.fileExists(atPath: fileURL.path) else { throw AgentRichArtifactError.storageMoved }
+        guard case let .v1(current) = try currentDurableLifecycle(fileURL: fileURL, sessionID: capability.sessionID),
+              current.incarnationID == capability.incarnationID
+        else {
+            throw AgentScheduledSendMutationError.staleIncarnation(expected: capability.incarnationID, actual: nil)
+        }
+        try await MainActor.run { try checkCurrentStorage() }
+        return try await AgentRichArtifactStore.offMain { try read(root) }
+    }
+
+    /// The validated manifest of `reference` (assets are not read). A missing or invalid manifest
+    /// throws; the renderer then shows the reference's labeled fallback.
+    package func readRichArtifactManifest(
+        capability: RichArtifactReadCapability,
+        reference: RichPresentationReference,
+        checkCurrentStorage: @escaping @MainActor () throws -> Void
+    ) async throws -> AgentRichArtifactManifest {
+        let sessionID = capability.sessionID
+        return try await withRichReadCapability(capability, checkCurrentStorage: checkCurrentStorage) { root in
+            try AgentRichArtifactStore.readManifest(root: root, sessionID: sessionID, reference: reference)
+        }
+    }
+
+    /// The validated JPEG bytes of one asset of `manifest`. A missing or invalid asset throws; the
+    /// renderer then shows that image's placeholder and keeps the rest of the document.
+    package func readRichArtifactAsset(
+        capability: RichArtifactReadCapability,
+        manifest: AgentRichArtifactManifest,
+        assetID: UUID,
+        checkCurrentStorage: @escaping @MainActor () throws -> Void
+    ) async throws -> Data {
+        let sessionID = capability.sessionID
+        return try await withRichReadCapability(capability, checkCurrentStorage: checkCurrentStorage) { root in
+            try AgentRichArtifactStore.readAsset(root: root, sessionID: sessionID, manifest: manifest, assetID: assetID)
         }
     }
 

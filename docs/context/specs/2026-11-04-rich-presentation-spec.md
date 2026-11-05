@@ -6,9 +6,9 @@ Last-verified: 2026-11-04
 
 ## Goal and status
 Let an assistant gather information with its existing tools, then publish attractive line/bar charts and complete newspaper briefings directly in Agent Mode's transcript. Existing content remains readable offline and after restart.
-**Specification only; nothing implemented.** OracleE and OracleD received identical initial evidence/policy, then two argument-exchange rounds. One material disagreement remains (D1). Step counters below record those specification rounds, not implementation reviews.
+**Steps 1–4 implemented and reviewed; Step 5 static acceptance passed, with live acceptance deferred by the owner.** OracleE and OracleD received identical initial evidence/policy, then two argument-exchange rounds. One material disagreement remains (D1). Step counters below now record implementation re-review rounds.
 Evidence directory (local, ignored, not committed): `docs/investigations/2026-11-04-rich-presentation/evidence/`. It contains scouts, exact requests/replies, finding dispositions, and documentation-check results; none belongs in this spec.
-Follow the [review policy](../review-policy.md) and [validation workflow](../workflows/validation.md). No runtime performance or security validation has occurred.
+Follow the [review policy](../review-policy.md) and [validation workflow](../workflows/validation.md). Automated validation is recorded in the evidence directory; live provider/UI and advisory performance acceptance remain unverified.
 
 ## Decisions
 - The owner requires both charts and complete briefings fully inline, not Preview-only.
@@ -20,6 +20,7 @@ Follow the [review policy](../review-policy.md) and [validation workflow](../wor
 - The owner includes all trusted local Agent Mode runs, including workers, Explore and Knowledge; general external MCP clients are excluded.
 - The owner requested a technical spec, not implementation.
 - On 2026-11-05, the owner chose bounded storage support: refuse rich creation and artifact-bearing handoffs when resolved workspace and session storage disagree, accept the resulting global-custom-storage limitation, and leave existing session persistence unchanged (D2).
+- On 2026-11-05, the owner deferred live acceptance and chose to leave the current Dev app untouched; provider/UI/restart and advisory performance checks remain unverified (D3).
 
 ## Non-goals
 No scraping/scheduling, arbitrary HTML/JavaScript, WebKit changes, MCP Apps hosting, general structured-result migration, new branch UI, or native Codex conversation-branching implementation. No background image refresh, redirects, authenticated downloads, automatic retries, animation/SVG, advanced chart types, embedded briefing charts, new export formats, or cross-session shared assets.
@@ -100,12 +101,12 @@ Step 3 — done | rounds 2/2 | open: none | downgraded: none | assumed: A4 | def
 - Change: `present_rich` provider via `MCPWindowToolRuntime` with freshness none; canonical names/group/catalog, capabilities/grants, admission/execution contracts and recognition; Core turn model/sanitizer/compactor; App outer block renderer. Advertise only once storage and full-inline retention are integrated.
 - Validation: `AgentToolResultPersistencePolicyTests`, `AgentTranscriptGroupInspectionTests`, catalog/admission tests and one end-to-end fixture: publish → sanitize twice including ACP → save → all retention tiers → reload → render exactly once, with missing assets and creation disabled.
 - Done when: complete content stays outer-inline with stable ordering and no historical network traffic or duplicate success body.
-Step 4 — todo | rounds 0/2 | open: activation and inline retention | downgraded: none | assumed: A1,A2,A6 | deferred: activation gates in step3-final.md
+Step 4 — done | rounds 1/2 | open: none | downgraded: none | assumed: A1,A2,A6; existing outer history reveal | deferred: advisory findings and live acceptance in step4-final.md
 ### Step 5 — Acceptance and durable guidance
 - Change: fix only observed integration defects and update this owning spec's status/contract; keep raw evidence outside it.
 - Validation: affected `make dev-test FILTER=<Suite>`, `make dev-lint`, product build and `make guardrails`; context checker plus its negative suite. With immediate owner approval, exercise Claude/Codex/OMP tool refresh, worker/Knowledge output, long history, resizing, selection, restart, handoff and image denial in the Dev app.
 - Done when: full-inline normal use works and required security/data-retention checks pass; record provider/live gaps honestly. Compare scroll/layout/memory behavior against a text baseline under matched conditions, report uncertainty on the noisy host, and let the owner accept advisory results.
-Step 5 — todo | rounds 2/2 | open: implementation/live evidence not yet collected | downgraded: none | assumed: A1–A6 | deferred: no measured SLA gates
+Step 5 — blocked | rounds 0/2 | open: owner-deferred live acceptance (D3) | downgraded: none | assumed: A1–A6 | deferred: provider/UI/restart and advisory measurements in step5-final.md
 
 ## Disagreements
 - **Resolved:** native rendering and one tool replace the proposed chart/WebKit split; full-inline layout needs no webview sizing lifecycle.

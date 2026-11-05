@@ -6,6 +6,10 @@ package enum AgentRichArtifactError: Error, LocalizedError {
     /// D2: the workspace's resolved storage directory and its session-persistence directory
     /// differ (for example, a global custom storage location is set). Not retryable.
     case storageLocationUnsupported
+    /// Creation only: the session's persistence stamp predates a completed rename or storage move
+    /// (stamps are never refreshed). History and handoff still read the same incarnation at the
+    /// moved root; a new artifact needs a current stamp.
+    case staleSessionStamp
     package var errorDescription: String? {
         switch self {
         case .busy: "Rich presentation is busy. Try again after the current publications finish."
@@ -15,6 +19,7 @@ package enum AgentRichArtifactError: Error, LocalizedError {
         case .sourceUnavailable: "The handoff source session is not saved. Save or reload the source session, then retry. The source is unchanged."
         case let .missingArtifact(id): "Required artifact \(id) is unavailable. Restore or repair it, then retry the handoff. The source is unchanged."
         case .storageLocationUnsupported: "Rich presentations are not supported for this workspace because its storage location differs from where its agent sessions are saved, for example when a global custom storage location is set. Nothing was created or copied, and the source is unchanged. Retrying will not help while the locations differ."
+        case .staleSessionStamp: "This session's storage moved after it was opened, so this run cannot create a rich presentation. Nothing was created. Reopen the session and start a new run to present again."
         case .unreadableReferences: "This session has rich presentation references this version cannot read. They are preserved unchanged, but the handoff is refused so none is lost. Open the session in the version that wrote them. The source is unchanged."
         }
     }

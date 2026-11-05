@@ -638,7 +638,7 @@ actor ServerNetworkManager {
         if let cachedWindowID = windowIDByRunID[runID] {
             return cachedWindowID
         }
-        if let policyWindowID = runPolicyStateByRunID[runID]?.windowID {
+        if let policyWindowID = usableRunPolicyState(runID)?.windowID {
             windowIDByRunID[runID] = policyWindowID
             return policyWindowID
         }
@@ -743,7 +743,7 @@ actor ServerNetworkManager {
         LiveRunRouteActorEvidence(
             expectedRunID: runID,
             connectionRunID: runIDByConnectionID[connectionID],
-            policyWindowID: runPolicyStateByRunID[runID]?.windowID,
+            policyWindowID: usableRunPolicyState(runID)?.windowID,
             cachedWindowID: windowIDByRunID[runID],
             connectionWindowID: connectionWindowMap[connectionID],
             assignedWindowID: windowAssignmentByConnection[connectionID],
@@ -1594,7 +1594,7 @@ actor ServerNetworkManager {
         let workspaceID: UUID?
         let tabID: UUID?
         let restrictedTools: Set<String>
-        let additionalTools: Set<String>?
+        var additionalTools: Set<String>?
         let allowedToolsOverride: Set<String>?
         let sessionProfile: AgentSessionProfile
         let purpose: MCPRunPurpose
@@ -1603,7 +1603,42 @@ actor ServerNetworkManager {
         let codeModeEligibility: MCPCodeModeEligibility
         let updatedAt: Date
         /// The newest admitted attempt's ownership for the run (rich-presentation authority).
+        /// Always eligible against this state's own watermark and workspace (every writer applies
+        /// `runOwnershipIsEligible`).
         var runOwnership: AgentRunOwnership?
+        /// The run's revocation watermark: every admission at or below it is ineligible for rich
+        /// ownership on this run (`runOwnershipIsEligible`). Raised only when a routing reseed
+        /// clears an installed attempt for a changed or unprovable binding
+        /// (`reseedRunPolicyRouting`); never lowered by any writer, rollback, or cleanup.
+        /// `admissionSequence` is process-wide (`AgentRunAdmissionSequence`), so one scalar rejects
+        /// every predecessor, including one never individually cleared.
+        var maxRevokedAdmissionSequence: UInt64 = 0
+        /// A revocation-only entry (`revocationOnly`): it keeps the watermark for a run whose
+        /// usable state rollback or cleanup removed. It has no routing, affinity, purpose, tools or
+        /// ownership; every usable-policy reader goes through `usableRunPolicyState` and sees none.
+        /// Only a normal policy installation (`seedRunPolicyState`) activates the run again.
+        var isRevocationOnly: Bool = false
+
+        /// The inert entry that retains `maxRevokedAdmissionSequence` for the process lifetime.
+        static func revocationOnly(maxRevokedAdmissionSequence: UInt64) -> RunConnectionPolicyState {
+            RunConnectionPolicyState(
+                windowID: 0,
+                workspaceID: nil,
+                tabID: nil,
+                restrictedTools: [],
+                additionalTools: nil,
+                allowedToolsOverride: nil,
+                sessionProfile: .standard,
+                purpose: .unknown,
+                taskLabelKind: nil,
+                allowsAgentExternalControlTools: false,
+                codeModeEligibility: .native,
+                updatedAt: .distantPast,
+                runOwnership: nil,
+                maxRevokedAdmissionSequence: maxRevokedAdmissionSequence,
+                isRevocationOnly: true
+            )
+        }
     }
 
     /// Same-process live reconnect affinity keyed by MCP client name + capability token.
@@ -3355,7 +3390,7 @@ actor ServerNetworkManager {
         let purpose = runPurposeByConnection[connectionID] ?? .unknown
         let runState: RunConnectionPolicyState? = {
             guard let runID = runIDByConnectionID[connectionID] else { return nil }
-            return runPolicyStateByRunID[runID]
+            return usableRunPolicyState(runID)
         }()
         let allowedToolsOverride = allowedToolsOverrideByConnection[connectionID] ?? runState?.allowedToolsOverride
         let sessionProfile = sessionProfileByConnection[connectionID] ?? runState?.sessionProfile ?? .standard
@@ -3381,7 +3416,7 @@ actor ServerNetworkManager {
         ) -> [String: String] {
             let effective = policy ?? effectivePolicyState(for: connectionID)
             let runID = runIDByConnectionID[connectionID]
-            let runState = runID.flatMap { runPolicyStateByRunID[$0] }
+            let runState = runID.flatMap { usableRunPolicyState($0) }
             var fields = extra
             fields["connectionID"] = connectionID.uuidString
             fields["runID"] = runID?.uuidString ?? "nil"
@@ -3954,11 +3989,11 @@ actor ServerNetworkManager {
     }
 
     func hasCachedRunPolicyState(for runID: UUID) -> Bool {
-        runPolicyStateByRunID[runID] != nil
+        usableRunPolicyState(runID) != nil
     }
 
     func cachedRunPolicyWindowID(for runID: UUID) -> Int? {
-        runPolicyStateByRunID[runID]?.windowID
+        usableRunPolicyState(runID)?.windowID
     }
 
     private func reusableWindowForClient(newConnectionID: UUID, clientName: String) async -> Int? {
@@ -4202,7 +4237,7 @@ actor ServerNetworkManager {
                 }
                 assignRunRoute(runID, to: connectionID)
             }
-            let policyApplied = runPolicyStateByRunID[runID] != nil
+            let policyApplied = usableRunPolicyState(runID) != nil
             recordRequestYieldedToHolder(
                 event: "run_mapping_yielded_to_holder",
                 source: refusalSource,
@@ -4250,7 +4285,7 @@ actor ServerNetworkManager {
             sessionKey: routingSessionKey(for: connectionID),
             runID: runID,
             windowID: windowID,
-            purpose: runPurposeByConnection[connectionID] ?? runPolicyStateByRunID[runID]?.purpose
+            purpose: runPurposeByConnection[connectionID] ?? usableRunPolicyState(runID)?.purpose
         )
 
         #if DEBUG
@@ -4314,7 +4349,7 @@ actor ServerNetworkManager {
             sessionKey: routingSessionKey(for: connectionID),
             runID: runID,
             windowID: windowID,
-            purpose: runPurposeByConnection[connectionID] ?? runPolicyStateByRunID[runID]?.purpose
+            purpose: runPurposeByConnection[connectionID] ?? usableRunPolicyState(runID)?.purpose
         )
         await applyRunPolicyStateIfAvailable(
             runID: runID,
@@ -4328,7 +4363,10 @@ actor ServerNetworkManager {
     /// nothing). A policy-only writer (`preservingWorkspaceForPolicyRefresh`) supplies no workspace:
     /// its `nil` means "not asserted", so the source workspace that exact-tab admission established
     /// is kept when the run's window, nonnil tab, and purpose are unchanged. Every other field comes
-    /// from the new state, and any other writer's `nil` replaces (clears) the workspace.
+    /// from the new state, and any other writer's `nil` replaces (clears) the workspace. The stored
+    /// rich-presentation grant is always exactly the one the resolved ownership derives: a supplied
+    /// `additionalTools` never carries `present_rich` past a cleared or older attempt. A
+    /// revocation-only entry counts as no state, except that its watermark is kept and applied.
     private func seedRunPolicyState(
         runID: UUID,
         windowID: Int,
@@ -4346,37 +4384,36 @@ actor ServerNetworkManager {
         runOwnership: AgentRunOwnership? = nil,
         updatedAt: Date
     ) {
-        let existing = runPolicyStateByRunID[runID]
+        let watermark = runPolicyStateByRunID[runID]?.maxRevokedAdmissionSequence ?? 0
+        let existing = usableRunPolicyState(runID)
         if let existing, existing.updatedAt >= updatedAt {
             return
         }
-        // An older attempt of the same tab never replaces the newer attempt ownership already
-        // installed (a delayed predecessor install); its rich grant is reconciled to the kept one.
-        var resolvedRunOwnership = runOwnership
-        var resolvedAdditionalTools = additionalTools
-        if let installed = existing?.runOwnership,
-           let runOwnership,
-           installed.binding.tabID == runOwnership.binding.tabID,
-           installed.admissionSequence > runOwnership.admissionSequence
-        {
-            resolvedRunOwnership = installed
-            resolvedAdditionalTools = Self.reconcilingRichPresentationGrant(
-                additionalTools,
-                runOwnership: installed,
-                allowedToolsOverride: allowedToolsOverride
+        var resolvedWorkspaceID = workspaceID
+        if preservingWorkspaceForPolicyRefresh, workspaceID == nil {
+            resolvedWorkspaceID = Self.preservedRunWorkspaceID(
+                existing,
+                windowID: windowID,
+                tabID: tabID,
+                purpose: purpose
             )
         }
-        var resolvedWorkspaceID = workspaceID
-        if preservingWorkspaceForPolicyRefresh,
-           workspaceID == nil,
-           let existing,
-           let tabID,
-           existing.tabID == tabID,
-           existing.windowID == windowID,
-           existing.purpose == purpose
-        {
-            resolvedWorkspaceID = existing.workspaceID
-        }
+        // Only an eligible ownership enters the run's state. An installed attempt of the same tab
+        // that the candidate may not replace (a delayed predecessor, or the same ordinal with a
+        // different ownership) is kept, and only when it is itself still eligible.
+        let resolvedRunOwnership = Self.resolvingRunOwnership(
+            candidate: runOwnership,
+            installed: existing?.runOwnership,
+            maxRevokedAdmissionSequence: watermark,
+            workspaceID: resolvedWorkspaceID
+        )
+        // The rich grant follows the resolved ownership on every seed (the kept newer attempt, a
+        // routing reseed's proven ownership, or none); every other tool is unchanged.
+        let resolvedAdditionalTools = Self.reconcilingRichPresentationGrant(
+            additionalTools,
+            runOwnership: resolvedRunOwnership,
+            allowedToolsOverride: allowedToolsOverride
+        )
         runPolicyStateByRunID[runID] = RunConnectionPolicyState(
             windowID: windowID,
             workspaceID: resolvedWorkspaceID,
@@ -4394,9 +4431,76 @@ actor ServerNetworkManager {
                 sessionProfile: sessionProfile
             ),
             updatedAt: updatedAt,
-            runOwnership: resolvedRunOwnership
+            runOwnership: resolvedRunOwnership,
+            maxRevokedAdmissionSequence: watermark
         )
         windowIDByRunID[runID] = windowID
+    }
+
+    /// The run's usable policy state: nil for a revocation-only entry, which only the ownership
+    /// writers read, for its watermark. Every routing, affinity, purpose and projection reader
+    /// uses this.
+    private func usableRunPolicyState(_ runID: UUID) -> RunConnectionPolicyState? {
+        guard let state = runPolicyStateByRunID[runID], !state.isRevocationOnly else { return nil }
+        return state
+    }
+
+    /// Removes the run's policy state, keeping a revocation-only entry when it carries a nonzero
+    /// watermark. Watermark-bearing entries live for the process lifetime: there is no proven,
+    /// irreversible run-ID retirement, so a delayed writer may still arrive after cleanup.
+    private func removeRunPolicyStateRetainingWatermark(_ runID: UUID) {
+        guard let state = runPolicyStateByRunID[runID] else { return }
+        if state.maxRevokedAdmissionSequence > 0 {
+            runPolicyStateByRunID[runID] = .revocationOnly(
+                maxRevokedAdmissionSequence: state.maxRevokedAdmissionSequence
+            )
+        } else {
+            runPolicyStateByRunID.removeValue(forKey: runID)
+        }
+    }
+
+    /// The ownership a seed stores: `installed` when the candidate may not replace it and it is
+    /// still eligible; otherwise the candidate when eligible; otherwise none. A nil candidate grants
+    /// nothing (and raises no watermark).
+    private nonisolated static func resolvingRunOwnership(
+        candidate: AgentRunOwnership?,
+        installed: AgentRunOwnership?,
+        maxRevokedAdmissionSequence: UInt64,
+        workspaceID: UUID?
+    ) -> AgentRunOwnership? {
+        guard let candidate else { return nil }
+        if let installed,
+           installed.binding.tabID == candidate.binding.tabID,
+           !runOwnershipMayReplace(installed, with: candidate)
+        {
+            return runOwnershipIsEligible(
+                installed,
+                maxRevokedAdmissionSequence: maxRevokedAdmissionSequence,
+                workspaceID: workspaceID
+            ) ? installed : nil
+        }
+        return runOwnershipIsEligible(
+            candidate,
+            maxRevokedAdmissionSequence: maxRevokedAdmissionSequence,
+            workspaceID: workspaceID
+        ) ? candidate : nil
+    }
+
+    /// The workspace a policy-only seed keeps (`preservingWorkspaceForPolicyRefresh`): the existing
+    /// state's, when its window, nonnil tab, and purpose are unchanged; otherwise none.
+    private nonisolated static func preservedRunWorkspaceID(
+        _ existing: RunConnectionPolicyState?,
+        windowID: Int,
+        tabID: UUID?,
+        purpose: MCPRunPurpose
+    ) -> UUID? {
+        guard let existing,
+              let tabID,
+              existing.tabID == tabID,
+              existing.windowID == windowID,
+              existing.purpose == purpose
+        else { return nil }
+        return existing.workspaceID
     }
 
     private func cacheRunPolicyStateIfNeeded(_ policy: ClientConnectionPolicy) {
@@ -4418,6 +4522,178 @@ actor ServerNetworkManager {
             runOwnership: policy.runOwnership,
             updatedAt: policy.createdAt
         )
+    }
+
+    /// Re-records the run's routing binding (window, resolved workspace, tab) after a routing
+    /// install or a run-tab rebind, carrying every other field from the run's current policy state
+    /// (read here, after the caller's suspensions). Attempt ownership survives only a proven
+    /// same-binding refresh (`routingReseedRunOwnership`); a changed or unprovable binding clears
+    /// it, raises the run's watermark to its admission (`maxRevokedAdmissionSequence`), and removes
+    /// exactly its rich-presentation grant. The revocation holds even when the routing seed itself
+    /// is skipped by its `updatedAt` (a stale reseed never overwrites newer routing fields, but the
+    /// invalidation it discovered against the current state still lands). `updatedAt` is injectable
+    /// for tests. Nothing is resampled and no sequence is allocated: a new attempt arrives only
+    /// through an install or `refreshRunAttemptRichPresentation`. A run whose usable state is gone
+    /// is not recreated. Every live connection the cleared attempt was applied to loses it and
+    /// exactly its rich grant, with `tools/list_changed` only where its tools changed (after every
+    /// write).
+    private func reseedRunPolicyRouting(
+        runID: UUID,
+        windowID: Int,
+        workspaceID: UUID,
+        tabID: UUID?,
+        updatedAt: Date = Date()
+    ) async {
+        guard let current = usableRunPolicyState(runID) else { return }
+        let provenOwnership = Self.routingReseedRunOwnership(
+            current,
+            windowID: windowID,
+            workspaceID: workspaceID,
+            tabID: tabID
+        )
+        seedRunPolicyState(
+            runID: runID,
+            windowID: windowID,
+            workspaceID: workspaceID,
+            tabID: tabID,
+            restrictedTools: current.restrictedTools,
+            additionalTools: current.additionalTools,
+            allowedToolsOverride: current.allowedToolsOverride,
+            sessionProfile: current.sessionProfile,
+            purpose: current.purpose,
+            taskLabelKind: current.taskLabelKind,
+            allowsAgentExternalControlTools: current.allowsAgentExternalControlTools,
+            codeModeEligibility: current.codeModeEligibility,
+            runOwnership: provenOwnership,
+            updatedAt: updatedAt
+        )
+        // A cleared attempt, and every earlier admission, can never be re-delivered to this run by
+        // any writer.
+        guard provenOwnership == nil, let cleared = current.runOwnership else { return }
+        raiseRunOwnershipWatermark(runID: runID, revoking: cleared.admissionSequence)
+        await revokeAppliedRunOwnership(runID: runID)
+    }
+
+    /// Raises the run's watermark to at least `admissionSequence`, then drops the run state's
+    /// ownership, and exactly its rich grant, if it is no longer eligible. Routing fields and
+    /// `updatedAt` are unchanged.
+    private func raiseRunOwnershipWatermark(runID: UUID, revoking admissionSequence: UInt64) {
+        guard var state = runPolicyStateByRunID[runID] else { return }
+        state.maxRevokedAdmissionSequence = max(state.maxRevokedAdmissionSequence, admissionSequence)
+        if let ownership = state.runOwnership,
+           !Self.runOwnershipIsEligible(
+               ownership,
+               maxRevokedAdmissionSequence: state.maxRevokedAdmissionSequence,
+               workspaceID: state.workspaceID
+           )
+        {
+            state.runOwnership = nil
+            state.additionalTools = Self.reconcilingRichPresentationGrant(
+                state.additionalTools,
+                runOwnership: nil,
+                allowedToolsOverride: state.allowedToolsOverride
+            )
+        }
+        runPolicyStateByRunID[runID] = state
+    }
+
+    /// The single eligibility check every ownership writer applies (seed, install, pending
+    /// application, refresh, rollback, live-connection revocation). Independent of any installed
+    /// ownership, so a genuine first admission passes. `candidate` is eligible only when its
+    /// process-wide admission is positive (0 is a non-session admission, never rich authority) and
+    /// above the run's watermark, and, when the run has a resolved `workspaceID`, the workspace its
+    /// captured rich policy names does not conflict with it (the call-time resolver would refuse it
+    /// there). Ordering only: `RichPresentationMCPAuthorityResolver` still proves the bound session
+    /// at every call.
+    private nonisolated static func runOwnershipIsEligible(
+        _ candidate: AgentRunOwnership,
+        maxRevokedAdmissionSequence: UInt64,
+        workspaceID: UUID?
+    ) -> Bool {
+        guard candidate.admissionSequence > 0,
+              candidate.admissionSequence > maxRevokedAdmissionSequence
+        else { return false }
+        if let workspaceID,
+           let policyWorkspaceID = candidate.richPresentationPolicy?.workspaceID,
+           policyWorkspaceID != workspaceID
+        {
+            return false
+        }
+        return true
+    }
+
+    /// Removes a revoked attempt's ownership, and exactly its rich grant, from every connection it
+    /// was applied to for `runID` (at or below the run's watermark). Other tools, restrictions and
+    /// routes are unchanged. All writes precede the notifications; a connection is notified only
+    /// when its tools changed.
+    private func revokeAppliedRunOwnership(runID: UUID) async {
+        guard let state = runPolicyStateByRunID[runID], state.maxRevokedAdmissionSequence > 0 else { return }
+        let targets = appliedRunOwnershipByConnection
+            .compactMap { connectionID, applied -> UUID? in
+                guard applied.runID == runID,
+                      !Self.runOwnershipIsEligible(
+                          applied.ownership,
+                          maxRevokedAdmissionSequence: state.maxRevokedAdmissionSequence,
+                          workspaceID: nil
+                      )
+                else { return nil }
+                return connectionID
+            }
+            .sorted { $0.uuidString < $1.uuidString }
+        var changedConnectionIDs: [UUID] = []
+        for connectionID in targets {
+            appliedRunOwnershipByConnection.removeValue(forKey: connectionID)
+            let previousTools = additionalToolsByConnection[connectionID]
+            let reconciledTools = Self.reconcilingRichPresentationGrant(
+                previousTools,
+                runOwnership: nil,
+                allowedToolsOverride: nil
+            )
+            guard (reconciledTools ?? []) != (previousTools ?? []) else { continue }
+            if let reconciledTools {
+                additionalToolsByConnection[connectionID] = reconciledTools
+            } else {
+                additionalToolsByConnection.removeValue(forKey: connectionID)
+            }
+            if var applied = appliedRunPolicyProjectionByConnectionID[connectionID] {
+                // Revocation writes only the rich grant. Other pending policy fields, including
+                // code-mode eligibility, must still be applied by the next full refresh.
+                applied.additionalTools = reconciledTools ?? []
+                appliedRunPolicyProjectionByConnectionID[connectionID] = applied
+            }
+            if connections[connectionID] != nil {
+                changedConnectionIDs.append(connectionID)
+            }
+        }
+        for connectionID in changedConnectionIDs {
+            await notifyToolListChanged(connectionID: connectionID)
+        }
+    }
+
+    /// The attempt ownership a routing reseed may carry: the run state's own ownership, only for a
+    /// proven same-binding refresh. That is an Agent Mode run in the same window and the
+    /// ownership's own tab, in the same workspace: a cached workspace equal to the resolved one, or,
+    /// with none cached, the attempt's captured rich policy independently naming the resolved
+    /// workspace. A conflicting cached workspace, another window or tab, or no provable workspace
+    /// yields nil. The exact session binding generation and current attempt are re-proven at call
+    /// time by `RichPresentationMCPAuthorityResolver`; this only refuses to copy authority blindly.
+    private nonisolated static func routingReseedRunOwnership(
+        _ state: RunConnectionPolicyState,
+        windowID: Int,
+        workspaceID: UUID,
+        tabID: UUID?
+    ) -> AgentRunOwnership? {
+        guard state.purpose == .agentModeRun,
+              let ownership = state.runOwnership,
+              state.windowID == windowID,
+              let tabID,
+              state.tabID == tabID,
+              ownership.binding.tabID == tabID
+        else { return nil }
+        if let cachedWorkspaceID = state.workspaceID {
+            return cachedWorkspaceID == workspaceID ? ownership : nil
+        }
+        return ownership.richPresentationPolicy?.workspaceID == workspaceID ? ownership : nil
     }
 
     private nonisolated static func normalizedClientName(_ clientName: String) -> String {
@@ -4476,7 +4752,7 @@ actor ServerNetworkManager {
         purpose: MCPRunPurpose?
     ) {
         guard !clientName.isEmpty, let sessionKey, let runID, let windowID else { return }
-        let resolvedPurpose = purpose ?? runPolicyStateByRunID[runID]?.purpose ?? .unknown
+        let resolvedPurpose = purpose ?? usableRunPolicyState(runID)?.purpose ?? .unknown
         guard shouldAllowPersistedAgentModeRestore(clientName: clientName, purpose: resolvedPurpose) else {
             return
         }
@@ -4508,7 +4784,7 @@ actor ServerNetworkManager {
         else {
             return nil
         }
-        guard let cached = runPolicyStateByRunID[affinity.runID] else {
+        guard let cached = usableRunPolicyState(affinity.runID) else {
             liveRunAffinityByClientSession[matchedKey]?[sessionKey] = nil
             if liveRunAffinityByClientSession[matchedKey]?.isEmpty == true {
                 liveRunAffinityByClientSession.removeValue(forKey: matchedKey)
@@ -4538,7 +4814,7 @@ actor ServerNetworkManager {
             guard admittedPolicyRunIDs.contains(runID),
                   !expectedPIDs.isEmpty,
                   isAncestor(expectedPIDs: expectedPIDs, ofPid: pid_t(clientPid)),
-                  let cached = runPolicyStateByRunID[runID],
+                  let cached = usableRunPolicyState(runID),
                   shouldAllowPersistedAgentModeRestore(clientName: clientName, purpose: cached.purpose)
             else {
                 return nil
@@ -4647,7 +4923,7 @@ actor ServerNetworkManager {
         // A read-only companion derives its tools from its grant's run state; it never takes the
         // run's policy, route, window binding or tab.
         guard companionRoleByConnectionID[connectionID] == nil,
-              let cached = runPolicyStateByRunID[runID]
+              let cached = usableRunPolicyState(runID)
         else { return nil }
 
         restrictedToolsByConnection[connectionID] = cached.restrictedTools
@@ -4724,7 +5000,7 @@ actor ServerNetworkManager {
     }
 
     func runPolicyPurpose(for runID: UUID) -> MCPRunPurpose? {
-        runPolicyStateByRunID[runID]?.purpose
+        usableRunPolicyState(runID)?.purpose
     }
 
     /// The run's own tab from its policy state, for a connection routed to `runID` actor-side.
@@ -4773,7 +5049,7 @@ actor ServerNetworkManager {
     /// binding (a request that yielded the window's run mapping), never active-tab compatibility.
     func actorRoutedRunPolicyTab(for connectionID: UUID) -> RunPolicyTab? {
         guard let runID = runIDByConnectionID[connectionID],
-              let state = runPolicyStateByRunID[runID],
+              let state = usableRunPolicyState(runID),
               let tabID = state.tabID
         else { return nil }
         return RunPolicyTab(runID: runID, windowID: state.windowID, workspaceID: state.workspaceID, tabID: tabID)
@@ -4806,7 +5082,7 @@ actor ServerNetworkManager {
     ) async -> RunTabRehydrateOutcome {
         guard companionRoleByConnectionID[connectionID] == nil,
               let runID = await runIDForConnection(connectionID),
-              let cached = runPolicyStateByRunID[runID],
+              let cached = usableRunPolicyState(runID),
               cached.purpose == .agentModeRun,
               cached.tabID != nil
         else {
@@ -4873,7 +5149,9 @@ actor ServerNetworkManager {
     /// Use this at true end-of-scope boundaries (session deletion, tab/window close),
     /// not for normal observer lifecycle teardown.
     func cleanupRunRoutingState(for runID: UUID, windowID: Int? = nil) async {
-        runPolicyStateByRunID.removeValue(forKey: runID)
+        // A watermark-bearing state is demoted to revocation-only, never erased: a delayed writer
+        // of a revoked attempt may still arrive for this run ID.
+        removeRunPolicyStateRetainingWatermark(runID)
         admittedPolicyRunIDs.remove(runID)
         windowIDByRunID.removeValue(forKey: runID)
         pendingPolicyApplicationIDByRunID.removeValue(forKey: runID)
@@ -4913,7 +5191,7 @@ actor ServerNetworkManager {
     /// Preserves window affinity while dropping tab-scoped run state.
     func cleanupRunRoutingState(forTabID tabID: UUID, windowID: Int? = nil) async {
         let targetRunIDs = runPolicyStateByRunID.compactMap { runID, state -> UUID? in
-            guard state.tabID == tabID else { return nil }
+            guard !state.isRevocationOnly, state.tabID == tabID else { return nil }
             if let windowID, state.windowID != windowID {
                 return nil
             }
@@ -5384,7 +5662,7 @@ actor ServerNetworkManager {
               runIDByConnectionID[connectionID] == runID,
               isLiveNonTerminalConnection(connectionID),
               MCPClientIdentity.matches(clientIDByConnection[connectionID], clientName),
-              let policyWindowID = runPolicyStateByRunID[runID]?.windowID,
+              let policyWindowID = usableRunPolicyState(runID)?.windowID,
               connectionWindowMap[connectionID] == policyWindowID
         else { return false }
         if let agentPID {
@@ -7928,7 +8206,11 @@ actor ServerNetworkManager {
             debugLiveRunMappedOMPIdentityConnections.removeAll()
             debugOMPProcessCorrelationFieldsByConnectionIDForTesting.removeAll()
         #endif
-        runPolicyStateByRunID.removeAll()
+        // Revocation watermarks outlive a server restart (the process, and so its delayed writers
+        // and admission ordinals, continue); every usable run state is dropped.
+        for runID in Array(runPolicyStateByRunID.keys) {
+            removeRunPolicyStateRetainingWatermark(runID)
+        }
         admittedPolicyRunIDs.removeAll()
         windowIDByRunID.removeAll()
         pendingPolicyApplicationIDByConnectionID.removeAll()
@@ -9780,6 +10062,7 @@ actor ServerNetworkManager {
             runOwnership,
             purpose: purpose,
             runID: runID,
+            windowID: windowID,
             tabID: tabID,
             installedState: runID.flatMap { runPolicyStateByRunID[$0] }
         )
@@ -10163,7 +10446,7 @@ actor ServerNetworkManager {
         }
 
         func debugRunPolicyState(for runID: UUID) -> (windowID: Int, workspaceID: UUID?, restrictedTools: Set<String>, additionalTools: Set<String>?, allowedToolsOverride: Set<String>?, sessionProfile: AgentSessionProfile, purpose: MCPRunPurpose)? {
-            guard let cached = runPolicyStateByRunID[runID] else { return nil }
+            guard let cached = usableRunPolicyState(runID) else { return nil }
             return (
                 windowID: cached.windowID,
                 workspaceID: cached.workspaceID,
@@ -10211,6 +10494,34 @@ actor ServerNetworkManager {
             codeModeEligibilityByConnection[connectionID]
         }
 
+        /// The production routing reseed (`installTabContextFromPolicy`, run-tab rebind).
+        func debugReseedRunPolicyRouting(
+            runID: UUID,
+            windowID: Int,
+            workspaceID: UUID,
+            tabID: UUID?,
+            updatedAt: Date = Date()
+        ) async {
+            await reseedRunPolicyRouting(
+                runID: runID,
+                windowID: windowID,
+                workspaceID: workspaceID,
+                tabID: tabID,
+                updatedAt: updatedAt
+            )
+        }
+
+        func debugRunPolicyOwnership(for runID: UUID) -> AgentRunOwnership? {
+            runPolicyStateByRunID[runID]?.runOwnership
+        }
+
+        /// The run's revocation watermark and whether its entry is revocation-only (nil: no entry).
+        func debugRunPolicyRevocation(for runID: UUID) -> (maxRevokedAdmissionSequence: UInt64, isRevocationOnly: Bool)? {
+            runPolicyStateByRunID[runID].map { state in
+                (maxRevokedAdmissionSequence: state.maxRevokedAdmissionSequence, isRevocationOnly: state.isRevocationOnly)
+            }
+        }
+
         func debugConnectionPolicyState(for connectionID: UUID) -> (restrictedTools: Set<String>, additionalTools: Set<String>, allowedToolsOverride: Set<String>?, sessionProfile: AgentSessionProfile, purpose: MCPRunPurpose, windowID: Int?) {
             (
                 restrictedTools: restrictedToolsByConnection[connectionID] ?? [],
@@ -10250,10 +10561,10 @@ actor ServerNetworkManager {
             runPurpose _: MCPRunPurpose?
         ) async -> (didRestore: Bool, restrictedTools: Set<String>, additionalTools: Set<String>, purpose: MCPRunPurpose, cachedPolicyPurpose: MCPRunPurpose?) {
             setConnectionWindowMapping(connectionID, windowID: windowID)
-            let cachedPurpose = runID.flatMap { runPolicyStateByRunID[$0]?.purpose }
+            let cachedPurpose = runID.flatMap { usableRunPolicyState($0)?.purpose }
             let didRestore: Bool
             if let runID,
-               runPolicyStateByRunID[runID] != nil,
+               usableRunPolicyState(runID) != nil,
                shouldAllowPersistedAgentModeRestore(clientName: clientName, purpose: cachedPurpose ?? .unknown)
             {
                 updateLiveRunAffinity(
@@ -12235,7 +12546,7 @@ actor ServerNetworkManager {
             /// projection; nil when the connection has no fingerprint or the run no policy state.
             func debugAppliedRunPolicyProjectionMatchesRunPolicy(connectionID: UUID, runID: UUID) -> Bool? {
                 guard let applied = appliedRunPolicyProjectionByConnectionID[connectionID],
-                      let state = runPolicyStateByRunID[runID]
+                      let state = usableRunPolicyState(runID)
                 else { return nil }
                 return applied == AppliedRunPolicyProjection(state)
             }
@@ -13034,14 +13345,14 @@ actor ServerNetworkManager {
         clientName: String,
         agentPID: pid_t? = nil
     ) async {
-        guard let target = runPolicyStateByRunID[runID].map(AppliedRunPolicyProjection.init) else { return }
+        guard let target = usableRunPolicyState(runID).map(AppliedRunPolicyProjection.init) else { return }
         for connectionID in connectionIDs {
             #if DEBUG
                 if let suspension = debugRetainedRunPolicyRefreshSuspension {
                     await suspension(connectionID)
                 }
             #endif
-            guard let cached = runPolicyStateByRunID[runID], AppliedRunPolicyProjection(cached) == target else { return }
+            guard let cached = usableRunPolicyState(runID), AppliedRunPolicyProjection(cached) == target else { return }
             guard appliedRunPolicyProjectionByConnectionID[connectionID] != target,
                   connectionHoldsProvenRunRoute(connectionID, runID: runID, clientName: clientName, agentPID: agentPID)
             else { continue }
@@ -13077,13 +13388,18 @@ actor ServerNetworkManager {
     }
 
     /// The attempt ownership an install may carry: only for an Agent Mode run install whose own tab
-    /// is the ownership's tab (never another purpose's or tab's authority). A newer attempt of that
-    /// tab already in the run's state is kept. A nil incoming ownership grants nothing; every live
-    /// Agent Mode installer passes its attempt.
+    /// is the ownership's tab (never another purpose's or tab's authority). An installed attempt of
+    /// that tab the incoming one may not replace (`runOwnershipMayReplace`: a delayed predecessor,
+    /// or the same ordinal with a different ownership) is kept, only while it is still eligible. An
+    /// ineligible incoming attempt (`runOwnershipIsEligible`: at or below the run's watermark, a
+    /// non-session admission, or another workspace than the one the install's seed will keep)
+    /// carries nothing. A nil incoming ownership grants nothing; every live Agent Mode installer
+    /// passes its attempt. A revocation-only state supplies only its watermark.
     private nonisolated static func acceptedInstallRunOwnership(
         _ incoming: AgentRunOwnership?,
         purpose: MCPRunPurpose,
         runID: UUID?,
+        windowID: Int,
         tabID: UUID?,
         installedState: RunConnectionPolicyState?
     ) -> AgentRunOwnership? {
@@ -13093,36 +13409,43 @@ actor ServerNetworkManager {
               let tabID,
               incoming.binding.tabID == tabID
         else { return nil }
-        if let installedState,
-           installedState.purpose == .agentModeRun,
-           installedState.tabID == tabID,
-           let installed = installedState.runOwnership,
-           installed.binding.tabID == tabID,
-           installed.admissionSequence > incoming.admissionSequence
-        {
-            return installed
+        let watermark = installedState?.maxRevokedAdmissionSequence ?? 0
+        let usableState = installedState?.isRevocationOnly == true ? nil : installedState
+        let workspaceID = preservedRunWorkspaceID(usableState, windowID: windowID, tabID: tabID, purpose: purpose)
+        let installed = usableState.flatMap { state in
+            state.purpose == .agentModeRun && state.tabID == tabID ? state.runOwnership : nil
         }
-        return incoming
+        return resolvingRunOwnership(
+            candidate: incoming,
+            installed: installed,
+            maxRevokedAdmissionSequence: watermark,
+            workspaceID: workspaceID
+        )
     }
 
-    /// `policy` as a pending application may stage it now: a queued policy of an older attempt of
-    /// the run's tab takes the newer ownership the run state holds, with exactly its rich grant.
+    /// `policy` as a pending application may stage it now, against the run's current watermark and
+    /// routing context (the same rule as an install, `acceptedInstallRunOwnership`): a queued
+    /// policy of an older attempt of the run's tab (or the same ordinal with a different ownership)
+    /// takes the eligible ownership the run state holds, and a queued attempt that became
+    /// ineligible after it was queued carries none; either way with exactly the resulting rich
+    /// grant.
     private func reconcilingPendingRunOwnership(_ policy: ClientConnectionPolicy) -> ClientConnectionPolicy {
         guard policy.purpose == .agentModeRun,
               let runID = policy.runID,
-              let queued = policy.runOwnership,
-              let state = runPolicyStateByRunID[runID],
-              state.purpose == .agentModeRun,
-              state.tabID == policy.tabID,
-              let installed = state.runOwnership,
-              installed.binding.tabID == queued.binding.tabID,
-              installed.admissionSequence > queued.admissionSequence
+              policy.runOwnership != nil
         else { return policy }
         var reconciled = policy
-        reconciled.runOwnership = installed
+        reconciled.runOwnership = Self.acceptedInstallRunOwnership(
+            policy.runOwnership,
+            purpose: policy.purpose,
+            runID: runID,
+            windowID: policy.windowID,
+            tabID: policy.tabID,
+            installedState: runPolicyStateByRunID[runID]
+        )
         reconciled.additionalTools = Self.reconcilingRichPresentationGrant(
             policy.additionalTools,
-            runOwnership: installed,
+            runOwnership: reconciled.runOwnership,
             allowedToolsOverride: policy.allowedToolsOverride
         )
         return reconciled
@@ -13143,8 +13466,12 @@ actor ServerNetworkManager {
     /// controller (Claude, Codex, ACP): the run's cached policy state, its unconsumed pending
     /// policies, and every live connection routed actor-side to the run for `clientName` take the
     /// attempt's ownership and exactly its rich-presentation grant. Nothing else in a policy
-    /// changes, so delegation restrictions keep their existing lifetime. Refuses an ownership for
-    /// another tab than the run's policy, or older than the one installed (a delayed predecessor).
+    /// changes, so delegation restrictions keep their existing lifetime. Refuses, before any write,
+    /// an ownership for another tab than the run's policy, one that may not replace the installed
+    /// one (`runOwnershipMayReplace`: a delayed predecessor, or the same ordinal with a different
+    /// ownership), and an ineligible one (`runOwnershipIsEligible`: at or below the run's
+    /// watermark, a non-session admission, or another workspace), even when no ownership is
+    /// installed. A revocation-only state is never activated by a refresh.
     /// Re-checks the target after every suspension and stops once a successor replaced it.
     /// Idempotent; `tools/list_changed` goes only to a connection whose granted tools changed.
     func refreshRunAttemptRichPresentation(
@@ -13152,10 +13479,18 @@ actor ServerNetworkManager {
         runID: UUID,
         runOwnership: AgentRunOwnership
     ) async {
-        guard let state = runPolicyStateByRunID[runID],
+        guard let state = usableRunPolicyState(runID),
               state.purpose == .agentModeRun,
               state.tabID == runOwnership.binding.tabID,
-              Self.runOwnershipMayReplace(state.runOwnership, with: runOwnership)
+              Self.runOwnershipMayReplace(state.runOwnership, with: runOwnership),
+              // Checked even when no ownership is installed: a binding change's cleared attempt
+              // (or any earlier admission) and another workspace's attempt never regain the run. A
+              // later owner's lower local counter is irrelevant: its process-wide ordinal is higher.
+              Self.runOwnershipIsEligible(
+                  runOwnership,
+                  maxRevokedAdmissionSequence: state.maxRevokedAdmissionSequence,
+                  workspaceID: state.workspaceID
+              )
         else { return }
         if state.runOwnership != runOwnership {
             runPolicyStateByRunID[runID] = RunConnectionPolicyState(
@@ -13175,7 +13510,8 @@ actor ServerNetworkManager {
                 allowsAgentExternalControlTools: state.allowsAgentExternalControlTools,
                 codeModeEligibility: state.codeModeEligibility,
                 updatedAt: max(Date(), state.updatedAt.addingTimeInterval(0.001)),
-                runOwnership: runOwnership
+                runOwnership: runOwnership,
+                maxRevokedAdmissionSequence: state.maxRevokedAdmissionSequence
             )
         }
         // Unconsumed pending policies of the run admit their connection with this attempt.
@@ -13310,7 +13646,7 @@ actor ServerNetworkManager {
         // turn's queue entry is removed.
         guard !provenLaunchRouteConnectionIDs(runID: runID, clientName: clientName, agentPID: agentPID).isEmpty,
               !runPolicyApplicationInFlight(runID),
-              let target = runPolicyStateByRunID[runID].map(AppliedRunPolicyProjection.init)
+              let target = usableRunPolicyState(runID).map(AppliedRunPolicyProjection.init)
         else {
             #if DEBUG
                 await debugRecordProvenRouteReleaseRefusal(
@@ -13319,7 +13655,7 @@ actor ServerNetworkManager {
                     agentPID: agentPID,
                     reason: runPolicyApplicationInFlight(runID)
                         ? "policy_application_in_flight"
-                        : runPolicyStateByRunID[runID] == nil ? "no_run_policy" : "launch_route_not_proven"
+                        : usableRunPolicyState(runID) == nil ? "no_run_policy" : "launch_route_not_proven"
                 )
             #endif
             return false
@@ -13336,7 +13672,7 @@ actor ServerNetworkManager {
         // Re-checked after the refresh's suspensions: the launch's route is still proven, the
         // run's projection is still the target, and every proven connection of the run carries it.
         guard !provenLaunchRouteConnectionIDs(runID: runID, clientName: clientName, agentPID: agentPID).isEmpty,
-              runPolicyStateByRunID[runID].map(AppliedRunPolicyProjection.init) == target,
+              usableRunPolicyState(runID).map(AppliedRunPolicyProjection.init) == target,
               liveProvenRouteConnectionIDs(for: runID, clientName: clientName)
               .allSatisfy({ appliedRunPolicyProjectionByConnectionID[$0] == target })
         else {
@@ -13596,7 +13932,7 @@ actor ServerNetworkManager {
                 mcpPolicyLog(
                     "hydrated run policy without the window's run mapping reason=\(reason) client=\(clientName) connection=\(connectionID) window=\(liveAffinity.windowID) runID=\(liveAffinity.runID.uuidString)"
                 )
-                return runPolicyStateByRunID[liveAffinity.runID] != nil
+                return usableRunPolicyState(liveAffinity.runID) != nil
             }
             let restored = outcome == .mapped
             if restored {
@@ -14092,7 +14428,7 @@ actor ServerNetworkManager {
         // `cacheRunPolicyStateIfNeeded` keeps, leaves no fingerprint, so the next refresh corrects
         // the connection.
         if let runID = policy.runID,
-           let seeded = runPolicyStateByRunID[runID],
+           let seeded = usableRunPolicyState(runID),
            AppliedRunPolicyProjection(seeded) == AppliedRunPolicyProjection(stagedPolicy)
         {
             appliedRunPolicyProjectionByConnectionID[connectionID] = AppliedRunPolicyProjection(stagedPolicy)
@@ -14400,6 +14736,7 @@ actor ServerNetworkManager {
             restorePoint,
             connectionID: connectionID,
             policyRunID: policy.runID,
+            transactionRunOwnership: policy.runOwnership,
             restoreConnectionScopedState: ownsConnectionState,
             restoreRunScopedState: ownsRunState
         )
@@ -14423,18 +14760,37 @@ actor ServerNetworkManager {
         }
     }
 
+    /// Rolls a pending application back to `restorePoint`. Rich authority is never restored past
+    /// the run's current watermark: the connection's and the run's restored ownership are both
+    /// filtered against it, and each restored tool set carries exactly the rich grant of its
+    /// accepted ownership (a snapshot's stale grant included). The watermark is never lowered. An
+    /// independently installed successor (`transactionRunOwnership` is the rolled-back policy's own
+    /// attempt) keeps the run state. A transaction that created the run state leaves a
+    /// revocation-only entry instead of removing it when the run carries a watermark. The abandoned
+    /// application's own attempt is not watermarked: its one-shot policy is requeued for retry
+    /// (`rollbackOneShotPendingPolicyReservation`), and that retry is legitimate.
     private func restorePendingPolicyState(
         _ restorePoint: PendingPolicyRestorePoint,
         connectionID: UUID,
         policyRunID: UUID?,
+        transactionRunOwnership: AgentRunOwnership?,
         restoreConnectionScopedState: Bool,
         restoreRunScopedState: Bool
     ) {
         if restoreConnectionScopedState {
             // The restored state was not announced as a run policy projection: unknown again.
             appliedRunPolicyProjectionByConnectionID.removeValue(forKey: connectionID)
-            if let appliedRunOwnership = restorePoint.appliedRunOwnership {
-                appliedRunOwnershipByConnection[connectionID] = appliedRunOwnership
+            // A restore point captured before a routing reseed raised the run's watermark never
+            // restores an attempt at or below it, or its rich grant.
+            let restoredAppliedRunOwnership = restorePoint.appliedRunOwnership.flatMap { applied in
+                Self.runOwnershipIsEligible(
+                    applied.ownership,
+                    maxRevokedAdmissionSequence: runPolicyStateByRunID[applied.runID]?.maxRevokedAdmissionSequence ?? 0,
+                    workspaceID: nil
+                ) ? applied : nil
+            }
+            if let restoredAppliedRunOwnership {
+                appliedRunOwnershipByConnection[connectionID] = restoredAppliedRunOwnership
             } else {
                 appliedRunOwnershipByConnection.removeValue(forKey: connectionID)
             }
@@ -14443,7 +14799,16 @@ actor ServerNetworkManager {
             } else {
                 restrictedToolsByConnection.removeValue(forKey: connectionID)
             }
-            if let additionalTools = restorePoint.additionalTools {
+            // An accepted ownership keeps the snapshot's tools (derived from it under the
+            // connection's own ceiling); none strips any rich grant the snapshot still carries.
+            let restoredAdditionalTools = restoredAppliedRunOwnership == nil
+                ? Self.reconcilingRichPresentationGrant(
+                    restorePoint.additionalTools,
+                    runOwnership: nil,
+                    allowedToolsOverride: nil
+                )
+                : restorePoint.additionalTools
+            if let additionalTools = restoredAdditionalTools {
                 additionalToolsByConnection[connectionID] = additionalTools
             } else {
                 additionalToolsByConnection.removeValue(forKey: connectionID)
@@ -14496,8 +14861,55 @@ actor ServerNetworkManager {
         } else {
             admittedPolicyRunIDs.remove(policyRunID)
         }
-        if let runPolicyState = restorePoint.runPolicyState {
+        let currentRunPolicyState = runPolicyStateByRunID[policyRunID]
+        // Revocations recorded since the restore point survive the rollback.
+        let watermark = max(
+            currentRunPolicyState?.maxRevokedAdmissionSequence ?? 0,
+            restorePoint.runPolicyState?.maxRevokedAdmissionSequence ?? 0
+        )
+        let restorePointRunOwnership = restorePoint.runPolicyState?.runOwnership
+        // A successor admitted independently while this application was suspended (neither the
+        // restore point's attempt nor the rolled-back policy's, eligible, and strictly later than
+        // both) owns the run state now: rollback neither replaces nor removes it.
+        if let currentRunPolicyState,
+           !currentRunPolicyState.isRevocationOnly,
+           let successor = currentRunPolicyState.runOwnership,
+           successor != restorePointRunOwnership,
+           successor != transactionRunOwnership,
+           successor.admissionSequence > max(
+               restorePointRunOwnership?.admissionSequence ?? 0,
+               transactionRunOwnership?.admissionSequence ?? 0
+           ),
+           Self.runOwnershipIsEligible(
+               successor,
+               maxRevokedAdmissionSequence: watermark,
+               workspaceID: currentRunPolicyState.workspaceID
+           )
+        {
+            return
+        }
+        if var runPolicyState = restorePoint.runPolicyState, !runPolicyState.isRevocationOnly {
+            // The restored state never carries an ineligible attempt, and its rich grant is
+            // exactly the one its accepted ownership derives.
+            runPolicyState.maxRevokedAdmissionSequence = watermark
+            if let restoredOwnership = runPolicyState.runOwnership,
+               !Self.runOwnershipIsEligible(
+                   restoredOwnership,
+                   maxRevokedAdmissionSequence: watermark,
+                   workspaceID: runPolicyState.workspaceID
+               )
+            {
+                runPolicyState.runOwnership = nil
+            }
+            runPolicyState.additionalTools = Self.reconcilingRichPresentationGrant(
+                runPolicyState.additionalTools,
+                runOwnership: runPolicyState.runOwnership,
+                allowedToolsOverride: runPolicyState.allowedToolsOverride
+            )
             runPolicyStateByRunID[policyRunID] = runPolicyState
+        } else if watermark > 0 {
+            // No usable state to restore, but the run carries revocation knowledge: keep it.
+            runPolicyStateByRunID[policyRunID] = .revocationOnly(maxRevokedAdmissionSequence: watermark)
         } else {
             runPolicyStateByRunID.removeValue(forKey: policyRunID)
         }
@@ -14552,21 +14964,13 @@ actor ServerNetworkManager {
             return (false, nil)
         }
 
-        if resolved.routed, let cached = runPolicyStateByRunID[runID] {
-            seedRunPolicyState(
+        if resolved.routed {
+            // Ownership survives only a proven same-binding refresh (`reseedRunPolicyRouting`).
+            await reseedRunPolicyRouting(
                 runID: runID,
                 windowID: windowID,
                 workspaceID: resolved.workspaceID,
-                tabID: resolved.snapshot.id,
-                restrictedTools: cached.restrictedTools,
-                additionalTools: cached.additionalTools,
-                allowedToolsOverride: cached.allowedToolsOverride,
-                sessionProfile: cached.sessionProfile,
-                purpose: cached.purpose,
-                taskLabelKind: cached.taskLabelKind,
-                allowsAgentExternalControlTools: cached.allowsAgentExternalControlTools,
-                codeModeEligibility: cached.codeModeEligibility,
-                updatedAt: Date()
+                tabID: resolved.snapshot.id
             )
         }
         connectionLog("Installed tab context from policy: tab=\(tabID) run=\(runID) window=\(windowID) workspace=\(resolved.workspaceID) client=\(clientName)")
@@ -14622,7 +15026,7 @@ actor ServerNetworkManager {
         // primary's context, and binding it would make the next primary "replace" (terminate) it.
         guard companionRoleByConnectionID[connectionID] == nil else { return .failed }
         guard
-            let cached = runPolicyStateByRunID[runID],
+            let cached = usableRunPolicyState(runID),
             let tabID = cached.tabID
         else {
             return .noRunTab
@@ -14698,20 +15102,13 @@ actor ServerNetworkManager {
                 return .yieldedToHolder(holder: holder)
             }
             if let workspaceID = bindingResult.workspaceID, workspaceID != cached.workspaceID {
-                seedRunPolicyState(
+                // Carries the run's state as of now, not `cached` from before the main-actor hop;
+                // ownership survives only a proven same-binding refresh (`reseedRunPolicyRouting`).
+                await reseedRunPolicyRouting(
                     runID: runID,
                     windowID: cached.windowID,
                     workspaceID: workspaceID,
-                    tabID: cached.tabID,
-                    restrictedTools: cached.restrictedTools,
-                    additionalTools: cached.additionalTools,
-                    allowedToolsOverride: cached.allowedToolsOverride,
-                    sessionProfile: cached.sessionProfile,
-                    purpose: cached.purpose,
-                    taskLabelKind: cached.taskLabelKind,
-                    allowsAgentExternalControlTools: cached.allowsAgentExternalControlTools,
-                    codeModeEligibility: cached.codeModeEligibility,
-                    updatedAt: Date()
+                    tabID: cached.tabID
                 )
             }
             if bindingResult.didBind {
@@ -17519,7 +17916,7 @@ actor ServerNetworkManager {
         } else {
             await runIDForConnection(connectionID)
         }
-        let runPurpose = runID.flatMap { runPolicyStateByRunID[$0]?.purpose } ?? runPurposeByConnection[connectionID]
+        let runPurpose = runID.flatMap { usableRunPolicyState($0)?.purpose } ?? runPurposeByConnection[connectionID]
         updateLiveRunAffinity(
             clientName: clientID,
             sessionKey: sessionKey,

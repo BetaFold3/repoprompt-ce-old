@@ -1,6 +1,7 @@
 import Combine
 import Foundation
 import ImageIO
+import MCP
 @_spi(TestSupport) @testable import RepoPromptAgentCore
 @testable import RepoPromptPlatform
 @testable import RepoPromptUI
@@ -4545,6 +4546,725 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
         XCTAssertEqual(presentation.workingRows.map(\.text), expectedTexts, file: file, line: line)
     }
 
+    /// Step 4 end to end: a real `present_rich` execution through the production tool service
+    /// (exact attempt authority, owner save, publication with a local-fixture image), its text
+    /// result through the production ACP boundary into the session, save and reload, exactly one
+    /// outer block at every tier with duplicate and error rows retained, summary-only replay, and
+    /// historical loading: disabled creation still renders history, a D2 global move refuses
+    /// creation while history still reads the moved root, a missing image keeps the document text
+    /// and a missing manifest falls back to the summary. History never touches the network.
+    func testPresentRichEndToEndThroughACPPublicationSaveReloadAndHistoricalLoading() async throws {
+        try await withFixture { fixture in
+            let manager = fixture.window.workspaceManager
+            let dataService = fixture.viewModel.dataService
+            let session = fixture.sessionA
+            let transport = RichPresentationImageFixtureTransport.state
+            transport.reset()
+            let previousGlobal = WorkspaceGlobalCustomStorageLocation.load()
+            do {
+                try await assertPresentRichEndToEnd(fixture, manager: manager, dataService: dataService, session: session)
+            } catch {
+                transport.reset()
+                session.runID = nil
+                if manager.globalCustomStorageURL != nil { try? await manager.resetGlobalStorageToDefault() }
+                WorkspaceGlobalCustomStorageLocation.store(previousGlobal)
+                throw error
+            }
+            transport.reset()
+            session.runID = nil
+            if manager.globalCustomStorageURL != nil { try? await manager.resetGlobalStorageToDefault() }
+            WorkspaceGlobalCustomStorageLocation.store(previousGlobal)
+        }
+    }
+
+    /// Step 4 R1 validation gaps 1 and 2: the production pending-policy application routes a run
+    /// through the real `installTabContextFromPolicy` into this headless registered window, whose
+    /// same-binding reseed keeps the attempt's ownership and grant; then a `tools/call` of the
+    /// window catalog's own `present_rich` (routed only by the connection's task-local identity:
+    /// no metadata override, no injected resolver) returns a value whose production-formatted
+    /// content is exactly one canonical text block for both resource modes, which the production
+    /// normalizer accepts. A chart needs no image, so nothing touches the network.
+    func testPresentRichThroughRealPolicyInstallCatalogToolAndFormatterYieldsTheCanonicalText() async throws {
+        #if DEBUG
+            try await withFixture { fixture in
+                let manager = ServerNetworkManager.shared
+                let session = fixture.sessionA
+                let toolName = AgentRichPresentationToolPolicy.toolName
+                let workspaceID = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace?.id)
+                fixture.viewModel.richPresentationSettingsRead = { _ in WorkspaceRichPresentationSettings(enabled: true) }
+                let clientName = "codex-rich-catalog-\(UUID().uuidString)"
+                let runID = UUID()
+                let connectionID = UUID()
+                session.runID = runID
+                let ownership = session.beginRunAttempt(source: "test.presentRich.catalog")
+                XCTAssertEqual(ownership.richPresentationPolicy?.workspaceID, workspaceID)
+                @MainActor func cleanUp() async {
+                    await manager.clearClientConnectionPolicy(for: clientName, windowID: fixture.window.windowID, runID: runID)
+                    await manager.removeConnection(connectionID)
+                    await manager.cleanupRunRoutingState(for: runID)
+                    session.runID = nil
+                }
+                do {
+                    await manager.installClientConnectionPolicy(
+                        for: clientName,
+                        windowID: fixture.window.windowID,
+                        restrictedTools: AgentModeMCPToolPolicy.restrictedTools,
+                        oneShot: true,
+                        reason: "rich presentation catalog test",
+                        ttl: 10,
+                        tabID: fixture.tabAID,
+                        runID: runID,
+                        additionalTools: AgentModeMCPPolicyInstaller.additionalTools(for: .codexExec, runOwnership: ownership),
+                        purpose: .agentModeRun,
+                        runOwnership: ownership
+                    )
+                    let applied = await manager.debugApplyPendingPolicy(
+                        clientName: clientName, connectionID: connectionID, requireRunRouting: true
+                    )
+                    XCTAssertEqual(applied.outcome, "applied")
+                    XCTAssertTrue(applied.additionalTools.contains(toolName))
+                    let bound = try XCTUnwrap(fixture.window.mcpServer.tabContextByConnectionID[connectionID])
+                    XCTAssertEqual(bound.tabID, fixture.tabAID, "The real install bound the run's tab")
+                    XCTAssertEqual(bound.workspaceID, workspaceID)
+                    let kept = await manager.debugRunPolicyOwnership(for: runID)
+                    XCTAssertEqual(kept, ownership, "The install's same-binding reseed keeps the attempt")
+                    let routing = await manager.requestRoutingContext(for: connectionID)
+                    XCTAssertEqual(routing.appliedRunOwnership?.ownership, ownership)
+                    XCTAssertEqual(routing.actorRoutedRunTab?.tabID, fixture.tabAID)
+                    XCTAssertEqual(routing.actorRoutedRunTab?.workspaceID, workspaceID)
+                    let effective = await manager.debugEffectivePolicyState(for: connectionID)
+                    XCTAssertTrue(effective.additionalTools.contains(toolName), "The grant survives the install")
+
+                    let tools = await fixture.window.mcpServer.windowMCPTools
+                    let tool = try XCTUnwrap(tools.first { $0.name == MCPWindowToolName.presentRich })
+                    let input = RichPresentationInput(title: "Local data", content: .chart(RichPresentationChart(
+                        chartType: .bar, xLabel: "Item", unit: "count", x: ["A"], series: [.init(name: "Measured", y: [2])],
+                        sources: [.init(label: "Local fixture")]
+                    )))
+                    let args = try JSONDecoder().decode([String: Value].self, from: JSONEncoder().encode(input))
+                    session.isDirty = true
+                    let value = try await ServerNetworkManager.withConnectionID(connectionID, toolInvocationID: UUID()) {
+                        try await tool(args)
+                    }
+                    for emitResources in [false, true] {
+                        let blocks = ToolOutputFormatter.buildContentBlocks(
+                            toolName: MCPWindowToolName.presentRich, args: args, result: value, emitResources: emitResources
+                        )
+                        XCTAssertEqual(blocks.count, 1, "emitResources=\(emitResources)")
+                        guard case let .text(text, _, _)? = blocks.first else {
+                            XCTFail("present_rich formats as one text block (emitResources=\(emitResources))")
+                            continue
+                        }
+                        let reference = try XCTUnwrap(AgentRichPresentationResultNormalizer.reference(fromResultText: text))
+                        XCTAssertEqual(text, AgentRichPresentationResultNormalizer.canonicalResultJSON(for: reference))
+                        XCTAssertEqual(reference.kind, .chart)
+                        XCTAssertEqual(reference.title, "Local data")
+                    }
+                } catch {
+                    await cleanUp()
+                    throw error
+                }
+                await cleanUp()
+            }
+        #else
+            throw XCTSkip("Connection policy diagnostics require DEBUG helpers.")
+        #endif
+    }
+
+    /// Step 4 R1 B-S4-02: `present_rich` is a control-lane tool. A real socketpair `tools/call`
+    /// held inside publication (after the owner save, with the session gate and rich-artifact fence
+    /// held) does not hold the window-wide mutation lease, so another connection's exclusive call on
+    /// the same window is admitted and completes. Under the previous exclusive class, the second
+    /// call waits on that window lease until the rich call finishes, which this test never allows
+    /// before the second call returns. The held call then installs normally. A chart needs no image.
+    func testPresentRichHeldInPublicationDoesNotBlockAnotherConnectionsExclusiveCallInTheSameWindow() async throws {
+        #if DEBUG
+            XCTAssertEqual(MCPToolAdmissionPolicy.classification(forCanonicalToolName: MCPWindowToolName.presentRich), .control)
+            XCTAssertEqual(MCPToolAdmissionPolicy.classification(forCanonicalToolName: MCPWindowToolName.prompt), .exclusive)
+            try await MCPSharedServerTestLease.shared.withLease { _ in
+                try await withFixture { fixture in
+                    try await assertPresentRichLeavesWindowLeaseFree(fixture)
+                }
+            }
+        #else
+            throw XCTSkip("Socketpair dispatch and rich-artifact phase hooks require DEBUG helpers.")
+        #endif
+    }
+
+    /// Step 4 R1 save-adapter state contract: the adapter discards the save outcome and authorizes
+    /// creation only from owner state that a durable save established for this exact session and
+    /// workspace. A never-persisted owner whose save is skipped (clean owner: `.notWritten`), fails
+    /// (`.notWritten` after an injected write failure) or is coalesced behind an in-flight save
+    /// (`.deferredBehindInFlightSave`) refuses with the unsaved-session message: no persistence
+    /// state, and publication is never reached (no rich-artifact phase fires). Once the in-flight
+    /// save completes durably, the same call succeeds. (Launch-suppressed persistence is a static
+    /// launch flag checked before any save; it is not switchable in-process.)
+    func testPresentRichOwnerSaveThatEstablishesNoOwnerStateRefusesBeforePublication() async throws {
+        #if DEBUG
+            try await withFixture { fixture in
+                try await assertSaveAdapterRefusesWithoutOwnerState(fixture)
+            }
+        #else
+            throw XCTSkip("Session write and rich-artifact phase hooks require DEBUG helpers.")
+        #endif
+    }
+
+    #if DEBUG
+        private func assertSaveAdapterRefusesWithoutOwnerState(_ fixture: Fixture) async throws {
+            let viewModel = fixture.viewModel
+            let session = fixture.sessionA
+            let dataService = viewModel.dataService
+            viewModel.richPresentationSettingsRead = { _ in WorkspaceRichPresentationSettings(enabled: true) }
+            let workspaceID = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace?.id)
+            let resolver = RichPresentationMCPAuthorityResolver(
+                isGatewayPrincipalConnection: { _ in false }, windows: { [fixture.window] }
+            )
+            let input = RichPresentationInput(title: "Local data", content: .chart(RichPresentationChart(
+                chartType: .bar, xLabel: "Item", unit: "count", x: ["A"], series: [.init(name: "Measured", y: [2])],
+                sources: [.init(label: "Local fixture")]
+            )))
+            let args = try JSONDecoder().decode([String: Value].self, from: JSONEncoder().encode(input))
+            let phases = RichPhaseLog()
+            await dataService.test_setRichArtifactPhase { phase, _ in phases.append(phase) }
+            let writeGate = SessionWriteGate()
+            @MainActor func execute() async throws -> Value {
+                let runID = UUID()
+                session.runID = runID
+                let ownership = session.beginRunAttempt(source: "test.presentRich.saveContract")
+                let metadata = MCPServerViewModel.RequestMetadata(
+                    connectionID: UUID(), clientName: "codex", windowID: fixture.window.windowID,
+                    runPurpose: .agentModeRun, toolInvocationID: UUID(),
+                    actorRoutedRunTab: .init(runID: runID, windowID: fixture.window.windowID, workspaceID: workspaceID, tabID: fixture.tabAID),
+                    appliedRunOwnership: .init(runID: runID, ownership: ownership)
+                )
+                var service = RichPresentationMCPToolService(captureRequestMetadata: { metadata })
+                service.resolver = resolver
+                return try await service.execute(args: args)
+            }
+            @MainActor func assertRefuses(_ label: String) async {
+                do {
+                    _ = try await execute()
+                    XCTFail("\(label): a save without durable owner state must refuse")
+                } catch let MCPError.invalidParams(message) {
+                    XCTAssertEqual(message, AgentModeViewModel.richPublicationUnsavedSessionMessage, label)
+                } catch {
+                    XCTFail("\(label): unexpected error \(error)")
+                }
+                XCTAssertNil(session.persistenceState(for: fixture.sessionAID), "\(label): no owner state")
+                XCTAssertEqual(phases.values, [], "\(label): publication was never reached")
+            }
+            @MainActor func cleanUp() async {
+                writeGate.release()
+                await dataService.test_setSessionWriteFailureInjector(nil)
+                await dataService.test_setRichArtifactPhase(nil)
+                session.runID = nil
+            }
+            do {
+                XCTAssertNil(session.persistenceState(for: fixture.sessionAID), "The fixture owner was never persisted")
+
+                // 1) Skipped: a clean owner's save writes nothing.
+                session.isDirty = false
+                let skipped = await viewModel.saveSessionDetailed(for: fixture.tabAID)
+                XCTAssertEqual(skipped, .notWritten)
+                await assertRefuses("skipped")
+
+                // 2) Failed: the owner's initial write fails.
+                session.isDirty = true
+                struct InjectedWriteFailure: Error {}
+                await dataService.test_setSessionWriteFailureInjector { _ in InjectedWriteFailure() }
+                await assertRefuses("failed")
+                await dataService.test_setSessionWriteFailureInjector(nil)
+
+                // 3) Coalesced: an in-flight owner save is held inside its write; the adapter's own
+                // save is deferred behind it and establishes nothing.
+                session.isDirty = true
+                await dataService.test_setSessionWriteFailureInjector { _ in
+                    writeGate.holdUntilReleased()
+                    return nil
+                }
+                let inFlight = Task { @MainActor in await viewModel.saveSessionDetailed(for: fixture.tabAID) }
+                let held = await writeGate.waitUntilEntered(timeout: .seconds(20))
+                XCTAssertTrue(held, "The first owner save is in flight")
+                session.isDirty = true
+                let coalesced = await viewModel.saveSessionDetailed(for: fixture.tabAID)
+                XCTAssertEqual(coalesced, .deferredBehindInFlightSave)
+                await assertRefuses("coalesced")
+
+                writeGate.release()
+                let first = await inFlight.value
+                XCTAssertTrue(first.didWriteDurably, "The held save completes durably: \(first)")
+                await dataService.test_setSessionWriteFailureInjector(nil)
+                let state = try XCTUnwrap(session.persistenceState(for: fixture.sessionAID), "Durable save established owner state")
+                XCTAssertEqual(state.stamp.workspaceID, workspaceID)
+
+                // The paired state now authorizes creation; publication runs.
+                let value = try await execute()
+                let blocks = ToolOutputFormatter.buildContentBlocks(
+                    toolName: MCPWindowToolName.presentRich, args: args, result: value, emitResources: false
+                )
+                guard case let .text(text, _, _)? = blocks.first else {
+                    return XCTFail("present_rich formats as one text block")
+                }
+                XCTAssertEqual(AgentRichPresentationResultNormalizer.reference(fromResultText: text)?.kind, .chart)
+                XCTAssertTrue(phases.values.contains("beforeStage"), "Publication ran once owner state existed")
+            } catch {
+                await cleanUp()
+                throw error
+            }
+            await cleanUp()
+        }
+
+        private func assertPresentRichLeavesWindowLeaseFree(_ fixture: Fixture) async throws {
+            let manager = ServerNetworkManager.shared
+            let session = fixture.sessionA
+            let windowID = fixture.window.windowID
+            let dataService = fixture.viewModel.dataService
+            fixture.viewModel.richPresentationSettingsRead = { _ in WorkspaceRichPresentationSettings(enabled: true) }
+            let catalog = fixture.window.mcpServer.windowMCPToolCatalogService
+            ServiceRegistry.register(catalog)
+            let clientName = "codex-rich-control-lane-\(UUID().uuidString)"
+            let runID = UUID()
+            session.runID = runID
+            let ownership = session.beginRunAttempt(source: "test.presentRich.controlLane")
+            let hold = RichPublicationHold()
+            var endpoints: [PersistentMCPTestEndpoint] = []
+            var richCall: Task<PersistentMCPTestRPCResponse, Error>?
+            @MainActor func cleanUp() async {
+                await hold.release()
+                if let richCall { _ = try? await richCall.value }
+                await dataService.test_setRichArtifactPhase(nil)
+                await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.prompt, operation: nil)
+                for endpoint in endpoints {
+                    endpoint.client.close()
+                    await endpoint.connectionManager.stop()
+                    await manager.debugRemoveConnection(endpoint.connectionID)
+                    await manager.clearClientConnectionPolicy(for: endpoint.clientName)
+                    await manager.debugClearPersistedRoutingState(for: endpoint.clientName)
+                    fixture.window.mcpServer.removeTabContext(
+                        forConnectionID: endpoint.connectionID, clientName: endpoint.clientName, windowID: nil, runID: nil
+                    )
+                }
+                await manager.cleanupRunRoutingState(for: runID)
+                session.runID = nil
+                fixture.window.mcpServer.windowToolsEnabled = false
+                ServiceRegistry.unregister(catalog)
+            }
+            do {
+                await manager.installClientConnectionPolicy(
+                    for: clientName,
+                    windowID: windowID,
+                    restrictedTools: AgentModeMCPToolPolicy.restrictedTools,
+                    oneShot: true,
+                    reason: "rich presentation control-lane test",
+                    ttl: 30,
+                    tabID: fixture.tabAID,
+                    runID: runID,
+                    additionalTools: AgentModeMCPPolicyInstaller.additionalTools(for: .codexExec, runOwnership: ownership),
+                    purpose: .agentModeRun,
+                    runOwnership: ownership
+                )
+                // The rich connection's initialize applies the run's pending policy (real install).
+                let rich = try await PersistentMCPTestEndpoint.make(
+                    label: "rich", networkManager: manager, clientName: clientName,
+                    clearPersistedRoutingState: false, requiredToolNames: [MCPWindowToolName.presentRich]
+                )
+                endpoints.append(rich)
+                let other = try await PersistentMCPTestEndpoint.make(
+                    label: "other-exclusive", networkManager: manager, requiredToolNames: [MCPWindowToolName.prompt]
+                )
+                endpoints.append(other)
+                // The other connection targets this window explicitly with `_windowID`, which requires
+                // the window's MCP tools enabled (enabled after both handshakes, as in TabContextRoutingTests).
+                fixture.window.mcpServer.windowToolsEnabled = true
+                // Real admission still runs for `prompt` (exclusive: window mutation lease first);
+                // only its body is replaced so the call needs no tab binding.
+                await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.prompt) {
+                    .string("other-exclusive-ran")
+                }
+                await dataService.test_setRichArtifactPhase { phase, _ in
+                    guard phase == "beforeStage" else { return }
+                    await hold.hold()
+                }
+
+                let input = RichPresentationInput(title: "Local data", content: .chart(RichPresentationChart(
+                    chartType: .bar, xLabel: "Item", unit: "count", x: ["A"], series: [.init(name: "Measured", y: [2])],
+                    sources: [.init(label: "Local fixture")]
+                )))
+                let arguments = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(input)) as? [String: Any])
+                session.isDirty = true
+                richCall = Task { try await rich.callTool(name: MCPWindowToolName.presentRich, arguments: arguments, timeoutSeconds: 30) }
+                let entered = await hold.waitUntilEntered(timeout: .seconds(20))
+                XCTAssertTrue(entered, "present_rich reached publication staging (owner saved, gate and fence held)")
+                XCTAssertNotNil(session.persistenceState(for: fixture.sessionAID), "The exact owner was saved before publication")
+                let richInFlight = await manager.hasInFlightCalls(for: rich.connectionID)
+                XCTAssertTrue(richInFlight, "present_rich is still executing while held")
+
+                // Another connection's exclusive call on the same window completes while present_rich is held.
+                let otherResponse = try await other.callTool(
+                    name: MCPWindowToolName.prompt, arguments: ["op": "get", "_windowID": windowID], timeoutSeconds: 10
+                )
+                // The production formatter's rendering of the override's string value.
+                XCTAssertEqual(try Self.socketToolText(otherResponse), "```json\n\"other-exclusive-ran\"\n```")
+                let stillHeld = await manager.hasInFlightCalls(for: rich.connectionID)
+                XCTAssertTrue(stillHeld, "The exclusive call finished while present_rich was still held")
+                let richWindow = await manager.debugConnectionPolicyState(for: rich.connectionID).windowID
+                XCTAssertEqual(richWindow, windowID, "Both calls target the same window")
+
+                await hold.release()
+                let richResponse = try await XCTUnwrap(richCall).value
+                let reference = try XCTUnwrap(
+                    AgentRichPresentationResultNormalizer.reference(fromResultText: Self.socketToolText(richResponse))
+                )
+                XCTAssertEqual(reference.kind, .chart)
+                XCTAssertEqual(reference.title, "Local data")
+            } catch {
+                await cleanUp()
+                throw error
+            }
+            await cleanUp()
+        }
+
+        /// The text of a socketpair `tools/call` response; throws on a JSON-RPC or tool error.
+        private static func socketToolText(_ response: PersistentMCPTestRPCResponse) throws -> String {
+            struct ToolCallFailed: Error, CustomStringConvertible { let description: String }
+            let data = try XCTUnwrap(response.rawJSON.data(using: .utf8))
+            let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+            guard object["error"] == nil, let result = object["result"] as? [String: Any] else {
+                throw ToolCallFailed(description: response.rawJSON)
+            }
+            let content = try XCTUnwrap(result["content"] as? [[String: Any]])
+            let text = content.compactMap { $0["text"] as? String }.joined()
+            guard result["isError"] as? Bool != true else { throw ToolCallFailed(description: text) }
+            return text
+        }
+    #endif
+
+    private func assertPresentRichEndToEnd(
+        _ fixture: Fixture,
+        manager: WorkspaceManagerViewModel,
+        dataService: AgentSessionDataService,
+        session: AgentTabSession
+    ) async throws {
+        let transport = RichPresentationImageFixtureTransport.state
+        let jpeg = try richJPEG(width: 4, height: 3)
+        transport.setBehavior { _ in .respond(status: 200, headers: ["Content-Type": "image/jpeg"], chunks: [jpeg]) }
+        var settings = WorkspaceRichPresentationSettings(enabled: true, approvedImageHosts: ["images.example.com"])
+        fixture.viewModel.richPresentationSettingsRead = { _ in settings }
+        let resolver = RichPresentationMCPAuthorityResolver(
+            isGatewayPrincipalConnection: { _ in false },
+            windows: { [fixture.window] }
+        )
+        /// `backgroundWorkspaceID`: the attempt's route and captured policy name a workspace that is
+        /// not the window's active workspace (a run whose workspace went to the background).
+        func toolService(backgroundWorkspaceID: UUID? = nil) throws -> RichPresentationMCPToolService {
+            let activeWorkspaceID = try XCTUnwrap(manager.activeWorkspace?.id)
+            let runID = UUID()
+            session.runID = runID
+            var ownership = session.beginRunAttempt(source: "test.presentRich.endToEnd")
+            if let backgroundWorkspaceID {
+                ownership = AgentRunOwnership(
+                    binding: ownership.binding,
+                    richPresentationPolicy: .captured(
+                        workspaceID: backgroundWorkspaceID, enabled: true, approvedImageHosts: ["images.example.com"]
+                    ),
+                    admissionSequence: ownership.admissionSequence
+                )
+            }
+            let workspaceID = backgroundWorkspaceID ?? activeWorkspaceID
+            // The client name and provider below are the production ACP normalizer's fixture inputs,
+            // not evidence of live OpenCode support (the live provider gate is separate).
+            let metadata = MCPServerViewModel.RequestMetadata(
+                connectionID: UUID(), clientName: "opencode", windowID: fixture.window.windowID,
+                runPurpose: .agentModeRun, toolInvocationID: UUID(),
+                actorRoutedRunTab: .init(runID: runID, windowID: fixture.window.windowID, workspaceID: workspaceID, tabID: fixture.tabAID),
+                appliedRunOwnership: .init(runID: runID, ownership: ownership)
+            )
+            var service = RichPresentationMCPToolService(captureRequestMetadata: { metadata })
+            service.resolver = resolver
+            service.publicationService = { [self] in RichPresentationPublicationService(fetcher: fixtureImageFetcher()) }
+            return service
+        }
+        let args = try JSONDecoder().decode([String: Value].self, from: richBriefingToolInput())
+
+        // 1) Real creation: authority, owner save, publication and the canonical text result. The
+        // fixture installed its items silently (bound, clean, never persisted); an admitted turn
+        // carries unsaved content, so the owner is dirty and the publication's save writes it.
+        XCTAssertNil(session.persistenceState(for: fixture.sessionAID))
+        session.isDirty = true
+        let result = try await toolService().execute(args: args)
+        // The production `tools/call` formatter: exactly one text block, the canonical body.
+        let formatted = ToolOutputFormatter.buildContentBlocks(
+            toolName: MCPWindowToolName.presentRich, args: args, result: result, emitResources: false
+        )
+        XCTAssertEqual(formatted.count, 1)
+        guard case let .text(resultText, _, _)? = formatted.first else {
+            return XCTFail("present_rich formats as one text block")
+        }
+        let reference = try XCTUnwrap(AgentRichPresentationResultNormalizer.reference(fromResultText: resultText))
+        XCTAssertEqual(resultText, AgentRichPresentationResultNormalizer.canonicalResultJSON(for: reference))
+        XCTAssertEqual(reference.kind, .briefing)
+        XCTAssertEqual(reference.warnings, [])
+        XCTAssertLessThanOrEqual(reference.fallbackText.utf8.count, RichPresentationLimits.maxFallbackTextBytes)
+        XCTAssertEqual(transport.requests.count, 1, "Creation fetched the one approved image")
+        let state = try XCTUnwrap(session.persistenceState(for: fixture.sessionAID), "The owner was saved before publication")
+
+        // 2) The text result through the production ACP boundary into the session's items.
+
+        func acpResult(status: String, callID: String) throws -> AIStreamResult {
+            let events = ACPDefaultSessionUpdateNormalizer.normalize([
+                "sessionUpdate": "tool_call_update", "status": status, "toolCallId": callID,
+                "toolName": "present_rich", "kind": "other", "title": "present_rich",
+                "rawOutput": ["content": [["type": "text", "text": resultText]]]
+            ], providerID: .openCode)
+            struct MissingACPToolResult: Error {}
+            guard case let .stream(stream) = try XCTUnwrap(events.first) else {
+                XCTFail("Expected a normalized ACP tool result")
+                throw MissingACPToolResult()
+            }
+            return stream
+        }
+        let first = try acpResult(status: "completed", callID: "present-rich-1")
+        let duplicate = try acpResult(status: "completed", callID: "present-rich-2")
+        let failed = try acpResult(status: "failed", callID: "present-rich-3")
+        // A completed live call is one row: the call item becomes its result in place (a separate
+        // leftover `.toolCall` row is a pending call, which a save finalizes as an error).
+
+        func items(_ stream: AIStreamResult, sequence: Int) throws -> [AgentChatItem] {
+            try [
+                .toolResult(
+                    name: XCTUnwrap(stream.toolName), invocationID: stream.toolInvocationID, argsJSON: "{}",
+                    resultJSON: XCTUnwrap(stream.toolResultJSON), isError: stream.toolIsError,
+                    sequenceIndex: sequence
+                )
+            ]
+        }
+        let toolItems = try items(first, sequence: 1) + items(duplicate, sequence: 3) + items(failed, sequence: 5)
+        session.setItemsSilently(
+            [.user("Brief me", sequenceIndex: 0)] + toolItems + [.assistant("Here is the briefing.", sequenceIndex: 7)],
+            reason: .testOverride
+        )
+        fixture.viewModel.refreshDerivedTranscriptState(for: session)
+        XCTAssertEqual(session.transcript.turns.flatMap(\.richPresentations).map(\.reference), [reference])
+        session.isDirty = true
+        let saved = await fixture.viewModel.saveSession(for: fixture.tabAID)
+        XCTAssertTrue(saved)
+
+        // 2b) A new live turn after the save: the derived refresh keeps exactly one reference, on
+        // the turn that owns the call, and the new turn owns none.
+        session.setItemsSilently(
+            [.user("Brief me", sequenceIndex: 0)] + toolItems + [
+                .assistant("Here is the briefing.", sequenceIndex: 7),
+                .user("Thanks", sequenceIndex: 8),
+                .assistant("You're welcome.", sequenceIndex: 9)
+            ],
+            reason: .testOverride
+        )
+        fixture.viewModel.refreshDerivedTranscriptState(for: session)
+        XCTAssertEqual(session.transcript.turns.flatMap(\.richPresentations).map(\.reference), [reference])
+        XCTAssertEqual(session.transcript.turns.first?.richPresentations.map(\.reference), [reference])
+        XCTAssertEqual(session.transcript.turns.last?.richPresentations.count, 0)
+        XCTAssertGreaterThan(session.transcript.turns.count, 1, "The new turn is its own turn")
+
+        // 3) Reload: the turn owns exactly one reference; every tier projects one outer block and
+        // keeps the duplicate and error rows; replay carries only the summary once.
+        let workspace = try XCTUnwrap(manager.activeWorkspace)
+        let reloadedSession = try await dataService.loadAgentSession(id: fixture.sessionAID, for: workspace)
+        let reloaded = try XCTUnwrap(reloadedSession?.transcript)
+        XCTAssertEqual(reloaded.turns.flatMap(\.richPresentations).map(\.reference), [reference])
+        for tier in AgentTranscriptRetentionTier.allCases {
+            var tiered = reloaded
+            for index in tiered.turns.indices {
+                tiered.turns[index].retentionTier = tier
+            }
+            let projection = AgentTranscriptProjectionBuilder.build(from: tiered)
+            let blocks = (projection.archivedBlocks + projection.workingBlocks).filter { $0.kind == .richPresentation }
+            XCTAssertEqual(blocks.map(\.richPresentation?.reference), [reference], "\(tier)")
+        }
+        let fullProjection = AgentTranscriptProjectionBuilder.build(from: reloaded)
+        let resultRows = fullProjection.workingRows.filter { $0.kind == .toolResult }
+        XCTAssertEqual(resultRows.count, 3, "Duplicate and error rows are retained as ordinary evidence")
+        XCTAssertEqual(resultRows.count(where: { $0.toolIsError == true }), 1)
+        let replay = AgentTranscriptIO.buildConversationHistory(from: reloaded)
+        XCTAssertEqual(replay.components(separatedBy: "<rich_presentation>\(reference.fallbackText)</rich_presentation>").count - 1, 1)
+        XCTAssertFalse(replay.contains("Accepted text"), "Replay never carries the document body")
+
+        // 4) Disabled creation: refused before any fetch, while history still renders.
+        settings = WorkspaceRichPresentationSettings(enabled: false)
+        do {
+            _ = try await toolService().execute(args: args)
+            XCTFail("Disabled creation must be refused")
+        } catch let MCPError.invalidParams(message) {
+            XCTAssertEqual(message, RichPresentationMCPAuthorityResolver.disabledMessage)
+        }
+        XCTAssertEqual(transport.requests.count, 1, "Nothing was downloaded")
+
+        // 4b) A run whose workspace is no longer the window's active workspace is refused with
+        // guidance that a new run will not help (no background-workspace authority).
+        do {
+            _ = try await toolService(backgroundWorkspaceID: UUID()).execute(args: args)
+            XCTFail("A background workspace's run must be refused")
+        } catch let MCPError.invalidParams(message) {
+            XCTAssertEqual(message, RichPresentationMCPAuthorityResolver.inactiveWorkspaceMessage)
+            XCTAssertNotEqual(message, RichPresentationMCPAuthorityResolver.noAttemptAuthorityMessage)
+        }
+        XCTAssertEqual(transport.requests.count, 1, "Nothing was downloaded")
+        let owner = try XCTUnwrap(fixture.viewModel.richHistoryOwner(forTabID: fixture.tabAID))
+        let loader = RichPresentationHistoryLoader()
+        guard case let .loaded(manifest)? = await loader.manifest(for: reference, owner: owner) else {
+            return XCTFail("History renders while creation is off")
+        }
+        guard case let .briefing(briefing) = manifest.document.content,
+              case let .asset(asset)? = manifest.images.first?.terminal.outcome
+        else { return XCTFail("Expected the briefing with one stored image") }
+        XCTAssertEqual(briefing.sections.first?.articles.first?.body, "Accepted text")
+        let image = await loader.image(assetID: asset.assetID, reference: reference, owner: owner)
+        XCTAssertEqual(image.map { [$0.image.width, $0.image.height] }, [4, 3])
+        XCTAssertEqual(loader.test_manifestReadCount, 1)
+        _ = await loader.manifest(for: reference, owner: owner)
+        _ = await loader.image(assetID: asset.assetID, reference: reference, owner: owner)
+        XCTAssertEqual(loader.test_manifestReadCount, 1, "The manifest is cached")
+        XCTAssertEqual(loader.test_decodeCount, 1, "The decoded image is cached")
+
+        // 5) D2: a completed global storage move refuses creation, yet history reads the moved root.
+        settings = WorkspaceRichPresentationSettings(enabled: true, approvedImageHosts: ["images.example.com"])
+        let globalURL = fixture.rootURL.appendingPathComponent("GlobalStorage", isDirectory: true)
+        try FileManager.default.createDirectory(at: globalURL, withIntermediateDirectories: true)
+        try await manager.updateGlobalStoragePath(globalURL)
+        let movedWorkspace = try XCTUnwrap(manager.activeWorkspace)
+        let movedRoot = manager.workspaceDirectory(for: movedWorkspace)
+        XCTAssertNotEqual(
+            movedRoot.standardizedFileURL, dataService.workspaceStorageRoot(for: movedWorkspace).standardizedFileURL,
+            "Precondition: the roots disagree"
+        )
+        // The D2 refusal precedes the owner save: a dirty owner is left unsaved.
+        session.isDirty = true
+        do {
+            _ = try await toolService().execute(args: args)
+            XCTFail("Creation must be refused while the roots differ")
+        } catch let MCPError.invalidParams(message) {
+            XCTAssertEqual(message, AgentRichArtifactError.storageLocationUnsupported.localizedDescription)
+        }
+        XCTAssertTrue(session.isDirty, "A D2 refusal never saves the owner")
+        session.isDirty = false
+        XCTAssertEqual(transport.requests.count, 1, "Nothing was downloaded")
+        let movedOwner = try XCTUnwrap(fixture.viewModel.richHistoryOwner(forTabID: fixture.tabAID))
+        XCTAssertEqual(movedOwner.state, state, "The stamp is never refreshed by the move")
+        let movedLoader = RichPresentationHistoryLoader()
+        guard case .loaded(manifest)? = await movedLoader.manifest(for: reference, owner: movedOwner) else {
+            return XCTFail("D2 must not hide history at the moved root")
+        }
+        let movedImage = await movedLoader.image(assetID: asset.assetID, reference: reference, owner: movedOwner)
+        XCTAssertNotNil(movedImage)
+
+        // 5b) A mounted block across an in-flight root mutation and an owner replacement.
+        try await assertMountedStateAcrossMutationAndOwnerReplacement(
+            reference: reference, manifest: manifest, owner: movedOwner, otherSession: fixture.sessionB
+        )
+
+        // 6) A missing image keeps the document; a missing manifest falls back to the summary.
+        let artifactDirectory = richSessionDirectory(root: movedRoot, sessionID: fixture.sessionAID)
+            .appendingPathComponent(reference.artifactID.uuidString)
+        try FileManager.default.removeItem(at: artifactDirectory.appendingPathComponent(asset.assetID.uuidString + ".jpg"))
+        let missingImageLoader = RichPresentationHistoryLoader()
+        guard case .loaded? = await missingImageLoader.manifest(for: reference, owner: movedOwner) else {
+            return XCTFail("A missing image must keep the document text")
+        }
+        let missingImage = await missingImageLoader.image(assetID: asset.assetID, reference: reference, owner: movedOwner)
+        XCTAssertNil(missingImage)
+        let manifestURL = artifactDirectory.appendingPathComponent("manifest.json")
+        let manifestBytes = try Data(contentsOf: manifestURL)
+        try FileManager.default.removeItem(at: manifestURL)
+        let missingManifestLoader = RichPresentationHistoryLoader()
+        let missingManifest = await missingManifestLoader.manifest(for: reference, owner: movedOwner)
+        XCTAssertEqual(missingManifest, .unavailable)
+
+        // 7) The negative cache holds until the fallback's explicit retry: restoring the file is
+        // not seen by itself, and the retry for the same identity reads the disk again.
+        try manifestBytes.write(to: manifestURL)
+        let readsBeforeRetry = missingManifestLoader.test_manifestReadCount
+        let stillCached = await missingManifestLoader.manifest(for: reference, owner: movedOwner)
+        XCTAssertEqual(stillCached, .unavailable)
+        XCTAssertEqual(missingManifestLoader.test_manifestReadCount, readsBeforeRetry, "Served from the negative cache")
+        guard case let .ready(retryIdentity) = missingManifestLoader.loadContext(for: reference, owner: movedOwner) else {
+            return XCTFail("The restored owner is ready")
+        }
+        var retryState = RichPresentationBlockLoadState()
+        XCTAssertTrue(retryState.accept(stillCached, startedFor: retryIdentity, current: .ready(retryIdentity)))
+        missingManifestLoader.forgetUnavailable(for: retryIdentity)
+        retryState.reset()
+        XCTAssertNil(retryState.displayed(for: .ready(retryIdentity), cached: missingManifestLoader.cachedManifest(for:)))
+        let retried = await missingManifestLoader.manifest(for: reference, owner: movedOwner)
+        XCTAssertEqual(retried, .loaded(manifest), "The retry reads the restored manifest")
+        XCTAssertEqual(missingManifestLoader.test_manifestReadCount, readsBeforeRetry + 1)
+        XCTAssertTrue(retryState.accept(retried, startedFor: retryIdentity, current: .ready(retryIdentity)))
+        XCTAssertEqual(
+            retryState.displayed(for: .ready(retryIdentity), cached: missingManifestLoader.cachedManifest(for:)),
+            .loaded(manifest)
+        )
+        XCTAssertEqual(transport.requests.count, 1, "History never touches the network")
+    }
+
+    /// A mounted block's state machine with the real loader: a read that races a root mutation is
+    /// discarded and caches nothing, the mutation publishes `storageGeneration` and changes the
+    /// identity, a completion that started for the old identity is dropped, and an owner
+    /// replacement (another session object with the same IDs, stamp and root) never shows the
+    /// previous owner's content.
+    private func assertMountedStateAcrossMutationAndOwnerReplacement(
+        reference: RichPresentationReference,
+        manifest: AgentRichArtifactManifest,
+        owner: RichPresentationHistoryLoader.Owner,
+        otherSession: AgentTabSession
+    ) async throws {
+        let publication = RichPresentationPublicationService()
+        let loader = RichPresentationHistoryLoader(publication: { publication })
+        guard case let .ready(before) = loader.loadContext(for: reference, owner: owner) else {
+            return XCTFail("The owner is ready before the mutation")
+        }
+        var state = RichPresentationBlockLoadState()
+        let generationBefore = publication.storageGeneration
+        var mutation: RichPresentationPublicationService.Mutation?
+        loader.test_onManifestReadStarted = {
+            mutation = publication.beginMutation(workspaceIDs: [owner.workspaceID])
+        }
+        let raced = await loader.manifest(for: reference, owner: owner)
+        loader.test_onManifestReadStarted = nil
+        XCTAssertNil(raced, "A read that raced a root mutation is discarded")
+        XCTAssertGreaterThan(publication.storageGeneration, generationBefore, "The mutation is observable")
+        XCTAssertEqual(loader.loadContext(for: reference, owner: owner), .pending)
+        XCTAssertNil(loader.cachedManifest(for: before), "Nothing is cached for the raced identity")
+        XCTAssertFalse(state.accept(raced, startedFor: before, current: loader.loadContext(for: reference, owner: owner)))
+        XCTAssertNil(state.displayed(for: .pending, cached: loader.cachedManifest(for:)), "Pending shows loading")
+
+        let generationDuring = publication.storageGeneration
+        try publication.endMutation(XCTUnwrap(mutation))
+        XCTAssertGreaterThan(publication.storageGeneration, generationDuring, "The end is observable")
+        guard case let .ready(after) = loader.loadContext(for: reference, owner: owner) else {
+            return XCTFail("The owner is ready after the mutation")
+        }
+        XCTAssertNotEqual(after, before, "The revision changes the identity")
+        XCTAssertFalse(
+            state.accept(.loaded(manifest), startedFor: before, current: .ready(after)),
+            "A completion for the old identity is dropped"
+        )
+        let loaded = await loader.manifest(for: reference, owner: owner)
+        XCTAssertEqual(loaded, .loaded(manifest))
+        XCTAssertTrue(state.accept(loaded, startedFor: after, current: .ready(after)))
+        XCTAssertEqual(state.displayed(for: .ready(after), cached: loader.cachedManifest(for:)), .loaded(manifest))
+
+        // Owner replacement: everything equal but the session object.
+        let replaced = RichPresentationHistoryLoader.LoadIdentity(
+            tabID: after.tabID, session: ObjectIdentifier(otherSession), sessionID: after.sessionID,
+            stamp: after.stamp, workspaceID: after.workspaceID, root: after.root,
+            revision: after.revision, artifactID: after.artifactID
+        )
+        XCTAssertNotEqual(replaced, after)
+        XCTAssertNil(
+            state.displayed(for: .ready(replaced), cached: { _ in nil }),
+            "A replaced owner never shows the previous owner's manifest"
+        )
+        XCTAssertFalse(state.accept(.loaded(manifest), startedFor: after, current: .ready(replaced)))
+    }
+
     private struct PublishedSourceReference {
         let sourceState: AgentSessionPersistenceState
         let reference: RichPresentationReference
@@ -4714,6 +5434,87 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
 @MainActor
 private final class RichHandoffFlag {
     var value = false
+}
+
+/// Phases observed by a rich-artifact phase hook (called on the data-service actor).
+private final class RichPhaseLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recorded: [String] = []
+
+    var values: [String] {
+        lock.withLock { recorded }
+    }
+
+    func append(_ phase: String) {
+        lock.withLock { recorded.append(phase) }
+    }
+}
+
+/// Holds one session write inside the data service's synchronous write-failure injector until
+/// released from the main actor (the injector cannot suspend). Release is idempotent.
+private final class SessionWriteGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private let semaphore = DispatchSemaphore(value: 0)
+    private var entered = false
+    private var released = false
+
+    func holdUntilReleased() {
+        let mustWait = lock.withLock { () -> Bool in
+            entered = true
+            return !released
+        }
+        if mustWait { semaphore.wait() }
+    }
+
+    @MainActor
+    func waitUntilEntered(timeout: Duration) async -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now + timeout
+        while !lock.withLock({ entered }), clock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return lock.withLock { entered }
+    }
+
+    func release() {
+        let shouldSignal = lock.withLock { () -> Bool in
+            guard !released else { return false }
+            released = true
+            return entered
+        }
+        if shouldSignal { semaphore.signal() }
+    }
+}
+
+/// Holds a rich publication at a data-service phase until released (never resumes on its own).
+private actor RichPublicationHold {
+    private var entered = false
+    private var released = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func hold() async {
+        entered = true
+        guard !released else { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func waitUntilEntered(timeout: Duration) async -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now + timeout
+        while !entered, clock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return entered
+    }
+
+    func release() {
+        released = true
+        let pending = waiters
+        waiters = []
+        for waiter in pending {
+            waiter.resume()
+        }
+    }
 }
 
 @MainActor

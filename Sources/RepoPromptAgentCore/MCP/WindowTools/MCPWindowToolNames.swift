@@ -41,6 +41,9 @@ package enum MCPWindowToolName {
     /// RepoPrompt-owned script executor over the four exploration tools (plan §6 D3). Advertised
     /// and executable only under an installed run policy with `.directTools` eligibility.
     package static let codeMode = "code_mode"
+    /// Inline rich presentation; listed only for a granted Agent Mode run attempt
+    /// (`AgentRichPresentationToolPolicy`).
+    package static let presentRich = "present_rich"
 
     package static let shareThoughts = "share_thoughts"
     package static let setStatus = "set_status"

@@ -48,7 +48,8 @@ enum AgentSanitizeIncrementalPathReason: String, Equatable {
 }
 
 package struct AgentSanitizedTranscriptMetrics: Equatable {
-    package let transcript: AgentTranscript
+    /// Mutable only so rich-presentation capture can attach turn-owned references after any path.
+    package var transcript: AgentTranscript
     let sanitizedActivityCount: Int
     let reusedTurnCount: Int
     let incrementalPathReason: AgentSanitizeIncrementalPathReason
@@ -176,6 +177,30 @@ package enum AgentToolResultPersistencePolicy {
                 processID: execution?.processID,
                 exitCode: execution?.exitCode,
                 preservesRawPayload: true
+            )
+        }
+
+        // A recognized successful `present_rich` result is stored as its canonical text body. The
+        // turn-owned reference (captured before sanitization) is the durable authority, so a later
+        // persistent cap replacing this body loses nothing. Errors and anything unrecognized fall
+        // through to ordinary handling.
+        if normalizedToolName == AgentRichPresentationToolPolicy.toolName,
+           AgentRichPresentationResultNormalizer.isPresentRichToolName(item.toolName),
+           item.toolIsError != true,
+           let rawResultJSON,
+           let reference = AgentRichPresentationResultNormalizer.reference(fromResultText: rawResultJSON),
+           let canonical = AgentRichPresentationResultNormalizer.canonicalResultJSON(for: reference)
+        {
+            return AgentSanitizedToolResult(
+                text: canonical,
+                resultJSON: canonical,
+                toolIsError: false,
+                persistedStatusWord: "success",
+                transcriptStatus: .success,
+                summaryOnly: false,
+                processID: nil,
+                exitCode: nil,
+                preservesRawPayload: false
             )
         }
 
@@ -766,6 +791,32 @@ package enum AgentToolResultPersistencePolicy {
         preservedVisibleToolResultRowIDs: Set<UUID>? = nil,
         context: AgentToolResultProcessingContext? = nil,
         purpose: AgentToolResultSanitizationPurpose = .runtimePresentation
+    ) -> AgentSanitizedTranscriptMetrics {
+        var metrics = sanitizeTranscriptWithMetricsUncaptured(
+            transcript,
+            previousSanitizedTranscript: previousSanitizedTranscript,
+            previousRawInputEvidence: previousRawInputEvidence,
+            reusablePrefixTurnCount: reusablePrefixTurnCount,
+            trustedReusablePrefixTurnCount: trustedReusablePrefixTurnCount,
+            trustedIncrementalFinalTurnStartSequenceIndex: trustedIncrementalFinalTurnStartSequenceIndex,
+            preservedVisibleToolResultRowIDs: preservedVisibleToolResultRowIDs,
+            context: context,
+            purpose: purpose
+        )
+        metrics.transcript = AgentRichPresentationCapture.attaching(from: transcript, to: metrics.transcript)
+        return metrics
+    }
+
+    private static func sanitizeTranscriptWithMetricsUncaptured(
+        _ transcript: AgentTranscript,
+        previousSanitizedTranscript: AgentTranscript?,
+        previousRawInputEvidence: AgentSanitizeRawInputEvidence?,
+        reusablePrefixTurnCount: Int?,
+        trustedReusablePrefixTurnCount: Int?,
+        trustedIncrementalFinalTurnStartSequenceIndex: Int?,
+        preservedVisibleToolResultRowIDs: Set<UUID>?,
+        context: AgentToolResultProcessingContext?,
+        purpose: AgentToolResultSanitizationPurpose
     ) -> AgentSanitizedTranscriptMetrics {
         if purpose == .runtimePresentation,
            (preservedVisibleToolResultRowIDs ?? []).isEmpty,

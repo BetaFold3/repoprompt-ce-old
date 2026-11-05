@@ -41,7 +41,7 @@ final class MCPToolExecutionContractTests: XCTestCase {
                 MCPGlobalToolName.orderedToolNames + MCPWindowToolGroup.orderedToolNames,
                 caseLabel
             )
-            XCTAssertEqual(MCPToolExecutionContractCatalog.orderedAdvertisedToolNames.count, 31, caseLabel)
+            XCTAssertEqual(MCPToolExecutionContractCatalog.orderedAdvertisedToolNames.count, 32, caseLabel)
             XCTAssertEqual(
                 Set(MCPToolExecutionContractCatalog.orderedAdvertisedToolNames).count,
                 MCPToolExecutionContractCatalog.orderedAdvertisedToolNames.count,
@@ -75,7 +75,8 @@ final class MCPToolExecutionContractTests: XCTestCase {
                 MCPWindowToolName.setStatus,
                 MCPWindowToolName.history,
                 MCPWindowToolName.workspaceSteer,
-                MCPWindowToolName.codeMode
+                MCPWindowToolName.codeMode,
+                MCPWindowToolName.presentRich
             ], caseLabel)
 
             for toolName in names(for: .bounded) {

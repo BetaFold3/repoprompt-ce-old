@@ -66,8 +66,8 @@ package struct AgentRichPresentationAttemptPolicy: Equatable, Hashable {
 package typealias AgentRichPresentationPolicyResolver = @MainActor (AgentTabSession) -> AgentRichPresentationAttemptPolicy?
 
 /// Derives the dedicated rich-presentation tool grant from an attempt's captured ownership.
-/// `present_rich` itself stays unregistered until Step 4: the grant only shapes connection policy
-/// (listing and direct-call checks) and is inert while no provider registers the tool.
+/// `present_rich` is registered in every window catalog but policy-gated: this grant decides its
+/// listing and direct-call admission, and the call-time resolver re-proves the exact attempt.
 package enum AgentRichPresentationToolPolicy {
     /// The tool name reserved for the dedicated `.richPresentation` capability.
     package static let toolName = "present_rich"

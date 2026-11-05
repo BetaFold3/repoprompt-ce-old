@@ -17,7 +17,10 @@ final class MCPCodeModeToolIntegrationTests: XCTestCase {
     // MARK: - Catalog and policy
 
     func testCodeModeCatalogEntryHasItsContractAdmissionClassAndRestrictions() {
-        XCTAssertEqual(MCPWindowToolGroup.orderedToolNames.last, MCPWindowToolName.codeMode)
+        XCTAssertEqual(
+            Array(MCPWindowToolGroup.orderedToolNames.suffix(2)),
+            [MCPWindowToolName.codeMode, MCPWindowToolName.presentRich]
+        )
         XCTAssertEqual(
             MCPToolExecutionContractCatalog.contract(for: MCPWindowToolName.codeMode),
             .bounded(deadline: .seconds(62), cancellationGrace: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace)

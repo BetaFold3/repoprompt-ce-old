@@ -4,7 +4,7 @@ import RepoPromptAgentCore
 /// Exact rich-presentation creation authority for one MCP request
 /// (docs/context/specs/2026-11-04-rich-presentation-spec.md, A3).
 ///
-/// The Step 1 admission seam for the future `present_rich` tool; no tool uses it yet. Authority
+/// The admission seam for `present_rich` (`RichPresentationMCPToolService`). Authority
 /// comes only from trusted request metadata captured in one actor read: the connection's run
 /// route (`actorRoutedRunTab`) and the attempt ownership applied to that connection with its run
 /// policy (`appliedRunOwnership`). Tool arguments, `_windowID`, `context_id`, selected tabs, client
@@ -115,10 +115,13 @@ struct RichPresentationMCPAuthorityResolver {
             return .failure(.invalidContext(Self.noAttemptAuthorityMessage))
         }
         guard let window = windows().first(where: { $0.windowID == windowID }),
-              !window.isClosing,
-              window.workspaceManager.activeWorkspace?.id == routeWorkspaceID
+              !window.isClosing
         else {
             return .failure(.invalidContext(Self.noAttemptAuthorityMessage))
+        }
+        // Only the guidance differs: background-workspace runs are not authorized (no redesign).
+        guard window.workspaceManager.activeWorkspace?.id == routeWorkspaceID else {
+            return .failure(.invalidContext(Self.inactiveWorkspaceMessage))
         }
         let viewModel = window.agentModeViewModel
         guard let session = viewModel.sessions[tabID],
@@ -147,6 +150,8 @@ struct RichPresentationMCPAuthorityResolver {
 
     static let noAttemptAuthorityMessage =
         "Rich presentation needs the current local Agent Mode run of this session, and this request's run could not be proven current. Nothing was created. Start a new agent run."
+    static let inactiveWorkspaceMessage =
+        "Rich presentation works only while this run's workspace is the active workspace of its window, and another workspace is active now. Nothing was created. Starting a new run will not help while the workspace stays in the background: ask the user to switch the window back to this workspace and then present again, or continue in text."
     static let gatewayRefusalMessage =
         "Rich presentation is available only to local Agent Mode runs, not paired devices or external clients. Nothing was created."
     static let disabledMessage =
