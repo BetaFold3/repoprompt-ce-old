@@ -6,7 +6,7 @@ Last-verified: 2026-11-04
 
 ## Goal and status
 Let an assistant gather information with its existing tools, then publish attractive line/bar charts and complete newspaper briefings directly in Agent Mode's transcript. Existing content remains readable offline and after restart.
-**Steps 1–4 implemented and reviewed; Step 5 static acceptance passed, with live acceptance deferred by the owner.** OracleE and OracleD received identical initial evidence/policy, then two argument-exchange rounds. One material disagreement remains (D1). Step counters below now record implementation re-review rounds.
+**Steps 1–4 implemented and reviewed; Step 5 static acceptance passed and live acceptance is in progress.** OracleE and OracleD received identical initial evidence/policy, then two argument-exchange rounds. One material disagreement remains (D1). Step counters below now record implementation re-review rounds.
 Evidence directory (local, ignored, not committed): `docs/investigations/2026-11-04-rich-presentation/evidence/`. It contains scouts, exact requests/replies, finding dispositions, and documentation-check results; none belongs in this spec.
 Follow the [review policy](../review-policy.md) and [validation workflow](../workflows/validation.md). Automated validation is recorded in the evidence directory; live provider/UI and advisory performance acceptance remain unverified.
 
@@ -21,6 +21,7 @@ Follow the [review policy](../review-policy.md) and [validation workflow](../wor
 - The owner requested a technical spec, not implementation.
 - On 2026-11-05, the owner chose bounded storage support: refuse rich creation and artifact-bearing handoffs when resolved workspace and session storage disagree, accept the resulting global-custom-storage limitation, and leave existing session persistence unchanged (D2).
 - On 2026-11-05, the owner deferred live acceptance and chose to leave the current Dev app untouched; provider/UI/restart and advisory performance checks remain unverified (D3).
+- On 2026-11-06, the owner reported rebuilding/relaunching, confirmed workspace Rich Presentation enabled with empty approved image hosts, and approved Claude/Codex/OMP live acceptance sessions.
 
 ## Non-goals
 No scraping/scheduling, arbitrary HTML/JavaScript, WebKit changes, MCP Apps hosting, general structured-result migration, new branch UI, or native Codex conversation-branching implementation. No background image refresh, redirects, authenticated downloads, automatic retries, animation/SVG, advanced chart types, embedded briefing charts, new export formats, or cross-session shared assets.
@@ -106,7 +107,7 @@ Step 4 — done | rounds 1/2 | open: none | downgraded: none | assumed: A1,A2,A6
 - Change: fix only observed integration defects and update this owning spec's status/contract; keep raw evidence outside it.
 - Validation: affected `make dev-test FILTER=<Suite>`, `make dev-lint`, product build and `make guardrails`; context checker plus its negative suite. With immediate owner approval, exercise Claude/Codex/OMP tool refresh, worker/Knowledge output, long history, resizing, selection, restart, handoff and image denial in the Dev app.
 - Done when: full-inline normal use works and required security/data-retention checks pass; record provider/live gaps honestly. Compare scroll/layout/memory behavior against a text baseline under matched conditions, report uncertainty on the noisy host, and let the owner accept advisory results.
-Step 5 — blocked | rounds 0/2 | open: owner-deferred live acceptance (D3) | downgraded: none | assumed: A1–A6 | deferred: provider/UI/restart and advisory measurements in step5-final.md
+Step 5 — doing | rounds 0/2 | open: live acceptance | downgraded: none | assumed: A1–A6 | deferred: remaining provider/UI/restart and advisory checks tracked in step5-live-2026-11-06.md
 
 ## Disagreements
 - **Resolved:** native rendering and one tool replace the proposed chart/WebKit split; full-inline layout needs no webview sizing lifecycle.
