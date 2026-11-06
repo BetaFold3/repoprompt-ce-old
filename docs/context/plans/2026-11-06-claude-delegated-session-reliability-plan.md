@@ -3,7 +3,7 @@
 Scope: read when the task touches delegated/MCP-originated Claude runtime retention, completed-session release, admission-pressure reconnects, or standalone CLI bootstrap diagnosis.
 Authority: Authoritative
 Last-verified: 2026-11-06
-Status: item 1 implemented and owner-approved after independent OracleA and OracleB approval; live acceptance remains explicitly deferred (§1 status line). Items 2–4 remain design only.
+Status: item 1 implemented and owner-approved after independent OracleA and OracleB approval; bounded live idle-release/follow-up/user-control acceptance passed on `b0580cb8` (§1 status line). Items 2–4 remain design only.
 
 ## 0. Decisions, boundaries and implementation order
 
@@ -15,7 +15,7 @@ Implement in this order, because a clean measurement environment first needs bou
 3. Option A: intentional retirement of server-proven completed-owned idle admission victims, rather than a reconnectable socket close.
 4. Recheck standalone CLI bootstrap after items 1–3; defer timeout/retry policy changes unless the problem persists.
 
-Owner authorization (2026-11-06): finish and commit item 1, merge `dev/v1.0.29-remote-client-models` (including `b7baf605` and `09d8d43b`), and prepare a clean, signed daily debug bundle without launching it. Relaunch, paid model attempts, push, cap mutation and process cleanup remain unauthorized. Savings, cost-gate and promotion remain deferred. Future measurement is governed by [code-mode plan §13](2026-10-03-code-mode-readiness-and-git-narrowing-plan.md#13-future-re-measurement-protocol-not-authorized-to-run).
+Owner authorization (2026-11-06): finish and commit item 1, merge `dev/v1.0.29-remote-client-models` (including `b7baf605` and `09d8d43b`), and prepare a clean, signed daily debug bundle without launching it. The owner subsequently reported relaunching that bundle and approved a bounded live item-1 smoke check: delegated idle shutdown, one follow-up, and user-created control tabs. That check is complete; further model attempts, relaunch, push, cap mutation and process cleanup are not authorized by this record. Savings, cost-gate and promotion remain deferred. Future measurement is governed by [code-mode plan §13](2026-10-03-code-mode-readiness-and-git-narrowing-plan.md#13-future-re-measurement-protocol-not-authorized-to-run).
 
 Source references below were checked in the worktree at `9f78a54b` (code unchanged from `e24e593c`); line numbers supersede the older handoff's offsets. File aliases expand to these repository-relative paths:
 
@@ -34,7 +34,7 @@ Source references below were checked in the worktree at `9f78a54b` (code unchang
 
 ## 1. Delegated Claude idle shutdown — first implementation
 
-Step 1 — done | rounds 2/2 | open: none; owner-approved implementation | downgraded: none | assumed: none | deferred: live process/helper/socket acceptance; OracleB P2-7 (tested handoff overload); N2/N3 (unproven caller/rare fresh-ID ordering), N4 (retirement-stop diagnostics), N5 (fixture fidelity), N6/R2-4 (single runner/probe invariant); two documented pre-existing lifecycle failures. Evidence: `evidence/2026-11-06-claude-delegated-session-reliability/validation.txt`, `oracle-a-round2.txt`, `oracle-b-round2.txt` in that directory.
+Step 1 — done | rounds 2/2 | open: none; owner-approved implementation | downgraded: none | assumed: none | deferred: broader live cancellation/race and resource-pressure coverage; OracleB P2-7 (tested handoff overload); N2/N3 (unproven caller/rare fresh-ID ordering), N4 (retirement-stop diagnostics), N5 (fixture fidelity), N6/R2-4 (single runner/probe invariant); two documented pre-existing lifecycle failures. Evidence: `evidence/2026-11-06-claude-delegated-session-reliability/validation.txt`, `oracle-a-round2.txt`, `oracle-b-round2.txt`, and `live-idle-b0580cb8-20261106.txt` in that directory.
 
 ### Current behavior and authority
 
@@ -65,7 +65,7 @@ Step 1 — done | rounds 2/2 | open: none; owner-approved implementation | downg
 
 ### Implementation status (item 1, 2026-11-06)
 
-Implemented and approved for commit by the owner; no live qualification is claimed. The C/R/V/S line references above predate this change; C owns the `Delegated idle runtime release` section. Validation and review narrative lives in the local evidence directory (`docs/context/plans/evidence/2026-11-06-claude-delegated-session-reliability/`), not here.
+Implemented in `8728a2c9` and integrated in `b0580cb8`. Owner-approved bounded live acceptance passed on the clean signed `b0580cb8` daily bundle: two idle releases, one fresh-conversation follow-up with truthful handoff, and two unchanged user-owned controls. This is not live race or resource-pressure qualification. The C/R/V/S line references above predate this change; C owns the `Delegated idle runtime release` section. Validation and review narrative lives in the local evidence directory (`docs/context/plans/evidence/2026-11-06-claude-delegated-session-reliability/`), not here.
 
 **Arming.** `scheduleIdleRuntimeReleaseIfEligible(for:reason:committedAttemptID:)` is the single entry point.
 - It requires all of the following:
@@ -122,7 +122,7 @@ Implemented and approved for commit by the owner; no live qualification is claim
 **Tests.** `Tests/RepoPromptTests/AgentMode/ClaudeCompatible/ClaudeDelegatedIdleRuntimeReleaseTests.swift` contains the `AgentModeRunServiceLifecycleTests.testClaudeDelegatedIdle*` tests. They use a fake controller, manual clock and host-consumed handoff staging.
 
 **Remaining gaps.**
-- All evidence is deterministic; there is no live process or socket release evidence.
+- Live evidence covers two ordinary idle intervals and one follow-up only. Owned wrapper/Claude/helper processes and helper connections exited; user-owned Haiku and Sonnet controls remained retained. Cancellation/stale-owner races and preservation of an already-pending payload/delivery ID remain deterministic-test evidence, not live coverage. Longer-run/global resource stabilization is unqualified on the shared host.
 - The superseded-attempt late request is exercised directly. The A5 overlap is exercised through a gated real terminal publication and the barrier's real duplicate-commit retry.
 - The at-expiry matrix omits `pendingAskUser`, `pendingWorktreeMergeReview` and composer submission; these rely on the shared predicate.
 - A permanently dirty session is never released.
