@@ -443,7 +443,10 @@ enum ToolOutputFormatter {
         if let m = message, !m.isEmpty { out.append("- **Note**: \(m)") }
         out.append(contentsOf: worktreeScopeLines(worktreeScope, operation: .readFile))
         out.append("")
-        out.append("```\(language)\n\(content)\n```")
+        // Preserve source bytes, adding only the separator needed to put the closing fence
+        // on its own line. An existing LF (including CRLF) must not become a synthetic blank.
+        let fenceSeparator = content.isEmpty || content.utf8.last == 0x0A ? "" : "\n"
+        out.append("```\(language)\n\(content)\(fenceSeparator)```")
         return out.joined(separator: "\n")
     }
 
