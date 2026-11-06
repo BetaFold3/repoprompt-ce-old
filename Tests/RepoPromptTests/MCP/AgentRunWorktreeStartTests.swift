@@ -1798,6 +1798,89 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         XCTAssertEqual(viewModel.executionLocationProps(tabID: tabID)?.isEnabled, true)
     }
 
+    func testFreshBindingTransitionsDoNotStageRecoveryContextAndPreserveExistingPayloads() async throws {
+        for intent in [AgentModeViewModel.WorktreeBindingTransitionIntent.initialSend, .externalManagement] {
+            // Interactive New Session may reuse an untouched placeholder; isolate each case
+            // so the second intent cannot inherit the first case's reserved handoff.
+            let root = try makeTemporaryDirectory(named: "fresh-handoff-root")
+            let worktree = try makeTemporaryDirectory(named: "fresh-handoff-worktree")
+            let window = try await makeWindow(root: root)
+            let viewModel = window.agentModeViewModel
+            let createdTabID = await viewModel.createAndActivateSessionTab()
+            let tabID = try XCTUnwrap(createdTabID)
+            let session = try await viewModel.ensureSessionReady(tabID: tabID)
+            let sessionID = try XCTUnwrap(session.activeAgentSessionID)
+            let binding = makeBinding(logicalRoot: root.path, worktreeRoot: worktree.path)
+            _ = try await viewModel.transitionWorktreeBindings([binding], forSessionID: sessionID, intent: intent)
+
+            XCTAssertNil(session.pendingHandoff.payload, "A fresh worktree binding is not a failed resume")
+            let staged = viewModel.stagePendingHandoffIfNeeded("First task", session: session)
+            let message = AgentModeViewModel.composeInitialThreadMessage(
+                initialMessage: staged.text, fileTree: "current-worktree", promptText: nil
+            )
+            XCTAssertEqual(message.components(separatedBy: "<file_map>").count - 1, 1)
+            XCTAssertFalse(message.contains("<forked_session"))
+            XCTAssertFalse(message.contains("native resume failed"))
+
+            session.pendingHandoff = AgentPendingHandoffState(
+                payload: "Existing handoff", sourceItemID: UUID(), payloadID: UUID()
+            )
+            _ = viewModel.stagePendingHandoffIfNeeded("Reserved task", session: session)
+            let existing = session.pendingHandoff
+            _ = try await viewModel.transitionWorktreeBindings([], forSessionID: sessionID, intent: .externalManagement)
+            XCTAssertEqual(session.pendingHandoff, existing, "A transition must not clear or restage an existing payload")
+        }
+    }
+
+    func testBindingTransitionPreservesHistoricalTranscriptOutsideWorkingItems() async throws {
+        let root = try makeTemporaryDirectory(named: "historical-handoff-root")
+        let worktree = try makeTemporaryDirectory(named: "historical-handoff-worktree")
+        let window = try await makeWindow(root: root)
+        let viewModel = window.agentModeViewModel
+        let createdTabID = await viewModel.createAndActivateSessionTab()
+        let tabID = try XCTUnwrap(createdTabID)
+        let session = try await viewModel.ensureSessionReady(tabID: tabID)
+        let sessionID = try XCTUnwrap(session.activeAgentSessionID)
+        session.transcript = AgentTranscriptIO.buildTranscript(
+            from: [.user("Historical question", sequenceIndex: 0), .assistant("Historical answer", sequenceIndex: 1)],
+            terminalState: .completed, compact: false
+        )
+        XCTAssertTrue(session.items.isEmpty)
+        let binding = makeBinding(logicalRoot: root.path, worktreeRoot: worktree.path)
+        _ = try await viewModel.transitionWorktreeBindings([binding], forSessionID: sessionID, intent: .externalManagement)
+
+        let payload = try XCTUnwrap(session.pendingHandoff.payload)
+        XCTAssertTrue(payload.contains("Historical question"))
+        XCTAssertTrue(payload.contains("Historical answer"))
+        XCTAssertTrue(payload.contains("Continue this session using the recovered transcript"))
+        XCTAssertTrue(payload.contains("<original_thread_context>"))
+        XCTAssertFalse(payload.contains("native resume failed"))
+    }
+
+    func testBindingTransitionDoesNotMistakeAnUnresolvedCutoffForEmptyHistory() async throws {
+        let root = try makeTemporaryDirectory(named: "unresolved-handoff-root")
+        let worktree = try makeTemporaryDirectory(named: "unresolved-handoff-worktree")
+        let window = try await makeWindow(root: root)
+        let viewModel = window.agentModeViewModel
+        let createdTabID = await viewModel.createAndActivateSessionTab()
+        let tabID = try XCTUnwrap(createdTabID)
+        let session = try await viewModel.ensureSessionReady(tabID: tabID)
+        let sessionID = try XCTUnwrap(session.activeAgentSessionID)
+        let unmatched = AgentChatItem.user("Unmatched working cutoff", sequenceIndex: 0)
+        session.items = [unmatched]
+        session.transcript = AgentTranscriptIO.buildTranscript(
+            from: [.user("Historical question", sequenceIndex: 0)],
+            terminalState: .completed, compact: false
+        )
+        XCTAssertNil(viewModel.resolvedHandoffSourceTranscript(for: session, upToItemID: unmatched.id))
+        let binding = makeBinding(logicalRoot: root.path, worktreeRoot: worktree.path)
+        _ = try await viewModel.transitionWorktreeBindings([binding], forSessionID: sessionID, intent: .externalManagement)
+
+        let payload = try XCTUnwrap(session.pendingHandoff.payload)
+        XCTAssertTrue(payload.contains("<original_thread_context>"), "Unavailable history retains the context-only fallback")
+        XCTAssertFalse(payload.contains("native resume failed"))
+    }
+
     func testBindingTransitionMaterializesSessionWorktreeWithoutCodemapWork() async throws {
         let root = try makeTemporaryDirectory(named: "transition-root")
         let worktree = try makeTemporaryDirectory(named: "transition-worktree")

@@ -240,6 +240,54 @@ final class AgentPendingHandoffStageOutcomeTests: XCTestCase {
         XCTAssertEqual(vm.stagePendingHandoffIfNeeded("user", session: session).text, "## Handoff\n\nuser")
     }
 
+    func testGenuineResumeRecoveryStillPreservesContextWithoutATranscript() {
+        let payload = AgentModeViewModel.composeClaudeResumeRecoveryHandoffPayload(
+            sourceTabName: "Source", sourceAgentName: "Claude Code",
+            transcriptXML: "<transcript>\n</transcript>",
+            initialThreadContextBlock: "<file_map>\noriginal\n</file_map>",
+            deliveryID: "delivery", reason: .nativeResumeFailure
+        )
+        let expected = [
+            "<forked_session source=\"Source\" delivery_id=\"delivery\">",
+            "You are continuing a session that was restarted after a native resume failed for Claude Code. Use the recovered transcript below, plus any preserved thread context, to continue seamlessly.",
+            "",
+            "<original_thread_context>",
+            "<file_map>",
+            "original",
+            "</file_map>",
+            "</original_thread_context>",
+            "</forked_session>"
+        ].joined(separator: "\n")
+        XCTAssertEqual(Array(payload.utf8), Array(expected.utf8))
+    }
+
+    func testRecoveryStagingPreservesOwnershipAndAConcurrentlyInstalledPayload() async {
+        let (vm, session) = makeLiveSession()
+        session.items = [.user("Recover this question", sequenceIndex: 0)]
+        var owned = true
+        let lostOwnership = await vm.stageClaudeResumeRecoveryHandoffIfNeeded(
+            for: session, ifStillOwned: { owned }, beforeCommit: { owned = false }
+        )
+        XCTAssertFalse(lostOwnership)
+        XCTAssertNil(session.pendingHandoff.payload)
+
+        let existing = AgentPendingHandoffState(
+            payload: "Concurrent handoff", sourceItemID: UUID(), payloadID: UUID()
+        )
+        let installed = await vm.stageClaudeResumeRecoveryHandoffIfNeeded(
+            for: session, ifStillOwned: { true }, beforeCommit: { session.pendingHandoff = existing }
+        )
+        XCTAssertTrue(installed)
+        XCTAssertEqual(session.pendingHandoff, existing)
+
+        let preserved = await vm.stageClaudeResumeRecoveryHandoffIfNeeded(
+            for: session, ifStillOwned: { true },
+            beforeCommit: { XCTFail("Existing payload must short-circuit staging") }
+        )
+        XCTAssertTrue(preserved)
+        XCTAssertEqual(session.pendingHandoff, existing)
+    }
+
     // MARK: - Harness
 
     private func makeLiveSession() -> (AgentModeViewModel, AgentTabSession) {

@@ -8485,7 +8485,12 @@ final class AgentModeViewModel: ObservableObject {
                     throw ExecutionLocationTransitionError.stale
                 }
                 if !changedDuringActiveRun {
-                    await stageResumeRecoveryHandoffIfNeeded(for: session)
+                    _ = await stageResumeRecoveryHandoffIfNeeded(
+                        for: session,
+                        reason: .executionLocationChange,
+                        ifStillOwned: { true },
+                        beforeCommit: nil
+                    )
                 }
                 await invalidateProviderContextForExecutionLocationChange(session)
                 guard sessions[session.tabID] === session,
@@ -19092,12 +19097,18 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     // SEARCH-HELPER: Handoff, Resume, Recovery, Transcript, Session Transfer
-    // Shared helper that stages a resume-recovery handoff so the model has
-    // conversational context after a forced fresh session start.
+    enum RecoveryHandoffReason {
+        case nativeResumeFailure
+        case executionLocationChange
+    }
+
+    /// Shared helper that stages a resume-recovery handoff so the model has
+    /// conversational context after a forced fresh session start.
     @MainActor
     func stageResumeRecoveryHandoffIfNeeded(for session: AgentTabSession) async {
         _ = await stageResumeRecoveryHandoffIfNeeded(
             for: session,
+            reason: .nativeResumeFailure,
             ifStillOwned: { true },
             beforeCommit: nil
         )
@@ -19106,6 +19117,7 @@ final class AgentModeViewModel: ObservableObject {
     @MainActor
     private func stageResumeRecoveryHandoffIfNeeded(
         for session: AgentTabSession,
+        reason: RecoveryHandoffReason,
         ifStillOwned: @escaping @MainActor () -> Bool,
         beforeCommit: (@MainActor () async -> Void)?
     ) async -> Bool {
@@ -19117,6 +19129,14 @@ final class AgentModeViewModel: ObservableObject {
             return true
         }
         let cutoffItemID = session.items.last(where: { $0.kind != .thinking })?.id
+        let sourceTranscript = resolvedHandoffSourceTranscript(for: session, upToItemID: cutoffItemID)
+        if reason == .executionLocationChange, let sourceTranscript,
+           AgentTranscriptIO.buildHandoffTranscriptItems(from: sourceTranscript, upToRowID: cutoffItemID).isEmpty
+        {
+            // A fresh binding is not a failed resume. An unresolved cutoff is not proof of
+            // empty history, so retain the existing context-only fallback in that case.
+            return ifStillOwned()
+        }
         let sourceTabName = normalizedSessionTitle(workspaceManager?.composeTabName(with: session.tabID))
         let escapedSourceTabName = sourceTabName
             .replacingOccurrences(of: "\u{26}", with: "\u{26}amp;")
@@ -19124,7 +19144,10 @@ final class AgentModeViewModel: ObservableObject {
             .replacingOccurrences(of: "<", with: "\u{26}lt;")
             .replacingOccurrences(of: ">", with: "\u{26}gt;")
         let sourceAgentName = session.selectedAgent.displayName
-        let transcriptXML = buildForkTranscriptXML(from: session, upToItemID: cutoffItemID)
+        let transcriptXML = buildForkTranscriptXML(
+            from: sourceTranscript ?? .empty,
+            upToItemID: sourceTranscript == nil ? nil : cutoffItemID
+        )
         // delivery_id makes crash/restart retries best-effort idempotent at the prompt level.
         let deliveryID = UUID().uuidString
         let payload = await Self.composeClaudeResumeRecoveryHandoffPayload(
@@ -19132,7 +19155,8 @@ final class AgentModeViewModel: ObservableObject {
             sourceAgentName: sourceAgentName,
             transcriptXML: transcriptXML,
             initialThreadContextBlock: buildInitialThreadContextBlock(tabID: session.tabID),
-            deliveryID: deliveryID
+            deliveryID: deliveryID,
+            reason: reason
         )
         guard !payload.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return ifStillOwned()
@@ -19164,6 +19188,7 @@ final class AgentModeViewModel: ObservableObject {
     ) async -> Bool {
         await stageResumeRecoveryHandoffIfNeeded(
             for: session,
+            reason: .nativeResumeFailure,
             ifStillOwned: ifStillOwned,
             beforeCommit: beforeCommit
         )
@@ -22468,7 +22493,8 @@ final class AgentModeViewModel: ObservableObject {
         sourceAgentName: String,
         transcriptXML: String,
         initialThreadContextBlock: String?,
-        deliveryID: String
+        deliveryID: String,
+        reason: RecoveryHandoffReason
     ) -> String {
         let trimmedTranscriptXML = transcriptXML.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedInitialThreadContextBlock = initialThreadContextBlock?
@@ -22495,10 +22521,16 @@ final class AgentModeViewModel: ObservableObject {
         }
         guard !payloadSections.isEmpty else { return "" }
 
+        let introduction = switch reason {
+        case .nativeResumeFailure:
+            "You are continuing a session that was restarted after a native resume failed for \(sourceAgentName). Use the recovered transcript below, plus any preserved thread context, to continue seamlessly."
+        case .executionLocationChange:
+            "Continue this session using the recovered transcript below and any preserved thread context."
+        }
         let payloadBody = payloadSections.joined(separator: "\n\n")
         return """
         <forked_session source="\(sourceTabName)" delivery_id="\(deliveryID)">
-        You are continuing a session that was restarted after a native resume failed for \(sourceAgentName). Use the recovered transcript below, plus any preserved thread context, to continue seamlessly.
+        \(introduction)
 
         \(payloadBody)
         </forked_session>
