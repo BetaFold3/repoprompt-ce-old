@@ -49,7 +49,10 @@ final class MCPRichPresentationToolProvider: MCPWindowToolProviding {
             inputSchema: .object(
                 description: "One rich presentation: version, title and a chart or briefing content object.",
                 properties: [
-                    "version": .integer(description: "Schema version; must be \(Limits.schemaVersion).", enum: [.int(Limits.schemaVersion)]),
+                    // No `enum` here: Gemini-family function declarations (e.g. OMP's Google Cloud
+                    // Code Assist) accept only string enum members and reject the whole tool list on
+                    // a numeric one. `RichPresentationValidator` still rejects any other version.
+                    "version": .integer(description: "Schema version; must be \(Limits.schemaVersion)."),
                     "title": .string(description: "Presentation title (1–\(Limits.maxTitleCharacters) characters)."),
                     "content": contentSchema()
                 ],
