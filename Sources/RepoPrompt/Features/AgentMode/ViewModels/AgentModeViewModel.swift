@@ -3955,6 +3955,9 @@ final class AgentModeViewModel: ObservableObject {
             return
         }
         lastProcessedTabID = nil
+        // `stop()` cancelled delegated idle intervals when agent mode was hidden while their
+        // runtimes stayed alive; eligible delegated tabs get a fresh full interval again.
+        claudeCoordinator.rearmIdleRuntimeReleases(reason: "agent-mode-active")
         let targetTabID = pendingTabIDForLoad ?? currentTabID
         #if DEBUG
             let targetTabIDForLog = targetTabID?.uuidString.prefix(8).description ?? "nil"
@@ -19100,6 +19103,9 @@ final class AgentModeViewModel: ObservableObject {
     enum RecoveryHandoffReason {
         case nativeResumeFailure
         case executionLocationChange
+        /// A delegated session's idle runtime was released on purpose; the next turn starts a
+        /// fresh provider conversation. Not a failure.
+        case idleRuntimeRelease
     }
 
     /// Shared helper that stages a resume-recovery handoff so the model has
@@ -19183,10 +19189,30 @@ final class AgentModeViewModel: ObservableObject {
     @MainActor
     func stageClaudeResumeRecoveryHandoffIfNeeded(
         for session: AgentTabSession,
+        reason: ClaudeFreshStartHandoffReason,
         ifStillOwned: @escaping @MainActor () -> Bool,
         beforeCommit: (@MainActor () async -> Void)?
     ) async -> Bool {
-        await stageResumeRecoveryHandoffIfNeeded(
+        let recoveryReason: RecoveryHandoffReason = switch reason {
+        case .nativeResumeFailure: .nativeResumeFailure
+        case .idleRuntimeRelease: .idleRuntimeRelease
+        }
+        return await stageResumeRecoveryHandoffIfNeeded(
+            for: session,
+            reason: recoveryReason,
+            ifStillOwned: ifStillOwned,
+            beforeCommit: beforeCommit
+        )
+    }
+
+    /// Genuine native-resume-failure staging (the fallback's original contract).
+    @MainActor
+    func stageClaudeResumeRecoveryHandoffIfNeeded(
+        for session: AgentTabSession,
+        ifStillOwned: @escaping @MainActor () -> Bool,
+        beforeCommit: (@MainActor () async -> Void)?
+    ) async -> Bool {
+        await stageClaudeResumeRecoveryHandoffIfNeeded(
             for: session,
             reason: .nativeResumeFailure,
             ifStillOwned: ifStillOwned,
@@ -22526,6 +22552,8 @@ final class AgentModeViewModel: ObservableObject {
             "You are continuing a session that was restarted after a native resume failed for \(sourceAgentName). Use the recovered transcript below, plus any preserved thread context, to continue seamlessly."
         case .executionLocationChange:
             "Continue this session using the recovered transcript below and any preserved thread context."
+        case .idleRuntimeRelease:
+            "You are continuing a session whose idle \(sourceAgentName) runtime was released to free resources, so this turn starts a new \(sourceAgentName) conversation. Nothing failed. Use the transcript below, plus any preserved thread context, to continue seamlessly."
         }
         let payloadBody = payloadSections.joined(separator: "\n\n")
         return """

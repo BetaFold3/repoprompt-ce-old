@@ -58,6 +58,27 @@ final class ClaudeIntegratedAgentModeRunner {
         self.claudeCoordinator = claudeCoordinator
         self.hooks = hooks
         self.terminalCommitBarrier = terminalCommitBarrier
+        claudeCoordinator.installIdleRuntimeReleaseRunnerFence { [weak self] tabID in
+            self?.idleRuntimeReleaseBlocker(tabID: tabID)
+        }
+        claudeCoordinator.installIdleRuntimeReleaseRunTaskProbe { [weak self] tabID, attemptID in
+            self?.idleDeliveryHoldsByTabID[tabID]?.contains(attemptID) == true
+        }
+    }
+
+    /// Live-run fence for the coordinator's delegated idle release: a run task still alive, or
+    /// provider output not yet delivered or still draining, keeps the runtime retained.
+    private func idleRuntimeReleaseBlocker(tabID: UUID) -> String? {
+        if idleDeliveryHoldsByTabID[tabID]?.isEmpty == false {
+            return "run-task-alive"
+        }
+        if drainingEventRoutersByTabID[tabID]?.contains(where: { !$0.isFinished }) == true {
+            return "draining-output"
+        }
+        if eventRoutersByTabID[tabID]?.hasUndeliveredEvents == true {
+            return "undelivered-output"
+        }
+        return nil
     }
 
     func startRun(
@@ -69,6 +90,8 @@ final class ClaudeIntegratedAgentModeRunner {
         handoff: AgentProviderHandoff,
         makeLease: (_ runID: UUID, _ ownership: AgentRunOwnership) -> MCPBootstrapLease
     ) async {
+        // A new turn ends any armed idle interval; this run's own end arms a fresh one.
+        claudeCoordinator.cancelArmedIdleRuntimeRelease(for: tabID, reason: "new-turn")
         let attachmentReservationID = hooks.reserveAttachmentsForTurn(attachments, session)
 
         if initialMessageForRun != initialUserMessage,
@@ -117,7 +140,20 @@ final class ClaudeIntegratedAgentModeRunner {
             // completion → delivery unknown.
             defer { handoff.settleRunInputScope() }
             guard let self else { return }
-            defer { self.releaseIdleDeliveryHold(tabID: tabID, attemptID: runAttemptID) }
+            defer {
+                self.releaseIdleDeliveryHold(tabID: tabID, attemptID: runAttemptID)
+                // A delegated tab's idle interval starts only from this attempt's own terminal
+                // commit, and only when that commit is still current and its publication was
+                // accepted (the barrier can reject or be superseded). Expiry also waits for the
+                // save receipt and re-checks every fence.
+                if let session {
+                    self.claudeCoordinator.scheduleIdleRuntimeReleaseIfEligible(
+                        for: session,
+                        reason: "run-ended",
+                        committedAttemptID: runAttemptID
+                    )
+                }
+            }
             guard let session else { return }
             await withTaskCancellationHandler {
                 let acquired = await lease.acquire()
@@ -650,6 +686,17 @@ final class ClaudeIntegratedAgentModeRunner {
                 claudeCoordinator.releaseWrittenDispatchHandoffs(tabID: tabID) { controller in
                     liveRouters.contains { !$0.isFinished && $0.isBound(to: controller) }
                 }
+            },
+            onInboxChanged: { [weak self, weak session] router in
+                // A held approval request (waiting for the next run) or one dropped with its
+                // cancellation is activity for the delegated idle interval of the runtime this
+                // router reads; another runtime's router is not. Ordinary stream output re-arms
+                // through the between-run handler instead.
+                guard let self, let session,
+                      let controller = session.claudeController,
+                      router.isBound(to: controller as AnyObject)
+                else { return }
+                claudeCoordinator.noteIdleRuntimeActivity(for: session)
             }
         )
         if markerIsOnSubscribedStream {
@@ -755,14 +802,20 @@ final class ClaudeIntegratedAgentModeRunner {
         switch event {
         case let .stream(result):
             await hooks.handleBackgroundNativeStreamResult(result, sourceID, session)
+            // Between-run provider activity restarts a full idle interval.
+            claudeCoordinator.scheduleIdleRuntimeReleaseIfEligible(for: session, reason: "background-output")
         case let .runtimeInit(status):
             guard session.claudeAuthoritativeEventSourceID == sourceID else { return }
             persistRuntimeInitSessionID(status, session: session)
+            // A between-run conversation identity change ends the armed interval as stale; the
+            // same runtime is re-armed for its new identity.
+            claudeCoordinator.scheduleIdleRuntimeReleaseIfEligible(for: session, reason: "runtime-init")
         case let .error(message):
             // Through the background stream path, which records the row as between-run output so
             // neither a run's continuation nor its notification text treats it as the run's.
             guard let text = Self.displayableRuntimeErrorText(message) else { return }
             await hooks.handleBackgroundNativeStreamResult(AIStreamResult(type: "error", text: text), sourceID, session)
+            claudeCoordinator.scheduleIdleRuntimeReleaseIfEligible(for: session, reason: "background-output")
         case .turnCompleted:
             // Delivery evidence was recorded above; a between-run completion belongs to no
             // expected turn.

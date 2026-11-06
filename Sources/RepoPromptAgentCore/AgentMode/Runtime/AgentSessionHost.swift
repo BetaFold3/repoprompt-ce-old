@@ -117,6 +117,14 @@ final class ClaudeDispatchBaselineRefusal {
     var refused = false
 }
 
+/// Why the Claude coordinator started a fresh provider conversation that must carry the transcript.
+package enum ClaudeFreshStartHandoffReason: Equatable {
+    /// Resuming the saved conversation failed, so a fresh one was started as a fallback.
+    case nativeResumeFailure
+    /// The delegated session's idle runtime was released intentionally; nothing failed.
+    case idleRuntimeRelease
+}
+
 /// Host surface used by `ClaudeAgentModeCoordinator`.
 @MainActor
 package protocol ClaudeAgentModeCoordinatorHost: AgentSessionHost {
@@ -130,6 +138,7 @@ package protocol ClaudeAgentModeCoordinatorHost: AgentSessionHost {
     )
     func stageClaudeResumeRecoveryHandoffIfNeeded(
         for session: AgentTabSession,
+        reason: ClaudeFreshStartHandoffReason,
         ifStillOwned: @escaping @MainActor () -> Bool,
         beforeCommit: (@MainActor () async -> Void)?
     ) async -> Bool

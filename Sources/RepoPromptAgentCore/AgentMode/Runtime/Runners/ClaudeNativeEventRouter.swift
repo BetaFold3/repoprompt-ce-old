@@ -84,6 +84,12 @@ final class ClaudeNativeEventRouter {
     private let idleHandler: IdleEventHandler
     private let isRunTaskAlive: @MainActor (UUID) -> Bool
     private let onFinished: @MainActor (ClaudeNativeEventRouter) -> Void
+    /// Called synchronously whenever an approval request is held in the inbox or a held approval
+    /// request is dropped with its cancellation, so between-run approvals that appear and disappear
+    /// without any delivery are still observed (the delegated idle release restarts its interval).
+    /// Other events are not reported: delivered output re-arms through the between-run handler and
+    /// undelivered output is fenced at expiry.
+    private let onInboxChanged: @MainActor (ClaudeNativeEventRouter) -> Void
 
     private var inbox: [InboxEntry] = []
     private var inboxHead = 0
@@ -122,7 +128,8 @@ final class ClaudeNativeEventRouter {
         initialOwner: UUID?,
         idleHandler: @escaping IdleEventHandler,
         isRunTaskAlive: @escaping @MainActor (UUID) -> Bool,
-        onFinished: @escaping @MainActor (ClaudeNativeEventRouter) -> Void = { _ in }
+        onFinished: @escaping @MainActor (ClaudeNativeEventRouter) -> Void = { _ in },
+        onInboxChanged: @escaping @MainActor (ClaudeNativeEventRouter) -> Void = { _ in }
     ) {
         self.controller = controller
         self.streamGeneration = streamGeneration
@@ -131,6 +138,7 @@ final class ClaudeNativeEventRouter {
         self.idleHandler = idleHandler
         self.isRunTaskAlive = isRunTaskAlive
         self.onFinished = onFinished
+        self.onInboxChanged = onInboxChanged
         if let initialOwner {
             runStarts = [RunStart(attemptID: initialOwner, firstSequence: 0)]
         }
@@ -193,6 +201,12 @@ final class ClaudeNativeEventRouter {
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             streamEndWaiters.append(continuation)
         }
+    }
+
+    /// Whether any read event is not yet dispatched, or one is being dispatched now (held approvals
+    /// included). The delegated idle release never retires a runtime with such output.
+    var hasUndeliveredEvents: Bool {
+        !isFinished && (inboxHead < inbox.count || inFlightSequence != nil)
     }
 
     /// Whether any undelivered event belongs to `attemptID`.
@@ -305,11 +319,15 @@ final class ClaudeNativeEventRouter {
             // No run has seen the request, so neither it nor its cancellation has an effect.
             inbox.remove(at: index)
             signal()
+            onInboxChanged(self)
             return
         }
         inbox.append(InboxEntry(sequence: nextSequence, event: event))
         nextSequence += 1
         signal()
+        if case .approvalRequest = event {
+            onInboxChanged(self)
+        }
     }
 
     private func appendRunStart(_ attemptID: UUID) {

@@ -395,6 +395,7 @@ allowed_tracked_docs=(
   "docs/context/agent-mcp-delegation-depth.md"
   "docs/context/agent-composer-file-paste.md"
   "docs/context/plans/2026-11-04-agent-document-attachments.md"
+  "docs/context/plans/2026-11-06-claude-delegated-session-reliability-plan.md"
   "docs/context/archive/2026-07-30-AGENTS.md"
   "docs/context/archive/2026-07-30-CLAUDE.md"
   "docs/context/archive/MANIFEST.md"

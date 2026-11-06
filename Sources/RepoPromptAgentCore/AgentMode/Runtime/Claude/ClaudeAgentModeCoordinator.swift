@@ -1,6 +1,7 @@
 import Foundation
 import MCP
 import OSLog
+import RepoPromptWorkspace
 
 @MainActor
 package final class ClaudeAgentModeCoordinator {
@@ -233,6 +234,72 @@ package final class ClaudeAgentModeCoordinator {
     private var pendingResumeTransferTasksByTabID: [UUID: Task<NativeAgentRuntimeSessionRef, Never>] = [:]
     private var pendingResumeTransferGenerationByTabID: [UUID: UUID] = [:]
     private var retiredResumeTransferTasksByTabID: [UUID: [Task<NativeAgentRuntimeSessionRef, Never>]] = [:]
+
+    /// Delegated idle runtime release (reliability plan item 1). One armed, cancellable timer per
+    /// tab; at expiry it moves to `retiringIdleRuntimeReleaseByTabID`, where it is joined (never
+    /// cancelled) by a successor start or an explicit shutdown of the same tab.
+    private struct IdleRuntimeRelease {
+        let generation: UUID
+        let owner: IdleRuntimeReleaseOwner
+        /// The session's idle-activity generation this interval started from.
+        var activityGeneration: UInt64
+        let task: Task<Void, Never>
+    }
+
+    /// The exact runtime owner an idle interval was armed for, captured from the accepted terminal
+    /// commit. Any difference means a later or different owner, which must survive.
+    private struct IdleRuntimeReleaseOwner: Equatable {
+        let sessionIdentifier: ObjectIdentifier
+        let binding: AgentPersistentSessionBindingIdentity?
+        let bindingTransitionGeneration: UInt64
+        let controllerIdentifier: ObjectIdentifier
+        let runAttemptGeneration: UInt64
+        let runID: UUID?
+        let terminalCommitID: UUID
+        let origin: AgentSessionOrigin
+        let provider: AgentProviderKind
+        let conversationID: String?
+        let worktreeBindings: [AgentSessionWorktreeBinding]
+    }
+
+    private enum IdleRuntimeReleaseCheck: Equatable {
+        case releasable
+        /// Transient work or interaction: no release now; a fresh full interval starts once it settles.
+        case blocked(String)
+        /// The armed timer no longer describes this tab's runtime; it ends without release.
+        case stale(String)
+    }
+
+    private enum IdleRuntimeReleaseStep {
+        case finished
+        case probe
+        case restartFullInterval
+    }
+
+    package typealias IdleRuntimeReleaseSleeper = @MainActor (_ nanoseconds: UInt64) async throws -> Void
+    /// Runner-owned live-run fence: a non-nil reason (run task alive, output undelivered or still
+    /// draining) blocks idle release of the tab's runtime.
+    package typealias IdleRuntimeReleaseRunnerFence = @MainActor (_ tabID: UUID) -> String?
+    /// Runner-owned: whether the run task of one specific run attempt has not yet returned.
+    package typealias IdleRuntimeReleaseRunTaskProbe = @MainActor (_ tabID: UUID, _ attemptID: UUID) -> Bool
+
+    package nonisolated static let delegatedIdleRuntimeReleaseDelayNanos: UInt64 = 300_000_000_000
+    /// How often a blocked timer re-observes its fences; release still needs one full interval of
+    /// quiescence after the blocker clears.
+    package nonisolated static let delegatedIdleRuntimeReleaseProbeNanos: UInt64 = 5_000_000_000
+    private static let idleRuntimeLogger = Logger(subsystem: "com.repoprompt.agents", category: "ClaudeIdleRuntime")
+
+    private var idleRuntimeReleaseDelayNanos = ClaudeAgentModeCoordinator.delegatedIdleRuntimeReleaseDelayNanos
+    private var idleRuntimeReleaseProbeNanos = ClaudeAgentModeCoordinator.delegatedIdleRuntimeReleaseProbeNanos
+    private var idleRuntimeReleaseSleeper: IdleRuntimeReleaseSleeper = { try await Task.sleep(nanoseconds: $0) }
+    private var idleRuntimeReleaseRunnerFence: IdleRuntimeReleaseRunnerFence?
+    private var idleRuntimeReleaseRunTaskProbe: IdleRuntimeReleaseRunTaskProbe?
+    private var armedIdleRuntimeReleaseByTabID: [UUID: IdleRuntimeRelease] = [:]
+    private var retiringIdleRuntimeReleaseByTabID: [UUID: IdleRuntimeRelease] = [:]
+    #if DEBUG
+        /// Bounded lifecycle diagnostics (`outcome:reason`), newest last.
+        private(set) var test_idleRuntimeReleaseEvents: [String] = []
+    #endif
     package var toolTrackingHooks: AgentToolTrackingHooks = .noOp {
         didSet {
             for handler in toolHandlerByTabID.values {
@@ -330,6 +397,7 @@ package final class ClaudeAgentModeCoordinator {
     }
 
     package func stop() {
+        cancelAllArmedIdleRuntimeReleases(reason: "coordinator-stop")
         preparationByTabID.values.forEach { $0.task.cancel() }
         preparationByTabID.removeAll()
         dispatchReservationByTabID.removeAll()
@@ -366,6 +434,7 @@ package final class ClaudeAgentModeCoordinator {
     /// recycled tab IDs do not inherit stale tracking state. Do not call from `stop()`, which
     /// also runs when agent mode UI is hidden while sessions remain alive.
     package func detachAllClaudeToolTrackingHandlersForWorkspaceSwitch() {
+        cancelAllArmedIdleRuntimeReleases(reason: "workspace-detach")
         let handlers = toolHandlerByTabID
         toolHandlerByTabID.removeAll()
         for (tabID, handler) in handlers {
@@ -510,6 +579,7 @@ package final class ClaudeAgentModeCoordinator {
     private func ensureClaudeNativeSessionReadiness(
         session: AgentTabSession
     ) async -> Bool {
+        cancelArmedIdleRuntimeRelease(for: session.tabID, reason: "runtime-preparation")
         while true {
             if let existing = preparationByTabID[session.tabID] {
                 #if DEBUG
@@ -551,6 +621,9 @@ package final class ClaudeAgentModeCoordinator {
     ) async {
         guard session.selectedAgent.usesClaudeNativeRuntime, !Task.isCancelled else { return }
         await awaitPendingClaudeResumeTransferIfNeeded(for: session)
+        guard !Task.isCancelled else { return }
+        // A successor never starts while this tab's idle runtime is still being retired.
+        await awaitRetiringIdleRuntimeReleaseIfNeeded(for: session.tabID)
         guard !Task.isCancelled else { return }
 
         if let controller = session.claudeController,
@@ -1198,19 +1271,24 @@ package final class ClaudeAgentModeCoordinator {
         await detached.toolHandler?.stopTracking(for: session)
     }
 
+    /// - Parameter mayCaptureProviderSessionID: an extra owner check evaluated after the capture
+    ///   await, before the provider session ID is written or saved (the delegated idle release
+    ///   passes its exact-owner predicate, so a rebound or replaced tab is never overwritten).
     @discardableResult
     private func retireClaudeController(
         _ detached: DetachedClaudeController,
         for session: AgentTabSession,
         captureProviderSessionID: Bool,
-        scheduleProviderSessionSave: Bool = true
+        scheduleProviderSessionSave: Bool = true,
+        mayCaptureProviderSessionID: (@MainActor () -> Bool)? = nil
     ) async -> Bool {
         let generation = UUID()
         controllerRetirementGenerationByTabID[session.tabID] = generation
         if captureProviderSessionID {
             let sessionRef = await detached.controller.currentSessionRef()
             if controllerRetirementGenerationByTabID[session.tabID] == generation,
-               session.claudeController == nil
+               session.claudeController == nil,
+               mayCaptureProviderSessionID?() ?? true
             {
                 updateProviderSessionIDIfNeeded(
                     sessionRef.sessionID,
@@ -1497,6 +1575,14 @@ package final class ClaudeAgentModeCoordinator {
     ) async throws -> NativeAgentRuntimeSessionRef {
         let existingSessionID = session.providerSessionID
         let runAttemptID = session.activeRunAttemptID
+        // Item 1: the delegated idle release retired this conversation's runtime on purpose. The
+        // next start launches a fresh conversation and carries the transcript (idle-continuation
+        // wording), never a fabricated resume failure.
+        let idleReleaseFreshStart = consumeIdleReleaseFreshStartIntent(
+            for: session,
+            existingSessionID: existingSessionID
+        )
+        let launchSessionID = idleReleaseFreshStart ? nil : existingSessionID
         // R6 owner capture: this start (launch reservation, startup permission mode) and its fresh
         // fallback carry the scope of the run attempt captured here, never one read later.
         let runtimeOwner = session.runtimeSessionScope(processRunID: runID)
@@ -1529,7 +1615,7 @@ package final class ClaudeAgentModeCoordinator {
         do {
             let sessionRef = try await AgentRuntimeOperationOwner.$session.withValue(runtimeOwner) {
                 try await controller.startOrResume(
-                    existingSessionID: existingSessionID,
+                    existingSessionID: launchSessionID,
                     model: model,
                     effortLevel: effortLevel,
                     systemPromptOverride: systemPromptOverride
@@ -1549,6 +1635,15 @@ package final class ClaudeAgentModeCoordinator {
                 await shutdownClaudeControllerIfUnowned(controller, by: session)
                 throw ControllerLifecycleError.superseded
             }
+            if idleReleaseFreshStart, let existingSessionID {
+                try await stageIdleReleaseContinuationHandoff(
+                    for: session,
+                    controller: controller,
+                    releasedConversationID: existingSessionID,
+                    runID: runID,
+                    runAttemptID: runAttemptID
+                )
+            }
             if let existingSessionID, session.recoveryResumeFallbackSuppressedConversationID == existingSessionID {
                 // Phase 4: the recovery dispatch resumed its conversation; the suppression ends.
                 session.recoveryResumeFallbackSuppressedConversationID = nil
@@ -1566,9 +1661,11 @@ package final class ClaudeAgentModeCoordinator {
                 await shutdownClaudeControllerIfUnowned(controller, by: session)
                 throw ControllerLifecycleError.superseded
             }
+            // An intentional idle fresh start resumed nothing, so its failure is never a resume
+            // failure: `launchSessionID` is nil and the error surfaces as an ordinary start failure.
             switch Self.resumeFailureDisposition(
                 after: error,
-                existingSessionID: existingSessionID,
+                existingSessionID: launchSessionID,
                 suppressedConversationID: session.recoveryResumeFallbackSuppressedConversationID
             ) {
             case .rethrow:
@@ -1703,6 +1800,7 @@ package final class ClaudeAgentModeCoordinator {
                 #endif
                 handoffOwnershipMaintained = await viewModel.stageClaudeResumeRecoveryHandoffIfNeeded(
                     for: session,
+                    reason: .nativeResumeFailure,
                     ifStillOwned: { [weak self, weak session] in
                         guard let self, let session else { return false }
                         return sessionOwnsDetachedFallbackReplacementClaim(
@@ -2276,6 +2374,7 @@ package final class ClaudeAgentModeCoordinator {
                 handoff.noteNoHandoff()
             }
         }
+        cancelArmedIdleRuntimeRelease(for: session.tabID, reason: "dispatch")
         guard dispatchReservationByTabID[session.tabID] == nil else {
             return false
         }
@@ -2936,6 +3035,7 @@ package final class ClaudeAgentModeCoordinator {
     /// Detaches the current Claude controller and its tool tracker synchronously
     /// so a replacement run cannot be affected by the old controller's async cleanup.
     func prepareClaudeCancelSync(_ session: AgentTabSession) -> DetachedClaudeController? {
+        cancelArmedIdleRuntimeRelease(for: session.tabID, reason: "cancel-or-reset")
         guard session.selectedAgent.usesClaudeNativeRuntime else { return nil }
         preparationByTabID.removeValue(forKey: session.tabID)?.task.cancel()
         dispatchReservationByTabID.removeValue(forKey: session.tabID)
@@ -2959,6 +3059,7 @@ package final class ClaudeAgentModeCoordinator {
         invalidatePendingClaudeResumeTransfer(for: session)
         clearRepoPromptMCPRecovery(for: session)
         session.providerSessionID = nil
+        session.claudeIdleReleasedConversationID = nil
         return detached
     }
 
@@ -3001,6 +3102,7 @@ package final class ClaudeAgentModeCoordinator {
         let detached = prepareClaudeCancelSync(session)
         invalidatePendingClaudeResumeTransfer(for: session)
         clearRepoPromptMCPRecovery(for: session)
+        session.claudeIdleReleasedConversationID = nil
         Task { await cancelClaudeRun(session, oldController: detached) }
     }
 
@@ -3109,40 +3211,144 @@ package final class ClaudeAgentModeCoordinator {
         clearTabScopedCoordinatorState: Bool = true,
         detachedRunID: UUID? = nil
     ) async {
-        await awaitPendingClaudeResumeTransferIfNeeded(
-            for: session,
-            scheduleProviderSessionSave: clearTabScopedCoordinatorState
+        cancelArmedIdleRuntimeRelease(for: session.tabID, reason: "explicit-shutdown")
+        // An idle release already retiring this tab's runtime finishes first; this shutdown then
+        // owns whatever state remains.
+        await awaitRetiringIdleRuntimeReleaseIfNeeded(for: session.tabID)
+        await performClaudeSessionShutdown(
+            session,
+            clearTabScopedCoordinatorState: clearTabScopedCoordinatorState,
+            detachedRunID: detachedRunID,
+            idleOwner: nil
         )
-        if let controller = session.claudeController {
-            guard let detached = detachClaudeController(
-                controller,
-                from: session,
-                removeToolTracking: clearTabScopedCoordinatorState
-            ) else {
-                return
-            }
-            guard await retireClaudeController(
-                detached,
+    }
+
+    /// The shared release primitive. Explicit callers (`idleOwner == nil`) keep their existing
+    /// semantics. With `idleOwner` (the delegated idle release) every owner-sensitive step is fenced
+    /// to that exact owner: the idle check runs before anything is mutated; the provider session ID
+    /// captured after the retirement await is written only while the exact owner still holds the
+    /// live tab; and the post-retirement clears run only under the same predicate. A lost owner
+    /// returns `false` without touching the successor's identity, persistence, run state, or tab
+    /// slots (only this release's own detached tracker is stopped).
+    @discardableResult
+    private func performClaudeSessionShutdown(
+        _ session: AgentTabSession,
+        clearTabScopedCoordinatorState: Bool,
+        detachedRunID: UUID?,
+        idleOwner: IdleRuntimeRelease?
+    ) async -> Bool {
+        guard let idleOwner else {
+            await awaitPendingClaudeResumeTransferIfNeeded(
                 for: session,
-                captureProviderSessionID: true,
                 scheduleProviderSessionSave: clearTabScopedCoordinatorState
-            ) else {
-                return
+            )
+            if let controller = session.claudeController {
+                guard let detached = detachClaudeController(
+                    controller,
+                    from: session,
+                    removeToolTracking: clearTabScopedCoordinatorState
+                ) else {
+                    return false
+                }
+                guard await retireClaudeController(
+                    detached,
+                    for: session,
+                    captureProviderSessionID: true,
+                    scheduleProviderSessionSave: clearTabScopedCoordinatorState
+                ) else {
+                    return false
+                }
+            } else {
+                invalidateControllerRetirement(for: session)
+                clearClaudeControllerLaunchMetadata(for: session)
             }
-        } else {
-            invalidateControllerRetirement(for: session)
-            clearClaudeControllerLaunchMetadata(for: session)
+            clearSessionRunStateAfterShutdown(session)
+            if clearTabScopedCoordinatorState {
+                await clearClaudeToolTracking(for: session)
+            } else {
+                await clearClaudeToolTracking(for: session, matchingRunID: detachedRunID)
+            }
+            return true
         }
+        // No await precedes this check (a pending resume transfer is a blocker), so nothing of the
+        // session is mutated before the exact owner is confirmed.
+        guard idleRuntimeReleaseCheck(for: session, owner: idleOwner.owner) == .releasable,
+              session.claudeIdleActivityGeneration == idleOwner.activityGeneration,
+              let controller = session.claudeController
+        else {
+            return false
+        }
+        // Before detach, in the same main-actor slice as the final check: a successor that starts
+        // while the old process is still shutting down launches fresh, never resuming the
+        // conversation that process may still be persisting.
+        let releasedConversationID = session.providerSessionID
+        session.claudeIdleReleasedConversationID = releasedConversationID
+        // Removes exactly this owner's tracker into `detached`; retirement stops only that one.
+        guard let detached = detachClaudeController(controller, from: session, removeToolTracking: true) else {
+            return false
+        }
+        let owner = idleOwner.owner
+        let retired = await retireClaudeController(
+            detached,
+            for: session,
+            captureProviderSessionID: true,
+            scheduleProviderSessionSave: true,
+            mayCaptureProviderSessionID: { [weak self, weak session] in
+                guard let self, let session else { return false }
+                return idleRetirementOwnerLoss(for: session, owner: owner) == nil
+                    && session.providerSessionID == owner.conversationID
+            }
+        )
+        if let loss = idleRetirementOwnerLoss(for: session, owner: owner) {
+            if loss == "session-rebound" || loss == "session-replaced",
+               session.claudeIdleReleasedConversationID == releasedConversationID
+            {
+                // The object now holds another durable session: the marker named the old one.
+                session.claudeIdleReleasedConversationID = nil
+            }
+            return false
+        }
+        guard retired else { return false }
+        if let released = session.claudeIdleReleasedConversationID,
+           let captured = session.providerSessionID,
+           released != captured
+        {
+            // Retirement captured a newer conversation identity of the same runtime.
+            session.claudeIdleReleasedConversationID = captured
+        }
+        // The tab-keyed tracker slot is not cleared here: this owner's tracker left with the
+        // detach, so any tracker now in the slot belongs to a successor.
+        clearSessionRunStateAfterShutdown(session)
+        return true
+    }
+
+    /// Whether the idle release `owner` still exactly owns `session` across the retirement awaits:
+    /// the same owner snapshot (controller detached by this release), the same live tab object,
+    /// and no successor run, attempt, preparation or dispatch. Returns the loss reason, or nil.
+    private func idleRetirementOwnerLoss(
+        for session: AgentTabSession,
+        owner: IdleRuntimeReleaseOwner
+    ) -> String? {
+        if let mismatch = idleRuntimeReleaseOwnerMismatch(for: session, owner: owner, afterRetirement: true) {
+            return mismatch
+        }
+        guard let viewModel, viewModel.sessions[session.tabID] === session else { return "session-not-live" }
+        guard !session.runState.isActive,
+              session.activeRunAttemptID == nil,
+              preparationByTabID[session.tabID] == nil,
+              dispatchReservationByTabID[session.tabID] == nil
+        else {
+            return "successor-started"
+        }
+        return nil
+    }
+
+    private func clearSessionRunStateAfterShutdown(_ session: AgentTabSession) {
         session.runID = nil
         session.pendingSupersedingTurnCompletions = 0
         session.claudeSupersedingProtectedTurnIDs.removeAll()
         session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
         session.setRunningStatus(nil, source: nil)
-        if clearTabScopedCoordinatorState {
-            await clearClaudeToolTracking(for: session)
-        } else {
-            await clearClaudeToolTracking(for: session, matchingRunID: detachedRunID)
-        }
     }
 
     private func clearClaudeToolTracking(
@@ -3162,6 +3368,587 @@ package final class ClaudeAgentModeCoordinator {
         toolHandlerByTabID.removeValue(forKey: session.tabID)
         await handler.stopTracking(for: session)
     }
+
+    // MARK: - Delegated idle runtime release (reliability plan item 1)
+
+    /// Installed by the Claude runner, which owns run-task holds and event routers.
+    func installIdleRuntimeReleaseRunnerFence(_ fence: @escaping IdleRuntimeReleaseRunnerFence) {
+        idleRuntimeReleaseRunnerFence = fence
+    }
+
+    /// Installed by the Claude runner: whether one specific run attempt's task is still alive.
+    func installIdleRuntimeReleaseRunTaskProbe(_ probe: @escaping IdleRuntimeReleaseRunTaskProbe) {
+        idleRuntimeReleaseRunTaskProbe = probe
+    }
+
+    /// Arms, or re-arms with a fresh full interval, the idle release of an eligible delegated
+    /// (`isMCPOriginated`) tab's retained Claude runtime. The runner calls it once a run task has
+    /// ended, naming the attempt whose terminal commit must be the session's current, accepted
+    /// one, and whenever between-run output arrives. Arming requires an accepted terminal
+    /// publication of the session's current terminal state; a tab whose run attempt is still
+    /// active does not arm (that attempt's own end arms it). User-owned tabs never arm.
+    ///
+    /// A request that does not arm leaves any armed interval untouched (that interval revalidates
+    /// its own owner), so a superseded run's late request never removes its successor's timer.
+    func scheduleIdleRuntimeReleaseIfEligible(
+        for session: AgentTabSession,
+        reason: String,
+        committedAttemptID: UUID? = nil
+    ) {
+        guard session.isMCPOriginated else { return }
+        session.onClaudeTerminalPublicationAccepted = { [weak self] session in
+            self?.noteIdleRuntimeTerminalPublicationAccepted(for: session)
+        }
+        guard let controller = session.claudeController,
+              !session.runState.isActive,
+              session.activeRunAttemptID == nil,
+              retiringIdleRuntimeReleaseByTabID[session.tabID] == nil
+        else {
+            return
+        }
+        guard let revision = idleRuntimeReleaseAcceptedTerminalCommit(for: session),
+              committedAttemptID == nil || revision.ownership.attemptID == committedAttemptID
+        else {
+            recordIdleRuntimeRelease("not-armed", reason: "terminal-not-accepted", tabID: session.tabID, generation: nil)
+            return
+        }
+        if let ineligibility = idleRuntimeReleaseIneligibility(for: session) {
+            recordIdleRuntimeRelease("not-armed", reason: ineligibility, tabID: session.tabID, generation: nil)
+            return
+        }
+        // Validated: this request replaces the armed interval with a fresh one.
+        cancelArmedIdleRuntimeRelease(for: session.tabID, reason: nil)
+        let owner = IdleRuntimeReleaseOwner(
+            sessionIdentifier: ObjectIdentifier(session),
+            binding: session.persistentSessionBindingIdentity,
+            bindingTransitionGeneration: session.bindingTransitionGeneration,
+            controllerIdentifier: ObjectIdentifier(controller as AnyObject),
+            runAttemptGeneration: session.runAttemptGeneration,
+            runID: session.runID,
+            terminalCommitID: revision.commitID,
+            origin: session.origin,
+            provider: session.selectedAgent,
+            conversationID: session.providerSessionID,
+            worktreeBindings: session.worktreeBindings
+        )
+        armIdleRuntimeRelease(for: session, owner: owner, reason: reason)
+    }
+
+    /// Starts a full interval for `owner` from now. The session's synchronous activity
+    /// notification restarts it (same owner) whenever a blocking field changes.
+    private func armIdleRuntimeRelease(
+        for session: AgentTabSession,
+        owner: IdleRuntimeReleaseOwner,
+        reason: String
+    ) {
+        let tabID = session.tabID
+        let generation = UUID()
+        let sleeper = idleRuntimeReleaseSleeper
+        let fullInterval = idleRuntimeReleaseDelayNanos
+        let probeInterval = idleRuntimeReleaseProbeNanos
+        let task = Task { @MainActor [weak self, weak session] in
+            var delay = fullInterval
+            var awaitingQuiescence = false
+            while true {
+                do {
+                    try await sleeper(delay)
+                } catch {
+                    return
+                }
+                guard !Task.isCancelled, let coordinator = self else { return }
+                guard let liveSession = session else {
+                    coordinator.endArmedIdleRuntimeRelease(
+                        tabID: tabID,
+                        generation: generation,
+                        outcome: "stale",
+                        reason: "session-gone"
+                    )
+                    return
+                }
+                switch await coordinator.expireIdleRuntimeRelease(
+                    tabID: tabID,
+                    generation: generation,
+                    session: liveSession,
+                    awaitingQuiescence: awaitingQuiescence
+                ) {
+                case .finished:
+                    return
+                case .probe:
+                    awaitingQuiescence = true
+                    delay = probeInterval
+                case .restartFullInterval:
+                    awaitingQuiescence = false
+                    delay = fullInterval
+                }
+            }
+        }
+        armedIdleRuntimeReleaseByTabID[tabID] = IdleRuntimeRelease(
+            generation: generation,
+            owner: owner,
+            activityGeneration: session.claudeIdleActivityGeneration,
+            task: task
+        )
+        session.onClaudeIdleActivity = { [weak self] session in
+            self?.noteIdleRuntimeActivity(for: session)
+        }
+        recordIdleRuntimeRelease("scheduled", reason: reason, tabID: tabID, generation: generation)
+    }
+
+    /// A barrier retry (or the first commit) turned the current terminal publication into an
+    /// accepted one. Only the accepted commit's own run task, while still alive, arms the interval
+    /// itself when it ends; any other runner (a superseded attempt still publishing) never does,
+    /// so this is armed now and the expiry-time runner fence keeps the runtime until that runner
+    /// has returned.
+    private func noteIdleRuntimeTerminalPublicationAccepted(for session: AgentTabSession) {
+        if let attemptID = session.lastTerminalCommitRevision?.ownership.attemptID,
+           idleRuntimeReleaseRunTaskProbe?(session.tabID, attemptID) == true
+        {
+            return
+        }
+        scheduleIdleRuntimeReleaseIfEligible(for: session, reason: "publication-accepted")
+    }
+
+    /// Re-arms delegated tabs whose interval `stop()` cancelled while their runtime stayed alive
+    /// (agent mode UI hidden, then shown again). Tabs already armed keep their interval;
+    /// user-owned and ineligible tabs are untouched.
+    package func rearmIdleRuntimeReleases(reason: String) {
+        guard let viewModel else { return }
+        for session in viewModel.sessions.values
+            where session.isMCPOriginated && armedIdleRuntimeReleaseByTabID[session.tabID] == nil
+        {
+            scheduleIdleRuntimeReleaseIfEligible(for: session, reason: reason)
+        }
+    }
+
+    /// Synchronous notification that one of the session's blocking fields started or stopped
+    /// blocking, or that the runtime's event router held or dropped a between-run event. An armed
+    /// interval for the same owner restarts in full from now, so a blocker that appears and clears
+    /// between samples still yields a full quiescent interval; an owner that no longer matches
+    /// ends the interval without release.
+    func noteIdleRuntimeActivity(for session: AgentTabSession) {
+        let tabID = session.tabID
+        guard let armed = armedIdleRuntimeReleaseByTabID[tabID],
+              armed.owner.sessionIdentifier == ObjectIdentifier(session)
+        else {
+            return
+        }
+        armedIdleRuntimeReleaseByTabID.removeValue(forKey: tabID)
+        armed.task.cancel()
+        if let reason = idleRuntimeReleaseOwnerMismatch(for: session, owner: armed.owner)
+            ?? idleRuntimeReleaseIneligibility(for: session)
+        {
+            recordIdleRuntimeRelease("stale", reason: reason, tabID: tabID, generation: armed.generation)
+            return
+        }
+        armIdleRuntimeRelease(for: session, owner: armed.owner, reason: "activity")
+    }
+
+    /// Cancels only an armed timer. A release already retiring is joined, never cancelled.
+    func cancelArmedIdleRuntimeRelease(for tabID: UUID, reason: String?) {
+        guard let armed = armedIdleRuntimeReleaseByTabID.removeValue(forKey: tabID) else { return }
+        armed.task.cancel()
+        if let reason {
+            recordIdleRuntimeRelease("cancelled", reason: reason, tabID: tabID, generation: armed.generation)
+        }
+    }
+
+    private func cancelAllArmedIdleRuntimeReleases(reason: String) {
+        for tabID in Array(armedIdleRuntimeReleaseByTabID.keys) {
+            cancelArmedIdleRuntimeRelease(for: tabID, reason: reason)
+        }
+    }
+
+    /// Generation-matched: an old timer never removes a successor timer's slot.
+    private func endArmedIdleRuntimeRelease(tabID: UUID, generation: UUID, outcome: String, reason: String) {
+        guard armedIdleRuntimeReleaseByTabID[tabID]?.generation == generation else { return }
+        armedIdleRuntimeReleaseByTabID.removeValue(forKey: tabID)
+        recordIdleRuntimeRelease(outcome, reason: reason, tabID: tabID, generation: generation)
+    }
+
+    private func awaitRetiringIdleRuntimeReleaseIfNeeded(for tabID: UUID) async {
+        guard let retiring = retiringIdleRuntimeReleaseByTabID[tabID] else { return }
+        await retiring.task.value
+    }
+
+    private func expireIdleRuntimeRelease(
+        tabID: UUID,
+        generation: UUID,
+        session: AgentTabSession,
+        awaitingQuiescence: Bool
+    ) async -> IdleRuntimeReleaseStep {
+        guard let armed = armedIdleRuntimeReleaseByTabID[tabID], armed.generation == generation else {
+            return .finished
+        }
+        let restartReason: String?
+        switch idleRuntimeReleaseExpiryCheck(for: session, armed: armed, awaitingQuiescence: awaitingQuiescence) {
+        case let .stop(step):
+            return step
+        case let .proceed(reason):
+            restartReason = reason
+        }
+        guard let controller = session.claudeController else {
+            // Unreachable while the owner check requires the armed controller; never leave a slot.
+            endArmedIdleRuntimeRelease(tabID: tabID, generation: generation, outcome: "stale", reason: "controller-replaced")
+            return .finished
+        }
+        // Quiescence includes the provider: a fresh interval (or the release) starts only after
+        // a completed observation that no provider turn is in flight.
+        let turnInFlight = await controller.hasTurnInFlight
+        guard !Task.isCancelled,
+              let current = armedIdleRuntimeReleaseByTabID[tabID],
+              current.generation == generation
+        else {
+            return .finished
+        }
+        if turnInFlight {
+            if !awaitingQuiescence {
+                recordIdleRuntimeRelease(
+                    "deferred",
+                    reason: "provider-turn-in-flight",
+                    tabID: tabID,
+                    generation: generation
+                )
+            }
+            return .probe
+        }
+        // Revalidated after the await: the same owner, no new activity and no blocker.
+        switch idleRuntimeReleaseExpiryCheck(for: session, armed: current, awaitingQuiescence: awaitingQuiescence) {
+        case let .stop(step):
+            return step
+        case let .proceed(reason):
+            if let reason = restartReason ?? reason {
+                // The blocker settled (or unobserved activity happened): release needs one more
+                // full interval of quiescence from this observation, never the original deadline.
+                armedIdleRuntimeReleaseByTabID[tabID]?.activityGeneration = session.claudeIdleActivityGeneration
+                recordIdleRuntimeRelease("rearmed", reason: reason, tabID: tabID, generation: generation)
+                return .restartFullInterval
+            }
+        }
+        armedIdleRuntimeReleaseByTabID.removeValue(forKey: tabID)
+        retiringIdleRuntimeReleaseByTabID[tabID] = current
+        let released = await performClaudeSessionShutdown(
+            session,
+            clearTabScopedCoordinatorState: true,
+            detachedRunID: nil,
+            idleOwner: current
+        )
+        if retiringIdleRuntimeReleaseByTabID[tabID]?.generation == generation {
+            retiringIdleRuntimeReleaseByTabID.removeValue(forKey: tabID)
+        }
+        if released {
+            recordIdleRuntimeRelease("released", reason: "idle-interval", tabID: tabID, generation: generation)
+            viewModel?.requestUIRefresh(tabID: tabID, urgent: false)
+            viewModel?.scheduleSave(for: tabID)
+        } else {
+            recordIdleRuntimeRelease("stale", reason: "superseded-during-release", tabID: tabID, generation: generation)
+        }
+        return .finished
+    }
+
+    private enum IdleRuntimeReleaseExpiryDecision {
+        /// No fence blocks. A non-nil reason means a fresh full interval must start (after the
+        /// provider is observed idle) instead of releasing.
+        case proceed(restartReason: String?)
+        case stop(IdleRuntimeReleaseStep)
+    }
+
+    /// One synchronous expiry decision for the armed interval `armed`. It never restarts the
+    /// interval itself: the caller first observes the provider.
+    private func idleRuntimeReleaseExpiryCheck(
+        for session: AgentTabSession,
+        armed: IdleRuntimeRelease,
+        awaitingQuiescence: Bool
+    ) -> IdleRuntimeReleaseExpiryDecision {
+        let tabID = session.tabID
+        switch idleRuntimeReleaseCheck(for: session, owner: armed.owner) {
+        case let .stale(reason):
+            endArmedIdleRuntimeRelease(tabID: tabID, generation: armed.generation, outcome: "stale", reason: reason)
+            return .stop(.finished)
+        case let .blocked(reason):
+            if !awaitingQuiescence {
+                recordIdleRuntimeRelease("deferred", reason: reason, tabID: tabID, generation: armed.generation)
+            }
+            return .stop(.probe)
+        case .releasable:
+            break
+        }
+        if awaitingQuiescence {
+            return .proceed(restartReason: "quiescent")
+        }
+        if session.claudeIdleActivityGeneration != armed.activityGeneration {
+            return .proceed(restartReason: "activity")
+        }
+        return .proceed(restartReason: nil)
+    }
+
+    private func idleRuntimeReleaseCheck(
+        for session: AgentTabSession,
+        owner: IdleRuntimeReleaseOwner
+    ) -> IdleRuntimeReleaseCheck {
+        if let reason = idleRuntimeReleaseOwnerMismatch(for: session, owner: owner) {
+            return .stale(reason)
+        }
+        if let reason = idleRuntimeReleaseIneligibility(for: session) {
+            return .stale(reason)
+        }
+        if let reason = idleRuntimeReleaseBlocker(for: session) {
+            return .blocked(reason)
+        }
+        return .releasable
+    }
+
+    /// Whether `session` still describes exactly the runtime owner the interval was armed for:
+    /// the same session object bound to the same durable session (no rebinding since), the same
+    /// run attempt generation, run, accepted terminal commit, provenance, provider, conversation,
+    /// worktree bindings and controller. `afterRetirement` skips the controller (now detached) and
+    /// the conversation identity (retirement may capture a newer one of the same runtime).
+    private func idleRuntimeReleaseOwnerMismatch(
+        for session: AgentTabSession,
+        owner: IdleRuntimeReleaseOwner,
+        afterRetirement: Bool = false
+    ) -> String? {
+        guard ObjectIdentifier(session) == owner.sessionIdentifier else { return "session-replaced" }
+        guard session.persistentSessionBindingIdentity == owner.binding,
+              session.bindingTransitionGeneration == owner.bindingTransitionGeneration
+        else {
+            return "session-rebound"
+        }
+        guard session.runAttemptGeneration == owner.runAttemptGeneration else { return "new-run-attempt" }
+        guard session.runID == owner.runID else { return "run-changed" }
+        guard session.lastTerminalCommitRevision?.commitID == owner.terminalCommitID else {
+            return "terminal-commit-changed"
+        }
+        guard session.origin == owner.origin else { return "provenance-changed" }
+        guard session.selectedAgent == owner.provider else { return "provider-changed" }
+        guard session.worktreeBindings == owner.worktreeBindings else { return "location-changed" }
+        if afterRetirement {
+            return session.claudeController == nil ? nil : "controller-replaced"
+        }
+        guard let controller = session.claudeController,
+              ObjectIdentifier(controller as AnyObject) == owner.controllerIdentifier
+        else {
+            return "controller-replaced"
+        }
+        guard session.providerSessionID == owner.conversationID else { return "conversation-changed" }
+        return nil
+    }
+
+    /// The session's current terminal commit when its publication was accepted and the session
+    /// still shows that commit's terminal state; otherwise `nil` (no commit, rejected or stale
+    /// publication, or a state the commit did not publish, such as `.idle`).
+    private func idleRuntimeReleaseAcceptedTerminalCommit(
+        for session: AgentTabSession
+    ) -> AgentRunTerminalCommitRevision? {
+        guard let revision = session.lastTerminalCommitRevision,
+              case .accepted? = session.lastTerminalPublicationResult,
+              session.runState == revision.terminalState
+        else {
+            return nil
+        }
+        return revision
+    }
+
+    /// Structural eligibility: only an authoritative delegated/MCP-originated, live, local Claude
+    /// tab with an established conversation identity (so the next turn can carry its transcript)
+    /// whose current terminal state was published and accepted.
+    private func idleRuntimeReleaseIneligibility(for session: AgentTabSession) -> String? {
+        guard session.isMCPOriginated else { return "user-owned" }
+        guard session.selectedAgent.usesClaudeNativeRuntime else { return "provider-changed" }
+        guard let viewModel, viewModel.sessions[session.tabID] === session else { return "session-not-live" }
+        guard let conversationID = session.providerSessionID?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !conversationID.isEmpty
+        else {
+            return "no-conversation-identity"
+        }
+        guard idleRuntimeReleaseAcceptedTerminalCommit(for: session) != nil else { return "terminal-not-accepted" }
+        return nil
+    }
+
+    /// Transient work or interaction that must settle before the runtime may be released.
+    private func idleRuntimeReleaseBlocker(for session: AgentTabSession) -> String? {
+        let tabID = session.tabID
+        if session.runState.isActive || session.activeRunAttemptID != nil || session.terminalCommitInProgress {
+            return "run-active"
+        }
+        if let reason = idleRuntimeReleaseRunnerFence?(tabID) {
+            return reason
+        }
+        if preparationByTabID[tabID] != nil
+            || dispatchReservationByTabID[tabID] != nil
+            || hasPendingResumeTransfer(for: session)
+            || pendingResumeTransferGenerationByTabID[tabID] != nil
+            || controllerRetirementGenerationByTabID[tabID] != nil
+            || fallbackReplacementClaimByTabID[tabID] != nil
+            || privateFallbackControllerByTabID[tabID] != nil
+            || pendingRepoPromptMCPRecoveryByTabID[tabID] != nil
+        {
+            return "controller-lifecycle"
+        }
+        if dispatchHandoffsByTurnID.values.contains(where: { $0.tabID == tabID && $0.interruptPending }) {
+            return "interrupt-pending"
+        }
+        if session.pendingSupersedingTurnCompletions > 0
+            || !session.claudeSupersedingProtectedTurnIDs.isEmpty
+            || !session.claudeExpectedTurnIDs.isEmpty
+        {
+            return "superseding-completion"
+        }
+        if session.hasBindingBlockingInteraction
+            || session.recoveryQuestionCreationReservation != nil
+            || !session.recoveryQuestionResolutionReservations.isEmpty
+            || !session.resolvingWorktreeMergeReviewOperationIDs.isEmpty
+        {
+            return "interaction"
+        }
+        if session.mcpFollowUpRunPending
+            || session.isMCPInstructionDispatchInProgress
+            || !session.pendingInstructions.isEmpty
+            || !session.pendingClaudeSteeringInstructions.isEmpty
+            || session.claudeSteeringFlushTask != nil
+            || session.isComposerSubmissionInFlight
+        {
+            return "queued-work"
+        }
+        if session.pendingHandoff.hasPayload || session.pendingHandoff.deliveryHold != nil {
+            // Released only without a pending payload: the idle handoff never displaces one.
+            return "pending-handoff"
+        }
+        if session.worktreeBindingTransitionInProgress
+            || session.isChangingExecutionLocation
+            || session.isPreparingInitialWorktree
+            || session.bindingTransitionInProgress
+        {
+            return "location-transition"
+        }
+        if let runID = session.runID, hasActiveMCPTools(runID) || hasActiveChildAgentRunWaits(runID) {
+            return "tool-work"
+        }
+        if session.isDirty {
+            // The terminal state and transcript must be durably saved (a clean save receipt clears
+            // `isDirty`) before the runtime holding the conversation is released.
+            return "persistence-pending"
+        }
+        return nil
+    }
+
+    /// Whether this start is the intentional fresh start after an idle release of exactly
+    /// `existingSessionID`. A pending payload does not change that: the fresh start keeps it (and
+    /// its payload and delivery IDs) as the handoff, exactly like the genuine fallback. The intent
+    /// is dropped, keeping ordinary resume, only when the tab moved to another conversation or is
+    /// no longer MCP-originated, MCP
+    /// recovery or a recovery resume requirement owns the next start, or a payload's delivery is
+    /// held: a held payload is never re-sent, so a fresh conversation would carry no history.
+    private func consumeIdleReleaseFreshStartIntent(
+        for session: AgentTabSession,
+        existingSessionID: String?
+    ) -> Bool {
+        guard let released = session.claudeIdleReleasedConversationID else { return false }
+        guard let existingSessionID,
+              released == existingSessionID,
+              // Only the delegated tab the release was for: a tab no longer MCP-originated
+              // resumes ordinarily and never gets idle-release wording.
+              session.isMCPOriginated,
+              pendingRepoPromptMCPRecoveryByTabID[session.tabID] == nil,
+              session.recoveryResumeFallbackSuppressedConversationID != existingSessionID,
+              session.pendingHandoff.deliveryHold == nil
+        else {
+            session.claudeIdleReleasedConversationID = nil
+            return false
+        }
+        return true
+    }
+
+    /// Stages the idle-continuation transcript handoff for a fresh start that owns `controller`.
+    /// The intent ends only once the handoff is staged under the same owner; a lost owner leaves
+    /// it for the successor (which then starts fresh too) and never shuts down an owned controller.
+    private func stageIdleReleaseContinuationHandoff(
+        for session: AgentTabSession,
+        controller: any NativeAgentRuntimeControlling,
+        releasedConversationID: String,
+        runID: UUID,
+        runAttemptID: UUID?
+    ) async throws {
+        let stillOwned: @MainActor () -> Bool = { [weak self, weak session] in
+            guard let self, let session else { return false }
+            return session.runID == runID
+                && session.activeRunAttemptID == runAttemptID
+                && session.runState.isActive
+                && sessionOwnsClaudeController(controller, for: session)
+        }
+        let staged: Bool = if let viewModel {
+            await viewModel.stageClaudeResumeRecoveryHandoffIfNeeded(
+                for: session,
+                reason: .idleRuntimeRelease,
+                ifStillOwned: stillOwned,
+                beforeCommit: nil
+            )
+        } else {
+            stillOwned()
+        }
+        guard staged, stillOwned() else {
+            await shutdownClaudeControllerIfUnowned(controller, by: session)
+            throw ControllerLifecycleError.superseded
+        }
+        if session.claudeIdleReleasedConversationID == releasedConversationID {
+            session.claudeIdleReleasedConversationID = nil
+        }
+        recordIdleRuntimeRelease(
+            "fresh-start",
+            reason: "idle-continuation-handoff",
+            tabID: session.tabID,
+            generation: nil
+        )
+    }
+
+    private func recordIdleRuntimeRelease(
+        _ outcome: String,
+        reason: String,
+        tabID: UUID,
+        generation: UUID?
+    ) {
+        let generationText = generation.map { String($0.uuidString.prefix(8)) } ?? "-"
+        let message = "[ClaudeIdle] \(outcome) tab=\(tabID.uuidString) generation=\(generationText) reason=\(reason)"
+        // Provider-output re-arms and refused scheduling can repeat per streamed event.
+        // Keep bounded interaction activity visible at info level.
+        if outcome == "not-armed" || (outcome == "scheduled" && reason == "background-output") {
+            Self.idleRuntimeLogger.debug("\(message, privacy: .public)")
+        } else {
+            Self.idleRuntimeLogger.info("\(message, privacy: .public)")
+        }
+        #if DEBUG
+            test_idleRuntimeReleaseEvents.append("\(outcome):\(reason)")
+            if test_idleRuntimeReleaseEvents.count > 256 {
+                test_idleRuntimeReleaseEvents.removeFirst(test_idleRuntimeReleaseEvents.count - 256)
+            }
+        #endif
+    }
+
+    #if DEBUG
+        /// Replaces the idle release clock. The sleeper receives each requested interval and must
+        /// throw when its task is cancelled. Affects timers armed afterwards.
+        func test_setIdleRuntimeReleaseClock(
+            delayNanos: UInt64 = ClaudeAgentModeCoordinator.delegatedIdleRuntimeReleaseDelayNanos,
+            probeNanos: UInt64 = ClaudeAgentModeCoordinator.delegatedIdleRuntimeReleaseProbeNanos,
+            sleeper: @escaping IdleRuntimeReleaseSleeper
+        ) {
+            idleRuntimeReleaseDelayNanos = delayNanos
+            idleRuntimeReleaseProbeNanos = probeNanos
+            idleRuntimeReleaseSleeper = sleeper
+        }
+
+        func test_isIdleRuntimeReleaseArmed(for session: AgentTabSession) -> Bool {
+            armedIdleRuntimeReleaseByTabID[session.tabID] != nil
+        }
+
+        func test_isIdleRuntimeReleaseRetiring(for session: AgentTabSession) -> Bool {
+            retiringIdleRuntimeReleaseByTabID[session.tabID] != nil
+        }
+
+        /// The armed or retiring timer's task, so a test can await its end.
+        func test_idleRuntimeReleaseTask(for session: AgentTabSession) -> Task<Void, Never>? {
+            (armedIdleRuntimeReleaseByTabID[session.tabID] ?? retiringIdleRuntimeReleaseByTabID[session.tabID])?.task
+        }
+    #endif
 
     // MARK: - Tool Tracking Delegation
 

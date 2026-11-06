@@ -7520,6 +7520,11 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         acpControllerFactory: AgentACPControllerFactory? = nil,
         flushPendingAssistantDelta: ((AgentTabSession) -> Void)? = nil,
         publishTerminalCommit: ((AgentTabSession, AgentRunTerminalCommitRevision) async -> Void)? = nil,
+        publishTerminalCommitResult: ((
+            AgentTabSession,
+            AgentRunTerminalCommitRevision,
+            AgentRunEpochTransitionKind?
+        ) async -> AgentRunTerminalPublicationResult)? = nil,
         handleHeadlessStreamResult: ((AIStreamResult) async -> Void)? = nil,
         handleBackgroundNativeStreamResult: ((AIStreamResult, UUID) async -> Void)? = nil,
         endBackgroundNativeMessage: ((UUID) -> Void)? = nil,
@@ -7527,6 +7532,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         autoSignalACPRouting: Bool = false,
         stageResumeRecoveryHandoffIfNeeded: ((AgentTabSession) async -> Void)? = nil,
         stagesDurablePendingHandoffThroughHost: Bool = false,
+        recordsPendingHandoffSendOutcomeThroughHost: Bool = false,
         expectedPIDPolicyArmer: @escaping (MCPBootstrapLeaseSpec) async -> Bool = { _ in true },
         ompQualificationAuthorizer: @escaping (OhMyPiAgentModeSmokeGate.StartTransaction, UUID) -> Bool = { _, _ in false },
         ompQualificationActiveWorkspaceID: @escaping () -> UUID? = { nil },
@@ -7640,6 +7646,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                     recorder: recorder,
                     flushPendingAssistantDelta: flushPendingAssistantDelta,
                     publishTerminalCommit: publishTerminalCommit,
+                    publishTerminalCommitResult: publishTerminalCommitResult,
                     handleHeadlessStreamResult: handleHeadlessStreamResult,
                     handleBackgroundNativeStreamResult: handleBackgroundNativeStreamResult,
                     endBackgroundNativeMessage: endBackgroundNativeMessage,
@@ -7647,6 +7654,11 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                     stagePendingHandoffForDurableDispatch: stagesDurablePendingHandoffThroughHost
                         ? { [weak host] text, session in
                             await host?.stagePendingHandoffForDurableDispatch(text, session: session) ?? .failed
+                        }
+                        : nil,
+                    recordPendingHandoffSendOutcome: recordsPendingHandoffSendOutcomeThroughHost
+                        ? { [weak host] session, stage, disposition in
+                            host?.recordPendingHandoffStageOutcome(for: session, stage: stage, disposition: disposition)
                         }
                         : nil
                 ),
@@ -7677,7 +7689,8 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         handleBackgroundNativeStreamResult: ((AIStreamResult, UUID) async -> Void)? = nil,
         endBackgroundNativeMessage: ((UUID) -> Void)? = nil,
         stageResumeRecoveryHandoffIfNeeded: ((AgentTabSession) async -> Void)? = nil,
-        stagePendingHandoffForDurableDispatch: ((String, AgentTabSession) async -> AgentPendingHandoffDispatchStaging)? = nil
+        stagePendingHandoffForDurableDispatch: ((String, AgentTabSession) async -> AgentPendingHandoffDispatchStaging)? = nil,
+        recordPendingHandoffSendOutcome: ((AgentTabSession, AgentPendingHandoffStage?, AgentStagedInputDisposition) -> Void)? = nil
     ) -> AgentModeRunService.Hooks {
         let flushPendingAssistantDelta = flushPendingAssistantDelta ?? { _ in
             recorder.record("assistant-flush")
@@ -7731,8 +7744,9 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             stageResumeRecoveryHandoffIfNeeded: stageResumeRecoveryHandoffIfNeeded ?? { _ in },
             prependPendingHandoffIfNeeded: { text, _ in AgentStagedProviderText(text: text) },
             stagePendingHandoffForDurableDispatch: stagePendingHandoffForDurableDispatch ?? { _, _ in .none },
-            recordPendingHandoffSendOutcome: { _, _, disposition in
+            recordPendingHandoffSendOutcome: { session, stage, disposition in
                 recorder.record("handoff:\(Self.stagedInputLabel(disposition))")
+                recordPendingHandoffSendOutcome?(session, stage, disposition)
             },
             signalMCPInstructionDelivered: { _ in recorder.record("delivered") },
             recordDelegatedQuestionNoticeSendOutcome: { _, stageID, disposition in

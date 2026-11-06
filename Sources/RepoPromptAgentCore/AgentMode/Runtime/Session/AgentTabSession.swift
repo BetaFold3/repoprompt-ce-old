@@ -169,18 +169,31 @@ package final class AgentTabSession: ObservableObject {
     /// and intentionally never persisted as session state.
     package var pendingInitialStartLocation: AgentInitialStartLocation = .local
     package var composerSubmissionToken = UUID()
-    package var activeComposerSubmitAttempt: AgentComposerSubmitAttempt?
+    package var activeComposerSubmitAttempt: AgentComposerSubmitAttempt? {
+        didSet { noteClaudeIdleActivity((oldValue == nil) != (activeComposerSubmitAttempt == nil)) }
+    }
+
     package var isComposerSubmissionInFlight: Bool {
         activeComposerSubmitAttempt != nil
     }
 
-    package var isPreparingInitialWorktree: Bool = false
-    package var isChangingExecutionLocation: Bool = false
-    package var worktreeBindingTransitionInProgress: Bool = false
+    package var isPreparingInitialWorktree: Bool = false {
+        didSet { noteClaudeIdleActivity(oldValue != isPreparingInitialWorktree) }
+    }
+
+    package var isChangingExecutionLocation: Bool = false {
+        didSet { noteClaudeIdleActivity(oldValue != isChangingExecutionLocation) }
+    }
+
+    package var worktreeBindingTransitionInProgress: Bool = false {
+        didSet { noteClaudeIdleActivity(oldValue != worktreeBindingTransitionInProgress) }
+    }
 
     // Wait/question state
 
-    @Published package var waitingPrompt: String? = nil
+    @Published package var waitingPrompt: String? = nil {
+        didSet { noteClaudeIdleActivity((oldValue == nil) != (waitingPrompt == nil)) }
+    }
 
     /// The three question props notify on aggregate (`hasPendingQuestionUI`) changes only:
     /// draft edits and non-nil replacement keep the aggregate and stay silent.
@@ -189,6 +202,7 @@ package final class AgentTabSession: ObservableObject {
             notePendingQuestionUIAggregateChange(
                 from: oldValue != nil || pendingUserInputRequest != nil || pendingMCPElicitationRequest != nil
             )
+            noteClaudeIdleActivity((oldValue == nil) != (pendingAskUser == nil))
         }
     }
 
@@ -200,6 +214,7 @@ package final class AgentTabSession: ObservableObject {
             notePendingQuestionUIAggregateChange(
                 from: pendingAskUser != nil || oldValue != nil || pendingMCPElicitationRequest != nil
             )
+            noteClaudeIdleActivity((oldValue == nil) != (pendingUserInputRequest == nil))
         }
     }
 
@@ -208,29 +223,54 @@ package final class AgentTabSession: ObservableObject {
     /// Memory-only; dropped whenever the pending request changes.
     package var pendingUserInputDrafts: AgentRequestUserInputDraftState?
 
-    @Published package var pendingApproval: AgentApprovalRequest? = nil
-    @Published package var pendingPermissionsRequest: AgentPermissionsRequest? = nil
+    @Published package var pendingApproval: AgentApprovalRequest? = nil {
+        didSet { noteClaudeIdleActivity((oldValue == nil) != (pendingApproval == nil)) }
+    }
+
+    @Published package var pendingPermissionsRequest: AgentPermissionsRequest? = nil {
+        didSet { noteClaudeIdleActivity((oldValue == nil) != (pendingPermissionsRequest == nil)) }
+    }
+
     @Published package var pendingMCPElicitationRequest: AgentMCPElicitationRequest? = nil {
         didSet {
             notePendingQuestionUIAggregateChange(
                 from: pendingAskUser != nil || pendingUserInputRequest != nil || oldValue != nil
             )
+            noteClaudeIdleActivity((oldValue == nil) != (pendingMCPElicitationRequest == nil))
         }
     }
 
-    @Published package var pendingApplyEditsReview: PendingApplyEditsReview? = nil
-    @Published package var pendingWorktreeMergeReview: PendingWorktreeMergeReview? = nil
-    package var queuedUserInputRequests: [AgentRequestUserInputRequest] = []
-    package var queuedMCPElicitationRequests: [AgentMCPElicitationRequest] = []
+    @Published package var pendingApplyEditsReview: PendingApplyEditsReview? = nil {
+        didSet { noteClaudeIdleActivity((oldValue == nil) != (pendingApplyEditsReview == nil)) }
+    }
+
+    @Published package var pendingWorktreeMergeReview: PendingWorktreeMergeReview? = nil {
+        didSet { noteClaudeIdleActivity((oldValue == nil) != (pendingWorktreeMergeReview == nil)) }
+    }
+
+    package var queuedUserInputRequests: [AgentRequestUserInputRequest] = [] {
+        didSet { noteClaudeIdleActivity(oldValue.isEmpty != queuedUserInputRequests.isEmpty) }
+    }
+
+    package var queuedMCPElicitationRequests: [AgentMCPElicitationRequest] = [] {
+        didSet { noteClaudeIdleActivity(oldValue.isEmpty != queuedMCPElicitationRequests.isEmpty) }
+    }
+
     package var transcriptViewportState: AgentTranscriptViewportState = .liveBottom
     package var transcriptAutoFollowArmingState: AgentTranscriptAutoFollowArmingState = .armed
     package var askUserContinuation: CheckedContinuation<AgentAskUserResponse, Error>?
     /// An `ask_user` whose snapshot is being committed before it is published (plan §E): a
     /// concurrent request is refused as if this one were already pending.
-    package var recoveryQuestionCreationReservation: UUID?
+    package var recoveryQuestionCreationReservation: UUID? {
+        didSet { noteClaudeIdleActivity((oldValue == nil) != (recoveryQuestionCreationReservation == nil)) }
+    }
+
     /// Interactions whose answer is flushing its latest snapshot before the reply is sent: further
     /// edits, answers, and the timeout are refused for them meanwhile.
-    package var recoveryQuestionResolutionReservations: Set<UUID> = []
+    package var recoveryQuestionResolutionReservations: Set<UUID> = [] {
+        didSet { noteClaudeIdleActivity(oldValue.isEmpty != recoveryQuestionResolutionReservations.isEmpty) }
+    }
+
     package var askUserTimeoutTask: Task<Void, Never>?
     package var pendingAskUserTimeoutGeneration: UInt64 = 0
     package var hasPendingQuestionUI: Bool {
@@ -254,7 +294,10 @@ package final class AgentTabSession: ObservableObject {
     /// Step 5c: shown reviews whose decision was submitted (card cleared) but not yet processed by
     /// the waiting request. A lifecycle end treats them as shown, so a same-turn run end, reset, or
     /// replacement keeps them as history instead of withdrawing them. In memory only.
-    package var resolvingWorktreeMergeReviewOperationIDs: Set<String> = []
+    package var resolvingWorktreeMergeReviewOperationIDs: Set<String> = [] {
+        didSet { noteClaudeIdleActivity(oldValue.isEmpty != resolvingWorktreeMergeReviewOperationIDs.isEmpty) }
+    }
+
     /// Step 5c: in-flight or unacknowledged Discard of an ended merge review. In memory only.
     package var worktreeMergeReviewDiscard: AgentWorktreeMergeReviewDiscardState?
     package var mcpControlContext: AgentMCPControlContext?
@@ -283,10 +326,14 @@ package final class AgentTabSession: ObservableObject {
             if oldValue != mcpFollowUpRunPending {
                 mcpFollowUpRunPendingUpdatedAt = Date()
             }
+            noteClaudeIdleActivity(oldValue != mcpFollowUpRunPending)
         }
     }
 
-    package var isMCPInstructionDispatchInProgress: Bool = false
+    package var isMCPInstructionDispatchInProgress: Bool = false {
+        didSet { noteClaudeIdleActivity(oldValue != isMCPInstructionDispatchInProgress) }
+    }
+
     /// Session provenance (plan §6.4). `.user` unless MCP control created or
     /// claimed this session.
     package var origin: AgentSessionOrigin = .user
@@ -359,7 +406,10 @@ package final class AgentTabSession: ObservableObject {
 
     /// Instruction queue for when user sends while agent is not waiting (shared across all runners).
     /// Each entry carries the identity of the user input(s) it delivers.
-    package var pendingInstructions: [AgentPendingInstruction] = []
+    package var pendingInstructions: [AgentPendingInstruction] = [] {
+        didSet { noteClaudeIdleActivity(oldValue.isEmpty != pendingInstructions.isEmpty) }
+    }
+
     /// `.inactive` until recovery activation; `.mandatory` refuses untracked queued input.
     package var recoveryAdmissionMode: AgentRecoveryAdmissionMode = .inactive
     package let codexSteerAckTracker = CodexSteerAckTracker()
@@ -416,11 +466,19 @@ package final class AgentTabSession: ObservableObject {
         }
     }
 
-    package var pendingClaudeSteeringInstructions: [ClaudeSteeringInstruction] = []
+    package var pendingClaudeSteeringInstructions: [ClaudeSteeringInstruction] = [] {
+        didSet { noteClaudeIdleActivity(oldValue.isEmpty != pendingClaudeSteeringInstructions.isEmpty) }
+    }
+
     /// Claude turn IDs whose terminal events should be treated as superseded by accepted steering.
-    package var claudeSupersedingProtectedTurnIDs: Set<UUID> = []
+    package var claudeSupersedingProtectedTurnIDs: Set<UUID> = [] {
+        didSet { noteClaudeIdleActivity(oldValue.isEmpty != claudeSupersedingProtectedTurnIDs.isEmpty) }
+    }
+
     /// Task that drains `pendingClaudeSteeringInstructions` one-by-one, waiting for MCP tool idle between each.
-    package var claudeSteeringFlushTask: Task<Void, Never>?
+    package var claudeSteeringFlushTask: Task<Void, Never>? {
+        didSet { noteClaudeIdleActivity((oldValue == nil) != (claudeSteeringFlushTask == nil)) }
+    }
 
     /// ACP steering queue — carries text accepted for serialized live steering.
     package struct ACPSteeringInstruction: Identifiable {
@@ -520,6 +578,7 @@ package final class AgentTabSession: ObservableObject {
             if oldValue != pendingSupersedingTurnCompletions {
                 pendingSupersedingTurnCompletionsUpdatedAt = Date()
             }
+            noteClaudeIdleActivity((oldValue > 0) != (pendingSupersedingTurnCompletions > 0))
         }
     }
 
@@ -756,8 +815,11 @@ package final class AgentTabSession: ObservableObject {
     var codexFallbackSuccessorRetryTask: Task<Void, Never>?
     package let codexDispatchSerialGate = CodexDispatchSerialGate()
 
-    // Instruction steering coordination state
-    package var instructionContinuation: CheckedContinuation<UserInstructionResponse, Error>?
+    /// Instruction steering coordination state.
+    package var instructionContinuation: CheckedContinuation<UserInstructionResponse, Error>? {
+        didSet { noteClaudeIdleActivity((oldValue == nil) != (instructionContinuation == nil)) }
+    }
+
     package var instructionTimeoutTask: Task<Void, Never>?
     package var instructionWaitID: UUID?
     /// The newest `wait_for_next_instruction` call (set at its entry, before any await). A queued-head
@@ -1110,6 +1172,32 @@ package final class AgentTabSession: ObservableObject {
 
     /// Coordinator-owned, non-persisted Claude permission request evidence.
     package var claudePermissionSessionState: ClaudePermissionSessionState = .notStarted
+
+    /// Memory only: the provider conversation whose retained runtime the coordinator released
+    /// after the delegated idle interval. The next start for exactly this conversation launches a
+    /// fresh conversation carrying the transcript as an idle-continuation handoff instead of
+    /// resuming it. `providerSessionID` keeps the prior identity until that fresh start commits.
+    /// A relaunched app never sees it and keeps ordinary resume behavior.
+    package var claudeIdleReleasedConversationID: String?
+
+    /// Advanced synchronously whenever an interaction, reservation, queued-work, pending-handoff,
+    /// location-transition, superseding-turn or terminal-commit field starts or stops blocking a
+    /// delegated idle release, so an armed idle interval restarts from that moment instead of
+    /// sampling only at its deadline. Memory only.
+    package private(set) var claudeIdleActivityGeneration: UInt64 = 0
+    /// Fired synchronously after `claudeIdleActivityGeneration` advances; wired by the Claude
+    /// coordinator while it holds an armed idle interval for this tab.
+    package var onClaudeIdleActivity: ((AgentTabSession) -> Void)?
+    /// Fired synchronously when the current terminal publication becomes accepted (first commit or
+    /// a later barrier retry); wired by the Claude coordinator for delegated tabs, so a retry
+    /// that turns a rejected publication into an accepted one can arm the idle interval.
+    package var onClaudeTerminalPublicationAccepted: ((AgentTabSession) -> Void)?
+
+    private func noteClaudeIdleActivity(_ blockingChanged: Bool) {
+        guard blockingChanged else { return }
+        claudeIdleActivityGeneration &+= 1
+        onClaudeIdleActivity?(self)
+    }
 
     var claudeController: (any NativeAgentRuntimeControlling)? {
         didSet {
@@ -1580,7 +1668,10 @@ package final class AgentTabSession: ObservableObject {
     var codexWatchdogState: AgentCodexWatchdogState = .init()
     var codexNativeToolLiveness: AgentCodexNativeToolLivenessState = .init()
     /// Turn IDs started during the current run attempt, used to filter stale turnCompleted events.
-    package var claudeExpectedTurnIDs: Set<UUID> = []
+    package var claudeExpectedTurnIDs: Set<UUID> = [] {
+        didSet { noteClaudeIdleActivity(oldValue.isEmpty != claudeExpectedTurnIDs.isEmpty) }
+    }
+
     package var hasReconciledPersistedCodexCommandStatus: Bool = false
     package var activeReasoningItemID: UUID?
     package var reasoningItemIDsByGroupID: [String: UUID] = [:]
@@ -1646,19 +1737,36 @@ package final class AgentTabSession: ObservableObject {
     package var assistantDeltaTaskGeneration: UInt64 = 0
     package var assistantDeltaFlushGeneration: UInt64 = 0
     var providerTerminalDrainGeneration: UInt64 = 0
-    package var terminalCommitInProgress: Bool = false
+    package var terminalCommitInProgress: Bool = false {
+        didSet { noteClaudeIdleActivity(oldValue != terminalCommitInProgress) }
+    }
+
     /// Set once by the irreversible lifecycle teardown (two-stage shutdown Stage B or the legacy
     /// close path) before it cancels the run, so a runner that commits first after its task is
     /// cancelled still records the teardown cause. Stage A never sets it.
     package var lifecycleTeardownCause: AgentRunTerminalCause?
     package var lastTerminalCommitRevision: AgentRunTerminalCommitRevision?
-    var lastTerminalPublicationResult: AgentRunTerminalPublicationResult?
+    var lastTerminalPublicationResult: AgentRunTerminalPublicationResult? {
+        didSet {
+            guard case .accepted? = lastTerminalPublicationResult else { return }
+            if case .accepted? = oldValue { return }
+            onClaudeTerminalPublicationAccepted?(self)
+        }
+    }
+
     /// Commit whose queued follow-up instruction was already consumed (at most one per commit).
     var terminalFollowUpTakenCommitID: UUID?
     var runAttemptTerminalResources: AgentRunAttemptTerminalResources?
     /// Handoff payload (injected into provider-facing text on first user send).
     /// Cleared only after the provider accepts the turn.
-    package var pendingHandoff: AgentPendingHandoffState = .init()
+    package var pendingHandoff: AgentPendingHandoffState = .init() {
+        didSet {
+            noteClaudeIdleActivity(
+                (oldValue.hasPayload || oldValue.deliveryHold != nil)
+                    != (pendingHandoff.hasPayload || pendingHandoff.deliveryHold != nil)
+            )
+        }
+    }
 
     /// Pending scheduled (delayed) send for this session. Mirrors the persisted
     /// `AgentSession.scheduledSend` member; every durable change goes through the

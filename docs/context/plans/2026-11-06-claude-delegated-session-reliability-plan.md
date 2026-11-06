@@ -3,7 +3,7 @@
 Scope: read when the task touches delegated/MCP-originated Claude runtime retention, completed-session release, admission-pressure reconnects, or standalone CLI bootstrap diagnosis.
 Authority: Authoritative
 Last-verified: 2026-11-06
-Status: owner-requested design only; implementation and live acceptance pending.
+Status: item 1 implemented and owner-approved after independent OracleA and OracleB approval; live acceptance remains explicitly deferred (§1 status line). Items 2–4 remain design only.
 
 ## 0. Decisions, boundaries and implementation order
 
@@ -15,7 +15,7 @@ Implement in this order, because a clean measurement environment first needs bou
 3. Option A: intentional retirement of server-proven completed-owned idle admission victims, rather than a reconnectable socket close.
 4. Recheck standalone CLI bootstrap after items 1–3; defer timeout/retry policy changes unless the problem persists.
 
-No implementation, relaunch, paid model attempt, push, cap mutation or process cleanup is authorized by this design session. Do not merge `b7baf605` (rich-presentation OMP schema/layout) or `09d8d43b` (review/live-recheck documentation) now; both are pending integration for the next rebuild. Savings, cost-gate and promotion remain deferred. Future measurement is governed by [code-mode plan §13](2026-10-03-code-mode-readiness-and-git-narrowing-plan.md#13-future-re-measurement-protocol-not-authorized-to-run).
+Owner authorization (2026-11-06): finish and commit item 1, merge `dev/v1.0.29-remote-client-models` (including `b7baf605` and `09d8d43b`), and prepare a clean, signed daily debug bundle without launching it. Relaunch, paid model attempts, push, cap mutation and process cleanup remain unauthorized. Savings, cost-gate and promotion remain deferred. Future measurement is governed by [code-mode plan §13](2026-10-03-code-mode-readiness-and-git-narrowing-plan.md#13-future-re-measurement-protocol-not-authorized-to-run).
 
 Source references below were checked in the worktree at `9f78a54b` (code unchanged from `e24e593c`); line numbers supersede the older handoff's offsets. File aliases expand to these repository-relative paths:
 
@@ -33,6 +33,8 @@ Source references below were checked in the worktree at `9f78a54b` (code unchang
 | I | `Packages/RepoPromptCore/Sources/RepoPromptMCPCore/Interactive/InteractiveMCPClientSession.swift` |
 
 ## 1. Delegated Claude idle shutdown — first implementation
+
+Step 1 — done | rounds 2/2 | open: none; owner-approved implementation | downgraded: none | assumed: none | deferred: live process/helper/socket acceptance; OracleB P2-7 (tested handoff overload); N2/N3 (unproven caller/rare fresh-ID ordering), N4 (retirement-stop diagnostics), N5 (fixture fidelity), N6/R2-4 (single runner/probe invariant); two documented pre-existing lifecycle failures. Evidence: `evidence/2026-11-06-claude-delegated-session-reliability/validation.txt`, `oracle-a-round2.txt`, `oracle-b-round2.txt` in that directory.
 
 ### Current behavior and authority
 
@@ -60,6 +62,72 @@ Source references below were checked in the worktree at `9f78a54b` (code unchang
 - Verify shutdown uses the existing retirement path, preserves history/usage/binding and does not mark the answer failed. Test follow-up fresh launch plus exactly one truthful handoff, preserved pending payload/delivery ID, and unchanged genuine-resume/fresh-worktree regressions.
 - Add focused coverage in the existing Claude coordinator/runtime and lifecycle test areas; use injected time and controllable suspension gates, not real 300-second sleeps. Run coordinated `make dev-test FILTER=<new-suite>`, the affected coordinator recovery/lifecycle suites, `AgentPendingHandoffStageOutcomeTests`, and `AgentRunWorktreeStartTests`; run `make dev-lint`. Never update the frozen XCTest ledger or weaken existing failures.
 - Obtain independent concurrency/ownership review before declaring implementation complete. A live app is required to prove actual provider/helper processes and sockets exit, retained-resource counts stabilize, a later follow-up works, and a user-owned tab remains unaffected. Mocked shutdown calls alone do not establish process release; no live acceptance is claimed here.
+
+### Implementation status (item 1, 2026-11-06)
+
+Implemented and approved for commit by the owner; no live qualification is claimed. The C/R/V/S line references above predate this change; C owns the `Delegated idle runtime release` section. Validation and review narrative lives in the local evidence directory (`docs/context/plans/evidence/2026-11-06-claude-delegated-session-reliability/`), not here.
+
+**Arming.** `scheduleIdleRuntimeReleaseIfEligible(for:reason:committedAttemptID:)` is the single entry point.
+- It requires all of the following:
+  - an `isMCPOriginated` session that is the live `viewModel.sessions[tabID]` object;
+  - a Claude session with a non-empty `providerSessionID`;
+  - an owned controller with no active run, attempt or retiring release;
+  - the committed attempt's `lastTerminalCommitRevision`, with `lastTerminalPublicationResult == .accepted` and `runState == revision.terminalState`.
+- It validates before it cancels: a request that cannot arm, such as a late call for a superseded attempt or an unaccepted publication, leaves an armed successor interval untouched.
+- It is called from these places:
+  - R's run-task `defer`;
+  - between-run background output;
+  - between-run `runtimeInit`, after the new conversation ID is persisted;
+  - S's `onClaudeTerminalPublicationAccepted`, fired on the transition to `.accepted`, so a barrier retry that later accepts arms the release. It is skipped only while the accepted commit's own run task is alive (that task's run end arms it). Another live runner, such as a superseded attempt still publishing, never suppresses it; the expiry-time runner fence keeps the runtime until that runner returns;
+  - `rearmIdleRuntimeReleases`, called from `setAgentModeActive(true)` for unarmed delegated tabs, because `coordinator.stop()` cancelled them.
+- User-owned tabs never arm.
+- `session.isDirty` defers release as `persistence-pending`; the production clean-save receipt clears it.
+- The delay is 300 s (`delegatedIdleRuntimeReleaseDelayNanos`).
+
+**Owner and activity.**
+- The timer captures `IdleRuntimeReleaseOwner`:
+  - the session object, durable binding and `bindingTransitionGeneration`;
+  - the controller and `runAttemptGeneration`;
+  - the runID and terminal commit;
+  - origin, provider, conversation ID and worktree bindings.
+- Any mismatch ends the timer as `stale:<reason>`.
+- Blocker fields in S fire `onClaudeIdleActivity` synchronously from `didSet`. This covers every field in `hasBindingBlockingInteraction`, plus reservations, follow-up and dispatch, steering, superseding turns, terminal commit, `worktreeBindingTransitionInProgress`, location transitions and the pending handoff.
+- `bindingTransitionInProgress` is not a notifier: it is sampled at expiry, and the owner's `bindingTransitionGeneration` makes any completed rebinding stale.
+- R's router `onInboxChanged` reports only a held between-run approval request and a dropped approval/cancellation pair. Delivered output re-arms through the between-run handler, and undelivered output is fenced at expiry.
+- Any such activity cancels the armed interval and re-arms a fresh full interval or goes stale. A blocker that settles before the original deadline therefore never lets that deadline release.
+- Armed (cancellable) and retiring (joined, never cancelled) slots are separate. Every removal is generation-matched.
+
+**Expiry.**
+- The coordinator's own fences are sampled at expiry. These include runtime preparation, dispatch reservations, MCP tools or child waits, the runner fence, controller preparation, resume transfer, retirement, fallback or recovery, and a pending interrupt.
+- The provider's `hasTurnInFlight` is always awaited before any restart or release. While it is busy, the timer records `deferred` once and probes every 5 s.
+- Only an observed `false` together with a clean recheck starts a fresh full interval (`rearmed:<reason>`) or releases.
+
+**Release (idle path of `performClaudeSessionShutdown`).**
+- Before any marker, provider-ID or save mutation, it requires the full owner check (`.releasable`) and an unchanged activity generation, with no intervening await.
+- It sets the fresh-start marker, then detaches and retires the exact controller.
+- Capturing the provider session ID is gated by `mayCaptureProviderSessionID`. That gate rechecks the exact owner (`idleRetirementOwnerLoss`: owner, liveness, successor run/attempt/preparation/dispatch) and that the conversation ID is unchanged.
+- An owner lost after the await returns without touching the successor. The marker is cleared only for its own released ID on rebinding or replacement.
+- Tool tracking is released only through the detached controller. Tab-keyed tracker slots are never cleared on the idle path.
+- Explicit `shutdownClaudeSession` callers keep their existing semantics.
+- Transcript, usage, bindings, lineage and the completed result are preserved.
+
+**Follow-up.**
+- The memory-only `claudeIdleReleasedConversationID` is consumed only for exactly that conversation, on a still-`isMCPOriginated` session, and starts fresh with a nil resume target.
+- The guarded V handoff (`RecoveryHandoffReason.idleRuntimeRelease`, "Nothing failed") is staged, and real host stage consumption (`recordPendingHandoffStageOutcome`) clears it after one send.
+- An existing payload keeps its payload and delivery IDs.
+- These still resume: a delivery hold, pending MCP recovery, a suppressed fallback, and any start after an app relaunch.
+
+**Diagnostics.** The `ClaudeIdleRuntime` log category records `scheduled`, `not-armed`, `cancelled`, `deferred`, `rearmed`, `released`, `stale` and `fresh-start`, each with a reason, tab and generation prefix. No prompts or secrets are logged. Per-event background-output re-arms and `not-armed` records log at debug level; bounded interaction activity and other lifecycle events log at info.
+
+**Tests.** `Tests/RepoPromptTests/AgentMode/ClaudeCompatible/ClaudeDelegatedIdleRuntimeReleaseTests.swift` contains the `AgentModeRunServiceLifecycleTests.testClaudeDelegatedIdle*` tests. They use a fake controller, manual clock and host-consumed handoff staging.
+
+**Remaining gaps.**
+- All evidence is deterministic; there is no live process or socket release evidence.
+- The superseded-attempt late request is exercised directly. The A5 overlap is exercised through a gated real terminal publication and the barrier's real duplicate-commit retry.
+- The at-expiry matrix omits `pendingAskUser`, `pendingWorktreeMergeReview` and composer submission; these rely on the shared predicate.
+- A permanently dirty session is never released.
+- A delivery hold resumes rather than starting fresh.
+- Coordinator-owned fences are sampled rather than notified.
 
 ## 2. Explicit completed-session release and cleanup ordering
 

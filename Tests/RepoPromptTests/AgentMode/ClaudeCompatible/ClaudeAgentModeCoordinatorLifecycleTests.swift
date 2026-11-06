@@ -2784,11 +2784,13 @@ private final class IsolatedPreferencesClaudeCoordinatorHost: ClaudeAgentModeCoo
 
     func stageClaudeResumeRecoveryHandoffIfNeeded(
         for session: AgentTabSession,
+        reason: ClaudeFreshStartHandoffReason,
         ifStillOwned: @escaping @MainActor () -> Bool,
         beforeCommit: (@MainActor () async -> Void)?
     ) async -> Bool {
         await base.stageClaudeResumeRecoveryHandoffIfNeeded(
             for: session,
+            reason: reason,
             ifStillOwned: ifStillOwned,
             beforeCommit: beforeCommit
         )
@@ -2868,7 +2870,7 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
     private let failResumeStart: Bool
     private let replacementAfterTerminalStartupFailure: Bool
     private var startGate: LifecycleAsyncGate?
-    private let currentSessionRefGate: LifecycleAsyncGate?
+    private var currentSessionRefGate: LifecycleAsyncGate?
     private var eventsStreamReadyGate: LifecycleAsyncGate?
     private var forceInitializationOnNextStart = false
     private var initializationGeneration: UInt64 = 0
@@ -3135,6 +3137,11 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
 
     func setTurnInFlight(_ value: Bool) {
         turnInFlight = value
+    }
+
+    /// Gates later `currentSessionRef()` calls only (for example the retirement capture).
+    func setCurrentSessionRefGate(_ gate: LifecycleAsyncGate?) {
+        currentSessionRefGate = gate
     }
 
     func setStartGate(_ gate: LifecycleAsyncGate?) {
