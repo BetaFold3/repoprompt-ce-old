@@ -2,8 +2,9 @@ import RepoPromptAgentCore
 import SwiftUI
 
 /// Briefing document (rich presentation spec, A6): masthead (title, date, deck) and ordered
-/// sections of articles in eager native stacks, two columns when the block is at least 760 points
-/// wide and one otherwise. No collapse, pagination, inner scrolling or lazy stack.
+/// sections of articles in eager native stacks, two columns when the briefing's content width
+/// (inside the block padding) is at least 760 points and one otherwise.
+/// No collapse, pagination, inner scrolling or lazy stack.
 struct RichPresentationBriefingView: View {
     let title: String
     let briefing: RichPresentationBriefing
@@ -15,14 +16,18 @@ struct RichPresentationBriefingView: View {
 
     static let twoColumnMinimumWidth: CGFloat = 760
 
-    /// Column count for an available block width (two at 760 points and wider).
+    /// Column count for an available content width (two at 760 points and wider).
     static func columnCount(forWidth width: CGFloat) -> Int {
         width >= twoColumnMinimumWidth ? 2 : 1
     }
 
-    @State private var width: CGFloat = 0
-
     var body: some View {
+        RichPresentationWidthReader { width in
+            document(columns: Self.columnCount(forWidth: width))
+        }
+    }
+
+    private func document(columns: Int) -> some View {
         VStack(alignment: .leading, spacing: 14) {
             VStack(alignment: .leading, spacing: 4) {
                 Text(title)
@@ -45,22 +50,14 @@ struct RichPresentationBriefingView: View {
                         .font(.headline)
                         .textSelection(.enabled)
                         .accessibilityAddTraits(.isHeader)
-                    articleRows(sectionIndex: sectionIndex, articles: section.articles)
+                    articleRows(sectionIndex: sectionIndex, articles: section.articles, columns: columns)
                 }
             }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            GeometryReader { proxy in
-                Color.clear.preference(key: RichPresentationWidthKey.self, value: proxy.size.width)
-            }
-        )
-        .onPreferenceChange(RichPresentationWidthKey.self) { width = $0 }
     }
 
     @ViewBuilder
-    private func articleRows(sectionIndex: Int, articles: [RichPresentationArticle]) -> some View {
-        let columns = Self.columnCount(forWidth: width)
+    private func articleRows(sectionIndex: Int, articles: [RichPresentationArticle], columns: Int) -> some View {
         let indexed = Array(articles.enumerated())
         let rows = stride(from: 0, to: indexed.count, by: columns).map { Array(indexed[$0 ..< min($0 + columns, indexed.count)]) }
         VStack(alignment: .leading, spacing: 14) {
@@ -88,10 +85,19 @@ struct RichPresentationBriefingView: View {
     }
 }
 
-private struct RichPresentationWidthKey: PreferenceKey {
-    static let defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = nextValue()
+/// Fills the offered width and passes its own laid-out width to `content` (0 before the first
+/// layout). Measured with `onGeometryChange`: a background-`GeometryReader` preference stayed at
+/// its default 0 once the content had selectable text or width-dependent columns (both true of the
+/// briefing), so the briefing never reached two columns.
+struct RichPresentationWidthReader<Content: View>: View {
+    @ViewBuilder let content: (CGFloat) -> Content
+
+    @State private var width: CGFloat = 0
+
+    var body: some View {
+        content(width)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width = $0 }
     }
 }
 

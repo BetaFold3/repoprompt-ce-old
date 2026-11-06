@@ -157,6 +157,29 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         XCTAssertTrue(standard.contains("confirm the requested deliverable exists"))
     }
 
+    /// Gemini-family function declarations (OMP through Google Cloud Code Assist) accept only
+    /// string `enum` members; a single numeric member rejects the whole tool list with HTTP 400
+    /// before any model call. `present_rich` keeps a required, described integer `version` without
+    /// an enum; `RichPresentationValidator` remains the version authority
+    /// (`RichPresentationSchemaTests.testRejectsUnsupportedOrMistypedVersion`).
+    func testAdvertisedWindowToolSchemasUseOnlyStringEnumMembers() async throws {
+        let window = Self.makeWindowWithoutAutoStart()
+        let tools = await window.mcpServer.windowMCPTools
+        XCTAssertTrue(tools.contains { $0.name == MCPWindowToolName.presentRich })
+        for tool in tools {
+            let offenders = try Self.nonStringEnumPaths(in: Value(tool.inputSchema), path: tool.name)
+            XCTAssertEqual(offenders, [], "\(tool.name) advertises non-string enum members")
+        }
+
+        let presentRich = try XCTUnwrap(tools.first { $0.name == MCPWindowToolName.presentRich })
+        let schema = try XCTUnwrap(Value(presentRich.inputSchema).objectValue)
+        XCTAssertEqual(Set(schema["required"]?.arrayValue?.compactMap(\.stringValue) ?? []), ["version", "title", "content"])
+        let version = try XCTUnwrap(Self.schemaProperties(for: presentRich)["version"]?.objectValue)
+        XCTAssertEqual(version["type"]?.stringValue, "integer")
+        XCTAssertEqual(version["description"]?.stringValue, "Schema version; must be \(RichPresentationLimits.schemaVersion).")
+        XCTAssertNil(version["enum"])
+    }
+
     func testCodingAgentPromptManifestMatchesRegisteredSchemas() async throws {
         let prompt = SystemPromptService.agentModePrompt()
         XCTAssertTrue(prompt.hasPrefix("# RepoPrompt Coding Agent — System Prompt (vNext-rc2.1)"))
@@ -978,6 +1001,24 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         return try XCTUnwrap(schema["properties"]?.objectValue, label, file: file, line: line)
     }
 
+    private static func nonStringEnumPaths(in value: Value, path: String) -> [String] {
+        switch value {
+        case let .object(object):
+            var paths: [String] = []
+            if let members = object["enum"]?.arrayValue, members.contains(where: { $0.stringValue == nil }) {
+                paths.append("\(path).enum")
+            }
+            for (key, child) in object.sorted(by: { $0.key < $1.key }) {
+                paths += nonStringEnumPaths(in: child, path: "\(path).\(key)")
+            }
+            return paths
+        case let .array(items):
+            return items.enumerated().flatMap { index, item in nonStringEnumPaths(in: item, path: "\(path)[\(index)]") }
+        default:
+            return []
+        }
+    }
+
     private static let expectedSignatures: [String] = [
         "0|manage_selection|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=b2facb46e2b8f9d4cfb00551bdfa19454b7f3eecd81bac510f4fed12f99452c3|schema=4b7a043e8e48130ee84cc6bbf7b9fd597b495aef238d44f17df6600088a2bb6f",
         "1|file_actions|enabled=true|ann=title=nil,readOnly=false,destructive=true,idempotent=nil,openWorld=false|desc=81230c22d826458cae079855b133d59da34c4a66ae4a68252727e564931335b8|schema=4fd6a59a00940e13efc05b74c81372928d3ad3de0e028c8b34586e2168d16103",
@@ -1007,7 +1048,7 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         "25|history|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=c4a738f11afe9f2c43772dfbf9842353c11370be23f3d66c1359b46ec5a01455|schema=62e0b861675086e0619134fac7d8823a71531b2afccb6b4451d9c7f519389e5d",
         "26|workspace_steer|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=369edee840b6334709591f2c990c009a1d74a830a909d04e7494cbeace9ff07f|schema=f1c4d5e91f4ea005cf2d5ac34594703265e6a6062d827489ff9d428c5016378c",
         "27|code_mode|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=81d387c9a0be4a15c9a6034cf9a295e27d9fdcee32ee50c67b64d2bc85361baf|schema=3a53ad002b6be098358ec6e27e5d3ea0d51d9671493b1d446f0bcdaf31afb7bf",
-        "28|present_rich|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=false,openWorld=true|desc=7aa0a39f3d6d09d17e62decaba62b28c1ad39258624a1427e3a2b8490a72eedd|schema=4ad2afd122f585733a4fe1a16dfa05d8ec51348b0715d5d3d6158fb3330bf167"
+        "28|present_rich|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=false,openWorld=true|desc=7aa0a39f3d6d09d17e62decaba62b28c1ad39258624a1427e3a2b8490a72eedd|schema=9e1f255d22f856a64b664cbd12841ca904f43bf8101dff1ffe7b1c2281358079"
     ]
 
     private static func signatures(for tools: [RepoPromptApp.Tool]) throws -> [String] {
