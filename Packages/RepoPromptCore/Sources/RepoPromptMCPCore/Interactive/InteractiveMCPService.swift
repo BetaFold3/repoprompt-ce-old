@@ -52,8 +52,16 @@ actor InteractiveMCPService: Service {
         // Connect to the app
         do {
             try await session.connect()
+            if options.verbose {
+                for timing in await session.startupTimings {
+                    fputs("\(timing)\n", stderr)
+                }
+            }
         } catch {
             handleConnectionError(error)
+            for timing in await session.startupTimings {
+                fputs("\(timing)\n", stderr)
+            }
             throw error
         }
 
@@ -114,8 +122,8 @@ actor InteractiveMCPService: Service {
             fputs("""
             \u{001B}[31mError: RepoPrompt did not respond to the bootstrap handshake\u{001B}[0m
 
-            The app accepted the socket connection too slowly or is wedged.
-            If RepoPrompt recently crashed under the debugger, restart it and try again.
+            See CLI startup diagnostics below for the phase, elapsed time and budget.
+            A startup timeout alone does not identify the app-side cause.
 
             """, stderr)
 

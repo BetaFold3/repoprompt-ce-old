@@ -83,13 +83,34 @@ private final class MCPInitializationSettlementState: @unchecked Sendable {
 
     private let lock = NSLock()
     private var outcome: Outcome = .pending
+    private var cancellationTask: Task<Void, Never>?
+    private let now: @Sendable () -> TimeInterval
+    private var settledAt: TimeInterval?
 
-    func claim(_ candidate: Outcome) -> Bool {
+    init(now: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
+        self.now = now
+    }
+
+    func settlementTime() -> TimeInterval? {
+        lock.lock()
+        defer { lock.unlock() }
+        return settledAt
+    }
+
+    func claim(_ candidate: Outcome, cancel: @escaping @Sendable () async -> Void) -> Bool {
         lock.lock()
         defer { lock.unlock() }
         guard case .pending = outcome else { return false }
         outcome = candidate
+        settledAt = now()
+        cancellationTask = Task.detached { await cancel() }
         return true
+    }
+
+    func cancellationToDrain() -> Task<Void, Never>? {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancellationTask
     }
 
     func finish() -> Outcome {
@@ -97,6 +118,7 @@ private final class MCPInitializationSettlementState: @unchecked Sendable {
         defer { lock.unlock() }
         if case .pending = outcome {
             outcome = .completed
+            settledAt = now()
         }
         return outcome
     }
@@ -343,6 +365,37 @@ private struct ToolListRefreshFlight {
     let request: ToolCatalogSharedTask<(tools: [MCP.Tool], nextCursor: String?)>
 }
 
+/// One bounded, payload-free observation of CLI startup. Connect has no application deadline;
+/// the write budget is an inactivity budget, not a whole-phase deadline.
+struct CLIStartupTiming: Equatable, CustomStringConvertible {
+    enum Phase: String {
+        case connect
+        case bootstrapWrite = "bootstrap_write"
+        case bootstrapResponse = "bootstrap_response"
+        case mcpInitialize = "mcp_initialize"
+    }
+
+    enum Outcome: String {
+        case completed, timedOut = "timed_out", cancelled, failed
+    }
+
+    let phase: Phase
+    let startedAt: Date
+    let elapsed: TimeInterval
+    let budget: TimeInterval?
+    let outcome: Outcome
+
+    var description: String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let startText = formatter.string(from: startedAt)
+        let elapsedText = String(format: "%.3f", locale: Locale(identifier: "en_US_POSIX"), elapsed)
+        let budgetText = budget.map { String(format: "%.3f", locale: Locale(identifier: "en_US_POSIX"), $0) } ?? "none"
+        let kind = phase == .bootstrapWrite ? "stall" : (budget == nil ? "none" : "deadline")
+        return "CLI startup: started_at_utc=\(startText) phase=\(phase.rawValue) outcome=\(outcome.rawValue) elapsed_s=\(elapsedText) budget_s=\(budgetText) budget_kind=\(kind)"
+    }
+}
+
 /// Manages an interactive MCP client session with the RepoPrompt app.
 actor InteractiveMCPClientSession {
     typealias TimeoutSleep = @Sendable (UInt64) async throws -> Void
@@ -355,9 +408,18 @@ actor InteractiveMCPClientSession {
     private let sessionToken: String
     private let clientName: String
     private let logger: Logger
-    private let timeoutSleep: TimeoutSleep
+    private var timeoutSleep: TimeoutSleep
     private let cancellationDeliveryDrainSleep: TimeoutSleep
     private let cancellationDeliveryDrainTimeoutNanoseconds: UInt64
+
+    private(set) var startupTimings: [CLIStartupTiming] = []
+    private var activeStartupPhase: (phase: CLIStartupTiming.Phase, started: TimeInterval, wallStart: Date, budget: TimeInterval?)?
+    private var startupNow: @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
+    #if DEBUG
+        private var bootstrapConnectedFDForTesting: Int32?
+        private var startupPhaseObserver: (@Sendable (CLIStartupTiming.Phase) -> Void)?
+        private var initializationCancellationDidDisconnect: (@Sendable () -> Void)?
+    #endif
 
     private var client: MCP.Client?
     private var transport: (any Transport)?
@@ -449,6 +511,65 @@ actor InteractiveMCPClientSession {
 
     /// Connects to the RepoPrompt app via bootstrap socket and initializes MCP.
     func connect(fetchInitialTools: Bool = true) async throws {
+        startupTimings.removeAll()
+        do {
+            try await connectAndInitialize(fetchInitialTools: fetchInitialTools)
+        } catch {
+            finishStartupPhase(error: error)
+            throw error
+        }
+    }
+
+    private func beginStartupPhase(_ phase: CLIStartupTiming.Phase, budget: TimeInterval?) {
+        finishStartupPhase()
+        activeStartupPhase = (phase, startupNow(), Date(), budget)
+        #if DEBUG
+            startupPhaseObserver?(phase)
+        #endif
+    }
+
+    private func finishStartupPhase(error: Error? = nil, endedAt: TimeInterval? = nil) {
+        guard let active = activeStartupPhase else { return }
+        activeStartupPhase = nil
+        let outcome: CLIStartupTiming.Outcome = if error is CancellationError {
+            .cancelled
+        } else if let error = error as? InteractiveSessionError {
+            switch error {
+            case .cancelled: .cancelled
+            case .bootstrapResponseTimeout: .timedOut
+            case .writeFailed(errno: ETIMEDOUT), .connectFailed(errno: ETIMEDOUT): .timedOut
+            default: .failed
+            }
+        } else {
+            error == nil ? .completed : .failed
+        }
+        let timing = CLIStartupTiming(
+            phase: active.phase, startedAt: active.wallStart,
+            elapsed: max(0, (endedAt ?? startupNow()) - active.started),
+            budget: active.budget, outcome: outcome
+        )
+        startupTimings.append(timing)
+        logger.debug("\(timing)")
+    }
+
+    #if DEBUG
+        /// The supplied socketpair endpoint transfers ownership to the next connect attempt.
+        func debugConfigureStartup(
+            connectedFD: Int32,
+            now: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+            timeoutSleep: @escaping TimeoutSleep = { try await Task.sleep(nanoseconds: $0) },
+            phaseObserver: (@Sendable (CLIStartupTiming.Phase) -> Void)? = nil,
+            cancellationDidDisconnect: (@Sendable () -> Void)? = nil
+        ) {
+            bootstrapConnectedFDForTesting = connectedFD
+            startupNow = now
+            self.timeoutSleep = timeoutSleep
+            startupPhaseObserver = phaseObserver
+            initializationCancellationDidDisconnect = cancellationDidDisconnect
+        }
+    #endif
+
+    private func connectAndInitialize(fetchInitialTools: Bool) async throws {
         logger.debug("InteractiveMCPClientSession connecting...")
         resetToolCatalogForConnectionBoundary()
 
@@ -479,6 +600,10 @@ actor InteractiveMCPClientSession {
         self.requestSendBarrier = requestSendBarrier
         self.client = client
         logger.debug("Created MCP client '\(clientName)'")
+        let initializationSettlement = MCPInitializationSettlementState(now: startupNow)
+        #if DEBUG
+            let cancellationDidDisconnect = initializationCancellationDidDisconnect
+        #endif
 
         do {
             // Register for tool list changed notifications
@@ -497,12 +622,23 @@ actor InteractiveMCPClientSession {
             // Connect and initialize. Avoid returning Initialize.Result through a
             // throwing task group: Swift 6.2 release builds can abort in
             // swift_task_dealloc when that timeout race tears down a child task.
+            beginStartupPhase(.mcpInitialize, budget: 10)
             let initResult = try await Self.awaitInitialization(
                 timeoutNanoseconds: 10_000_000_000,
-                timeoutSleep: timeoutSleep
+                timeoutSleep: timeoutSleep,
+                settlement: initializationSettlement,
+                cancelOperation: {
+                    // SDK response continuations do not settle on Task.cancel alone.
+                    // Close this attempt's transport so initialize drains before cleanup.
+                    await transport.disconnect()
+                    #if DEBUG
+                        cancellationDidDisconnect?()
+                    #endif
+                }
             ) {
                 try await client.connect(transport: transport)
             }
+            finishStartupPhase(endedAt: initializationSettlement.settlementTime())
             logger.debug("MCP client connected successfully")
 
             // Store server info
@@ -517,6 +653,8 @@ actor InteractiveMCPClientSession {
                 try await refreshTools()
             }
         } catch {
+            // Measure the failed phase before transport cleanup, not including teardown latency.
+            finishStartupPhase(error: error, endedAt: initializationSettlement.settlementTime())
             await client.disconnect()
             await transport.disconnect()
             self.client = nil
@@ -532,11 +670,13 @@ actor InteractiveMCPClientSession {
     private static func awaitInitialization(
         timeoutNanoseconds: UInt64,
         timeoutSleep: @escaping TimeoutSleep,
+        settlement: MCPInitializationSettlementState = MCPInitializationSettlementState(),
+        cancelOperation: @escaping @Sendable () async -> Void = {},
         operation: @escaping @Sendable () async throws -> Initialize.Result
     ) async throws -> Initialize.Result {
-        let settlement = MCPInitializationSettlementState()
         let connectionTask = Task {
-            try await operation()
+            try Task.checkCancellation()
+            return try await operation()
         }
         let timeoutTask = Task {
             do {
@@ -544,8 +684,9 @@ actor InteractiveMCPClientSession {
             } catch {
                 return
             }
-            if settlement.claim(.timedOut) {
+            _ = settlement.claim(.timedOut) {
                 connectionTask.cancel()
+                await cancelOperation()
             }
         }
 
@@ -560,6 +701,7 @@ actor InteractiveMCPClientSession {
             let outcome = settlement.finish()
             timeoutTask.cancel()
             await timeoutTask.value
+            await settlement.cancellationToDrain()?.value
 
             switch outcome {
             case .completed:
@@ -572,8 +714,9 @@ actor InteractiveMCPClientSession {
                 preconditionFailure("Connection task completion must settle initialization state")
             }
         } onCancel: {
-            if settlement.claim(.callerCancelled) {
+            _ = settlement.claim(.callerCancelled) {
                 connectionTask.cancel()
+                await cancelOperation()
             }
             timeoutTask.cancel()
         }
@@ -1414,9 +1557,16 @@ actor InteractiveMCPClientSession {
     /// Performs the bootstrap socket handshake and returns the connected FD.
     private func performBootstrapHandshake() async throws -> Int32 {
         let socketURL = MCPFilesystemConstants.bootstrapSocketURL()
+        beginStartupPhase(.connect, budget: nil)
 
-        // Create socket
-        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        // Create socket. Connect retains its existing OS-controlled blocking semantics.
+        #if DEBUG
+            let suppliedFD = bootstrapConnectedFDForTesting
+            bootstrapConnectedFDForTesting = nil
+        #else
+            let suppliedFD: Int32? = nil
+        #endif
+        let fd = suppliedFD ?? socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else {
             throw InteractiveSessionError.socketCreationFailed(errno: errno)
         }
@@ -1455,7 +1605,7 @@ actor InteractiveMCPClientSession {
 
         // Connect
         let addrLen = socklen_t(MemoryLayout<sockaddr_un>.size)
-        let connectResult = withUnsafePointer(to: &addr) { addrPtr in
+        let connectResult = suppliedFD != nil ? 0 : withUnsafePointer(to: &addr) { addrPtr in
             addrPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPtr in
                 Darwin.connect(fd, sockaddrPtr, addrLen)
             }
@@ -1472,9 +1622,11 @@ actor InteractiveMCPClientSession {
         logger.debug("Connected to bootstrap socket")
 
         // Send handshake request
+        beginStartupPhase(.bootstrapWrite, budget: MCPBootstrapTiming.initialRequestWriteTimeout)
         try sendHandshakeRequest(fd: fd)
 
         // Read handshake response
+        beginStartupPhase(.bootstrapResponse, budget: MCPBootstrapTiming.initialResponseTimeout)
         let response = try await readHandshakeResponse(
             fd: fd,
             timeout: MCPBootstrapTiming.initialResponseTimeout
@@ -1482,6 +1634,7 @@ actor InteractiveMCPClientSession {
 
         switch response.type {
         case "accepted":
+            finishStartupPhase()
             logger.debug("Bootstrap handshake accepted")
             shouldCloseFD = false
             return fd
@@ -1544,15 +1697,15 @@ actor InteractiveMCPClientSession {
         let readBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: 4096)
         defer { readBuffer.deallocate() }
 
-        let deadline = Date().addingTimeInterval(timeout)
+        let deadline = startupNow() + timeout
 
-        while Date() < deadline {
+        while startupNow() < deadline {
             if Task.isCancelled {
                 throw InteractiveSessionError.cancelled
             }
 
             var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
-            let remaining = Int32(deadline.timeIntervalSinceNow * 1000)
+            let remaining = Int32(max(0, min(100, (deadline - startupNow()) * 1000)))
             let pollResult = poll(&pfd, 1, min(100, max(1, remaining)))
 
             if pollResult < 0 {

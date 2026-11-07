@@ -58,6 +58,9 @@ actor ExecMCPService: Service {
             await session.disconnect()
             self.session = nil
             handleConnectionError(error)
+            for timing in await session.startupTimings {
+                fputs("\(timing)\n", stderr)
+            }
             throw error
         }
 
@@ -230,6 +233,11 @@ actor ExecMCPService: Service {
             attempt += 1
             do {
                 try await session.connect(fetchInitialTools: false)
+                if options.verbose {
+                    for timing in await session.startupTimings {
+                        fputs("\(timing)\n", stderr)
+                    }
+                }
                 return // Success
             } catch {
                 lastError = error
@@ -379,8 +387,8 @@ actor ExecMCPService: Service {
             fputs("""
             Error: RepoPrompt did not respond to the bootstrap handshake
 
-            The app accepted the socket connection too slowly or is wedged.
-            If RepoPrompt recently crashed under the debugger, restart it and try again.
+            See CLI startup diagnostics below for the phase, elapsed time and budget.
+            A startup timeout alone does not identify the app-side cause.
 
             """, stderr)
         default:
