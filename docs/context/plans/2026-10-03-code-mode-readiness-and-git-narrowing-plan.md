@@ -457,14 +457,15 @@ The owner selected option 2 on 2026-11-06: replace the hand-written unified-diff
 4. Fixture setup and read-only grading are reproducible, isolate repetitions, and fail closed on wrong base or contamination. An untouched fixture must not pass a required edit.
 5. Grader implementation receives independent review and focused tests before use. No grader is implemented in this session and no paid attempt is authorized by accepting this contract.
 
-## 13. Future re-measurement protocol (not authorized to run)
+## 13. Re-measurement protocol — bounded pilot stopped; full gate not authorized
 
-This is a prospective protocol, not acceptance or permission to dispatch. Defaults, the historical cost-gate result and promotion remain unchanged. Reliability work is owned by the [Claude delegated-session reliability plan](2026-11-06-claude-delegated-session-reliability-plan.md).
+The owner separately authorized the bounded Q/T-only pilot below on 2026-11-06. It stopped at its frozen two-event limit; that authorization does not permit top-ups or a full gate. The prospective full-gate preconditions below remain requirements, not permission to dispatch. Defaults, the historical cost-gate result and promotion remain unchanged. Reliability work is owned by the [Claude delegated-session reliability plan](2026-11-06-claude-delegated-session-reliability-plan.md).
 
 ### Preconditions and frozen manifest
 
+- Record the owner's current per-provider read-tool settings before measurement, set each arm explicitly, and restore the recorded values after completion or interruption rather than assuming native/native. An explicitly owner-local experimental per-provider preference is distinct from savings/promotion acceptance; the source default stays native.
 - Use one recorded fixed build containing `f8c2ae62` (handoff correction), `ae2ca61f` (fence separator), and completed/validated reliability items 1–3. Item 4's bootstrap recheck must pass or be explicitly resolved before dispatch; an unresolved startup path blocks measurement. Record app/helper binary hashes, build SHA, provider CLI/shim versions, host model IDs and effort, exact system/task prompts, tool definitions, permissions, fixture SHA, analyzer/pricing version and bootstrap method.
-- Base commits `b7baf605` and `09d8d43b` are pending for the next rebuild, **not merged now**. Record their eventual integration and any tool-exposure effects in the frozen manifest; do not silently mix builds within a cohort.
+- The owner's daily build `b0580cb8` includes the merged rich-presentation base (the formerly pending `b7baf605` and `09d8d43b` integration), handoff/fence fixes and delegated idle release `8728a2c9`. The pilot records that build and its tool-exposure effects below. A future full gate must record its own exact integration, reliability state and immutable manifest; do not silently mix builds within a cohort.
 - Require zero retained idle/completed Claude runtimes/helpers in the measurement environment, verified by owned process identity/start time and app diagnostics, not by PID counts alone. Preserve unrelated user sessions; if they prevent the clean-environment precondition, defer rather than kill them.
 - After separately authorized cleanup, restore and verify Dev caps at **64 per client / 128 global**, not temporary 200/200. Prove adequate stable headroom and no idle eviction/reconnect loop before dispatch. No cleanup or cap change occurs now.
 - Use the clean detached corpus at `d4cbd9d152fedd79a62dbc5e270270d0b141db92`; verify truths before either arm. Reset only owned disposable per-attempt fixtures through the future approved harness; no shared dirty checkout.
@@ -486,7 +487,33 @@ Keep the **§7 price-weighted whole-run gate unchanged**:
 
 Report raw tokens, first-request/post-first-request decomposition, turns and wall time as diagnostics only. Do not replace the gate with a post-request-1 ratio, subtract a fitted prompt floor, mix old/new cohorts, or turn a diagnostic subset into promotion acceptance. Missing evidence blocks a claim. Owner acceptance remains separate.
 
-### Evidence disposition and current-session boundary
+### Owner-authorized b0580cb8 Q/T pilot — 2026-11-06
+
+The owner authorized 220 maximum attempts: T1–T8 plus U1–U3, five repetitions per task/arm/model, Sonnet 5.5 native-provider medium and Codex gpt-6.1-sol medium, native versus code-mode, structured results off. No E tasks. The explicit pilot authorization allowed live-accepted idle-release item 1 while reliability items 2–4 remained incomplete; it did not certify those items. Protocol, schedule, numerical forecasts and collector hashes were frozen before dispatch in [pilot protocol](evidence/2026-10-03-code-mode-readiness-and-git-narrowing/pilot-b0580cb8-2026-11-06/protocol.md).
+
+**Stopped, not completed:** two standalone diagnostic CLI startup timeouts fired the frozen two-event rule, before n163 and after n172. All 172 collected answers are correct and usage-complete: Sonnet 110/110 (55/arm), Codex 62/62 (31/arm). Slots 173–220 remain unrun, with no replacement or imputation. Sonnet retains 14 strict tool-policy violation rows (9 native, 5 candidate), consisting of rejected invented/unqualified tool names, not successful shell execution. Codex has no violations but only 2–3 repetitions per task/arm. Its three recovered output-limit rows (n132/n153 U3, n148 T8) retain their costs and correct answers.
+
+Unchanged §7 weighted candidate/native ratios [95% bootstrap CI]:
+| Model | Single | Multi | Heavy | All (reported) |
+|---|---|---|---|---|
+| Sonnet 5.5 medium | 0.963 [0.453–2.199] | 0.895 [0.635–1.348] | 0.506 [0.372–1.058] | 0.781 [0.602–1.120] |
+| Codex gpt-6.1-sol medium | 0.933 [0.494–1.252] | 0.785 [0.712–1.086] | 0.863 [0.713–1.200] | 0.844 [0.722–1.028] |
+
+Sonnet met §7.1 majority-correctness and the §7.2 per-kind ≤1.10 point tests at five repetitions and fails only the zero-violation rule: 9 of its 14 violation rows are in the native baseline arm, and all 14 are rejected tool-name attempts that never executed. Codex meets the per-kind points but is exploratory and below the repetition requirement. Every interval includes 1, which blocks only a §7.3 savings claim, not the §7.2 point test. No gate pass, demonstrated savings or promotion acceptance is claimed; an explicitly owner-local experimental per-provider preference remains a separate decision, with the source default native.
+
+Single-lookup tasks had zero code_mode adoption in both models and both arms. Codex's candidate also moves the four exploration tools to the direct server (analyzer median direct mcp__rp calls 2 versus 0), so its single-kind ratio is not description overhead alone. Candidate first-input overhead from single-kind medians is +941 tokens Sonnet / +2,726 Codex. Output-cap recoveries affected 3 of 12 adopting Codex rows versus 0 of 20 adopting Sonnet rows.
+
+Every current row has no false recovery wrapper and one intended file map. Matched first-user removal meets the frozen wrapper-byte prediction wherever the historical reference exists (109 Sonnet/62 Codex). First-input token medians fall: Sonnet native 81,473.5→77,450 and candidate 82,416→78,391; matched retained Codex native 34,186→28,584 and candidate 36,917→31,298. Old/new cost rows remain non-comparable as clean causal before/after estimates.
+
+The preregistered matched user-byte measure above was met. Separately, offline reconstruction of 109 matched Claude initial API requests finds median net JSON reductions of 12,293 native /12,291.5 candidate bytes, despite approximately 19.25 KB removed from the user payload; Codex full requests were not reconstructed. System JSON grew 1,098 bytes and tool JSON 6,267 bytes: added `present_rich` plus changed native `DesignSync`/`SendToProject` definitions account for the tool growth. Under this section's historical-comparison rule, that tool/system definition growth is a build confound, not evidence against wrapper removal. These are recorded request-construction bytes, not network capture or attributed token costs. The dispatch-time `byte_hypothesis_supported` check covered the preregistered user-message measure; the Claude full-request offset was decomposed after the reliability stop, and no further attempt followed.
+
+Pre-batch checks recorded the fixed app hash, clean fixture, raw logging, available headroom and passive release of prior-batch delegated Claude runtimes. No prior-batch drain failure or eviction loop was observed. Caps were verified through absent persisted overrides and source defaults 64/128, not an unavailable in-memory cap diagnostic. The generic CLI error conflates 5-second bootstrap and 10-second initialize timeouts; it does not prove cap pressure, a wedged app or a necessary relaunch. Defaults were restored to native/native/off; no cleanup, cap mutation, relaunch or push occurred.
+
+The [pilot report](evidence/2026-10-03-code-mode-readiness-and-git-narrowing/pilot-b0580cb8-2026-11-06/report.md) contains per-model/arm/kind counts, weighted totals, floors, confidence intervals, archive references and limitations. The smallest next check is reliability item 4's phase-specific startup diagnosis followed by a separately bounded no-model CLI check. No further paid measurement is authorized; any future cohort needs fresh preregistration distinguishing user-byte removal from total-request drift. A full gate additionally requires the §12 edit tasks and resolved reliability preconditions.
+
+Pilot closeout validation confirms all 13 frozen file hashes, 172 schedule/session identities, reproducible offline projections and independently recalculated rounded weighted totals. The context checker still reports one error: the frozen pilot protocol lacks the required scope header. Its exact preregistered bytes are preserved rather than edited after the run; this is a disclosed documentation-validation failure, not a passing check. Non-frozen evidence-note header/reachability errors were corrected. Checker regression tests pass 23/23 and `git diff --check` passes; no app build or XCTest rerun occurred.
+
+### Evidence disposition and prior housekeeping boundary
 
 The existing `docs/context/plans/evidence/` directory is entirely untracked: 927 files, 24,337,886 logical bytes (about 23.2 MiB; `du -sh` reports 25 MiB), measured 2026-11-06 before any new measurement. This plan's evidence references depend on those local files; a clean clone does not carry them. Several receipts also refer to external native archives or temporary paths, so committing this directory alone would not make the whole investigation self-contained.
 
